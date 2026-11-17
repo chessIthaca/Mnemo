@@ -56,7 +56,7 @@ impl<'a> CheckRecorder<'a> {
         }
     }
 
-    async fn record_at_tip(&self, worker_id: &str, check: WorkerCheck) -> Result<(), String> {
+    pub(super) async fn record_at_tip(&self, worker_id: &str, check: WorkerCheck) -> Result<(), String> {
         let mut records = self.records.lock().await;
         let worker = records
             .iter_mut()
@@ -444,6 +444,7 @@ impl TeamRuntime {
         old_string: &str,
         new_string: &str,
     ) -> Result<WorkerRecord, String> {
+        self.proving_guard(worker_id)?;
         let _guard = self.merge_lock.lock().await;
         let worker = self.worker(worker_id).await?;
         if worker.status != WorkerStatus::InReview {
@@ -783,6 +784,7 @@ impl TeamRuntime {
         finding_id: &str,
         tier: Option<&str>,
     ) -> Result<WorkerRecord, String> {
+        self.proving_guard(worker_id)?;
         let _guard = self.merge_lock.lock().await;
         let worker = self.worker(worker_id).await?;
         // Audits only ever produce findings; they never receive them.

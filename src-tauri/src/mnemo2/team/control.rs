@@ -49,6 +49,7 @@ impl TeamRuntime {
         text: String,
         sender: MessageSender,
     ) -> Result<WorkerRecord, String> {
+        self.proving_guard(worker_id)?;
         let _guard = self.merge_lock.lock().await;
         self.message_inner(worker_id, text, sender).await
     }
@@ -424,6 +425,7 @@ impl TeamRuntime {
     /// Reattach a stopped/interrupted worker from its saved transcript. The
     /// session comes back idle; the lead then sends it a message.
     pub async fn resume(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        self.proving_guard(worker_id)?;
         let _guard = self.merge_lock.lock().await;
         self.resume_inner(worker_id).await
     }
@@ -536,6 +538,7 @@ impl TeamRuntime {
             self.live.clone(),
             self.fail_next_close.clone(),
             self.board(),
+            self.proof_ctx(),
         ));
         self.live.lock().await.insert(
             worker_id.to_string(),

@@ -50,6 +50,7 @@ mod persistence;
 // Public: the proof engine's contract is part of the crate's API, so a step
 // that adds it before the team calls it does not trip the dead-code lint.
 pub mod proof;
+mod proving;
 mod pump;
 mod record;
 mod review;
@@ -339,6 +340,12 @@ pub struct TeamRuntime {
     /// transcripts the window already holds.
     transcript_revs: Arc<std::sync::Mutex<TranscriptRevisionCache>>,
     board: std::sync::Mutex<Option<Arc<PlanBoard>>>,
+    /// The workers whose proofs are running. Every entry point that would move
+    /// a proved checkout refuses while the worker's id is in here.
+    proving: proving::Proving,
+    /// The two proof commands, behind a seam a test can answer without a
+    /// twenty-minute build.
+    proofs: std::sync::RwLock<Arc<dyn proving::ProofRunner>>,
     signals: broadcast::Sender<BoardSignal>,
     /// The external lead's attach flag, notice queue and activity clock.
     external: std::sync::Mutex<ExternalLead>,
@@ -453,6 +460,8 @@ impl TeamRuntime {
             save_lock: Arc::new(Mutex::new(())),
             transcript_revs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             board: std::sync::Mutex::new(None),
+            proving: proving::Proving::default(),
+            proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs)),
             signals,
             external: std::sync::Mutex::new(ExternalLead::default()),
             external_wake: tokio::sync::Notify::new(),
@@ -561,6 +570,40 @@ impl TeamRuntime {
             });
         }));
         *self.board.lock().unwrap_or_else(|e| e.into_inner()) = Some(board);
+    }
+
+    /// Everything a proof run reads from the runtime: the ledger handles it
+    /// writes through, the plan board it reads the plan from, the claim set,
+    /// and the runner.
+    pub(super) fn proof_ctx(&self) -> proving::ProofCtx {
+        proving::ProofCtx {
+            workspace_root: self.workspace_root.clone(),
+            records: self.records.clone(),
+            usage: self.usage.clone(),
+            save_lock: self.save_lock.clone(),
+            persistence: self.persistence.clone(),
+            signals: self.signals.clone(),
+            proving: self.proving.clone(),
+            board: self.board(),
+            runner: Arc::clone(&*self.proofs.read().unwrap_or_else(|e| e.into_inner())),
+        }
+    }
+
+    /// The refusal an entry point returns while a proof owns the worker's
+    /// checkout. Every path that would move that checkout, or start a turn in
+    /// it, must ask this first.
+    pub(super) fn proving_guard(&self, worker_id: &str) -> Result<(), String> {
+        if self.proving.is_active(worker_id) {
+            return Err(proving::proving_error(worker_id));
+        }
+        Ok(())
+    }
+
+    /// Replace the proof runner. Tests only: a scripted outcome must not need a
+    /// real build.
+    #[cfg(test)]
+    pub(crate) fn set_proof_runner_for_test(&self, runner: Arc<dyn proving::ProofRunner>) {
+        *self.proofs.write().unwrap_or_else(|e| e.into_inner()) = runner;
     }
 
     fn board(&self) -> Option<Arc<PlanBoard>> {

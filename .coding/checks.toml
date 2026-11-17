@@ -1,3 +1,15 @@
 # Exact commands only: run them as written in the checkout root.
 # Nothing else may appear on the line — no chaining, piping, or redirection.
 commands = ["cargo test --workspace", "cargo clippy --workspace --all-targets", "npm test --workspace mnemo2", "npm run check --workspace mnemo2"]
+
+[regression]
+# Runs one test by name; {name} is the plan's regression_test.
+command = "cargo test --workspace -- {name}"
+# Text that proves the test ran (the output must contain it, {name} replaced).
+ran = "{name} ... "
+
+[mutation]
+# {diff} = a unified diff file of the change, {out} = an output folder.
+command = "cargo mutants --in-diff {diff} --no-shuffle --jobs 2 --timeout 600 --output {out}"
+# A file under {out} listing the missed mutants, one per line.
+missed = "{out}/mutants.out/missed.txt"

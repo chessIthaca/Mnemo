@@ -3553,26 +3553,26 @@ fn merge_gate_requires_substantive_review_evidence() {
     // A summary plus passing checks alone can no longer merge: the
     // legacy-shaped review (evidence absent) is rejected.
     let unevidenced = in_review_worker(None);
-    let error = validate_merge(&unevidenced, "tip0001", &[], &full_lane())
+    let error = validate_merge(&unevidenced, "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect_err("a legacy review must not merge without fresh evidence");
     assert!(error.contains("structured evidence"), "{error}");
 
     // An anchored-only pass is not substantive either.
     let mut unanchored = evidence();
     unanchored.unanchored_pass = false;
-    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[], &full_lane())
+    let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect_err("unanchored evidence must not merge");
     assert!(rejected.contains("unanchored"), "{rejected}");
 
     // Empty assessments are rejected.
     let mut empty_intent = evidence();
     empty_intent.intent = "  ".into();
-    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[], &full_lane())
+    let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect_err("empty intent must not merge");
     assert!(empty.contains("intent"), "{empty}");
 
     // Complete evidence passes the gate for standard-risk work.
-    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[], &full_lane())
+    validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[], &full_lane(), &proving::MergeProof::default())
         .expect("complete evidence merges");
 }
 
@@ -3644,7 +3644,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     // High-risk work cannot merge on the lead's evidence alone.
     let mut high = in_review_worker(Some(evidence()));
     high.review_risk = "high".into();
-    let missing = validate_merge(&high, "tip0001", &records_empty, &full_lane())
+    let missing = validate_merge(&high, "tip0001", &records_empty, &full_lane(), &proving::MergeProof::default())
         .expect_err("high-risk work needs an independent audit");
     assert!(
         missing.contains("high-risk reviews require an independent reviewer"),
@@ -3657,7 +3657,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
     untracked_evidence.audit_adjudication = Some("accepted".into());
     let mut untracked_worker = in_review_worker(Some(untracked_evidence));
     untracked_worker.review_risk = "high".into();
-    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty, &full_lane())
+    let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty, &full_lane(), &proving::MergeProof::default())
         .expect_err("the linked reviewer must be a tracked worker");
     assert!(untracked.contains("not a tracked worker"), "{untracked}");
 
@@ -3670,26 +3670,26 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         WorkerStatus::Completed,
     );
     implementer.kind = "implementation".into();
-    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer], &full_lane())
+    let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer], &full_lane(), &proving::MergeProof::default())
         .expect_err("an implementation worker is not an independent audit");
     assert!(wrong_kind.contains("not a read-only audit worker"), "{wrong_kind}");
 
     // An audit still working cannot be linked.
     let mut live = audit_worker(WorkerStatus::Working, "evidence0001", "tip0001");
     live.status = WorkerStatus::Working;
-    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live], &full_lane())
+    let incomplete = validate_merge(&untracked_worker, "tip0001", &[live], &full_lane(), &proving::MergeProof::default())
         .expect_err("an unfinished audit must not merge");
     assert!(incomplete.contains("not completed"), "{incomplete}");
 
     // An audit of another worker is refused.
     let foreign = audit_worker(WorkerStatus::Completed, "other0001", "tip0001");
-    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign], &full_lane())
+    let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign], &full_lane(), &proving::MergeProof::default())
         .expect_err("a foreign audit must not link");
     assert!(mismatched.contains("reviews 'other0001'"), "{mismatched}");
 
     // An audit at an older tip is stale after a fix commit moved it.
     let stale = audit_worker(WorkerStatus::Completed, "evidence0001", "tip0000");
-    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale], &full_lane())
+    let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale], &full_lane(), &proving::MergeProof::default())
         .expect_err("a stale audit must block the merge");
     assert!(stale_error.contains("stale"), "{stale_error}");
 
@@ -3704,6 +3704,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
         &full_lane(),
+        &proving::MergeProof::default(),
     )
     .expect_err("linking an audit requires an adjudication");
     assert!(
@@ -3723,6 +3724,7 @@ fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
         "tip0001",
         &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
         &full_lane(),
+        &proving::MergeProof::default(),
     )
     .expect("a fresh completed audit with an adjudication merges");
 }
@@ -11937,6 +11939,314 @@ async fn unregistered_pool_is_rejected_before_worker_cleanliness_or_tip_probes()
     assert_eq!(
         team.worker(&worker.id).await.expect("unchanged worker").status,
         WorkerStatus::InReview
+    );
+    team.shutdown().await;
+}
+
+// --- The two proofs of plan 970d8d66: the red check and the mutation check ---
+
+/// A proof runner that answers with one scripted outcome, so the recording and
+/// the notice are exercised without a real test build.
+struct ScriptedProofs {
+    outcome: proof::RedOutcome,
+}
+
+#[async_trait::async_trait]
+impl proving::ProofRunner for ScriptedProofs {
+    async fn prove(&self, _request: proving::ProveRequest) -> Result<proof::RedOutcome, String> {
+        Ok(self.outcome.clone())
+    }
+
+    async fn mutate(&self, _request: proving::MutateRequest) -> Result<Vec<proof::Mutant>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// Wait for one lead notice whose text contains `needle`.
+async fn drain_notice(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> Option<String> {
+    for _ in 0..400 {
+        while let Ok(signal) = receiver.try_recv() {
+            if let BoardSignal::Notice { text, .. } = signal {
+                if text.contains(needle) {
+                    return Some(text);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
+}
+
+/// A team whose board holds a `bug_fixing` plan naming `regression_proves_red`
+/// as its regression test, with a provisioned worker whose checkout carries a
+/// commit that adds that name.
+async fn proof_fixture(
+    id: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<TeamRuntime>,
+    String,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    std::fs::create_dir_all(root.path().join(".coding")).expect("coding dir");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        "[regression]\ncommand = \"cargo test -- {name}\"\nran = \"{name} ... \"\n\n[mutation]\ncommand = \"cargo mutants --in-diff {diff} --output {out}\"\nmissed = \"{out}/missed.txt\"\n",
+    )
+    .expect("checks.toml");
+    let plans_dir = root.path().join(".coding/plans");
+    std::fs::create_dir_all(&plans_dir).expect("plans dir");
+    let board = PlanBoard::new(&plans_dir, root.path().join(".coding/reviews"));
+    let plan = board
+        .create(mnemo::app::plan_board::PlanDraft {
+            title: "Prove the fix".to_string(),
+            goal: "The regression test fails without the fix".to_string(),
+            context: "verified: the proof wiring lives in src-tauri/src/mnemo2/team/proving.rs; verify with cargo test.".to_string(),
+            kind: mnemo::memory::plan_format::PlanKind::BugFixing,
+            bug: Some("a filter accepts everything".to_string()),
+            steps: vec![
+                "**Wire** the proof in src-tauri/src/mnemo2/team/proving.rs".to_string(),
+            ],
+            ..Default::default()
+        })
+        .expect("create the plan");
+    board
+        .update(
+            &plan.id,
+            mnemo::app::plan_board::PlanEdit {
+                regression_test: Some("regression_proves_red".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("record the regression test");
+    let team = Arc::new(open_test_team(root.path(), state.path(), Vec::new()).await);
+    team.attach_board(Arc::new(board));
+    let worker = provision_pool_worker(&team, id).await;
+    std::fs::write(
+        worker.worktree.join("fix.rs"),
+        "fn regression_proves_red() {}\n",
+    )
+    .expect("worker change");
+    run_git(&worker.worktree, &["add", "fix.rs"]);
+    run_git(
+        &worker.worktree,
+        &["commit", "-m", "add the regression test"],
+    );
+    team.update_worker(&worker.id, |current| {
+        current.plan_id = Some(plan.id.clone());
+        current.plan_step = Some(1);
+    })
+    .await;
+    let record = team.worker(&worker.id).await.expect("worker");
+    assert!(
+        team.proof_ctx().worker_plan(&record).await.is_some(),
+        "the fixture's plan parses back from the board"
+    );
+    assert!(
+        proof::load_proof_config(root.path()).regression.is_some(),
+        "the fixture configures a regression command: {:?}",
+        std::fs::read_to_string(root.path().join(".coding/checks.toml"))
+    );
+    (root, state, team, worker.id)
+}
+
+/// While a proof runs, every entry point that would move the worker's checkout
+/// refuses with one message naming the proof, and the merge gate refuses even
+/// when it is reached directly.
+#[tokio::test]
+async fn merge_refuses_while_proving() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveBusy01").await;
+    assert!(team.proof_ctx().proving.hold_for_test(&worker_id));
+    let expected = proving::proving_error(&worker_id);
+    assert!(
+        expected.contains("is proving"),
+        "the refusal names the proof: {expected}"
+    );
+    assert_eq!(
+        team.message(&worker_id, "hello".to_string(), MessageSender::Lead)
+            .await
+            .expect_err("a message is refused while the proof runs"),
+        expected
+    );
+    assert_eq!(
+        team.merge_as(&worker_id, true)
+            .await
+            .expect_err("a merge is refused while the proof runs"),
+        expected
+    );
+    assert_eq!(
+        team.resume(&worker_id)
+            .await
+            .expect_err("a resume is refused while the proof runs"),
+        expected
+    );
+    assert_eq!(
+        team.route_fix(&worker_id, &proof_finding(&worker_id))
+            .await
+            .expect_err("a routed fix is refused while the proof runs"),
+        expected
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let running = proving::MergeProof {
+        running: true,
+        ..Default::default()
+    };
+    let error = validate_merge(&worker, "tip0001", &[], &full_lane(), &running)
+        .expect_err("the gate refuses a running proof");
+    assert_eq!(error, expected);
+    team.shutdown().await;
+}
+
+/// A resolved finding a routed fix would carry: the route is refused before the
+/// finding matters.
+fn proof_finding(worker_id: &str) -> String {
+    format!("{worker_id}-finding")
+}
+
+/// A bug-fix diff that adds the plan's regression test cannot merge until the
+/// tip carries the passed red check or the lead resolved the proof finding.
+#[tokio::test]
+async fn merge_requires_red_proof_for_bug_fix_adding_the_test() {
+    let worker = in_review_worker(Some(evidence()));
+    let required = proving::MergeProof {
+        regression_required: true,
+        ..Default::default()
+    };
+    let error = validate_merge(&worker, "tip0001", &[], &full_lane(), &required)
+        .expect_err("an unproven regression test blocks the merge");
+    assert_eq!(
+        error,
+        "the regression test has not been proven red at this tip; wait for the proof or run team_prove_regression"
+    );
+    let proven = proving::MergeProof {
+        regression_required: true,
+        regression_proven: true,
+        ..Default::default()
+    };
+    validate_merge(&worker, "tip0001", &[], &full_lane(), &proven)
+        .expect("a red check at the tip merges");
+    let waived = proving::MergeProof {
+        regression_required: true,
+        regression_waived: true,
+        ..Default::default()
+    };
+    validate_merge(&worker, "tip0001", &[], &full_lane(), &waived)
+        .expect("a resolved proof finding waives the red check");
+}
+
+/// A red outcome records the passed check at the proved tip and tells the lead.
+#[tokio::test]
+async fn red_outcome_records_a_passed_check_and_notice() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveRed01").await;
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs {
+        outcome: proof::RedOutcome::Red {
+            output: "test regression_proves_red ... FAILED\nfailures:\n    regression_proves_red"
+                .to_string(),
+        },
+    }));
+    let mut notices = team.subscribe_board();
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the red proof");
+    let notice = drain_notice(&mut notices, "regression proof for")
+        .await
+        .expect("the proof finishes with a notice");
+    assert!(notice.contains("red (fails without the fix)"), "{notice}");
+    let check = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .checks
+                .into_iter()
+                .find(|check| check.name == proving::RED_CHECK)
+        })
+    })
+    .await;
+    assert_eq!(check.status, "passed");
+    assert_eq!(check.tip, tip);
+    let detail = check.detail.unwrap_or_default();
+    assert!(detail.contains("regression_proves_red"), "{detail}");
+    let proven = team.worker(&worker_id).await.expect("worker");
+    let inputs = team.proof_ctx().merge_inputs(&proven, &tip).await;
+    assert!(inputs.regression_required, "{inputs:?}");
+    assert!(inputs.regression_proven, "{inputs:?}");
+    team.shutdown().await;
+}
+
+/// A regression test that still passes without the fix opens the high finding
+/// naming the file, and the gate then refuses the merge.
+#[tokio::test]
+async fn not_red_outcome_opens_a_high_finding() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveNotRed01").await;
+    team.set_proof_runner_for_test(Arc::new(ScriptedProofs {
+        outcome: proof::RedOutcome::NotRed {
+            output: "test regression_proves_red ... ok".to_string(),
+        },
+    }));
+    let mut notices = team.subscribe_board();
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    team.prove_regression_tool(&worker_id)
+        .await
+        .expect("start the red proof");
+    let notice = drain_notice(&mut notices, "regression proof for")
+        .await
+        .expect("the proof finishes with a notice");
+    assert!(
+        notice.contains("NOT red, finding regression-not-red opened"),
+        "{notice}"
+    );
+    let finding = eventually(|| async {
+        team.worker(&worker_id).await.ok().and_then(|worker| {
+            worker
+                .findings
+                .into_iter()
+                .find(|finding| finding.id == proving::NOT_RED_ID)
+        })
+    })
+    .await;
+    assert_eq!(finding.severity, "high");
+    assert_eq!(finding.status, "open");
+    assert_eq!(finding.title, "The regression test passes without the fix");
+    assert_eq!(finding.file, "fix.rs");
+    assert!(
+        finding.detail.contains("the test does not reproduce the defect"),
+        "{}",
+        finding.detail
+    );
+    let inputs = team.proof_ctx().merge_inputs(&worker, &tip).await;
+    assert!(inputs.regression_required, "{inputs:?}");
+    assert!(!inputs.regression_proven, "{inputs:?}");
+    team.shutdown().await;
+}
+
+/// The mutation tool is refused with the configuration hint when the project
+/// configured no `[mutation]` table, and both proof tools are exposed.
+#[tokio::test]
+async fn mutation_tool_refuses_without_config() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let specs = team.lead_host_tools();
+    for name in ["team_prove_regression", "team_mutation_check"] {
+        assert!(
+            specs.iter().any(|spec| spec.name == name),
+            "{name} is exposed to the lead"
+        );
+    }
+    assert_eq!(
+        team.mutation_check_tool("mutationCfg01")
+            .await
+            .expect_err("no [mutation] table configured"),
+        "configure [mutation] in .coding/checks.toml"
     );
     team.shutdown().await;
 }

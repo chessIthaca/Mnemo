@@ -430,6 +430,7 @@ pub(super) async fn pump_worker(
     live: Arc<Mutex<HashMap<String, LiveWorker>>>,
     fail_next_close: Arc<AtomicBool>,
     board: Option<Arc<PlanBoard>>,
+    proof: super::proving::ProofCtx,
 ) {
     let mut turn_active = false;
     // A steered turn end is held here until its follow-up turn starts (the
@@ -1220,6 +1221,14 @@ pub(super) async fn pump_worker(
                 &ledger,
             )
             .await;
+            // The turn is over: prove what it owes while nothing else may
+            // touch the checkout. The trigger runs off the pump, so the
+            // finished event is never delayed behind a proof decision.
+            let proof = proof.clone();
+            let proved_worker = worker_id.clone();
+            tokio::spawn(async move {
+                super::proving::spawn_turn_proofs(&proof, proved_worker).await;
+            });
         }
         // A suppressed repeated report is not forwarded (plan 9a6cffc1):
         // no TeamEvent means the runtime never turns it into a lead

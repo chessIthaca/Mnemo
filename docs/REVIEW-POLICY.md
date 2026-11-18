@@ -81,10 +81,11 @@ message naming the proof.
 
 Every open finding (title, detail, file, line, severity high or low) blocks the
 merge, whatever its severity. A finding closes as fixed with evidence, or as
-wontfix with a written justification. The lead can apply a tiny exact fix
-itself with `review_fix` (one replacement in one non-test source file); larger
-fixes go back to the worker with `team_route_fix`, which hands it every open
-finding at once.
+wontfix with a written justification. The lead can apply a tiny fix
+itself with `review_fix` (one replacement in one non-test source file, matched
+and written exactly as the worker edit tool would — line endings need not
+match); larger fixes go back to the worker with `team_route_fix`, which hands
+it every open finding at once.
 
 Each finding can name its kind (`category`, a short kebab-case slug reused
 across reviews) and where the mistake could be stopped for good (`enforce`:

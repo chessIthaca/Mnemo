@@ -822,8 +822,11 @@ pub(crate) fn literal_splice(
 
 /// Count non-overlapping matches of `needle` in `content` using the same
 /// EOL-agnostic (and optionally fuzzy-whitespace) matching as the literal
-/// splice — the batch ambiguity guard's counter (plan be16ea36 step 4).
-pub(crate) fn count_matches(content: &str, needle: &str, fuzzy: bool) -> usize {
+/// splice — the batch ambiguity guard's counter (plan be16ea36 step 4). Public
+/// because the lead's `review_fix` (mnemo2) reuses it for its exactly-once
+/// guard instead of carrying a second matcher (plan f89fd63d step 1): the
+/// lead's fix must match exactly what a worker `file_edit` would match.
+pub fn count_matches(content: &str, needle: &str, fuzzy: bool) -> usize {
     let (content_lf, _) = normalize_lf_with_offsets(content);
     let needle_lf = normalize_line_endings(needle, "\n");
     if needle_lf.is_empty() {

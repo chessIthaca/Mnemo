@@ -1594,9 +1594,12 @@ fn observe_edit_freshness(
         "multi_edit" => {
             // Per-path, like file_edit (plan 2e27f896): a success refreshes
             // EVERY path the call wrote; a drift-class failure records the
-            // path its error names (the engine's message carries
-            // "files[i] 'path'", falling back to the first entry when the
-            // parse is inconclusive).
+            // path its error NAMES — the engine prints `multi_edit: files[i]
+            // '<path>': …` (multi_edit.rs's `file_error`), so match that
+            // quoted form rather than a bare substring: with entries
+            // `a.txt` and `a.txt.bak`, a substring match would clear the
+            // wrong path's gate. Fall back to the first entry only when no
+            // entry is named.
             let paths = multi_edit_paths(args);
             if result.success {
                 for path in &paths {
@@ -1604,12 +1607,8 @@ fn observe_edit_freshness(
                 }
             } else if crate::agent::steering_stats::is_edit_drift_failure(tool_name, &result.output)
             {
-                if let Some(path) = paths
-                    .iter()
-                    .find(|p| result.output.contains(p.as_str()))
-                    .or_else(|| paths.first())
-                {
-                    note_drift_or_served_text(steering, agent_id, path, &result.output);
+                if let Some(path) = multi_edit_error_path(&result.output, &paths) {
+                    note_drift_or_served_text(steering, agent_id, &path, &result.output);
                 }
             }
         }
@@ -1627,6 +1626,19 @@ fn read_files_paths(args: &serde_json::Value) -> Vec<String> {
         .into_iter()
         .map(|spec| spec.path)
         .collect()
+}
+
+/// The single path a drift-class `multi_edit` error names. The engine prints
+/// `multi_edit: files[i] '<path>': <msg>` (`multi_edit.rs`'s `file_error`), so
+/// the exact quoted form is matched — `a.txt` must not be picked out of a
+/// message about `a.txt.bak` (finding f-9900077f). Falls back to the first
+/// entry only when no entry is named (an inconclusive parse).
+fn multi_edit_error_path(output: &str, paths: &[String]) -> Option<String> {
+    paths
+        .iter()
+        .find(|path| output.contains(&format!("] '{path}':")))
+        .or_else(|| paths.first())
+        .cloned()
 }
 
 /// The `files[].path` entries a `multi_edit` call touches (plan 2e27f896) —
@@ -2376,6 +2388,54 @@ mod tests {
             .is_some(),
             "lines without from_read is a line-range op, not a cite"
         );
+    }
+
+    #[test]
+    fn multi_edit_excerpt_clears_only_the_path_its_error_names() {
+        // Finding f-9900077f: the funnel picked the failing path by bare
+        // substring in args order, so an excerpt-bearing failure on
+        // `a.txt.bak` cleared `a.txt`'s armed gate. The engine prints
+        // `multi_edit: files[i] '<path>': …`; only that exact quoted path may
+        // be treated as read.
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        stats.note_edit_drift(1, "a.txt");
+        stats.note_edit_drift(1, "a.txt.bak");
+        let miss = format!(
+            "not found: multi_edit: files[1] 'a.txt.bak': {}\n{} 1-2, read receipt rX — \
+             cite it with from_read and lines):\n1: a",
+            drift_miss_output(),
+            crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK
+        );
+        observe_edit_freshness(
+            &stats,
+            1,
+            "multi_edit",
+            &serde_json::json!({"files": [{"path": "a.txt"}, {"path": "a.txt.bak"}]}),
+            &ToolResult::error(miss),
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, "a.txt").is_some(),
+            "a.txt's gate must stay armed — its name only prefixes the failing one"
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, "a.txt.bak").is_none(),
+            "the named path's gate is cleared by the served excerpt"
+        );
+        // An excerpt-less failure on the same call still ARMS the named path,
+        // and leaves the prefix-sharing one alone.
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        observe_edit_freshness(
+            &stats,
+            1,
+            "multi_edit",
+            &serde_json::json!({"files": [{"path": "a.txt"}, {"path": "a.txt.bak"}]}),
+            &ToolResult::error(format!(
+                "not found: multi_edit: files[1] 'a.txt.bak': {}",
+                drift_miss_output()
+            )),
+        );
+        assert!(file_edit_redirect(&stats, 1, "a.txt.bak").is_some());
+        assert!(file_edit_redirect(&stats, 1, "a.txt").is_none());
     }
 
     /// The REAL drift-class `multi_edit` error: `MultiEditTool` executed

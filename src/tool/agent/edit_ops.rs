@@ -745,7 +745,7 @@ pub(crate) fn near_miss_excerpt(
 ) -> Option<String> {
     const CONTEXT_LINES: usize = 3;
     const MAX_EXCERPT_LINES: usize = 40;
-    let (content_lf, _) = normalize_lf_with_offsets(content);
+    let (content_lf, offsets) = normalize_lf_with_offsets(content);
     let hay: Vec<char> = content_lf.chars().collect();
     let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
     let (best_start, best_len) = near_miss_position(&hay, &needle)?;
@@ -754,20 +754,55 @@ pub(crate) fn near_miss_excerpt(
     if last == 0 {
         return None;
     }
-    // 1-indexed line of a char offset in the LF projection — the numbering
-    // `read_files` serves (both count newlines before the position).
-    let line_of = |upto: usize| hay[..upto].iter().filter(|c| **c == '\n').count() + 1;
-    let match_line = line_of(best_start);
-    let diff_line = line_of(best_start + best_len);
+    // 1-indexed line of a projection position, in the SAME frame the served
+    // lines use: `content.lines()` splits on '\n' only, while the projection
+    // also turns a lone '\r' into '\n'. Counting the projection's newlines
+    // would overstate the line on CR-only or stray-'\r' content, push the
+    // window past the last line and make `end - first + 1` underflow — so map
+    // the position back to the original bytes through `offsets` and count the
+    // real newlines there.
+    let char_bytes: Vec<usize> = content_lf.char_indices().map(|(b, _)| b).collect();
+    let line_of = |projection_char: usize| -> Option<usize> {
+        let projection_byte = if projection_char == hay.len() {
+            content_lf.len()
+        } else {
+            *char_bytes.get(projection_char)?
+        };
+        let source_byte = if projection_byte == content_lf.len() {
+            content.len()
+        } else {
+            *offsets.get(projection_byte)?
+        };
+        if source_byte > content.len() || !content.is_char_boundary(source_byte) {
+            return None;
+        }
+        Some(
+            content.as_bytes()[..source_byte]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count()
+                + 1,
+        )
+    };
+    // A position that cannot be mapped into the served frame yields no
+    // excerpt: better none than a window in the wrong coordinates.
+    let match_line = line_of(best_start)?;
+    let diff_line = line_of(best_start + best_len)?;
     let needle_lines = needle.iter().filter(|c| **c == '\n').count() + 1;
     let mut first = match_line.saturating_sub(CONTEXT_LINES).max(1);
-    let mut end = (match_line + needle_lines + CONTEXT_LINES).min(last);
+    let mut end = match_line
+        .saturating_add(needle_lines)
+        .saturating_add(CONTEXT_LINES)
+        .min(last);
+    if first > end {
+        return None;
+    }
     if end - first + 1 > MAX_EXCERPT_LINES {
         // Too wide: 40 lines centred on the first-difference line, clamped
         // into the file so the window is always exactly 40 when it can be.
         let centre = diff_line.clamp(1, last);
         first = centre.saturating_sub(MAX_EXCERPT_LINES / 2).max(1);
-        end = (first + MAX_EXCERPT_LINES - 1).min(last);
+        end = first.saturating_add(MAX_EXCERPT_LINES - 1).min(last);
         first = end.saturating_sub(MAX_EXCERPT_LINES - 1).max(1);
     }
     let served: Vec<&str> = lines[first - 1..end].to_vec();
@@ -1937,6 +1972,78 @@ mod tests {
         assert!(
             near_miss_excerpt(&path, "", "alpha\nbeta").is_none(),
             "an empty file has nothing to serve"
+        );
+    }
+
+    /// Finding f-e05a95ed: CR-only content. `content.lines()` splits on '\n'
+    /// only, while the LF projection also turns a lone '\r' into '\n'. Taking
+    /// line numbers from the projection put the match on line 6 of a
+    /// one-line file, so `end - first + 1` underflowed (panic in debug). The
+    /// window must be computed in the frame the served lines use.
+    #[test]
+    fn excerpt_on_lone_cr_content_maps_to_the_served_line_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "s1\rs2\rs3\rs4\rs5\rs6\rTARGET\rend";
+        let excerpt = near_miss_excerpt(&path, content, "s6\nTARGEY")
+            .expect("a near miss on CR-only content still serves the text");
+        let (id, start, end) = excerpt_header(&excerpt);
+        // The whole file is ONE line in `content.lines()` (no '\n' at all).
+        assert_eq!((start, end), (1, 1));
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(served, vec![format!("1: {content}")]);
+        // ...and the receipt hash-verifies against those same bytes.
+        let (resolved_start, resolved_end) =
+            crate::tool::agent::read_registry::resolve(&id, &path, start, end, content)
+                .expect("the excerpt's receipt resolves on CR-only content");
+        assert_eq!((resolved_start, resolved_end), (start, end));
+    }
+
+    /// A CRLF file serves `read_files`' terminator-stripped lines and the
+    /// receipt still resolves against the CRLF bytes.
+    #[test]
+    fn excerpt_on_crlf_content_serves_stripped_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha line\r\nbeta line\r\ngamma line\r\ndelta line\r\n";
+        let excerpt = near_miss_excerpt(&path, content, "alpha line\r\nbeta LINE\r\ngamma line")
+            .expect("a near miss");
+        let (id, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (1, 4));
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(
+            served,
+            vec![
+                "1: alpha line",
+                "2: beta line",
+                "3: gamma line",
+                "4: delta line"
+            ]
+        );
+        assert!(
+            crate::tool::agent::read_registry::resolve(&id, &path, 2, 3, content).is_ok(),
+            "the receipt hashes terminator-stripped lines"
+        );
+    }
+
+    /// A file with no trailing newline still serves its last line, and the
+    /// window never runs past it.
+    #[test]
+    fn excerpt_without_trailing_newline_serves_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha line\nbeta line\ngamma line";
+        let excerpt = near_miss_excerpt(&path, content, "alpha line\nbeta LINE\ngamma line\nfour")
+            .expect("a near miss");
+        let (id, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (1, 3), "the window stops at the last line");
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(
+            served,
+            vec!["1: alpha line", "2: beta line", "3: gamma line"]
+        );
+        assert!(
+            crate::tool::agent::read_registry::resolve(&id, &path, start, end, content).is_ok()
         );
     }
 

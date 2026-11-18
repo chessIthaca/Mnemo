@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import QualityView from "./QualityView.svelte";
-import type { QualityReport, QualityRow, QualityTransport } from "../lib/quality";
+import type { EditOutcomes, QualityReport, QualityRow, QualityTransport } from "../lib/quality";
 
 const mocks = vi.hoisted(() => ({
   transport: null as QualityTransport | null,
@@ -36,6 +36,7 @@ function report(overrides: Partial<QualityReport> = {}): QualityReport {
     byModel: [row("openai/gpt-5", { merged: 4, firstPass: 0.25, avgFixRounds: 1.25 })],
     categories: [],
     missingMergeCommit: 0,
+    edits: { byModel: [], byWorker: [], topFiles: [], skipped: 0 },
     ...overrides,
   };
 }
@@ -91,6 +92,65 @@ describe("QualityView", () => {
     expect(screen.queryByRole("table")).toBeNull();
     expect(screen.queryByRole("heading", { name: "By tier" })).toBeNull();
     expect(screen.queryByRole("heading", { name: "Recurring findings" })).toBeNull();
+  });
+
+  it("shows edit attempts and failures by cause, model, worker and file", async () => {
+    const edits: EditOutcomes = {
+      byModel: [
+        { key: "glm-5.3", attempts: 40, ok: 24, shape: 7, receiptDrift: 2, mismatch: 4, blocked: 1, other: 2 },
+      ],
+      byWorker: [
+        { key: "simFactories01", attempts: 40, ok: 24, shape: 7, receiptDrift: 2, mismatch: 4, blocked: 1, other: 2 },
+      ],
+      topFiles: [
+        {
+          path: "crates/fg_sim/src/layout.rs",
+          attempts: 12,
+          failures: 5,
+          shape: 2,
+          receiptDrift: 1,
+          mismatch: 1,
+          blocked: 1,
+          other: 0,
+        },
+      ],
+      skipped: 0,
+    };
+    mocks.transport = { report: async () => report({ edits }) };
+    render(QualityView);
+
+    expect(await screen.findByRole("heading", { name: "Edits" })).toBeTruthy();
+    const models = await screen.findByRole("table", { name: "Edits by model" });
+    expect(
+      within(models).getAllByRole("columnheader").map((cell) => cell.textContent?.trim()),
+    ).toEqual([
+      "Model",
+      "Attempts",
+      "Failure rate",
+      "Shape",
+      "Receipt drift",
+      "Mismatch",
+      "Blocked",
+      "Other",
+    ]);
+    expect(cells(models)).toEqual([["glm-5.3", "40", "40%", "7", "2", "4", "1", "2"]]);
+
+    // The per-worker table is expandable but in the DOM.
+    expect(cells(screen.getByRole("table", { name: "Edits by worker" }))).toEqual([
+      ["simFactories01", "40", "40%", "7", "2", "4", "1", "2"],
+    ]);
+
+    expect(cells(screen.getByRole("table", { name: "Files with the most edit failures" }))).toEqual([
+      ["crates/fg_sim/src/layout.rs", "12", "5", "2", "1", "1", "1", "0"],
+    ]);
+  });
+
+  it("says so when the window has no edit calls", async () => {
+    mocks.transport = { report: async () => report() };
+    render(QualityView);
+
+    expect(await screen.findByText("No edit calls in this window.")).toBeTruthy();
+    expect(screen.queryByRole("table", { name: "Edits by model" })).toBeNull();
   });
 
   it("notes the older tasks without a merge commit only when there are some", async () => {

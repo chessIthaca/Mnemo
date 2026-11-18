@@ -368,17 +368,25 @@ fn prepare_edit_lines(
     // read served — drift hard-fails with the fresh-read steering,
     // never a fuzzy apply. Without a cite the range stays blind (the
     // historical line-range semantics).
-    if let Some(id) = &args.from_read {
-        if !args.old_string.is_empty() {
-            return Err(crate::error::Error::InvalidInput(
-                "from_read and old_string are BOTH set — exactly one anchor form: \
-                 {old_string, new_string} (verbatim) or {from_read, lines, \
-                 new_string} (read-receipt cite)"
-                    .to_string(),
-            ));
+    //
+    // A cite names lines in the READ's numbering, so the receipt's
+    // recorded file-tool writes since that read are translated first
+    // (plan f89fd63d step 2): `resolve` returns where those lines ARE
+    // now, and that is the range this edit must splice.
+    let (start, end) = match &args.from_read {
+        Some(id) => {
+            if !args.old_string.is_empty() {
+                return Err(crate::error::Error::InvalidInput(
+                    "from_read and old_string are BOTH set — exactly one anchor form: \
+                     {old_string, new_string} (verbatim) or {from_read, lines, \
+                     new_string} (read-receipt cite)"
+                        .to_string(),
+                ));
+            }
+            crate::tool::agent::read_registry::resolve(id, validated_path, start, end, content)?
         }
-        crate::tool::agent::read_registry::resolve(id, validated_path, start, end, content)?;
-    }
+        None => (start, end),
+    };
 
     // Split into lines. Rust's `str::lines()` splits on \n (dropping the
     // terminator) and does NOT yield a trailing empty element for a trailing
@@ -1043,6 +1051,15 @@ impl Tool for FileEditTool {
             if let Err(e) = std::fs::write(&validated, &prepared.new_content) {
                 return ToolResult::error(format!("failed to write '{}': {e}", args.path));
             }
+            // The bytes are on disk — record the write against every read
+            // receipt of this file, so a later from_read cite that still
+            // names lines in its read's numbering is translated through it
+            // (plan f89fd63d step 2).
+            crate::tool::agent::read_registry::note_write(
+                &validated,
+                &content,
+                &prepared.new_content,
+            );
 
             // H5 advisory (backlog e8b39d72): a large payload gets a NOTE on
             // the success result — never a rejection.
@@ -1341,16 +1358,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cite_after_own_edit_above_resolves_in_read_coordinates() {
+        // Plan f89fd63d step 2 regression (evidence: simFactories01
+        // messages 199 -> 201, 211 -> 213): a worker read a file, edited
+        // lines 80-96 (growing them by 20 lines), then cited the SAME
+        // receipt at lines 180-190. The receipt's hashes were still valid —
+        // the edit sat entirely above the cited range — but the cite's
+        // numbers no longer matched the file's, so the edit was refused
+        // with "line 180 changed since read" and the worker burned a turn
+        // on a full re-read. The registry now translates a cite through
+        // every file-tool write to its path, so the cite lands on the lines
+        // the read served.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let original: String = (1..=300).map(|n| format!("l{n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), &original).unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        // Own edit ABOVE the cite: lines 80-96 (17 lines) become 37 lines,
+        // so every line below moves down by 20.
+        let grown: Vec<String> = (1..=37).map(|n| format!("x{n}")).collect();
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "lines": [80, 96], "new_string": grown.join("\n")
+            }))
+            .await;
+        assert!(first.success, "{}", first.output);
+        // No re-read: the same receipt, cited in ITS OWN numbering. The
+        // lines it served as 180-190 now sit at 200-210.
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [180, 190],
+                "new_string": "REPLACED"
+            }))
+            .await;
+        assert!(
+            second.success,
+            "a cite above an own edit must resolve in read coordinates: {}",
+            second.output
+        );
+        let after = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        let lines: Vec<&str> = after.lines().collect();
+        assert_eq!(lines.len(), 310, "300 lines + 20 inserted - 11 + 1");
+        assert_eq!(lines[0], "l1", "the edit above left lines 1-79 alone");
+        assert_eq!(lines[79], "x1");
+        assert_eq!(lines[198], "l179");
+        assert_eq!(
+            lines[199], "REPLACED",
+            "the line the read served as line 180"
+        );
+        assert_eq!(lines[200], "l191");
+    }
+
+    #[tokio::test]
+    async fn cite_into_rewritten_region_is_refused_with_drift_nudge() {
+        // A cite whose lines an earlier FILE-TOOL write rewrote can never
+        // apply: those bytes are gone from the file, so no translation lands
+        // on them — drift class, and the nudge names the read and the
+        // rewritten range (plan f89fd63d step 2).
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "lines": [2, 3], "new_string": "B\nC"
+            }))
+            .await;
+        assert!(first.success, "{}", first.output);
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [3, 3], "new_string": "X"
+            }))
+            .await;
+        assert!(
+            !second.success,
+            "a rewritten cite must fail: {}",
+            second.output
+        );
+        assert!(
+            second
+                .output
+                .contains(crate::agent::steering_stats::EDIT_STALE_READ_MARK),
+            "drift class carries the fresh-read steering: {}",
+            second.output
+        );
+        assert!(
+            second
+                .output
+                .contains("were rewritten by an edit since that read"),
+            "{}",
+            second.output
+        );
+        assert!(
+            second.output.contains("lines 2-3 at the time"),
+            "the rewritten range is named: {}",
+            second.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "l1\nB\nC\nl4\nl5\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn crlf_preserving_edit_does_not_count_as_full_rewrite() {
+        // A CRLF-preserving write must not look like a whole-file rewrite:
+        // the shift is computed on EOL-agnostic lines, so it covers only
+        // what actually changed and a cite ABOVE it still resolves.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\r\nb\r\nc\r\nd\r\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "lines": [3, 3], "new_string": "C"
+            }))
+            .await;
+        assert!(first.success, "{}", first.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\r\nb\r\nC\r\nd\r\n"
+        );
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [1, 2], "new_string": "A\nB"
+            }))
+            .await;
+        assert!(second.success, "{}", second.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "A\r\nB\r\nC\r\nd\r\n",
+            "the file keeps its CRLF style throughout"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_rewrite_still_fails_hash_check() {
+        // Only FILE-TOOL writes are recorded. A shell command (or a format
+        // run) rewrites the file behind the registry's back, so a cite over
+        // the changed lines still fails its hash check — today's behavior,
+        // unchanged by the shift bookkeeping.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        std::fs::write(dir.path().join("a.txt"), "a\nZZ\nc\n").unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [2, 2], "new_string": "B"
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("line 2 changed since read"),
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nZZ\nc\n"
+        );
+    }
+
+    #[tokio::test]
     async fn from_read_cite_after_an_insert_lands_on_the_cited_lines() {
         // Plan f302cc0e regression (bug 2026-11-02): a batched ops array
         // whose earlier ops shift line numbers applied a from_read cite at
         // its raw cited numbers against the RUNNING content — the
         // replacement landed three lines too high and silently corrupted
         // the file (store.ts et al., worker memoryPaths122 on
-        // deepseek-flash). The cite's range lives in the CITED READ's
-        // coordinates — the file as the receipt validated it, BEFORE any
-        // op applies — and must land on exactly those lines however many
-        // ops precede it in the array.
+        // deepseek-flash). The cite's range arrives in PRE-CALL coordinates
+        // — the read's numbering translated through every file-tool write
+        // recorded since that read, i.e. the file as it is BEFORE any op in
+        // this array applies — and must land on exactly those lines however
+        // many ops precede it in the array.
         let dir = tempdir().unwrap();
         let tool = make_tool(dir.path());
         std::fs::write(

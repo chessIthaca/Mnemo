@@ -68,6 +68,10 @@ struct PreparedFile {
     validated: PathBuf,
     /// This file's own unified diff (concatenated into the combined one).
     diff: String,
+    /// The bytes as they were before this call's ops — the pre-write
+    /// content `note_write` needs once the file is on disk (plan f89fd63d
+    /// step 2).
+    original_content: String,
     new_content: String,
     notes: Vec<String>,
 }
@@ -212,6 +216,7 @@ fn prepare_files(
             path,
             validated,
             diff,
+            original_content: content,
             new_content,
             notes,
         });
@@ -356,6 +361,15 @@ impl Tool for MultiEditTool {
                         &e,
                     ));
                 }
+                // The bytes are on disk — record the write against every read
+                // receipt of this file (one call per file written), so a later
+                // from_read cite in that read's numbering is translated
+                // through it (plan f89fd63d step 2).
+                crate::tool::agent::read_registry::note_write(
+                    &file.validated,
+                    &file.original_content,
+                    &file.new_content,
+                );
                 written.push(file.path.clone());
             }
             let mut output = String::new();
@@ -741,6 +755,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_edit_write_shifts_receipts_for_a_later_file_edit() {
+        // Plan f89fd63d step 2 (evidence: simFactories01 messages 211 ->
+        // 213): a multi_edit write ABOVE the cited lines must move the read
+        // receipt's numbers too, so a later file_edit cite resolves in read
+        // coordinates instead of failing "line N changed since read".
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let read = crate::tool::agent::read_files::ReadFilesTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let read_result = read.execute(json!({"files": [{"path": "a.txt"}]})).await;
+        assert!(read_result.success, "{}", read_result.output);
+        let id = read_result
+            .output
+            .lines()
+            .find(|l| l.contains("[read receipt "))
+            .and_then(|l| l.split("[read receipt ").nth(1))
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .unwrap_or_else(|| panic!("read must mint a receipt: {}", read_result.output));
+        let multi = make_tool(dir.path());
+        let written = multi
+            .execute(json!({"files": [{"path": "a.txt", "ops": ["i2:NEW1\nNEW2"]}]}))
+            .await;
+        assert!(written.success, "{}", written.output);
+        // The read served l4 as line 4; it sits at line 6 now.
+        let edit = crate::tool::agent::file_edit::FileEditTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let cite = edit
+            .execute(json!({
+                "path": "a.txt", "from_read": id, "lines": [4, 4], "new_string": "L4"
+            }))
+            .await;
+        assert!(cite.success, "multi_edit's write must shift the receipt: {}", cite.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "l1\nl2\nNEW1\nNEW2\nl3\nL4\nl5\n"
+        );
+    }
+
+    #[tokio::test]
     async fn refuses_protected_paths_and_escapes_without_writing() {
         let dir = tempdir().unwrap();
         let tool = make_tool(dir.path());
@@ -816,6 +871,7 @@ mod tests {
             path: path.to_string(),
             validated: PathBuf::from(path),
             diff: String::new(),
+            original_content: String::new(),
             new_content: String::new(),
             notes: Vec::new(),
         };

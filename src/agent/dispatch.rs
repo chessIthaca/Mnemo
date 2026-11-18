@@ -308,10 +308,16 @@ impl AgentLoop {
         // anything left unparseable stays for the tool's positional error.
         crate::tool::repair_stringified_sequences(&schema.parameters, &mut args);
         // A `files` array that only became an array through the repair
-        // above can itself be the flattened form.
-        if tc.name == "multi_edit" && !files_flattened {
-            files_flattened =
-                crate::tool::agent::multi_edit::normalize_flattened_files(&mut args);
+        // above can itself be the flattened form. Wrapping its bare ops into
+        // `{path, ops}` moves them under the schema, so the repair runs once
+        // more — a flattened entry's own keys (`lines` included) are not in
+        // the schema (review f-12be1d54).
+        if tc.name == "multi_edit"
+            && !files_flattened
+            && crate::tool::agent::multi_edit::normalize_flattened_files(&mut args)
+        {
+            files_flattened = true;
+            crate::tool::repair_stringified_sequences(&schema.parameters, &mut args);
         }
 
         let parsed_call = ParsedToolCall {

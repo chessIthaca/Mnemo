@@ -8023,6 +8023,118 @@ async fn flattened_multi_edit_lines_text_range_is_coerced() {
     assert_eq!(now[108], "line 131", "the line after the range follows it");
 }
 
+/// Review f-12be1d54 (1), simFactories01[439]: `files` arrives as a JSON
+/// STRING of bare ops beside a top-level `path`, so only the post-repair
+/// normalise can see the file. It runs before the gates and the freshness
+/// bookkeeping: an armed gate intercepts the call, and a landed cite-only
+/// entry clears that gate.
+#[tokio::test]
+async fn stringified_flattened_multi_edit_is_gated_and_records_success() {
+    let dir = tempdir().unwrap();
+    let (agent, sandbox) = real_edit_agent(dir.path()).await;
+    std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let flattened = r#"{"files":"[{\"old_string\":\"a\",\"new_string\":\"b\"}]","path":"a.txt"}"#;
+
+    // Armed on a.txt: the stringified flattened call is intercepted.
+    agent.steering.note_edit_drift(1, "a.txt");
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new("c1", "multi_edit", flattened.to_string()),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        result.output.contains("EDIT INTERCEPTED"),
+        "the gate must intercept the stringified flattened call: {}",
+        result.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "a\nb\n",
+        "an intercepted call writes nothing"
+    );
+
+    // A cite-only entry cannot apply blindly, so the gate lets it through —
+    // and the landed edit clears the armed gate (the bookkeeping saw the
+    // path the post-repair normalise produced).
+    let validated = sandbox.validate(std::path::Path::new("a.txt")).unwrap();
+    let receipt = crate::tool::agent::read_registry::mint(validated, 1, &["a", "b"]);
+    let cited = format!(
+        r#"{{"files":"[{{\"from_read\":\"{receipt}\",\"lines\":[2,2],\"new_string\":\"B\"}}]","path":"a.txt"}}"#
+    );
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new("c2", "multi_edit", cited),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    assert!(
+        result.output.contains("NOTE: files was sent flattened"),
+        "the seam's normalisation must be reported: {}",
+        result.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "a\nB\n"
+    );
+    assert!(
+        agent.steering.should_gate_file_edit(1, "a.txt").is_none(),
+        "a landed stringified flattened edit must clear the armed gate"
+    );
+}
+
+/// Review f-12be1d54 (2): both halves of a stringified flattened cite are
+/// individually repairable — the array splice and the text range inside the
+/// entry. The repair that follows the post-repair normalise makes the pair
+/// land on lines 108-130.
+#[tokio::test]
+async fn stringified_flattened_multi_edit_lines_text_range_is_coerced() {
+    let dir = tempdir().unwrap();
+    let (agent, sandbox) = real_edit_agent(dir.path()).await;
+    let lines: Vec<String> = (1..=140).map(|n| format!("line {n}")).collect();
+    std::fs::write(dir.path().join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+    let served: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let validated = sandbox.validate(std::path::Path::new("a.rs")).unwrap();
+    let receipt = crate::tool::agent::read_registry::mint(validated, 1, &served);
+    let args = format!(
+        r#"{{"files":"[{{\"from_read\":\"{receipt}\",\"lines\":\"108, 130\",\"new_string\":\"x\"}}]","path":"a.rs"}}"#
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new("c1", "multi_edit", args),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    let content = std::fs::read_to_string(dir.path().join("a.rs")).unwrap();
+    let now: Vec<&str> = content.lines().collect();
+    assert_eq!(now.len(), 118, "the 23 cited lines became one");
+    assert_eq!(now[107], "x", "the range's first line was replaced");
+    assert_eq!(now[108], "line 131", "the line after the range follows it");
+}
+
 /// Review f-19f73567: the acceptance scenario `lines: "108, 130"` runs as
 /// `[108,130]` end-to-end through the REAL `file_edit` — a from_read receipt
 /// plus a TEXT range replaces exactly those lines and nothing else.

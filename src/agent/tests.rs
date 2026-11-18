@@ -7515,8 +7515,9 @@ async fn dispatch_drops_stringified_nulls_from_optional_params() {
 /// stringified JSON array is repaired at the dispatch seam before the tool
 /// sees the args — pinned end-to-end through execute_tool_call with an
 /// echo tool whose result IS the args it received. A string that parses to
-/// another kind stays untouched — the tool's own positional error names
-/// it (read_files' recovery layer).
+/// another kind stays a string through the repair — then the seam's
+/// argument-shape error (plan f89fd63d step 4) refuses it before the tool
+/// runs; `read_files` is exempt and keeps its own recovery layer.
 #[tokio::test]
 async fn dispatch_repairs_stringified_sequence_args() {
     let dir = tempdir().unwrap();
@@ -7599,8 +7600,11 @@ async fn dispatch_repairs_stringified_sequence_args() {
         result.output
     );
 
-    // A string that parses to an OBJECT stays a string — the seam repairs
-    // arrays only; the tool's own decode error names the rest.
+    // A string that parses to another KIND stays a string through the
+    // repair — then the seam's shape error (plan f89fd63d step 4) refuses
+    // it, so the tool never sees it and its own decode error never fires.
+    // read_files is the exemption: its lenient recovery keeps that path
+    // (pinned by `read_files_string_recovery_unchanged`).
     let (result, _) = agent
         .execute_tool_call(
             &call("c2", r#"{"items":"{\"a\":1}"}"#),
@@ -7611,9 +7615,246 @@ async fn dispatch_repairs_stringified_sequence_args() {
             &mut stop_signal,
         )
         .await;
+    assert!(!result.success, "{}", result.output);
     assert!(
-        result.output.contains(r#""items":"{\"a\":1}""#),
-        "non-array string stays for the tool to reject, tool saw: {}",
+        result
+            .output
+            .contains("'items' must be a JSON array, but it arrived as a string"),
+        "a non-array string is refused at the seam, got: {}",
+        result.output
+    );
+    assert!(
+        !result.output.contains(r#""items":"{\"a\":1}""#),
+        "the tool must not receive the string, got: {}",
+        result.output
+    );
+}
+
+/// A dispatch-seam shape-error spy (plan f89fd63d step 4): registered under
+/// `multi_edit`'s name with its `files`/`ops` schema — Agent + AutoRun, so
+/// the Planning filter admits it — and records whether it ever ran.
+struct MultiEditShapeSpy {
+    ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl crate::tool::Tool for MultiEditShapeSpy {
+    fn name(&self) -> &str {
+        "multi_edit"
+    }
+    fn category(&self) -> crate::tool::ToolCategory {
+        crate::tool::ToolCategory::Agent
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "multi_edit",
+            "spy: record whether the call reached the tool",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "files": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "ops": {"type": "array", "items": {"anyOf": [
+                                {"type": "string"},
+                                {"type": "object"}
+                            ]}}
+                        }
+                    }}
+                },
+                "required": ["files"]
+            }),
+        )
+    }
+    fn safety(&self) -> crate::tool::SafetyLevel {
+        crate::tool::SafetyLevel::AutoRun
+    }
+    async fn execute(&self, _args: serde_json::Value) -> crate::tool::ToolResult {
+        self.ran
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::tool::ToolResult::success("ran")
+    }
+}
+
+/// A loop whose only tool is [`MultiEditShapeSpy`], plus the spy's flag.
+fn shape_spy_agent(
+    dir: &std::path::Path,
+) -> (AgentLoop, Arc<std::sync::atomic::AtomicBool>) {
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MultiEditShapeSpy { ran: ran.clone() }));
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    (agent, ran)
+}
+
+/// Plan f89fd63d step 4 (d), simArms01[227]: a `files` string whose text is
+/// not valid JSON is refused at the dispatch seam — naming the tool, the
+/// property, the JSON error position and a correct call — and the tool never
+/// runs. Guessing at broken JSON would only hide the model's own byte error.
+#[tokio::test]
+async fn broken_files_string_returns_example_error_without_running() {
+    let dir = tempdir().unwrap();
+    let (agent, ran) = shape_spy_agent(dir.path());
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+
+    // The string carries an invalid escape (`\q`) — the 227 class.
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new(
+                "c1",
+                "multi_edit",
+                r#"{"files":"[{\"ops\": [{\"new_string\": \"let x = \\q;\"}]}]"}"#,
+            ),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the shape error must fire before the tool runs: {}",
+        result.output
+    );
+    assert!(
+        result
+            .output
+            .contains("'files' must be a JSON array, but it arrived as a string"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result.output.contains("line 1 column"),
+        "the JSON error position must be named: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains(
+            r#""files":[{"path":"src/a.rs","ops":[{"old_string":"let x = 1;","new_string":"let x = 2;"}]}]"#
+        ),
+        "a correct call must be shown: {}",
+        result.output
+    );
+}
+
+/// Plan f89fd63d step 4 (e), simArms01[233]: the arguments were split
+/// mid-string, so the array landed as an object key and `files` is empty.
+/// The seam says so — it does not guess at the broken payload.
+#[tokio::test]
+async fn split_key_files_gets_split_hint() {
+    let dir = tempdir().unwrap();
+    let (agent, ran) = shape_spy_agent(dir.path());
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+
+    // The array was sent as a top-level KEY; `files` is the empty string.
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new(
+                "c1",
+                "multi_edit",
+                r#"{"files":"","[{\"ops\": [{\"new_string\": \"x\"}]}": 1}"#,
+            ),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the shape error must fire before the tool runs: {}",
+        result.output
+    );
+    assert!(
+        result
+            .output
+            .contains("(the array was sent as an object key: your arguments were split mid-string)"),
+        "{}",
+        result.output
+    );
+    assert!(
+        result
+            .output
+            .contains("'files' must be a JSON array, but it arrived as a string"),
+        "{}",
+        result.output
+    );
+}
+
+/// Plan f89fd63d step 4 (d): `read_files` keeps its own positional string
+/// recovery — the seam's shape error is exempt for it.
+#[tokio::test]
+async fn read_files_string_recovery_unchanged() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+
+    // A string that is not a clean array, with one recoverable spec inside:
+    // read_files' lenient layer reads it and reports the repair itself.
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new(
+                "c1",
+                "read_files",
+                r#"{"files":"[{\"path\": \"a.rs\"}, garbage"}"#,
+            ),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    assert!(
+        result.output.contains("NOTE (repaired files argument)"),
+        "read_files' own recovery must keep running: {}",
+        result.output
+    );
+    assert!(
+        !result
+            .output
+            .contains("must be a JSON array, but it arrived as a string"),
+        "the seam's shape error must be exempt for read_files: {}",
         result.output
     );
 }

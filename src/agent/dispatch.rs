@@ -547,6 +547,23 @@ impl AgentLoop {
             }
         }
 
+        // Plan f89fd63d step 4: after the workflow gates and before approval
+        // and execution, an array-typed argument that is still a string is
+        // refused with a precise, example-bearing error instead of running
+        // the tool into a blind decode failure. The repair above already
+        // fixed every shape that parses cleanly; guessing at broken JSON
+        // would only hide the model's own byte error. `read_files` is
+        // exempt: it has its own positional string recovery.
+        if tc.name != "read_files" {
+            if let Some(shape_error) = crate::tool::argument_shape_error(
+                &tc.name,
+                &schema.parameters,
+                &parsed_call.arguments,
+            ) {
+                return (ToolResult::error(shape_error), Vec::new());
+            }
+        }
+
         // 3c (§5.9.6): the per-call policy veto — consulted BEFORE the
         // safety/approval machinery. WorkflowPolicy answers Allow today
         // (the app is inert here — verified: `gate_call` had zero

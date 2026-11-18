@@ -292,12 +292,15 @@ pub fn tracks(path: &Path) -> bool {
 /// not recorded, so a cite over rewritten lines still fails its hash check.
 ///
 /// Window: the shift is recorded AFTER the bytes are on disk, so a receipt
-/// minted by a concurrent read that lands between the write and this call
-/// receives a shift its own content never had. That is safe except when the
-/// written region ends on lines identical to the ones it added (an adjacent
-/// identical line can make the hash check accept a neighbour), and it cannot
-/// arise in practice because the dispatch loop runs one agent's tool calls
-/// sequentially — no read interleaves a write.
+/// minted by a read that lands between `tracks()`/the write and this call
+/// can miss or gain a shift its content never had. Tool calls are
+/// sequential WITHIN an agent, but the registry is process-wide and Mnemo2
+/// hosts several worker sessions in one process, so across agents the
+/// window is real (workers edit separate worktrees, so the paths rarely
+/// coincide). The consequence is bounded: the per-line hash check turns a
+/// bad mapping into a false DRIFT error — a re-read, never a wrong write —
+/// except where the shifted region abuts identical lines, where a
+/// neighbour can hash-match.
 pub fn note_write(path: &Path, old: &str, new: &str) {
     if old == new {
         return;

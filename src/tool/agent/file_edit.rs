@@ -1527,10 +1527,11 @@ mod tests {
         // its raw cited numbers against the RUNNING content — the
         // replacement landed three lines too high and silently corrupted
         // the file (store.ts et al., worker memoryPaths122 on
-        // deepseek-flash). The cite's range lives in the CITED READ's
-        // coordinates — the file as the receipt validated it, BEFORE any
-        // op applies — and must land on exactly those lines however many
-        // ops precede it in the array.
+        // deepseek-flash). The cite's range arrives in PRE-CALL coordinates
+        // — the read's numbering translated through every file-tool write
+        // recorded since that read, i.e. the file as it is BEFORE any op in
+        // this array applies — and must land on exactly those lines however
+        // many ops precede it in the array.
         let dir = tempdir().unwrap();
         let tool = make_tool(dir.path());
         std::fs::write(

@@ -963,16 +963,20 @@ pub(crate) fn map_lf_region_to_original(
 /// (`'i101:text'`, `'b5:x'`, `'d202-205'`, `'r102:x'`) or an anchor-based [`EditItem`]
 /// object. One array carries both forms, so a single field covers compact
 /// line-targeted ops and byte-exact anchor edits. A read-receipt cite gets
-/// its OWN variant (plan f302cc0e) rather than riding in as a line op: its
-/// range is in the cited read's coordinates, which only the apply phase —
-/// seeing the ops that precede it — can translate and check for overlap.
+/// its OWN variant (plans f302cc0e, f89fd63d step 2) rather than riding in
+/// as a line op: its range arrives in PRE-CALL coordinates — the cited
+/// read's numbering translated through every file-tool write recorded since
+/// that read — and only the apply phase, seeing the ops that precede it,
+/// can map it on through them and check for overlap.
 #[derive(Debug)]
 pub(crate) enum EditOp {
     Line(LineOp),
     Anchor(EditItem),
     /// A `from_read` cite that [`resolve_read_anchors`] validated against
-    /// the pre-ops bytes; its range stays in read coordinates until
-    /// [`apply_ops`] maps it through the earlier ops.
+    /// the pre-call bytes and already mapped into PRE-CALL coordinates (the
+    /// cited read's numbering translated through the file-tool writes
+    /// recorded since that read); [`apply_ops`] maps that range on through
+    /// the earlier ops.
     ReadCite(ReadCiteOp),
 }
 
@@ -1337,10 +1341,12 @@ pub(crate) fn resolve_read_anchors(
 /// first-difference pointer, per-item success notes). Line ops are matched
 /// against the content AS LEFT by the preceding ops — the same contract the
 /// anchors have, so a mixed array's line numbers reflect every earlier op.
-/// Read-receipt cites are the one exception (plan f302cc0e): their ranges
-/// are in the CITED READ's coordinates, so each is translated through the
-/// earlier ops' line shifts before it is applied, and a cite whose lines
-/// an earlier op already changed refuses the whole array.
+/// Read-receipt cites are the one exception (plans f302cc0e, f89fd63d step
+/// 2): their ranges arrive in PRE-CALL coordinates — the cited read's
+/// numbering translated through every file-tool write recorded since that
+/// read — so each is mapped on through the earlier ops' line shifts before
+/// it is applied, and a cite whose lines an earlier op already changed
+/// refuses the whole array.
 /// Emission artifacts are validated per op on its payload and once on the
 /// combined result's brace delta — a growth names the offending op(s) from
 /// the deficit trail (backlog 08d2125d); the diff itself is the caller's job.
@@ -1745,13 +1751,14 @@ mod tests {
         }
     }
 
-    /// Plan f302cc0e: a cite's range lives in the CITED READ's coordinates,
-    /// so an earlier ANCHOR op that shifts the line count must not move the
-    /// cite's landing lines either — the translation is perturbation-
-    /// agnostic (a line-level diff of the pre-ops content against the
-    /// running result), not compact-op bookkeeping. Engine-level twin of
-    /// the file_edit end-to-end regression; no receipt registry involved —
-    /// the ops are constructed directly.
+    /// Plans f302cc0e, f89fd63d step 2: a cite's range arrives in PRE-CALL
+    /// coordinates, so an earlier ANCHOR op that shifts the line count must
+    /// not move the cite's landing lines either — the translation is
+    /// perturbation-agnostic (a line-level diff of the pre-ops content
+    /// against the running result), not compact-op bookkeeping. Engine-level
+    /// twin of the file_edit end-to-end regression; no receipt registry
+    /// involved — the ops are constructed directly, which is why the cite
+    /// here is written in pre-call coordinates.
     #[test]
     fn read_cite_translates_through_an_earlier_anchor_op() {
         let ops = vec![

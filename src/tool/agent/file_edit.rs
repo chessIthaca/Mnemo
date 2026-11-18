@@ -242,10 +242,11 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
     // path stands in for the validated one. A from_read cite resolves
     // against the receipt's sandbox-canonical path, so the tool paths
     // (execute + the approval preview) thread the real validated path
-    // through prepare_edit_ctx. This layer still MINTS: every literal miss
-    // mints its current-text excerpt receipt (plan f89fd63d step 3) under
-    // the path it is handed — the display path here — so a direct caller's
-    // excerpt receipt is citable only through the same spelling.
+    // through prepare_edit_ctx. This layer still MINTS: every near-miss
+    // literal miss mints its current-text excerpt receipt (plan f89fd63d
+    // step 3) under the path it is handed — the display path here — so a
+    // direct caller's excerpt receipt is citable only through the same
+    // spelling.
     prepare_edit_ctx(args, content, "", Path::new(&args.path))
 }
 

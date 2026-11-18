@@ -2438,6 +2438,61 @@ mod tests {
         assert!(file_edit_redirect(&stats, 1, "a.txt").is_none());
     }
 
+    #[tokio::test]
+    async fn real_multi_edit_excerpt_clears_only_the_path_its_error_names() {
+        // Finding f-0875ebc1: the excerpt-bearing multi_edit path was only
+        // exercised with a hand-written error string. Derive it from the REAL
+        // tool instead — a near-miss anchor (16 shared chars) on the second
+        // of two prefix-sharing paths — so the quoted-path match is pinned
+        // against the SHIPPED message and cannot drift out of it.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(
+            dir.path().join("a.txt.bak"),
+            "alpha line\nbeta line\ngamma line\n",
+        )
+        .unwrap();
+        let tool = crate::tool::agent::multi_edit::MultiEditTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let args = serde_json::json!({
+            "files": [
+                {"path": "a.txt", "ops": ["i1:ok"]},
+                {"path": "a.txt.bak", "ops": [
+                    {"old_string": "alpha line\nbeta LINE\ngamma line", "new_string": "X"}
+                ]}
+            ]
+        });
+        let result = tool.execute(args.clone()).await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            crate::agent::steering_stats::is_edit_drift_failure("multi_edit", &result.output),
+            "the shipped error is drift-class: {}",
+            result.output
+        );
+        assert!(
+            result.output
+                .contains(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK),
+            "a near-miss anchor makes the shipped error serve an excerpt: {}",
+            result.output
+        );
+        // Both prefix-sharing paths are armed; only the named one is cleared.
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        stats.note_edit_drift(1, "a.txt");
+        stats.note_edit_drift(1, "a.txt.bak");
+        observe_edit_freshness(&stats, 1, "multi_edit", &args, &result);
+        assert!(
+            file_edit_redirect(&stats, 1, "a.txt").is_some(),
+            "a.txt's gate must stay armed — the real error names a.txt.bak only: {}",
+            result.output
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, "a.txt.bak").is_none(),
+            "the named path's gate is cleared by the served excerpt: {}",
+            result.output
+        );
+    }
+
     /// The REAL drift-class `multi_edit` error: `MultiEditTool` executed
     /// against a tempdir with a failing anchor on the second entry, the error
     /// text taken verbatim. Deriving the fixture from the tool pins the

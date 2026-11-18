@@ -1274,9 +1274,11 @@ pub(crate) fn validate_op_items(ops: &[EditOp]) -> Result<()> {
 /// is server-side (path match + range-within-coverage + per-line hash), so
 /// ANY drift hard-fails here with the fresh-read steering and nothing is
 /// written. Each validated cite becomes an [`EditOp::ReadCite`], which
-/// keeps its range in the CITED READ's coordinates (plan f302cc0e): the
-/// apply phase translates it through the ops that precede it in the array
-/// and refuses an in-call overlap, because the read's line numbers and the
+/// keeps its range in the cited read's coordinates TRANSLATED through the
+/// file-tool writes recorded since that read (plan f89fd63d step 2) — the
+/// pre-call coordinates apply_ops' in-call translation expects. The apply
+/// phase translates it on through the ops that precede it in the array and
+/// refuses an in-call overlap, because the read's line numbers and the
 /// running content's diverge as soon as an earlier op changes the line
 /// count. Verbatim anchors and compact line ops pass through untouched.
 pub(crate) fn resolve_read_anchors(
@@ -1307,15 +1309,17 @@ pub(crate) fn resolve_read_anchors(
                  end >= start) — got {lines:?}"
             )));
         }
-        super::read_registry::resolve(&id, validated_path, lines[0], lines[1], content)?;
-        // The cite keeps its OWN coordinates (plan f302cc0e): the range is
-        // in the cited read's line numbers, so it must NOT be collapsed
-        // into a line op here — apply_ops translates it through the earlier
-        // ops' perturbations and refuses an in-call overlap.
+        let (start, end) =
+            super::read_registry::resolve(&id, validated_path, lines[0], lines[1], content)?;
+        // The cite keeps the READ's coordinates, translated through the
+        // file-tool writes recorded since that read (plan f89fd63d step 2)
+        // — they are pre-call coordinates, exactly the frame apply_ops'
+        // in-call translation starts from, so it must NOT be collapsed
+        // into a line op here.
         resolved.push(EditOp::ReadCite(ReadCiteOp {
             raw: format!("from_read {id}"),
-            start: lines[0],
-            end: lines[1],
+            start,
+            end,
             payload: Some(item.new_string.clone()),
         }));
     }

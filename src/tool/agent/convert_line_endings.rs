@@ -187,6 +187,13 @@ impl Tool for ConvertLineEndingsTool {
             if let Err(e) = std::fs::write(&validated, &converted) {
                 return ToolResult::error(format!("failed to write '{}': {e}", args.path));
             }
+            // The bytes are on disk — record the write against every read
+            // receipt of this file (plan f89fd63d step 2). An ending-only
+            // conversion produces NO line shift (the registry compares lines
+            // EOL-agnostically), so the receipts survive it untouched; a
+            // conversion that collapses lone CRs genuinely changes the line
+            // structure and is recorded as the rewrite it is.
+            crate::tool::agent::read_registry::note_write(&validated, &content, &converted);
 
             ToolResult::success(format!(
                 "converted '{}' to {target_name} ({crlf} CRLF + {bare_lf} bare LF + {lone_cr} lone CR → {total} {target_name} line endings)",
@@ -234,6 +241,49 @@ mod tests {
         assert_eq!(
             content.matches("\r\n").count(),
             content.matches('\n').count()
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_line_endings_produces_no_shift() {
+        // Plan f89fd63d step 2: an ending-only conversion rewrites every
+        // BYTE but no line, so it must record no line shift — the receipt's
+        // hashes are terminator-stripped and a cite still resolves without
+        // a re-read.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\r\nb\r\nc\r\n").unwrap();
+        let read = crate::tool::agent::read_files::ReadFilesTool::new(
+            Sandbox::new(dir.path()).unwrap(),
+        );
+        let read_result = read.execute(json!({"files": [{"path": "a.txt"}]})).await;
+        assert!(read_result.success, "{}", read_result.output);
+        let id = read_result
+            .output
+            .lines()
+            .find(|l| l.contains("[read receipt "))
+            .and_then(|l| l.split("[read receipt ").nth(1))
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .unwrap_or_else(|| panic!("read must mint a receipt: {}", read_result.output))
+            .to_string();
+        let tool = make_tool(dir.path());
+        let converted = tool.execute(json!({"path": "a.txt", "to": "lf"})).await;
+        assert!(converted.success, "{}", converted.output);
+        let edit = crate::tool::agent::file_edit::FileEditTool::new(
+            Sandbox::new(dir.path()).unwrap(),
+        );
+        let cite = edit
+            .execute(json!({
+                "path": "a.txt", "from_read": id, "lines": [2, 2], "new_string": "B"
+            }))
+            .await;
+        assert!(
+            cite.success,
+            "an ending-only conversion must not invalidate a cite: {}",
+            cite.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nB\nc\n"
         );
     }
 

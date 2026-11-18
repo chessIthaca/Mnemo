@@ -155,8 +155,29 @@ impl Tool for FileWriteTool {
                 None => args.content.clone(),
             };
 
+            // The pre-write bytes, for the read-receipt bookkeeping below
+            // (plan f89fd63d step 2). A full overwrite replaces arbitrary
+            // lines, so only the file's own content can say which ones
+            // survived. read_files serves text only, so a file that does not
+            // read as text can hold no receipt — skip the bookkeeping then.
+            let previous = if validated.exists() {
+                std::fs::read_to_string(&validated).ok()
+            } else {
+                None
+            };
+
             if let Err(e) = std::fs::write(&validated, &content_to_write) {
                 return ToolResult::error(format!("failed to write '{}': {e}", args.path));
+            }
+            // The bytes are on disk — record the write against every read
+            // receipt of this file, so a later from_read cite that still
+            // names lines in its read's numbering is translated through it.
+            if let Some(previous) = previous {
+                crate::tool::agent::read_registry::note_write(
+                    &validated,
+                    &previous,
+                    &content_to_write,
+                );
             }
 
             ToolResult::success(format!(

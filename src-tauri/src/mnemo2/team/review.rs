@@ -12,6 +12,8 @@ use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 
 use mnemo::app::worktrees::agent_branch;
+use mnemo::tool::agent::edit_ops::count_matches;
+use mnemo::tool::agent::file_edit::{FileEditArgs, PreparedEdit, prepare_edit};
 
 use crate::mnemo2::phase3;
 use crate::mnemo2::dispatch_routing::{
@@ -455,6 +457,11 @@ impl TeamRuntime {
     }
 
     /// Apply and commit one constrained source replacement for a finding.
+    ///
+    /// The replacement goes through the worker edit tool's own matcher
+    /// ([`prepare_review_fix`]), so the lead's fix lands exactly as the same
+    /// edit would in a worker turn: line endings do not have to match, and the
+    /// written text keeps the file's own style.
     pub async fn review_fix(
         &self,
         worker_id: &str,
@@ -499,11 +506,10 @@ impl TeamRuntime {
         let path = phase3::review_file(&worker.worktree, relative)?;
         let original = std::fs::read_to_string(&path)
             .map_err(|err| format!("could not read {}: {err}", path.display()))?;
-        if original.matches(old_string).count() != 1 {
-            return Err("review_fix old_string must occur exactly once".to_string());
-        }
-        let updated = original.replacen(old_string, new_string, 1);
-        std::fs::write(&path, updated)
+        let PreparedEdit {
+            new_content, notes, ..
+        } = prepare_review_fix(relative, old_string, new_string, &original)?;
+        std::fs::write(&path, &new_content)
             .map_err(|err| format!("could not write {}: {err}", path.display()))?;
         let add = match phase3::git(&worker.worktree, &["add", "--", relative]).await {
             Ok(output) => output,
@@ -540,7 +546,7 @@ impl TeamRuntime {
             {
                 finding.status = "fixed".to_string();
                 finding.fix_commit = Some(fix_tip.clone());
-                finding.evidence = Some(format!("review_fix committed {fix_tip}"));
+                finding.evidence = Some(evidence_note(&fix_tip, &notes));
                 finding.justification = None;
             }
             worker.checks.clear();
@@ -880,6 +886,87 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 }
+
+/// Prepare a `review_fix` replacement with the worker edit tool's matcher
+/// (plan f89fd63d step 1): an LF `old_string` matches a CRLF file and the
+/// reverse, the replacement is written in the file's own line-ending style, and
+/// the tool's escape/whitespace fallbacks and emission-artifact checks apply
+/// exactly as they do in a worker turn.
+///
+/// The anchor must still occur exactly once. A miss or an ambiguity keeps the
+/// historical "must occur exactly once" message; a genuine miss appends the
+/// matcher's near-miss detail.
+fn prepare_review_fix(
+    relative: &str,
+    old_string: &str,
+    new_string: &str,
+    original: &str,
+) -> Result<PreparedEdit, String> {
+    let args = FileEditArgs {
+        path: relative.to_string(),
+        old_string: old_string.to_string(),
+        new_string: new_string.to_string(),
+        replace_all: false,
+        use_regex: false,
+        count: Some(1),
+        lines: None,
+        from_read: None,
+        fuzzy_whitespace: false,
+        ops: None,
+        append: false,
+        artifact_check: None,
+    };
+    let occurrences = count_matches(original, old_string, false);
+    if occurrences != 1 {
+        let detail = if occurrences == 0 {
+            matcher_miss_detail(&args, original)
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "review_fix old_string must occur exactly once{detail}"
+        ));
+    }
+    prepare_edit(&args, original).map_err(|err| format!("review_fix edit rejected: {err}"))
+}
+
+/// The matcher's one-line near-miss detail (` — near-miss: …`), if it has one.
+/// Its trailing fresh-read nudge is trimmed off: the lead fixes the source
+/// during review instead of re-reading it as a worker turn would.
+fn matcher_miss_detail(args: &FileEditArgs, original: &str) -> String {
+    let Err(err) = prepare_edit(args, original) else {
+        return String::new();
+    };
+    let text = err.to_string();
+    // The nudge is the error's tail, appended by the matcher; only the base
+    // message before it can carry a near-miss detail.
+    let base = text
+        .split(" — the content has likely drifted")
+        .next()
+        .unwrap_or_default();
+    let Some((_, detail)) = base.split_once(" — ") else {
+        return String::new();
+    };
+    let detail = detail.trim();
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" — {detail}")
+    }
+}
+
+/// The finding evidence for a `review_fix` round: the fix commit, plus the
+/// matcher's fallback NOTE when the anchor only matched through one, so a
+/// fallback is never silent for the lead either.
+fn evidence_note(fix_tip: &str, notes: &[String]) -> String {
+    let mut evidence = format!("review_fix committed {fix_tip}");
+    for note in notes {
+        evidence.push_str("; ");
+        evidence.push_str(note);
+    }
+    evidence
+}
+
 /// Drop a review and its checks when this transcript snapshot saw a worker
 /// commit that the review does not cover.
 ///

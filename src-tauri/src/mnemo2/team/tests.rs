@@ -10869,6 +10869,28 @@ fn readme_finding(id: &str) -> Finding {
     }
 }
 
+/// A review fixture whose worker checkout holds `content` as a committed,
+/// clean `README.md`, with the review of that tip already recorded — the
+/// state `review_fix` needs before it may edit.
+async fn review_fix_fixture(id: &str, content: &str) -> ReviewFixture {
+    let fixture = review_fixture(RoutingMode::Off, id).await;
+    let path = fixture.record.worktree.join("README.md");
+    std::fs::write(&path, content).expect("seed README");
+    run_git(&fixture.record.worktree, &["add", "README.md"]);
+    run_git(&fixture.record.worktree, &["commit", "-m", "seed README"]);
+    fixture
+        .team
+        .review(
+            &fixture.record.id,
+            "first pass".into(),
+            vec![readme_finding("finding1")],
+            evidence(),
+        )
+        .await
+        .expect("review of the seeded tip");
+    fixture
+}
+
 /// A record-based team with one routine-tier worker and no live session, for
 /// the repeated-finding escalation: nothing but the test itself can bump the
 /// worker's turn count.
@@ -10996,6 +11018,118 @@ async fn lead_review_fix_rounds_do_not_escalate() {
         fixture.rows()
     );
     team.shutdown().await;
+}
+
+/// Regression (plan f89fd63d step 1): `review_fix` matched `old_string`
+/// byte-exactly, so an LF old_string missed in a CRLF file. It now matches
+/// through the worker edit tool's matcher and writes the replacement in the
+/// file's own ending style.
+#[tokio::test]
+async fn review_fix_matches_lf_old_string_in_crlf_file() {
+    let fixture = review_fix_fixture("crlffix00001", "a\r\nb\r\nc\r\n").await;
+    let fixed = fixture
+        .team
+        .review_fix(&fixture.record.id, "finding1", "README.md", "a\nb", "x\ny")
+        .await
+        .expect("an LF old_string matches the CRLF file");
+    assert_eq!(fixed.fix_rounds, 1, "{fixed:?}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.record.worktree.join("README.md")).expect("README"),
+        "x\r\ny\r\nc\r\n"
+    );
+    fixture.team.shutdown().await;
+}
+
+/// The replacement is re-emitted in the file's own endings: lines the
+/// new_string adds stay CRLF in a CRLF file.
+#[tokio::test]
+async fn review_fix_keeps_crlf_endings_in_new_lines() {
+    let fixture = review_fix_fixture("crlfkeep0001", "a\r\nb\r\nc\r\n").await;
+    fixture
+        .team
+        .review_fix(
+            &fixture.record.id,
+            "finding1",
+            "README.md",
+            "a\nb",
+            "x\ny\nz",
+        )
+        .await
+        .expect("the CRLF file takes the LF replacement");
+    let text = std::fs::read_to_string(fixture.record.worktree.join("README.md")).expect("README");
+    assert_eq!(text, "x\r\ny\r\nz\r\nc\r\n");
+    assert!(
+        text.match_indices('\n')
+            .all(|(i, _)| i > 0 && text.as_bytes()[i - 1] == b'\r'),
+        "no bare LF may survive: {text:?}"
+    );
+    fixture.team.shutdown().await;
+}
+
+/// An ambiguous anchor is still refused, with the historical message and no
+/// write.
+#[tokio::test]
+async fn review_fix_still_refuses_ambiguous_old_string() {
+    let fixture = review_fix_fixture("crlfambig001", "a\r\nb\r\na\r\nb\r\nc\r\n").await;
+    let err = fixture
+        .team
+        .review_fix(&fixture.record.id, "finding1", "README.md", "a\nb", "x")
+        .await
+        .expect_err("two occurrences must be refused");
+    assert_eq!(err, "review_fix old_string must occur exactly once");
+    assert_eq!(
+        std::fs::read_to_string(fixture.record.worktree.join("README.md")).expect("README"),
+        "a\r\nb\r\na\r\nb\r\nc\r\n"
+    );
+    fixture.team.shutdown().await;
+}
+
+/// An LF file keeps its historical behaviour: the LF replacement lands
+/// verbatim and the fix round is recorded.
+#[tokio::test]
+async fn review_fix_lf_file_unchanged_behavior() {
+    let fixture = review_fix_fixture("crlflf000001", "a\nb\nc\n").await;
+    let fixed = fixture
+        .team
+        .review_fix(&fixture.record.id, "finding1", "README.md", "a\nb", "x\ny")
+        .await
+        .expect("the LF file edits as before");
+    assert_eq!(fixed.fix_rounds, 1, "{fixed:?}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.record.worktree.join("README.md")).expect("README"),
+        "x\ny\nc\n"
+    );
+    fixture.team.shutdown().await;
+}
+
+/// A miss keeps the historical message and appends the matcher's near-miss
+/// detail — without the worker-facing fresh-read nudge, which steers a worker
+/// turn, not the lead.
+#[tokio::test]
+async fn review_fix_reports_near_miss_without_the_read_nudge() {
+    let fixture =
+        review_fix_fixture("crlfmiss0001", "alpha\r\nbeta\r\ngamma\r\ndelta\r\n").await;
+    let err = fixture
+        .team
+        .review_fix(
+            &fixture.record.id,
+            "finding1",
+            "README.md",
+            "alpha\nbeta\ngamma\ndelto",
+            "x",
+        )
+        .await
+        .expect_err("an absent anchor must be refused");
+    assert!(
+        err.starts_with("review_fix old_string must occur exactly once — near-miss"),
+        "{err}"
+    );
+    assert!(!err.contains("Re-read the file"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(fixture.record.worktree.join("README.md")).expect("README"),
+        "alpha\r\nbeta\r\ngamma\r\ndelta\r\n"
+    );
+    fixture.team.shutdown().await;
 }
 
 /// The repeated-finding escalation still fires when the worker really did

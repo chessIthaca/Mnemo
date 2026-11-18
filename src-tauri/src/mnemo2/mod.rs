@@ -183,6 +183,11 @@ pub mod ui_log;
 /// bug-fix follow-ups.
 pub mod quality;
 
+/// Edit attempts and their failures by cause, read back from the persisted
+/// worker transcripts for the Quality tab's `Edits` section (plan f89fd63d
+/// step 5).
+pub mod edit_outcomes;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView, which also exposes `__TAURI_INTERNALS__`.
 #[tauri::command]

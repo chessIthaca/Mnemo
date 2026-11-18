@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
+use crate::mnemo2::edit_outcomes::{self, EditFileRow, EditOutcomeRow, EditOutcomes};
 use crate::mnemo2::team::findings_ledger;
 use crate::mnemo2::{dispatch_routing, phase3};
 
@@ -86,6 +87,10 @@ pub struct QualityReport {
     /// Merges whose row predates `merge_commit`, so a bug-fix follow-up cannot
     /// be detected for them. They count for every other metric.
     pub missing_merge_commit: u32,
+    /// Edit-tool attempts by model, worker and file, read from the persisted
+    /// worker transcripts (plan f89fd63d step 5). Empty in [`compute`], which
+    /// never touches the filesystem; [`report`] fills it.
+    pub edits: EditOutcomes,
 }
 
 /// One merged outcome in the window, as much of it as the metrics need.
@@ -215,6 +220,7 @@ pub fn compute(
         by_tier: ordered_rows(by_tier),
         categories,
         missing_merge_commit: u32::try_from(missing_merge_commit).unwrap_or(u32::MAX),
+        edits: EditOutcomes::default(),
     }
 }
 
@@ -358,14 +364,36 @@ pub async fn report(root: PathBuf, window_days: u32) -> Result<QualityReport, St
     let plan_kind = |plan_id: &str| -> Option<String> { kinds.get(plan_id).cloned() };
     let changed_files =
         |commit: &str| -> Option<Vec<String>> { changed.get(commit).cloned().flatten() };
-    Ok(compute(
+    let mut report = compute(
         &rows,
         &plan_kind,
         &changed_files,
         categories,
         now_ms,
         window_days,
-    ))
+    );
+    report.edits = edit_outcomes::collect(
+        &edit_outcomes::transcripts_dir(&root),
+        &window_worker_models(&rows, start, now_ms),
+    );
+    Ok(report)
+}
+
+/// The window's workers with the model each finished on, deduplicated: a
+/// resumed worker can write more than one outcome row, and the latest one wins.
+fn window_worker_models(
+    rows: &[DispatchRoutingRow],
+    start: u64,
+    now_ms: u64,
+) -> Vec<(String, String)> {
+    let mut models: BTreeMap<&str, &str> = BTreeMap::new();
+    for task in window_tasks(rows, start, now_ms) {
+        models.insert(task.worker_id, task.model);
+    }
+    models
+        .into_iter()
+        .map(|(worker, model)| (worker.to_string(), model.to_string()))
+        .collect()
 }
 
 
@@ -522,6 +550,29 @@ pub fn summary(report: &QualityReport) -> String {
             lines.push(format!("  {}", line(row)));
         }
     }
+    if !report.edits.by_model.is_empty() {
+        lines.push("Edits:".to_string());
+        for row in &report.edits.by_model {
+            lines.push(format!("  {}", edit_line(row)));
+        }
+        if !report.edits.top_files.is_empty() {
+            let listed = report
+                .edits
+                .top_files
+                .iter()
+                .take(5)
+                .map(edit_file_line)
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("Files with the most edit failures: {listed}"));
+        }
+    }
+    if report.edits.skipped > 0 {
+        lines.push(format!(
+            "Edits: {} worker transcript(s) were missing or unreadable and skipped",
+            report.edits.skipped
+        ));
+    }
     if !report.categories.is_empty() {
         let listed = report
             .categories
@@ -545,6 +596,77 @@ fn line(row: &QualityRow) -> String {
         row.reverted,
         row.bugfix_followups
     )
+}
+
+/// One model's or worker's line in the summary's `Edits` block:
+/// `glm-5.3: 40 attempts, 16 failed (7 shape, 2 receipt drift, ...)`.
+fn edit_line(row: &EditOutcomeRow) -> String {
+    let failed = row.failures();
+    if failed == 0 {
+        return format!("{}: {} attempts, none failed", row.key, row.attempts);
+    }
+    format!(
+        "{}: {} attempts, {} failed ({})",
+        row.key,
+        row.attempts,
+        failed,
+        edit_causes(
+            row.shape,
+            row.receipt_drift,
+            row.artifact,
+            row.cite_range,
+            row.mismatch,
+            row.blocked,
+            row.other
+        )
+    )
+}
+
+/// One problem file's line in the summary's `Edits` block:
+/// `crates/fg_sim/src/layout.rs (5 failed of 12: 2 shape, 1 blocked)`.
+fn edit_file_line(file: &EditFileRow) -> String {
+    format!(
+        "{} ({} failed of {}: {})",
+        file.path,
+        file.failures,
+        file.attempts,
+        edit_causes(
+            file.shape,
+            file.receipt_drift,
+            file.artifact,
+            file.cite_range,
+            file.mismatch,
+            file.blocked,
+            file.other
+        )
+    )
+}
+
+/// The causes that happened, as `7 shape, 2 receipt drift, ...`.
+fn edit_causes(
+    shape: u32,
+    receipt_drift: u32,
+    artifact: u32,
+    cite_range: u32,
+    mismatch: u32,
+    blocked: u32,
+    other: u32,
+) -> String {
+    let mut parts = Vec::new();
+    for (label, count) in [
+        ("shape", shape),
+        ("receipt drift", receipt_drift),
+        ("artifact", artifact),
+        ("cite range", cite_range),
+        ("mismatch", mismatch),
+        ("blocked", blocked),
+        ("other", other),
+    ] {
+        if count > 0 {
+            parts.push(format!("{count} {label}"));
+        }
+    }
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -914,5 +1036,60 @@ mod tests {
         assert_eq!(report.by_tier.len(), 1);
         assert_eq!(report.by_tier[0].key, "routine");
         assert_eq!(report.by_model.len(), 1);
+    }
+
+    #[test]
+    fn summary_names_the_edit_attempts_and_the_worst_files() {
+        let rows = vec![Merged {
+            worker_id: "w1",
+            plan_id: "p1",
+            ts: NOW - DAY_MS,
+            tier: "routine",
+            model: "m-a",
+            ..Merged::default()
+        }
+        .row()];
+        let mut report = plain(&rows);
+        report.edits = EditOutcomes {
+            by_model: vec![EditOutcomeRow {
+                key: "m-a".to_string(),
+                attempts: 40,
+                ok: 24,
+                shape: 7,
+                receipt_drift: 2,
+                artifact: 3,
+                cite_range: 2,
+                mismatch: 1,
+                blocked: 1,
+                other: 0,
+            }],
+            by_worker: Vec::new(),
+            top_files: vec![EditFileRow {
+                path: "crates/fg_sim/src/layout.rs".to_string(),
+                attempts: 12,
+                failures: 5,
+                shape: 2,
+                receipt_drift: 1,
+                artifact: 1,
+                cite_range: 1,
+                mismatch: 0,
+                blocked: 0,
+                other: 0,
+            }],
+            skipped: 1,
+        };
+        let text = summary(&report);
+        assert!(text.contains("Edits:"), "the summary gains an Edits block: {text}");
+        assert!(
+            text.contains("m-a: 40 attempts, 16 failed (7 shape, 2 receipt drift, 3 artifact, 2 cite range, 1 mismatch, 1 blocked)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Files with the most edit failures: crates/fg_sim/src/layout.rs (5 failed of 12: 2 shape, 1 receipt drift, 1 artifact, 1 cite range)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("1 worker transcript(s) were missing or unreadable"), "{text}");
     }
 }

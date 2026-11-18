@@ -195,7 +195,12 @@ only the app.
   per final tier and per model, how often merged work was first-pass, how many
   fix rounds and findings it took, how often it was reverted and how often a
   bug-fix plan merged the same files soon after — the evidence for tier and
-  model choices. Dispatch accepts a caller-stable worker
+  model choices. It also reports the window's edit-tool attempts and their
+  failures by cause (misshapen arguments, receipt drift, emission artifact,
+  out-of-range cite, `old_string` mismatch, stale-read interception, other), per
+  model and worker and for the files that failed most, read back from the worker
+  transcripts. Dispatch accepts a
+  caller-stable worker
   ID, an optional `review_risk` (`standard`/`high`), and returns a
   model-facing JSON receipt with its real ID/status. Its `model` parameter is
   an enum of the exact configured `endpoint/model` specs. Retrying that ID with the

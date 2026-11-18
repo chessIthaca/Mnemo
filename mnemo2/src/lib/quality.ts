@@ -33,6 +33,66 @@ export interface QualityRow {
   costPerMergedMicros: number;
 }
 
+/** One model's or one worker's edit attempts, by cause. */
+export interface EditOutcomeRow {
+  /** The model spec string, or the worker id. */
+  key: string;
+  /** Edit-tool calls counted. */
+  attempts: number;
+  /** Calls that succeeded. */
+  ok: number;
+  /** Calls whose arguments arrived misshapen. */
+  shape: number;
+  /** Calls refused because the cited lines had drifted from their read. */
+  receiptDrift: number;
+  /** Calls refused because the edit would unbalance the delimiters. */
+  artifact: number;
+  /** Calls refused because the cited lines were outside the read's range. */
+  citeRange: number;
+  /** Calls whose `old_string` did not match. */
+  mismatch: number;
+  /** Calls the stale-read gate intercepted. */
+  blocked: number;
+  /** Other tool errors. */
+  other: number;
+}
+
+/** One file's edit attempts, by cause — a row of the top-files list. */
+export interface EditFileRow {
+  /** The path as the call's arguments named it. */
+  path: string;
+  /** Calls counted for this file. */
+  attempts: number;
+  /** Calls counted for this file that failed. */
+  failures: number;
+  /** Failed calls whose arguments arrived misshapen. */
+  shape: number;
+  /** Failed calls whose read receipt had drifted. */
+  receiptDrift: number;
+  /** Failed calls refused for unbalancing the delimiters. */
+  artifact: number;
+  /** Failed calls whose cited lines were outside the read's range. */
+  citeRange: number;
+  /** Failed calls whose `old_string` did not match. */
+  mismatch: number;
+  /** Failed calls the stale-read gate intercepted. */
+  blocked: number;
+  /** Failed calls with another tool error. */
+  other: number;
+}
+
+/** The Quality tab's `Edits` section. */
+export interface EditOutcomes {
+  /** One row per final model, most attempts first. */
+  byModel: EditOutcomeRow[];
+  /** One row per worker, most attempts first. */
+  byWorker: EditOutcomeRow[];
+  /** The files with the most failed calls, most failures first. */
+  topFiles: EditFileRow[];
+  /** Workers whose transcript was missing or unreadable. */
+  skipped: number;
+}
+
 /** The whole Quality tab's data. */
 export interface QualityReport {
   /** The window the report was computed over, in days. */
@@ -47,6 +107,8 @@ export interface QualityReport {
   categories: [string, number][];
   /** Merges whose routing-log row predates `merge_commit`, so a follow-up bug fix cannot be detected for them. */
   missingMergeCommit: number;
+  /** Edit-tool attempts and their failures by cause, read from the worker transcripts. */
+  edits: EditOutcomes;
 }
 
 /** The Quality tab's transport: one query, the whole report. */

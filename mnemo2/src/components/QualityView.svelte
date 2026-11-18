@@ -17,6 +17,7 @@
     formatMean,
     formatShare,
     QUALITY_WINDOWS,
+    type EditOutcomeRow,
     type QualityReport,
     type QualityRow,
   } from "../lib/quality";
@@ -74,6 +75,31 @@
     "Bug fix followed",
     "Cost / merged",
   ] as const;
+
+  /** The edit section's columns: attempts and failure rate first, then one per cause. */
+  const editColumns = [
+    "Attempts",
+    "Failure rate",
+    "Shape",
+    "Receipt drift",
+    "Artifact",
+    "Cite range",
+    "Mismatch",
+    "Blocked",
+    "Other",
+  ] as const;
+
+  /** A row's failed calls: every cause but `ok`. */
+  function editFailures(row: EditOutcomeRow): number {
+    return (
+      row.shape + row.receiptDrift + row.artifact + row.citeRange + row.mismatch + row.blocked + row.other
+    );
+  }
+
+  /** The share (0-1) of a row's attempts that failed. */
+  function editFailureShare(row: EditOutcomeRow): number {
+    return row.attempts === 0 ? 0 : editFailures(row) / row.attempts;
+  }
 </script>
 
 {#snippet tableRows(rows: QualityRow[])}
@@ -110,6 +136,36 @@
       </table>
     </div>
   </section>
+{/snippet}
+{#snippet editTable(rows: EditOutcomeRow[], title: string, first: string)}
+  <div class="table-wrap">
+    <table aria-label={title}>
+      <thead>
+        <tr>
+          <th scope="col">{first}</th>
+          {#each editColumns as column (column)}
+            <th scope="col">{column}</th>
+          {/each}
+        </tr>
+      </thead>
+      <tbody>
+        {#each rows as row (row.key)}
+          <tr>
+            <th scope="row">{row.key}</th>
+            <td>{row.attempts}</td>
+            <td>{formatShare(editFailureShare(row))}</td>
+            <td>{row.shape}</td>
+            <td>{row.receiptDrift}</td>
+            <td>{row.artifact}</td>
+            <td>{row.citeRange}</td>
+            <td>{row.mismatch}</td>
+            <td>{row.blocked}</td>
+            <td>{row.other}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
 {/snippet}
 <section class="quality-view" aria-label="Quality">
   <header class="quality-header">
@@ -176,6 +232,61 @@
         {/if}
       {/if}
 
+      <section class="card" aria-label="Edits">
+        <h2>Edits</h2>
+        {#if report.edits.byModel.length === 0}
+          <p class="empty">No edit calls in this window.</p>
+        {:else}
+          {@render editTable(report.edits.byModel, "Edits by model", "Model")}
+          <details class="workers">
+            <summary>By worker</summary>
+            {@render editTable(report.edits.byWorker, "Edits by worker", "Worker")}
+          </details>
+          {#if report.edits.topFiles.length > 0}
+            <h3>Files with the most failures</h3>
+            <div class="table-wrap">
+              <table aria-label="Files with the most edit failures">
+                <thead>
+                  <tr>
+                    <th scope="col">File</th>
+                    <th scope="col">Attempts</th>
+                    <th scope="col">Failures</th>
+                    <th scope="col">Shape</th>
+                    <th scope="col">Receipt drift</th>
+                    <th scope="col">Artifact</th>
+                    <th scope="col">Cite range</th>
+                    <th scope="col">Mismatch</th>
+                    <th scope="col">Blocked</th>
+                    <th scope="col">Other</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each report.edits.topFiles as file (file.path)}
+                    <tr>
+                      <th scope="row">{file.path}</th>
+                      <td>{file.attempts}</td>
+                      <td>{file.failures}</td>
+                      <td>{file.shape}</td>
+                      <td>{file.receiptDrift}</td>
+                      <td>{file.artifact}</td>
+                      <td>{file.citeRange}</td>
+                      <td>{file.mismatch}</td>
+                      <td>{file.blocked}</td>
+                      <td>{file.other}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
+        {/if}
+        {#if report.edits.skipped > 0}
+          <p class="footnote">
+            {report.edits.skipped} worker transcript(s) were missing or unreadable and skipped.
+          </p>
+        {/if}
+      </section>
+
       {#if report.missingMergeCommit > 0}
         <p class="footnote">
           {report.missingMergeCommit} older tasks have no merge commit recorded, so they are not checked for follow-up bug fixes.
@@ -207,6 +318,9 @@
 
   .card { padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
   .card h2 { margin: 0 0 8px; font-size: var(--text-title); font-weight: 620; }
+  .card h3 { margin: 12px 0 6px; font-size: var(--text-body); font-weight: 620; }
+  .workers { margin-top: 10px; }
+  .workers summary { color: var(--muted); cursor: pointer; font-size: var(--text-meta); }
   .table-wrap { max-height: 320px; overflow: auto; }
   table { border-collapse: collapse; width: 100%; font-size: var(--text-meta); font-variant-numeric: tabular-nums; }
   th,

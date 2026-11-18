@@ -158,9 +158,13 @@ impl Tool for FileWriteTool {
             // The pre-write bytes, for the read-receipt bookkeeping below
             // (plan f89fd63d step 2). A full overwrite replaces arbitrary
             // lines, so only the file's own content can say which ones
-            // survived. read_files serves text only, so a file that does not
-            // read as text can hold no receipt — skip the bookkeeping then.
-            let previous = if validated.exists() {
+            // survived. Read it ONLY when a receipt actually tracks the path
+            // (an overwrite nobody has read costs no extra I/O), and skip it
+            // when the file does not read as text — read_files serves text
+            // only, so such a file holds no receipt.
+            let previous = if validated.exists()
+                && crate::tool::agent::read_registry::tracks(&validated)
+            {
                 std::fs::read_to_string(&validated).ok()
             } else {
                 None
@@ -412,6 +416,54 @@ mod tests {
             std::fs::read_to_string(dir.path().join("new.md")).unwrap(),
             "a\nb\n",
             "new files must be written with LF endings"
+        );
+    }
+
+    #[tokio::test]
+    async fn overwrite_shifts_receipts_for_a_later_cite() {
+        // Plan f89fd63d step 2 (finding f-d8b0460d): a full overwrite that
+        // ADDS lines above a read's lines must shift that read's receipt
+        // too, so a later file_edit cite lands on the lines the read served
+        // instead of failing "line 2 changed since read".
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\n").unwrap();
+        let read = crate::tool::agent::read_files::ReadFilesTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let read_result = read.execute(json!({"files": [{"path": "a.txt"}]})).await;
+        assert!(read_result.success, "{}", read_result.output);
+        let id = read_result
+            .output
+            .lines()
+            .find(|l| l.contains("[read receipt "))
+            .and_then(|l| l.split("[read receipt ").nth(1))
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .unwrap_or_else(|| panic!("read must mint a receipt: {}", read_result.output))
+            .to_string();
+        let written = tool
+            .execute(json!({
+                "path": "a.txt", "content": "HEAD1\nHEAD2\nl1\nl2\nl3\n"
+            }))
+            .await;
+        assert!(written.success, "{}", written.output);
+        // The read served 'l2' as line 2; it sits at line 4 now.
+        let edit = crate::tool::agent::file_edit::FileEditTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let cite = edit
+            .execute(json!({
+                "path": "a.txt", "from_read": id, "lines": [2, 2], "new_string": "L2"
+            }))
+            .await;
+        assert!(
+            cite.success,
+            "file_write's overwrite must shift the receipt: {}",
+            cite.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "HEAD1\nHEAD2\nl1\nL2\nl3\n"
         );
     }
 

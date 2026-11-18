@@ -1016,12 +1016,14 @@ pub(crate) struct LineOp {
     pub(crate) payload: Option<String>,
 }
 
-/// A validated read-receipt cite (plan f302cc0e): `start`/`end` are
-/// 1-indexed inclusive lines in the CITED READ's coordinates — the file as
-/// the receipt validated it, before this call's ops ran. [`apply_ops`] maps
-/// the range through every preceding op's line shifts (a line-level diff of
-/// the pre-ops content against the running content) and refuses the array
-/// when an earlier op already changed one of the cited lines.
+/// A validated read-receipt cite (plans f302cc0e, f89fd63d step 2):
+/// `start`/`end` are 1-indexed inclusive lines in the cited read's
+/// numbering, already translated through every file-tool write recorded
+/// since that read — i.e. the coordinates of the file as it is on disk
+/// when this call starts. [`apply_ops`] maps that range on through every
+/// preceding op's line shifts (a line-level diff of the pre-ops content
+/// against the running content) and refuses the array when an earlier op
+/// already changed one of the cited lines.
 #[derive(Debug)]
 pub(crate) struct ReadCiteOp {
     /// The cite's label, echoed in error messages (`from_read <id>`).
@@ -1357,11 +1359,13 @@ pub(crate) fn apply_ops(
     let track = artifact_check && checks_brace_balance(path);
     let mut current = content.to_string();
     let mut notes: Vec<String> = Vec::new();
-    // Read-receipt cites ride in the CITED READ's coordinates (plan
-    // f302cc0e) — the file as the receipt validated it, before any op in
-    // this array ran — so capture the pre-ops lines once: the translation
-    // in the loop is exactly the line-level diff between these and the
-    // running content, and an untouched cite short-circuits on equality.
+    // Read-receipt cites ride in PRE-CALL coordinates: the cited read's
+    // numbering already translated through every file-tool write recorded
+    // since that read (plans f302cc0e, f89fd63d step 2), so they name the
+    // file as it is before any op in this array runs — capture the pre-ops
+    // lines once: the translation in the loop is exactly the line-level
+    // diff between these and the running content, and an untouched cite
+    // short-circuits on equality.
     let read_lines: Vec<&str> = content.lines().collect();
     // The running brace/bracket/paren deficit after each op — the exact
     // attribution trail for a positive combined delta (backlog 08d2125d).
@@ -1432,13 +1436,14 @@ pub(crate) fn apply_ops(
             EditOp::Line(line_op) => {
                 current = apply_line_op(&current, le, line_op, idx)?;
             }
-            // A read-receipt cite names lines in the CITED READ's
-            // coordinates — the content as it was before this call — while
-            // every other op works in the running coordinates (plan
-            // f302cc0e). Translate through the earlier ops' perturbations
-            // first, so the cite lands on exactly the lines it validated
-            // (a cite no earlier op disturbed is byte-identical to the
-            // pre-fix blind apply).
+            // A read-receipt cite names lines in PRE-CALL coordinates — the
+            // cited read's numbering, translated through every file-tool
+            // write recorded since that read (plans f302cc0e, f89fd63d
+            // step 2), i.e. the content as it was before this call — while
+            // every other op works in the running coordinates. Translate
+            // through the earlier ops' perturbations first, so the cite
+            // lands on exactly the lines it validated (a cite no earlier op
+            // disturbed is byte-identical to the pre-fix blind apply).
             EditOp::ReadCite(cite) => {
                 let current_lines: Vec<&str> = current.lines().collect();
                 let (start, end) =
@@ -1497,15 +1502,16 @@ pub(crate) fn apply_ops(
     Ok((current, notes))
 }
 
-/// Map a read-receipt cite's range from the cited read's coordinates (the
-/// bytes the receipt validated — the file BEFORE this call's ops) into the
-/// running content's coordinates (plan f302cc0e). The mapping rides a
-/// line-level diff of the pre-ops content against the running content:
-/// every line the earlier ops left untouched survives in an Equal block,
-/// so a cite whose range fits entirely inside one block lands on exactly
-/// the lines it validated, however many insert/delete/replace/anchor ops
-/// preceded it — including an earlier cite, whose replacement is itself
-/// just another perturbation.
+/// Map a read-receipt cite's range from PRE-CALL coordinates into the
+/// running content's coordinates (plans f302cc0e, f89fd63d step 2).
+/// "Pre-call" is the cited read's numbering translated through every
+/// file-tool write recorded since that read, i.e. the bytes the file had
+/// before this call's ops. The mapping rides a line-level diff of the
+/// pre-ops content against the running content: every line the earlier ops
+/// left untouched survives in an Equal block, so a cite whose range fits
+/// entirely inside one block lands on exactly the lines it validated,
+/// however many insert/delete/replace/anchor ops preceded it — including an
+/// earlier cite, whose replacement is itself just another perturbation.
 ///
 /// A cite whose range is NOT intact refuses the whole array (atomicity):
 /// when an earlier op replaced or deleted one of its lines, or inserted

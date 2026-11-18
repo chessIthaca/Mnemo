@@ -290,6 +290,14 @@ pub fn tracks(path: &Path) -> bool {
 /// [`note_append`] instead, which describes the same shift from a line
 /// count. A write outside the file tools (a shell command, `cargo fmt`) is
 /// not recorded, so a cite over rewritten lines still fails its hash check.
+///
+/// Window: the shift is recorded AFTER the bytes are on disk, so a receipt
+/// minted by a concurrent read that lands between the write and this call
+/// receives a shift its own content never had. That is safe except when the
+/// written region ends on lines identical to the ones it added (an adjacent
+/// identical line can make the hash check accept a neighbour), and it cannot
+/// arise in practice because the dispatch loop runs one agent's tool calls
+/// sequentially — no read interleaves a write.
 pub fn note_write(path: &Path, old: &str, new: &str) {
     if old == new {
         return;
@@ -580,5 +588,63 @@ mod tests {
         note_write(&path, &body, "l1\nl2\nlast\n");
         let err = resolve(&id, &path, 1, 1, "l1\nl2\nlast\n").unwrap_err();
         assert!(err.to_string().contains("unknown read receipt"), "{err}");
+    }
+
+    #[test]
+    fn pure_deletion_above_a_cite_moves_it_up() {
+        // A deletion ABOVE the cited lines is a NEGATIVE delta — the cite
+        // moves up by the number of lines removed (plan f89fd63d step 2).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let id = mint(path.clone(), 1, &["l1", "l2", "l3", "l4", "l5", "l6"]);
+        let after = "l1\nl4\nl5\nl6\n";
+        note_write(&path, "l1\nl2\nl3\nl4\nl5\nl6\n", after);
+        // The read served 'l5' as line 5; two lines above it are gone.
+        assert_eq!(resolve(&id, &path, 5, 6, after).unwrap(), (3, 4));
+        assert_eq!(resolve(&id, &path, 1, 1, after).unwrap(), (1, 1));
+        // A cite of the DELETED lines can never apply.
+        let err = resolve(&id, &path, 2, 3, after).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lines [2, 3] of read"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("lines 2-3 at the time"), "{err}");
+    }
+
+    #[test]
+    fn deleting_every_line_refuses_a_cite() {
+        // A write that empties the file replaces every line with nothing:
+        // no translation can land on a cite, so it is refused as drift.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let id = mint(path.clone(), 1, &["l1", "l2", "l3"]);
+        note_write(&path, "l1\nl2\nl3\n", "");
+        let err = resolve(&id, &path, 1, 1, "").unwrap_err();
+        assert!(err.to_string().contains("lines 1-3 at the time"), "{err}");
+        assert!(err.to_string().contains("lines [1, 1] of read"), "{err}");
+    }
+
+    #[test]
+    fn lines_inserted_inside_a_cite_are_refused_with_the_insertion_message() {
+        // A pure insertion lands INSIDE the cite: the contiguous block it
+        // names no longer exists, so the nudge says so with the insertion
+        // wording rather than a bogus reversed "lines a-b" range.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let id = mint(path.clone(), 1, &["l1", "l2", "l3", "l4", "l5"]);
+        let after = "l1\nl2\nNEW1\nNEW2\nl3\nl4\nl5\n";
+        note_write(&path, "l1\nl2\nl3\nl4\nl5\n", after);
+        // Above and below the insertion point the cites still resolve...
+        assert_eq!(resolve(&id, &path, 1, 2, after).unwrap(), (1, 2));
+        assert_eq!(resolve(&id, &path, 3, 4, after).unwrap(), (5, 6));
+        // ...but a range that spans it cannot.
+        let err = resolve(&id, &path, 2, 4, after).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lines were inserted after line 2 at the time"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("lines [2, 4] of read"), "{err}");
     }
 }

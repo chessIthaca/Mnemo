@@ -2776,6 +2776,103 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Version bump, dependency updates and changelog only."
+    },
+    {
+      "id": "895098cb",
+      "status": "closed",
+      "created_at_ms": 1794867304235,
+      "closed_at_ms": 1794867518879,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-895098cb-20261116-221838.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Worker guidance text only."
+    },
+    {
+      "id": "bb7b2d99",
+      "status": "closed",
+      "created_at_ms": 1794922067559,
+      "closed_at_ms": 1794929968472,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-bb7b2d99-20261117-153928.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "953c3481",
+      "status": "closed",
+      "created_at_ms": 1794931014181,
+      "closed_at_ms": 1794932038058,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-953c3481-20261117-161358.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "970d8d66",
+      "status": "open",
+      "created_at_ms": 1794931643554,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds a new proof mechanism and merge-gate condition; no requirement of dispatch-routing, external-lead, tier-ladder or worker-brief changes (routing, lead attachment, tiers and worker briefs behave as before)."
+    },
+    {
+      "id": "0ff83146",
+      "status": "closed",
+      "created_at_ms": 1794931687974,
+      "closed_at_ms": 1795015386553,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-0ff83146-20261118-152306.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds advisory notes to shell output and repository policy tests; no specified capability's requirements change."
+    },
+    {
+      "id": "3c2ec71c",
+      "status": "open",
+      "created_at_ms": 1794931735010,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds optional finding fields, a findings ledger and backlog proposals; no requirement of the governed team capabilities changes."
+    },
+    {
+      "id": "dac2028d",
+      "status": "closed",
+      "created_at_ms": 1794931808476,
+      "closed_at_ms": 1795014896525,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-dac2028d-20261118-151456.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds two optional fields/rows to the routing log and a read-only report; Laya's routing requirements and labels are unchanged (new rows are ignored by the training readers)."
+    },
+    {
+      "id": "41874823",
+      "status": "closed",
+      "created_at_ms": 1794947437374,
+      "closed_at_ms": 1794948742423,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-41874823-20261117-205222.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Input validation inside the quality report's git call; no specified behaviour changes."
+    },
+    {
+      "id": "f89fd63d",
+      "status": "open",
+      "created_at_ms": 1795021986512,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Edit-tool robustness, review_fix matching and a Quality-tab metric; no OpenSpec capability governs these files' specified behavior."
     }
   ]
 }

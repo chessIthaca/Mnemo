@@ -82,6 +82,8 @@
     "Failure rate",
     "Shape",
     "Receipt drift",
+    "Artifact",
+    "Cite range",
     "Mismatch",
     "Blocked",
     "Other",
@@ -89,7 +91,9 @@
 
   /** A row's failed calls: every cause but `ok`. */
   function editFailures(row: EditOutcomeRow): number {
-    return row.shape + row.receiptDrift + row.mismatch + row.blocked + row.other;
+    return (
+      row.shape + row.receiptDrift + row.artifact + row.citeRange + row.mismatch + row.blocked + row.other
+    );
   }
 
   /** The share (0-1) of a row's attempts that failed. */
@@ -152,6 +156,8 @@
             <td>{formatShare(editFailureShare(row))}</td>
             <td>{row.shape}</td>
             <td>{row.receiptDrift}</td>
+            <td>{row.artifact}</td>
+            <td>{row.citeRange}</td>
             <td>{row.mismatch}</td>
             <td>{row.blocked}</td>
             <td>{row.other}</td>
@@ -247,6 +253,8 @@
                     <th scope="col">Failures</th>
                     <th scope="col">Shape</th>
                     <th scope="col">Receipt drift</th>
+                    <th scope="col">Artifact</th>
+                    <th scope="col">Cite range</th>
                     <th scope="col">Mismatch</th>
                     <th scope="col">Blocked</th>
                     <th scope="col">Other</th>
@@ -260,6 +268,8 @@
                       <td>{file.failures}</td>
                       <td>{file.shape}</td>
                       <td>{file.receiptDrift}</td>
+                      <td>{file.artifact}</td>
+                      <td>{file.citeRange}</td>
                       <td>{file.mismatch}</td>
                       <td>{file.blocked}</td>
                       <td>{file.other}</td>

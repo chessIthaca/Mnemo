@@ -45,6 +45,10 @@ export interface EditOutcomeRow {
   shape: number;
   /** Calls refused because the cited lines had drifted from their read. */
   receiptDrift: number;
+  /** Calls refused because the edit would unbalance the delimiters. */
+  artifact: number;
+  /** Calls refused because the cited lines were outside the read's range. */
+  citeRange: number;
   /** Calls whose `old_string` did not match. */
   mismatch: number;
   /** Calls the stale-read gate intercepted. */
@@ -65,6 +69,10 @@ export interface EditFileRow {
   shape: number;
   /** Failed calls whose read receipt had drifted. */
   receiptDrift: number;
+  /** Failed calls refused for unbalancing the delimiters. */
+  artifact: number;
+  /** Failed calls whose cited lines were outside the read's range. */
+  citeRange: number;
   /** Failed calls whose `old_string` did not match. */
   mismatch: number;
   /** Failed calls the stale-read gate intercepted. */

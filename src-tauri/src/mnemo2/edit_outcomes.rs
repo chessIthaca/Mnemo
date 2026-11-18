@@ -10,8 +10,9 @@
 //! The Quality tab already answers whether merged work held up; this module adds
 //! the tool-level half: how many edit calls each model and each worker made, how
 //! many of them failed, and why — misshapen arguments, a read receipt the file
-//! had moved away from, a remembered `old_string` that no longer matched, a
-//! stale-read interception, or some other tool error.
+//! had moved away from, an emission-artifact rejection, an out-of-range cite, a
+//! remembered `old_string` that no longer matched, a stale-read interception, or
+//! some other tool error.
 //!
 //! Nothing new is recorded at run time. Every tool call and its result already
 //! live in `.coding/mnemo2/transcripts/<worker_id>.json`, so the numbers cover
@@ -55,6 +56,13 @@ const RECEIPT_DRIFT_MARKERS: [&str; 4] = [
     "reach past the file's current end",
 ];
 
+/// Emission-artifact marker: the edit was refused because its result would leave
+/// the delimiters unbalanced (a dropped closing brace, a truncated payload).
+const ARTIFACT_MARKER: &str = "emission artifact detected";
+
+/// Cite-range marker: the cited lines fell outside the read's covered range.
+const CITE_RANGE_MARKER: &str = "covered range";
+
 /// `old_string` markers: the edit ran but found no anchor.
 const MISMATCH_MARKERS: [&str; 2] = ["old_string not found", "near-miss:"];
 
@@ -70,6 +78,10 @@ enum EditOutcome {
     Shape,
     /// A read receipt no longer matched the file, or was unknown.
     ReceiptDrift,
+    /// The edit was refused for unbalancing the delimiters (an emission artifact).
+    Artifact,
+    /// The cited lines fell outside the read's covered range.
+    CiteRange,
     /// The `old_string` did not match the file's current text.
     Mismatch,
     /// The stale-read gate intercepted the call.
@@ -79,8 +91,9 @@ enum EditOutcome {
 }
 
 /// The cause of one edit-tool result, in the plan's fixed order: a stale-read
-/// interception first, then a misshapen argument, a drifted read receipt, a
-/// non-matching `old_string`, another tool error, and finally success.
+/// interception first, then a misshapen argument, a drifted read receipt, an
+/// emission artifact, an out-of-range cite, a non-matching `old_string`, another
+/// tool error, and finally success.
 fn classify(content: &str) -> EditOutcome {
     let has = |markers: &[&str]| markers.iter().any(|marker| content.contains(marker));
     if content.contains(BLOCKED_MARKER) {
@@ -89,6 +102,10 @@ fn classify(content: &str) -> EditOutcome {
         EditOutcome::Shape
     } else if has(&RECEIPT_DRIFT_MARKERS) {
         EditOutcome::ReceiptDrift
+    } else if content.contains(ARTIFACT_MARKER) {
+        EditOutcome::Artifact
+    } else if content.contains(CITE_RANGE_MARKER) {
+        EditOutcome::CiteRange
     } else if has(&MISMATCH_MARKERS) {
         EditOutcome::Mismatch
     } else if content.starts_with("[tool error]") {
@@ -121,6 +138,10 @@ pub struct EditOutcomeRow {
     pub shape: u32,
     /// Calls refused because the cited lines had drifted from their read.
     pub receipt_drift: u32,
+    /// Calls refused because the edit would unbalance the delimiters.
+    pub artifact: u32,
+    /// Calls refused because the cited lines were outside the read's range.
+    pub cite_range: u32,
     /// Calls whose `old_string` did not match.
     pub mismatch: u32,
     /// Calls the stale-read gate intercepted.
@@ -145,6 +166,8 @@ impl EditOutcomeRow {
             EditOutcome::Ok => self.ok += 1,
             EditOutcome::Shape => self.shape += 1,
             EditOutcome::ReceiptDrift => self.receipt_drift += 1,
+            EditOutcome::Artifact => self.artifact += 1,
+            EditOutcome::CiteRange => self.cite_range += 1,
             EditOutcome::Mismatch => self.mismatch += 1,
             EditOutcome::Blocked => self.blocked += 1,
             EditOutcome::Other => self.other += 1,
@@ -172,6 +195,10 @@ pub struct EditFileRow {
     pub shape: u32,
     /// Failed calls whose read receipt had drifted.
     pub receipt_drift: u32,
+    /// Failed calls refused for unbalancing the delimiters.
+    pub artifact: u32,
+    /// Failed calls whose cited lines were outside the read's range.
+    pub cite_range: u32,
     /// Failed calls whose `old_string` did not match.
     pub mismatch: u32,
     /// Failed calls the stale-read gate intercepted.
@@ -201,6 +228,14 @@ impl EditFileRow {
             EditOutcome::ReceiptDrift => {
                 self.failures += 1;
                 self.receipt_drift += 1;
+            }
+            EditOutcome::Artifact => {
+                self.failures += 1;
+                self.artifact += 1;
+            }
+            EditOutcome::CiteRange => {
+                self.failures += 1;
+                self.cite_range += 1;
             }
             EditOutcome::Mismatch => {
                 self.failures += 1;
@@ -487,9 +522,17 @@ mod tests {
     /// `old_string` no longer matched.
     const MISMATCH: &str = r#"[tool error] not found: multi_edit: files[0] 'crates/fg_sim/src/layout.rs': edit 2/2 failed (anchor: '/// Squared distance between two tiles.'): old_string not found in file — near-miss: matched 113/132 chars; first difference at char 114: file has 'let ', you sent 'dx *' — the content has likely drifted from your last read. Re-read the file (read_files, this exact path) and retry with the exact current text; do not edit without a fresh read."#;
 
-    /// Real result text from `simFactories01.json` (message 229): a tool error
-    /// none of the named causes covers yet.
-    const OTHER: &str = r#"[tool error] invalid input: multi_edit: files[0] 'crates/fg_sim/src/views.rs': invalid input: edit rejected: emission artifact detected (unbalanced delimiters after the edit — the brace/bracket/paren deficit grew by 1 (0 → 1); ops[1] ('from_read rsc') grows it by +1 — rebalance each named op in the SAME call (pair it with its compensating op), or split the array; set artifact_check:false when you have verified the result yourself (cargo check / rustfmt --check)"#;
+    /// Real result text from `simFactories01.json` (message 229): the edit was
+    /// refused because its result would unbalance the delimiters.
+    const ARTIFACT: &str = r#"[tool error] invalid input: multi_edit: files[0] 'crates/fg_sim/src/views.rs': invalid input: edit rejected: emission artifact detected (unbalanced delimiters after the edit — the brace/bracket/paren deficit grew by 1 (0 → 1); ops[1] ('from_read rsc') grows it by +1 — rebalance each named op in the SAME call (pair it with its compensating op), or split the array; set artifact_check:false when you have verified the result yourself (cargo check / rustfmt --check)"#;
+
+    /// Real result text from `simFactories01.json` (message 310): the cited
+    /// lines fell outside the read's covered range.
+    const CITE_RANGE: &str = r#"[tool error] invalid input: multi_edit: files[1] 'crates/fg_sim/src/world.rs': invalid input: lines [62, 76] were not in read 'rtl's covered range (lines 66-80) — read the region first, then cite it"#;
+
+    /// Real result text from `simArms01.json` (message 162): an edit that named
+    /// both anchor forms, which no other cause covers.
+    const OTHER: &str = r#"[tool error] invalid input: multi_edit: files[0] 'crates/fg_sim/src/layout.rs': invalid input: edit 1/2 sets BOTH anchor forms — exactly one per item: {old_string, new_string} (verbatim) or {from_read, lines, new_string} (read-receipt cite)"#;
 
     /// Real success text from `simFactories01.json` (message 200).
     const OK: &str = r#"edited crates/fg_sim/src/types.rs
@@ -504,8 +547,8 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
 
     /// A small transcript in the shipped shape: two `file_edit`s, one
     /// successful and one failed `multi_edit`, a `file_write` whose `files`
-    /// arrived as a string, a drifted `file_append`, and a `shell` call that
-    /// must not count.
+    /// arrived as a string, a drifted `file_append`, an emission-artifact
+    /// rejection, an out-of-range cite, and a `shell` call that must not count.
     fn fixture_transcript() -> serde_json::Value {
         json!({
             "messages": [
@@ -534,9 +577,17 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
                 ]},
                 {"role": "tool", "tool_call_id": "c6", "content": RECEIPT_DRIFT},
                 {"role": "assistant", "tool_calls": [
-                    {"id": "c7", "name": "shell", "arguments": "{\"command\":\"ls\"}"}
+                    {"id": "c7", "name": "multi_edit", "arguments": "{\"files\":[{\"path\":\"src/f.rs\"}]}"}
                 ]},
-                {"role": "tool", "tool_call_id": "c7", "content": BLOCKED}
+                {"role": "tool", "tool_call_id": "c7", "content": ARTIFACT},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "c8", "name": "multi_edit", "arguments": "{\"files\":[{\"path\":\"src/g.rs\"}]}"}
+                ]},
+                {"role": "tool", "tool_call_id": "c8", "content": CITE_RANGE},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "c9", "name": "shell", "arguments": "{\"command\":\"ls\"}"}
+                ]},
+                {"role": "tool", "tool_call_id": "c9", "content": BLOCKED}
             ]
         })
     }
@@ -580,6 +631,26 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
     }
 
     #[test]
+    fn classify_artifact_rejection() {
+        assert_eq!(classify(ARTIFACT), EditOutcome::Artifact);
+        assert_eq!(
+            classify(
+                "[tool error] invalid input: file_edit: edit rejected: emission artifact detected (unbalanced delimiters after the edit)"
+            ),
+            EditOutcome::Artifact
+        );
+    }
+
+    #[test]
+    fn classify_out_of_range_cite() {
+        assert_eq!(classify(CITE_RANGE), EditOutcome::CiteRange);
+        assert_eq!(
+            classify("[tool error] not found: lines [62, 76] were not in read 'rtl's covered range (lines 66-80)"),
+            EditOutcome::CiteRange
+        );
+    }
+
+    #[test]
     fn classify_mismatch_and_other_and_ok() {
         assert_eq!(classify(MISMATCH), EditOutcome::Mismatch);
         assert_eq!(classify(OTHER), EditOutcome::Other);
@@ -606,18 +677,20 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
                 model.ok,
                 model.shape,
                 model.receipt_drift,
+                model.artifact,
+                model.cite_range,
                 model.mismatch,
                 model.blocked,
                 model.other
             ),
-            (6, 2, 1, 1, 1, 1, 0),
+            (8, 2, 1, 1, 1, 1, 1, 1, 0),
             "one count per edit-tool call; the shell call does not count"
         );
-        assert_eq!(model.failures(), 4);
+        assert_eq!(model.failures(), 6);
 
         let worker = outcomes.by_worker.first().expect("worker row");
         assert_eq!(worker.key, "editStat01");
-        assert_eq!((worker.attempts, worker.ok), (6, 2));
+        assert_eq!((worker.attempts, worker.ok), (8, 2));
 
         let paths: Vec<&str> = outcomes
             .top_files
@@ -626,7 +699,14 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
             .collect();
         assert_eq!(
             paths,
-            ["src/a.rs", "src/b.rs", UNPARSED_PATH, "src/e.rs"],
+            [
+                "src/a.rs",
+                "src/b.rs",
+                UNPARSED_PATH,
+                "src/e.rs",
+                "src/f.rs",
+                "src/g.rs"
+            ],
             "most failures first, then the busiest file, then path"
         );
         let a = outcomes
@@ -645,6 +725,18 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
             (2, 1, 1),
             "the success counts for every file, the failure once for the first"
         );
+        let f = outcomes
+            .top_files
+            .iter()
+            .find(|file| file.path == "src/f.rs")
+            .expect("f row");
+        assert_eq!((f.attempts, f.failures, f.artifact), (1, 1, 1));
+        let g = outcomes
+            .top_files
+            .iter()
+            .find(|file| file.path == "src/g.rs")
+            .expect("g row");
+        assert_eq!((g.attempts, g.failures, g.cite_range), (1, 1, 1));
         assert!(
             outcomes.top_files.iter().all(|file| file.path != "src/c.rs"),
             "a file with no failed call is not a problem file"
@@ -666,7 +758,7 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
         );
 
         assert_eq!(outcomes.by_worker.len(), 1);
-        assert_eq!(outcomes.by_model[0].attempts, 6);
+        assert_eq!(outcomes.by_model[0].attempts, 8);
     }
 
     #[test]
@@ -742,7 +834,7 @@ NOTE: large edit payload (old_string ~349 chars, new_string ~3491 chars) — emi
             &transcripts,
             &[("editStat01".to_string(), "glm-5.3".to_string())],
         );
-        assert_eq!(first.by_model[0].attempts, 6);
+        assert_eq!(first.by_model[0].attempts, 8);
 
         write_transcript(&transcripts, "editStat01", &json!({"messages": []}));
         let second = collect(

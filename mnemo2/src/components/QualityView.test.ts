@@ -97,10 +97,32 @@ describe("QualityView", () => {
   it("shows edit attempts and failures by cause, model, worker and file", async () => {
     const edits: EditOutcomes = {
       byModel: [
-        { key: "glm-5.3", attempts: 40, ok: 24, shape: 7, receiptDrift: 2, mismatch: 4, blocked: 1, other: 2 },
+        {
+          key: "glm-5.3",
+          attempts: 40,
+          ok: 24,
+          shape: 7,
+          receiptDrift: 2,
+          artifact: 3,
+          citeRange: 2,
+          mismatch: 1,
+          blocked: 1,
+          other: 0,
+        },
       ],
       byWorker: [
-        { key: "simFactories01", attempts: 40, ok: 24, shape: 7, receiptDrift: 2, mismatch: 4, blocked: 1, other: 2 },
+        {
+          key: "simFactories01",
+          attempts: 40,
+          ok: 24,
+          shape: 7,
+          receiptDrift: 2,
+          artifact: 3,
+          citeRange: 2,
+          mismatch: 1,
+          blocked: 1,
+          other: 0,
+        },
       ],
       topFiles: [
         {
@@ -109,8 +131,10 @@ describe("QualityView", () => {
           failures: 5,
           shape: 2,
           receiptDrift: 1,
-          mismatch: 1,
-          blocked: 1,
+          artifact: 1,
+          citeRange: 1,
+          mismatch: 0,
+          blocked: 0,
           other: 0,
         },
       ],
@@ -129,19 +153,23 @@ describe("QualityView", () => {
       "Failure rate",
       "Shape",
       "Receipt drift",
+      "Artifact",
+      "Cite range",
       "Mismatch",
       "Blocked",
       "Other",
     ]);
-    expect(cells(models)).toEqual([["glm-5.3", "40", "40%", "7", "2", "4", "1", "2"]]);
+    expect(cells(models)).toEqual([
+      ["glm-5.3", "40", "40%", "7", "2", "3", "2", "1", "1", "0"],
+    ]);
 
     // The per-worker table is expandable but in the DOM.
     expect(cells(screen.getByRole("table", { name: "Edits by worker" }))).toEqual([
-      ["simFactories01", "40", "40%", "7", "2", "4", "1", "2"],
+      ["simFactories01", "40", "40%", "7", "2", "3", "2", "1", "1", "0"],
     ]);
 
     expect(cells(screen.getByRole("table", { name: "Files with the most edit failures" }))).toEqual([
-      ["crates/fg_sim/src/layout.rs", "12", "5", "2", "1", "1", "1", "0"],
+      ["crates/fg_sim/src/layout.rs", "12", "5", "2", "1", "1", "1", "0", "0", "0"],
     ]);
   });
 

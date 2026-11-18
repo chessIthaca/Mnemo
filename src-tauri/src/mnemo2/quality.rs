@@ -613,6 +613,8 @@ fn edit_line(row: &EditOutcomeRow) -> String {
         edit_causes(
             row.shape,
             row.receipt_drift,
+            row.artifact,
+            row.cite_range,
             row.mismatch,
             row.blocked,
             row.other
@@ -631,6 +633,8 @@ fn edit_file_line(file: &EditFileRow) -> String {
         edit_causes(
             file.shape,
             file.receipt_drift,
+            file.artifact,
+            file.cite_range,
             file.mismatch,
             file.blocked,
             file.other
@@ -639,11 +643,21 @@ fn edit_file_line(file: &EditFileRow) -> String {
 }
 
 /// The causes that happened, as `7 shape, 2 receipt drift, ...`.
-fn edit_causes(shape: u32, receipt_drift: u32, mismatch: u32, blocked: u32, other: u32) -> String {
+fn edit_causes(
+    shape: u32,
+    receipt_drift: u32,
+    artifact: u32,
+    cite_range: u32,
+    mismatch: u32,
+    blocked: u32,
+    other: u32,
+) -> String {
     let mut parts = Vec::new();
     for (label, count) in [
         ("shape", shape),
         ("receipt drift", receipt_drift),
+        ("artifact", artifact),
+        ("cite range", cite_range),
         ("mismatch", mismatch),
         ("blocked", blocked),
         ("other", other),
@@ -1043,9 +1057,11 @@ mod tests {
                 ok: 24,
                 shape: 7,
                 receipt_drift: 2,
-                mismatch: 4,
+                artifact: 3,
+                cite_range: 2,
+                mismatch: 1,
                 blocked: 1,
-                other: 2,
+                other: 0,
             }],
             by_worker: Vec::new(),
             top_files: vec![EditFileRow {
@@ -1054,8 +1070,10 @@ mod tests {
                 failures: 5,
                 shape: 2,
                 receipt_drift: 1,
-                mismatch: 1,
-                blocked: 1,
+                artifact: 1,
+                cite_range: 1,
+                mismatch: 0,
+                blocked: 0,
                 other: 0,
             }],
             skipped: 1,
@@ -1063,12 +1081,12 @@ mod tests {
         let text = summary(&report);
         assert!(text.contains("Edits:"), "the summary gains an Edits block: {text}");
         assert!(
-            text.contains("m-a: 40 attempts, 16 failed (7 shape, 2 receipt drift, 4 mismatch, 1 blocked, 2 other)"),
+            text.contains("m-a: 40 attempts, 16 failed (7 shape, 2 receipt drift, 3 artifact, 2 cite range, 1 mismatch, 1 blocked)"),
             "{text}"
         );
         assert!(
             text.contains(
-                "Files with the most edit failures: crates/fg_sim/src/layout.rs (5 failed of 12: 2 shape, 1 receipt drift, 1 mismatch, 1 blocked)"
+                "Files with the most edit failures: crates/fg_sim/src/layout.rs (5 failed of 12: 2 shape, 1 receipt drift, 1 artifact, 1 cite range)"
             ),
             "{text}"
         );

@@ -40,6 +40,15 @@ you hit a real choice point or need the user.
 - Be precise. Use exact string matches for file_edit (its schema lists the \
 regex, counted, line-range, and fuzzy-whitespace modes, plus the compact \
 line-ops array `ops`).
+- After a format (cargo fmt, rustfmt, prettier) or any shell command that \
+rewrites files, re-read the file before you edit it again. Your own file_edit \
+and multi_edit edits need no re-read: read receipts follow them.
+- Keep old_string short and unique: the few lines that pin the spot, not the \
+whole block. Several small edits beat one large one. If an edit misses near \
+the right spot, the error shows the current text there with a read receipt: \
+cite that instead of re-reading.
+- Send files, ops and lines as real JSON arrays, never as a quoted string. For \
+a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
 files with file_edit (targeted) — or `multi_edit` for several files in one \
 atomic call — not a full file_write rewrite; for large files, write the first \
@@ -476,6 +485,15 @@ user.
 - Be precise. Use exact string matches for file_edit (its schema lists the \
 regex, counted, line-range, and fuzzy-whitespace modes, plus the compact \
 line-ops array `ops`).
+- After a format (cargo fmt, rustfmt, prettier) or any shell command that \
+rewrites files, re-read the file before you edit it again. Your own file_edit \
+and multi_edit edits need no re-read: read receipts follow them.
+- Keep old_string short and unique: the few lines that pin the spot, not the \
+whole block. Several small edits beat one large one. If an edit misses near \
+the right spot, the error shows the current text there with a read receipt: \
+cite that instead of re-reading.
+- Send files, ops and lines as real JSON arrays, never as a quoted string. For \
+a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
 files with file_edit (targeted) — or `multi_edit` for several files in one \
 atomic call — not a full file_write rewrite; for large files, write the first \
@@ -1075,8 +1093,12 @@ mod tests {
         // Bumped 2026-11-08 (plan 373dec00 step 4): the memory_write habit
         // gained one sentence on `evidence` — the prompt side of the
         // confirmation bonus.
+        // Bumped 2026-11-18 (plan f89fd63d step 6): three edit-guidance
+        // bullets joined the `Be precise` bullet — re-read after a formatter
+        // or shell rewrite, keep old_string short and cite the near-miss
+        // excerpt instead of re-reading, and send arrays as arrays.
         const GOLDEN_HEAD: &str =
-            "len=12706|sha256=e50d693bbb4d772ef7b1504d5608721077c211b375cbc0955ff28634978dd121";
+            "len=13301|sha256=bdb1eb9ad2e33081feddfc773f1c3b95f7b45f7d0f65dd1ff0bc88bbcf0936a6";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",
@@ -2313,6 +2335,35 @@ mod tests {
         assert!(!head.contains("plan-first"), "no plan-first text");
         assert!(!head.contains("create_plan"), "no create_plan text");
         assert!(!head.contains("complete_step"), "no complete_step text");
+    }
+
+    /// Plan f89fd63d step 6: the edit-guidance bullets live in BOTH the
+    /// workflow preamble and the kernel-safe principles, so a worker sees the
+    /// same advice in either variant. The two consts are maintained by hand —
+    /// this test is the sync check that keeps a future edit from landing in
+    /// only one of them.
+    #[test]
+    fn both_variants_carry_the_edit_guidance_bullets() {
+        for bullet in [
+            "- After a format (cargo fmt, rustfmt, prettier) or any shell command \
+that rewrites files, re-read the file before you edit it again. Your own \
+file_edit and multi_edit edits need no re-read: read receipts follow them.",
+            "- Keep old_string short and unique: the few lines that pin the spot, \
+not the whole block. Several small edits beat one large one. If an edit misses \
+near the right spot, the error shows the current text there with a read \
+receipt: cite that instead of re-reading.",
+            "- Send files, ops and lines as real JSON arrays, never as a quoted \
+string. For a change to one file, use file_edit.",
+        ] {
+            assert!(
+                CODING_SYSTEM_PREAMBLE.contains(bullet),
+                "the workflow preamble lacks the edit-guidance bullet: {bullet}"
+            );
+            assert!(
+                KERNEL_CODING_PRINCIPLES.contains(bullet),
+                "the kernel principles lack the edit-guidance bullet: {bullet}"
+            );
+        }
     }
 
     /// 2c.1/G1 (§5.9.1 :621): the spec's constitution mode filters the

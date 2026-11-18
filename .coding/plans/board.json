@@ -2865,10 +2865,10 @@
     },
     {
       "id": "f89fd63d",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795021986512,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795034626182,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f89fd63d-20261118-204346.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},

@@ -287,6 +287,19 @@ impl AgentLoop {
         let mut args = args;
         let schema = tool.schema();
         crate::tool::drop_stringified_nulls(&schema.parameters, &mut args);
+        // Plan f89fd63d step 4 (c), review f-81b42635: multi_edit's
+        // FLATTENED shape (bare ops with the target `path` beside them) is
+        // normalised here — before the schema repair and the gates — so
+        // every later stage sees the declared `files:[{path, ops}]`: the
+        // `lines` coercion inside `ops`, the stale-read gate and the
+        // per-path freshness bookkeeping (which read `files[].path`), the
+        // approval preview, and the tool itself. The tool-side call stays
+        // for direct callers; it is idempotent and then reports nothing.
+        let mut files_flattened = false;
+        if tc.name == "multi_edit" {
+            files_flattened =
+                crate::tool::agent::multi_edit::normalize_flattened_files(&mut args);
+        }
         // Backlog c19ec2ff (c): the same transport degradation also
         // delivers sequence-typed arguments as one stringified JSON array
         // (read_files' `files` was hit 3x in one turn, 2027-01-25, and
@@ -294,6 +307,18 @@ impl AgentLoop {
         // error taught nothing). Repair a CLEAN parse at the seam;
         // anything left unparseable stays for the tool's positional error.
         crate::tool::repair_stringified_sequences(&schema.parameters, &mut args);
+        // A `files` array that only became an array through the repair
+        // above can itself be the flattened form. Wrapping its bare ops into
+        // `{path, ops}` moves them under the schema, so the repair runs once
+        // more — a flattened entry's own keys (`lines` included) are not in
+        // the schema (review f-12be1d54).
+        if tc.name == "multi_edit"
+            && !files_flattened
+            && crate::tool::agent::multi_edit::normalize_flattened_files(&mut args)
+        {
+            files_flattened = true;
+            crate::tool::repair_stringified_sequences(&schema.parameters, &mut args);
+        }
 
         let parsed_call = ParsedToolCall {
             id: tc.id.clone(),
@@ -547,6 +572,23 @@ impl AgentLoop {
             }
         }
 
+        // Plan f89fd63d step 4: after the workflow gates and before approval
+        // and execution, an array-typed argument that is still a string is
+        // refused with a precise, example-bearing error instead of running
+        // the tool into a blind decode failure. The repair above already
+        // fixed every shape that parses cleanly; guessing at broken JSON
+        // would only hide the model's own byte error. `read_files` is
+        // exempt: it has its own positional string recovery.
+        if tc.name != "read_files" {
+            if let Some(shape_error) = crate::tool::argument_shape_error(
+                &tc.name,
+                &schema.parameters,
+                &parsed_call.arguments,
+            ) {
+                return (ToolResult::error(shape_error), Vec::new());
+            }
+        }
+
         // 3c (§5.9.6): the per-call policy veto — consulted BEFORE the
         // safety/approval machinery. WorkflowPolicy answers Allow today
         // (the app is inert here — verified: `gate_call` had zero
@@ -651,7 +693,7 @@ impl AgentLoop {
                         output_sink.clone(),
                     )
                     .await;
-                return (result, buffered);
+                return (Self::attach_flattened_note(result, files_flattened), buffered);
             }
 
             // Pure preview for the approval UI (file tools: unified diff /
@@ -736,7 +778,7 @@ impl AgentLoop {
                     output_sink.clone(),
                 )
                 .await;
-            return (result, buffered);
+            return (Self::attach_flattened_note(result, files_flattened), buffered);
         }
 
         // No approval needed — execute directly. The dispatch is wrapped in a
@@ -761,7 +803,23 @@ impl AgentLoop {
                 output_sink.clone(),
             )
             .await;
-        (result, buffered)
+        (Self::attach_flattened_note(result, files_flattened), buffered)
+    }
+
+    /// Plan f89fd63d step 4 (c), review f-81b42635: a flattened `multi_edit`
+    /// call normalised at the seam reaches the tool in the declared shape,
+    /// so the tool can no longer say it was flattened — the seam appends
+    /// the same one-line note to a successful result instead.
+    fn attach_flattened_note(mut result: ToolResult, flattened: bool) -> ToolResult {
+        if flattened && result.success {
+            if !result.output.is_empty() {
+                result.output.push('\n');
+            }
+            result
+                .output
+                .push_str(crate::tool::agent::multi_edit::FLATTENED_NOTE);
+        }
+        result
     }
 
     /// Build the live-output sink for one tool call: partial chunks are

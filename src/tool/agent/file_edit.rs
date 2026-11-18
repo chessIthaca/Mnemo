@@ -42,8 +42,9 @@ use serde_json::json;
 use crate::error::Result;
 use crate::provider::{ApprovalPreview, ToolSchema};
 use crate::tool::agent::edit_ops::{
-    apply_ops, literal_splice, near_miss_diagnostic, parse_ops, validate_emission_artifacts,
-    validate_op_items, with_fresh_read_nudge, EditOp, MatchOrigin, SpliceOutcome,
+    apply_ops, drift_error_with_excerpt, literal_splice, near_miss_diagnostic, parse_ops,
+    validate_emission_artifacts, validate_op_items, with_fresh_read_nudge, EditOp, MatchOrigin,
+    SpliceOutcome,
 };
 use crate::tool::agent::line_endings::{
     denormalize_literal_newlines, detect_line_ending, normalize_line_endings,
@@ -241,7 +242,11 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
     // path stands in for the validated one. A from_read cite resolves
     // against the receipt's sandbox-canonical path, so the tool paths
     // (execute + the approval preview) thread the real validated path
-    // through prepare_edit_ctx — the tests never mint receipts.
+    // through prepare_edit_ctx. This layer still MINTS: every near-miss
+    // literal miss mints its current-text excerpt receipt (plan f89fd63d
+    // step 3) under the path it is handed — the display path here — so a
+    // direct caller's excerpt receipt is citable only through the same
+    // spelling.
     prepare_edit_ctx(args, content, "", Path::new(&args.path))
 }
 
@@ -308,7 +313,7 @@ fn prepare_edit_ctx(
         if args.use_regex {
             prepare_edit_regex(args, content)
         } else {
-            prepare_edit_literal(args, content)
+            prepare_edit_literal(args, content, validated_path)
         }
     }
 }
@@ -463,7 +468,11 @@ fn prepare_edit_lines(
 /// replacement is spliced into the ORIGINAL content at the mapped byte
 /// offsets (untouched bytes keep their exact endings), with `new_string`
 /// re-emitted in the file's detected (majority) ending style.
-fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
+fn prepare_edit_literal(
+    args: &FileEditArgs,
+    content: &str,
+    validated_path: &Path,
+) -> Result<PreparedEdit> {
     let limit = if args.replace_all {
         usize::MAX
     } else {
@@ -493,7 +502,17 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
             let detail = near_miss_diagnostic(content, &args.old_string)
                 .map(|d| format!(" — {d}"))
                 .unwrap_or_default();
-            return Err(with_fresh_read_nudge(format!("{base}{detail}")));
+            // Plan f89fd63d step 3: after the nudge's single line, hand back
+            // the current text near the closest match with a fresh receipt,
+            // so the corrected retry needs no full re-read. `content` is the
+            // file's bytes (a miss writes nothing), which is what the
+            // receipt's line hashes are checked against.
+            return Err(drift_error_with_excerpt(
+                format!("{base}{detail}"),
+                validated_path,
+                content,
+                &args.old_string,
+            ));
         }
     };
 
@@ -558,6 +577,7 @@ fn prepare_edit_ops(
         &ops,
         args.fuzzy_whitespace,
         artifact_checks_enabled(args),
+        validated_path,
     )?;
     notes.extend(apply_notes);
     let diff = compute_diff(&args.path, content, &new_content);
@@ -1228,6 +1248,128 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "a\nB\nc\n"
+        );
+    }
+
+    /// The receipt id and line span a miss's current-text excerpt advertises
+    /// (plan f89fd63d step 3), so a test can cite exactly what it served.
+    fn excerpt_header(output: &str) -> (String, usize, usize) {
+        let header = output
+            .lines()
+            .find(|l| l.starts_with(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK))
+            .unwrap_or_else(|| panic!("the miss serves an excerpt: {output}"));
+        let id = header
+            .split("read receipt ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("the header names a receipt: {header}"))
+            .to_string();
+        let range = header
+            .split("(lines ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_else(|| panic!("the header names a range: {header}"));
+        let (start, end) = range.split_once('-').expect("a start-end span");
+        (id, start.parse().unwrap(), end.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn first_error_line_unchanged_with_excerpt() {
+        // Plan f89fd63d step 3: the current-text excerpt is APPENDED after
+        // the drift nudge — after its single line, which carries the
+        // EditStaleRead steering marker. The first line must stay
+        // byte-identical, or marker detection and the gate stop seeing the
+        // drift class.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "alpha line\nbeta line\ngamma line\n",
+        )
+        .unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "old_string": "alpha line\nbeta LINE\ngamma line",
+                "new_string": "x"
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        let mut lines = result.output.lines();
+        let first = lines.next().unwrap();
+        assert!(
+            first
+                .starts_with("not found: old_string not found in file — near-miss: matched "),
+            "{first}"
+        );
+        assert!(
+            first.ends_with(&format!(
+                "{} (read_files, this exact path) and retry with the exact current text; \
+                 do not edit without a fresh read.",
+                crate::agent::steering_stats::EDIT_STALE_READ_MARK
+            )),
+            "the marker line is unchanged: {first}"
+        );
+        assert!(
+            !first.contains(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK),
+            "the excerpt never shares the marker line: {first}"
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK),
+            "the excerpt follows on the next line"
+        );
+        // The drift marker still fires on the shipped first line.
+        assert!(
+            crate::agent::steering_stats::is_edit_drift_failure("file_edit", &result.output),
+            "{}",
+            result.output
+        );
+        // Nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha line\nbeta line\ngamma line\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn excerpt_receipt_cite_applies_without_reread() {
+        // Plan f89fd63d step 3 acceptance: a misremembered old_string is
+        // fixed in ONE retry. The miss serves the current text with a fresh
+        // receipt; citing exactly those lines applies with no read_files
+        // call in between.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "alpha line\nbeta line\ngamma line\ndelta line\n",
+        )
+        .unwrap();
+        let miss = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "old_string": "alpha line\nbeta LINE\ngamma line",
+                "new_string": "alpha line\nbeta line\nGAMMA line"
+            }))
+            .await;
+        assert!(!miss.success, "{}", miss.output);
+        let (id, start, end) = excerpt_header(&miss.output);
+        assert_eq!((start, end), (1, 4), "the window covers the served lines");
+        let cite = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [start, end], "new_string": "FIXED"
+            }))
+            .await;
+        assert!(
+            cite.success,
+            "the excerpt's receipt applies without a re-read: {}",
+            cite.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "FIXED\n"
         );
     }
 

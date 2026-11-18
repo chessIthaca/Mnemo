@@ -299,8 +299,7 @@ pub fn tracks(path: &Path) -> bool {
 /// window is real (workers edit separate worktrees, so the paths rarely
 /// coincide). The consequence is bounded: the per-line hash check turns a
 /// bad mapping into a false DRIFT error — a re-read, never a wrong write —
-/// except where the shifted region abuts identical lines, where a
-/// neighbour can hash-match.
+/// except where identical or duplicated lines let a neighbour hash-match.
 pub fn note_write(path: &Path, old: &str, new: &str) {
     if old == new {
         return;
@@ -510,18 +509,47 @@ mod tests {
 
     #[test]
     fn the_cap_evicts_the_oldest_receipt() {
+        // The policy is asserted on a LOCAL registry. Minting MAX_RECEIPTS+1
+        // receipts into the process-wide one evicted every other live
+        // receipt, so a test that mints and then keeps working
+        // (`shift_cap_drops_the_receipt`, 64 writes) could lose its own
+        // mid-test — a cross-test flake that any added mint (plan f89fd63d
+        // step 3 added the excerpt receipts) is free to surface.
         let dir = tempfile::tempdir().unwrap();
-        let oldest = mint(dir.path().join("f.txt"), 1, &["l"]);
-        for i in 0..MAX_RECEIPTS {
-            mint(dir.path().join(format!("g{i}.txt")), 1, &["l"]);
+        let bystander = mint(dir.path().join("f.txt"), 1, &["l"]);
+        let mut reg = Registry {
+            receipts: std::collections::HashMap::new(),
+            next_seq: 1,
+        };
+        for seq in 1..=MAX_RECEIPTS + 1 {
+            reg.receipts.insert(
+                format!("r{}", to_base36(seq as u64)),
+                ReadReceipt {
+                    path: dir.path().join(format!("g{seq}.txt")),
+                    first_line: 1,
+                    line_hashes: vec![hash_line("l")],
+                    shifts: Vec::new(),
+                    seq: seq as u64,
+                },
+            );
         }
-        // MAX_RECEIPTS newer mints pushed `oldest` past the cap.
+        prune_oldest(&mut reg);
+        assert_eq!(reg.receipts.len(), MAX_RECEIPTS);
         assert!(
-            resolve(&oldest, &dir.path().join("f.txt"), 1, 1, "l\n").is_err(),
+            !reg.receipts.contains_key(&format!("r{}", to_base36(1))),
             "the oldest receipt must be evicted under the cap"
         );
-        let fresh = mint(dir.path().join("n.txt"), 1, &["l"]);
-        assert!(resolve(&fresh, &dir.path().join("n.txt"), 1, 1, "l\n").is_ok());
+        assert!(
+            reg.receipts
+                .contains_key(&format!("r{}", to_base36((MAX_RECEIPTS + 1) as u64))),
+            "the newest receipt survives"
+        );
+        // ...and the process-wide registry is untouched: this test can no
+        // longer take a receipt away from a concurrent one.
+        assert!(
+            resolve(&bystander, &dir.path().join("f.txt"), 1, 1, "l\n").is_ok(),
+            "the cap test must not evict another test's live receipt"
+        );
     }
 
     #[test]

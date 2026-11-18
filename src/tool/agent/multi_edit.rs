@@ -209,6 +209,7 @@ fn prepare_files(
             &ops,
             false,
             args.artifact_check != Some(false),
+            &validated,
         )
         .map_err(|e| file_error(idx, &path, e))?;
         let diff = compute_diff(&path, &content, &new_content);

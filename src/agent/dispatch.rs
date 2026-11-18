@@ -527,14 +527,10 @@ impl AgentLoop {
         // (plan be16ea36 step 3). Like the C5 gate above, the intercepted
         // call never runs — no observe_result feedback.
         if tc.name == "file_edit" {
-            if let Some(path) = parsed_call.arguments.get("path").and_then(|v| v.as_str()) {
-                if let Some(redirect) = file_edit_redirect(
-                    &self.steering,
-                    agent_id,
-                    path,
-                ) {
-                    return (redirect, Vec::new());
-                }
+            if let Some(redirect) =
+                file_edit_call_redirect(&self.steering, agent_id, &parsed_call.arguments)
+            {
+                return (redirect, Vec::new());
             }
         }
 
@@ -1591,7 +1587,7 @@ fn observe_edit_freshness(
                     tool_name,
                     &result.output,
                 ) {
-                    steering.note_edit_drift(agent_id, path);
+                    note_drift_or_served_text(steering, agent_id, path, &result.output);
                 }
             }
         }
@@ -1613,7 +1609,7 @@ fn observe_edit_freshness(
                     .find(|p| result.output.contains(p.as_str()))
                     .or_else(|| paths.first())
                 {
-                    steering.note_edit_drift(agent_id, path);
+                    note_drift_or_served_text(steering, agent_id, path, &result.output);
                 }
             }
         }
@@ -1648,6 +1644,81 @@ fn multi_edit_paths(args: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Record a drift-class edit failure against `path`, unless the failure
+/// already served the agent the current text: a miss with a near-miss
+/// excerpt carries `read_registry` minted lines in `read_files`' numbering
+/// (plan f89fd63d step 3), so it is treated exactly like a read of `path` —
+/// which also CLEARS a count an earlier excerpt-less miss armed for the same
+/// path. That is right: the agent now holds current text for that region, so
+/// the gate's "do not retry blind" premise no longer applies.
+fn note_drift_or_served_text(
+    steering: &crate::agent::steering_stats::SteeringStats,
+    agent_id: AgentId,
+    path: &str,
+    output: &str,
+) {
+    if output.contains(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK) {
+        steering.note_file_read(agent_id, &[path.to_string()]);
+    } else {
+        steering.note_edit_drift(agent_id, path);
+    }
+}
+
+/// Is one `ops` element a read-receipt cite? A cite is an object carrying
+/// `from_read` and `lines` and no non-empty `old_string` — every cited line
+/// is hash-verified against the current bytes by `read_registry::resolve`
+/// before anything is written (plan f89fd63d step 3). A compact line-op
+/// string, an anchor object, or an unparseable value is NOT a cite.
+fn is_read_cite_op(op: &serde_json::Value) -> bool {
+    let Some(obj) = op.as_object() else {
+        return false;
+    };
+    let cites = obj
+        .get("from_read")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| !id.is_empty());
+    let names_lines = obj.get("lines").is_some_and(|v| !v.is_null());
+    cites && names_lines && is_blank_old_string(obj)
+}
+
+/// True when the object's `old_string` is absent, null, or empty — the
+/// anchor slots a cite must leave untouched.
+fn is_blank_old_string(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    !obj.get("old_string")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Is this `file_edit` call anchored only on read-receipt cites — the single
+/// `{from_read, lines, new_string}` form, or an `ops` array of nothing but
+/// cites? Such a call cannot apply blindly, so the stale-read gate never
+/// intercepts it (plan f89fd63d step 3). Mixed args gate as today.
+fn file_edit_call_is_cite_only(args: &serde_json::Value) -> bool {
+    let Some(obj) = args.as_object() else {
+        return false;
+    };
+    if obj
+        .get("from_read")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| !id.is_empty())
+    {
+        return obj.get("lines").is_some_and(|v| !v.is_null()) && is_blank_old_string(obj);
+    }
+    match obj.get("ops").and_then(|v| v.as_array()) {
+        Some(ops) => !ops.is_empty() && ops.iter().all(is_read_cite_op),
+        None => false,
+    }
+}
+
+/// Is this `multi_edit` file entry's `ops` array made of nothing but
+/// read-receipt cites? Unparseable entries are not cites.
+fn multi_edit_entry_is_cite_only(entry: &serde_json::Value) -> bool {
+    match entry.get("ops").and_then(|v| v.as_array()) {
+        Some(ops) => !ops.is_empty() && ops.iter().all(is_read_cite_op),
+        None => false,
+    }
+}
+
 /// C5-family: the file_edit stale-read gate (backlog 714196da). When
 /// `file_edit` is called on `path` after a drift-class failure on THAT path
 /// (the "Re-read the file …" nudge, emitted on the tool's
@@ -1677,6 +1748,25 @@ pub(crate) fn file_edit_redirect(
     )))
 }
 
+/// The gate's `file_edit` entry point — the call-level wrapper around
+/// [`file_edit_redirect`], shared by the dispatch seam and the tests. A call
+/// whose anchor is a read-receipt cite (plan f89fd63d step 3) is never
+/// intercepted: every cited line is hash-verified against the current bytes
+/// by `read_registry::resolve` before a byte is written, so the call cannot
+/// apply blindly, and intercepting it cost the worker a full re-read
+/// (simArms01 [182]→[184]). Everything else gates exactly as before.
+pub(crate) fn file_edit_call_redirect(
+    steering: &crate::agent::steering_stats::SteeringStats,
+    agent_id: AgentId,
+    args: &serde_json::Value,
+) -> Option<ToolResult> {
+    let path = args.get("path").and_then(|v| v.as_str())?;
+    if file_edit_call_is_cite_only(args) {
+        return None;
+    }
+    file_edit_redirect(steering, agent_id, path)
+}
+
 /// The stale-read gate's multi-file arm (plan 2e27f896): check EVERY
 /// `files[].path` entry of a `multi_edit` call, in order — the first gated
 /// path intercepts the WHOLE call (the multi-file tool is atomic, so one
@@ -1689,9 +1779,18 @@ pub(crate) fn multi_edit_redirect(
     agent_id: AgentId,
     args: &serde_json::Value,
 ) -> Option<ToolResult> {
-    multi_edit_paths(args)
-        .iter()
-        .find_map(|path| file_edit_redirect(steering, agent_id, path))
+    let files = args.get("files")?.as_array()?;
+    files.iter().find_map(|entry| {
+        let path = entry.get("path").and_then(|v| v.as_str())?;
+        // A gated path whose ops are ALL read-receipt cites is skipped: the
+        // registry hash-verifies every cited line, so that entry can never
+        // apply blindly (plan f89fd63d step 3). Any other gated path still
+        // intercepts the whole call.
+        if multi_edit_entry_is_cite_only(entry) {
+            return None;
+        }
+        file_edit_redirect(steering, agent_id, path)
+    })
 }
 
 /// C3: append this agent's queued nudge-escalation notes (an actionable
@@ -2051,6 +2150,232 @@ mod tests {
             &ToolResult::success("ok"),
         );
         assert!(file_edit_redirect(&stats, 1, "b.txt").is_none());
+    }
+
+    /// The drift-class miss a real `file_edit` produces for an anchor that
+    /// matches nowhere: the single-line fresh-read nudge (the shape the gate
+    /// arms from). Kept as a helper so the gate tests arm from the shipped
+    /// text rather than a paraphrase.
+    fn drift_miss_output() -> String {
+        "old_string not found in file — the content has likely drifted from your last read. \
+         Re-read the file (read_files, this exact path) and retry with the exact current \
+         text; do not edit without a fresh read."
+            .to_string()
+    }
+
+    /// A drift-class miss that ALSO served the current text near the closest
+    /// match (plan f89fd63d step 3) — the first line is byte-identical to
+    /// [`drift_miss_output`], the excerpt follows on the next line.
+    fn drift_miss_with_excerpt_output() -> String {
+        format!(
+            "{}\nCurrent text near the closest match (lines 4-9, read receipt r9 — cite it \
+             with from_read and lines):\n4: a\n5: b",
+            drift_miss_output()
+        )
+    }
+
+    #[test]
+    fn gate_lets_receipt_cite_through_after_a_miss() {
+        // REGRESSION (plan f89fd63d step 3, simArms01 [182]→[184]): a failed
+        // old_string edit armed the stale-read gate, and the worker's next
+        // call — a from_read cite over lines that had not changed since the
+        // read that minted the receipt — was intercepted, costing a full
+        // re-read. `read_registry::resolve` hash-verifies every cited line
+        // against the current bytes before anything is written, so such a
+        // call can never apply blindly: the gate must let it through.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let shown = path.to_string_lossy().to_string();
+        let receipt =
+            crate::tool::agent::read_registry::mint(path.clone(), 1, &["one", "two", "three"]);
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        // The miss arms the gate for the path (today's behavior, unchanged).
+        observe_edit_freshness(
+            &stats,
+            1,
+            "file_edit",
+            &serde_json::json!({"path": shown}),
+            &ToolResult::error(drift_miss_output()),
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, &shown).is_some(),
+            "a drift-class miss still arms the per-path gate"
+        );
+        // The hash-verified cite is let through...
+        assert!(
+            file_edit_call_redirect(
+                &stats,
+                1,
+                &serde_json::json!({
+                    "path": shown,
+                    "from_read": receipt,
+                    "lines": [2, 2],
+                    "new_string": "TWO"
+                })
+            )
+            .is_none(),
+            "a from_read cite is hash-verified — the gate must not intercept it"
+        );
+        // ...and an ops array of nothing but cites too (symmetric with
+        // multi_edit — the same registry check guards every item).
+        assert!(
+            file_edit_call_redirect(
+                &stats,
+                1,
+                &serde_json::json!({
+                    "path": shown,
+                    "ops": [{"from_read": receipt, "lines": [1, 1], "new_string": "ONE"}]
+                })
+            )
+            .is_none(),
+            "an all-cite ops array is hash-verified too"
+        );
+    }
+
+    #[test]
+    fn gate_still_blocks_blind_old_string_retry() {
+        // The complement of the cite exemption (plan f89fd63d step 3): a
+        // plain old_string retry with no receipt is exactly the blind
+        // re-emit from memory the gate exists for, so it stays intercepted.
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        observe_edit_freshness(
+            &stats,
+            1,
+            "file_edit",
+            &serde_json::json!({"path": "a.txt"}),
+            &ToolResult::error(drift_miss_output()),
+        );
+        let interception = file_edit_call_redirect(
+            &stats,
+            1,
+            &serde_json::json!({"path": "a.txt", "old_string": "one", "new_string": "1"}),
+        )
+        .expect("a blind old_string retry must still be intercepted");
+        assert!(
+            interception.output.contains("EDIT INTERCEPTED"),
+            "{}",
+            interception.output
+        );
+        // A cite that names neither from_read nor lines is not a cite.
+        assert!(
+            file_edit_call_redirect(
+                &stats,
+                1,
+                &serde_json::json!({"path": "a.txt", "from_read": "r9", "new_string": "1"})
+            )
+            .is_some(),
+            "from_read without lines is not a hash-verified cite"
+        );
+    }
+
+    #[test]
+    fn miss_with_excerpt_does_not_arm_gate() {
+        // Plan f89fd63d step 3: a miss that served the current text with a
+        // fresh receipt gave the agent what the gate would demand, so it
+        // must not arm — and must clear a count an earlier excerpt-less miss
+        // armed for the same path (the agent now holds current text for that
+        // region).
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        observe_edit_freshness(
+            &stats,
+            1,
+            "file_edit",
+            &serde_json::json!({"path": "a.txt"}),
+            &ToolResult::error(drift_miss_with_excerpt_output()),
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, "a.txt").is_none(),
+            "a miss that served the current text does not arm the gate"
+        );
+        // An excerpt-less miss arms; a later excerpt miss clears it.
+        observe_edit_freshness(
+            &stats,
+            1,
+            "file_edit",
+            &serde_json::json!({"path": "a.txt"}),
+            &ToolResult::error(drift_miss_output()),
+        );
+        assert!(file_edit_redirect(&stats, 1, "a.txt").is_some());
+        observe_edit_freshness(
+            &stats,
+            1,
+            "file_edit",
+            &serde_json::json!({"path": "a.txt"}),
+            &ToolResult::error(drift_miss_with_excerpt_output()),
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, "a.txt").is_none(),
+            "the served excerpt clears an earlier armed count"
+        );
+    }
+
+    #[test]
+    fn multi_edit_gate_passes_all_cite_entries_only() {
+        // Plan f89fd63d step 3: a gated path whose ops are ALL from_read
+        // cites is skipped — the registry hash-verifies every item — while
+        // any other gated path in the same call still intercepts the whole
+        // call (the tool is atomic).
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        stats.note_edit_drift(1, "a.txt");
+        stats.note_edit_drift(1, "b.txt");
+        let all_cites = serde_json::json!({
+            "files": [{"path": "a.txt", "ops": [
+                {"from_read": "r1", "lines": [2, 2], "new_string": "X"}
+            ]}]
+        });
+        assert!(
+            multi_edit_redirect(&stats, 1, &all_cites).is_none(),
+            "an all-cite entry is hash-verified"
+        );
+        // One verbatim anchor mixed in gates the entry as today.
+        let mixed = serde_json::json!({
+            "files": [{"path": "a.txt", "ops": [
+                {"from_read": "r1", "lines": [2, 2], "new_string": "X"},
+                {"old_string": "a", "new_string": "b"}
+            ]}]
+        });
+        assert!(
+            multi_edit_redirect(&stats, 1, &mixed).is_some(),
+            "a mixed ops array is gated as today"
+        );
+        // The clean entry's cites do not shield the other gated entry.
+        let one_cite_one_blind = serde_json::json!({
+            "files": [
+                {"path": "a.txt", "ops": [{"from_read": "r1", "lines": [2, 2], "new_string": "X"}]},
+                {"path": "b.txt", "ops": ["d1"]}
+            ]
+        });
+        let interception = multi_edit_redirect(&stats, 1, &one_cite_one_blind)
+            .expect("the blind entry still intercepts the call");
+        assert!(
+            interception.output.contains("EDIT INTERCEPTED"),
+            "{}",
+            interception.output
+        );
+        // A compact line op is not a cite, and `lines` without `from_read`
+        // is not one either.
+        assert!(
+            multi_edit_redirect(
+                &stats,
+                1,
+                &serde_json::json!({"files": [{"path": "b.txt", "ops": ["d1"]}]})
+            )
+            .is_some()
+        );
+        assert!(
+            multi_edit_redirect(
+                &stats,
+                1,
+                &serde_json::json!({
+                    "files": [{"path": "b.txt", "ops": [
+                        {"lines": [1, 1], "new_string": "x"}
+                    ]}]
+                })
+            )
+            .is_some(),
+            "lines without from_read is a line-range op, not a cite"
+        );
     }
 
     /// The REAL drift-class `multi_edit` error: `MultiEditTool` executed

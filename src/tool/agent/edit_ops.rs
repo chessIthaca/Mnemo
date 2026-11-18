@@ -84,11 +84,19 @@ pub fn compute_diff(path: &str, old: &str, new: &str) -> String {
 /// one line: the error text IS the result output's first line, the marker
 /// surface.
 pub(crate) fn with_fresh_read_nudge(msg: impl std::fmt::Display) -> crate::error::Error {
-    crate::error::Error::NotFound(format!(
+    crate::error::Error::NotFound(fresh_read_nudge_text(msg))
+}
+
+/// The nudge's own text — no error-class prefix — so a caller that has to
+/// append after the marker line (the current-text excerpt, plan f89fd63d
+/// step 3) rebuilds the exact same first line instead of wrapping the
+/// nudge's Display and doubling the `not found: ` prefix.
+fn fresh_read_nudge_text(msg: impl std::fmt::Display) -> String {
+    format!(
         "{msg} — the content has likely drifted from your last read. \
          {EDIT_STALE_READ_MARK} (read_files, this exact path) and retry with the \
          exact current text; do not edit without a fresh read."
-    ))
+    )
 }
 
 /// Extensions treated as code files for the markdown-heading artifact check
@@ -643,19 +651,17 @@ fn escape_display(s: &str) -> String {
     s.replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
 }
 
-/// The first-difference miss diagnostic (backlog 838b6f4e D): on a genuine
-/// literal miss, find the position in the LF-projected content sharing the
-/// longest common prefix with the needle (>= 8 chars) and report how far it
-/// matched and where the two diverge — turning a blind retry loop into a
-/// one-shot fix. Returns None when no position shares the threshold prefix
-/// (nothing useful to say). Char-based (not bytes) so the reported position
-/// and snippets are display-accurate.
-pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<String> {
-    const MIN_PREFIX: usize = 8;
-    let (content_lf, _) = normalize_lf_with_offsets(content);
-    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
-    let hay: Vec<char> = content_lf.chars().collect();
-    if needle.len() < MIN_PREFIX {
+/// Minimum shared prefix (chars) for a near-miss position to be worth
+/// reporting — below it the "closest" match is noise.
+const MIN_NEAR_MISS_PREFIX: usize = 8;
+
+/// The best shared-prefix position of `needle` in `hay`, in char
+/// coordinates: `(start, matched_chars)`. None when nothing reaches
+/// [`MIN_NEAR_MISS_PREFIX`]. Shared by the first-difference diagnostic and
+/// the current-text excerpt (plan f89fd63d step 3) so both name the same
+/// place.
+fn near_miss_position(hay: &[char], needle: &[char]) -> Option<(usize, usize)> {
+    if needle.len() < MIN_NEAR_MISS_PREFIX {
         return None;
     }
     // Work budget (review L3): bound the worst case — long runs of the
@@ -683,9 +689,29 @@ pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<St
             best_start = start;
         }
     }
-    if best_len < MIN_PREFIX {
+    if best_len < MIN_NEAR_MISS_PREFIX {
         return None;
     }
+    Some((best_start, best_len))
+}
+
+/// The excerpt header a drift-class miss carries when it served the current
+/// text near the closest match (plan f89fd63d step 3). One constant for the
+/// emitter and the dispatch funnel's detector, so the two cannot drift.
+pub(crate) const NEAR_MISS_EXCERPT_MARK: &str = "Current text near the closest match (lines";
+
+/// The first-difference miss diagnostic (backlog 838b6f4e D): on a genuine
+/// literal miss, find the position in the LF-projected content sharing the
+/// longest common prefix with the needle (>= 8 chars) and report how far it
+/// matched and where the two diverge — turning a blind retry loop into a
+/// one-shot fix. Returns None when no position shares the threshold prefix
+/// (nothing useful to say). Char-based (not bytes) so the reported position
+/// and snippets are display-accurate.
+pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<String> {
+    let (content_lf, _) = normalize_lf_with_offsets(content);
+    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
+    let hay: Vec<char> = content_lf.chars().collect();
+    let (best_start, best_len) = near_miss_position(&hay, &needle)?;
     let file_next: String = hay[best_start + best_len..].iter().take(4).collect();
     let sent_next: String = needle[best_len..].iter().take(4).collect();
     Some(format!(
@@ -697,6 +723,93 @@ pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<St
         escape_display(&file_next),
         escape_display(&sent_next)
     ))
+}
+
+/// The current text near the closest match, served as a fresh read receipt
+/// (plan f89fd63d step 3): on a literal miss with a near-miss position, hand
+/// back the numbered lines around it — `read_files`' own format — plus a
+/// receipt minted over exactly those lines, so a corrected retry can cite
+/// them with no full re-read. `content` must be the bytes on disk (the
+/// pre-call content), because the receipt's per-line hashes are checked
+/// against them; `validated_path` must be the sandbox-validated path the
+/// reader mints under, or a later cite fails the receipt's path check.
+///
+/// The window is three lines of context on each side of the best match plus
+/// the needle's own line span, capped at 40 lines: past that the window
+/// re-centres on the first-difference line (the line where the sent text
+/// diverges), which is the line a retry has to change.
+pub(crate) fn near_miss_excerpt(
+    validated_path: &Path,
+    content: &str,
+    old_string: &str,
+) -> Option<String> {
+    const CONTEXT_LINES: usize = 3;
+    const MAX_EXCERPT_LINES: usize = 40;
+    let (content_lf, _) = normalize_lf_with_offsets(content);
+    let hay: Vec<char> = content_lf.chars().collect();
+    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
+    let (best_start, best_len) = near_miss_position(&hay, &needle)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let last = lines.len();
+    if last == 0 {
+        return None;
+    }
+    // 1-indexed line of a char offset in the LF projection — the numbering
+    // `read_files` serves (both count newlines before the position).
+    let line_of = |upto: usize| hay[..upto].iter().filter(|c| **c == '\n').count() + 1;
+    let match_line = line_of(best_start);
+    let diff_line = line_of(best_start + best_len);
+    let needle_lines = needle.iter().filter(|c| **c == '\n').count() + 1;
+    let mut first = match_line.saturating_sub(CONTEXT_LINES).max(1);
+    let mut end = (match_line + needle_lines + CONTEXT_LINES).min(last);
+    if end - first + 1 > MAX_EXCERPT_LINES {
+        // Too wide: 40 lines centred on the first-difference line, clamped
+        // into the file so the window is always exactly 40 when it can be.
+        let centre = diff_line.clamp(1, last);
+        first = centre.saturating_sub(MAX_EXCERPT_LINES / 2).max(1);
+        end = (first + MAX_EXCERPT_LINES - 1).min(last);
+        first = end.saturating_sub(MAX_EXCERPT_LINES - 1).max(1);
+    }
+    let served: Vec<&str> = lines[first - 1..end].to_vec();
+    let receipt = crate::tool::agent::read_registry::mint(
+        validated_path.to_path_buf(),
+        first,
+        &served,
+    );
+    let mut out = format!(
+        "{NEAR_MISS_EXCERPT_MARK} {first}-{end}, read receipt {receipt} — cite it with \
+         from_read and lines):"
+    );
+    for (offset, line) in served.iter().enumerate() {
+        out.push('\n');
+        out.push_str(&crate::tool::agent::read_files::numbered_line(
+            first + offset,
+            line,
+        ));
+    }
+    Some(out)
+}
+
+/// The drift-class error for a literal miss: the fresh-read nudge (whose
+/// single line carries the `EditStaleRead` marker) with, after that line and
+/// never inside it, the current text near the closest match when there is
+/// one (plan f89fd63d step 3). None of the near-miss diagnostics change —
+/// the excerpt is appended.
+pub(crate) fn drift_error_with_excerpt(
+    msg: impl std::fmt::Display,
+    validated_path: &Path,
+    content: &str,
+    old_string: &str,
+) -> crate::error::Error {
+    match near_miss_excerpt(validated_path, content, old_string) {
+        // Same Error class and the same single-line prefix as
+        // [`with_fresh_read_nudge`]; the excerpt goes AFTER that line.
+        Some(excerpt) => crate::error::Error::NotFound(format!(
+            "{}\n{excerpt}",
+            fresh_read_nudge_text(msg)
+        )),
+        None => with_fresh_read_nudge(msg),
+    }
 }
 
 /// Resolve the effective needle for a literal match (backlog 838b6f4e C):
@@ -1362,6 +1475,7 @@ pub(crate) fn apply_ops(
     ops: &[EditOp],
     fuzzy_default: bool,
     artifact_check: bool,
+    validated_path: &Path,
 ) -> Result<(String, Vec<String>)> {
     let le = detect_line_ending(content);
     let total = ops.len();
@@ -1427,7 +1541,12 @@ pub(crate) fn apply_ops(
                     }
                     None => {
                         // First-difference pointer (backlog 838b6f4e D), scoped
-                        // to the content as left by the preceding ops.
+                        // to the content as left by the preceding ops. The
+                        // current-text excerpt and its receipt describe the
+                        // PRE-CALL `content` — the bytes on disk, since a
+                        // failure writes nothing (plan f89fd63d step 3): a
+                        // receipt over the running content could hash lines
+                        // the file never holds.
                         let detail = near_miss_diagnostic(&current, &item.old_string)
                             .map(|d| format!(" — {d}"))
                             .unwrap_or_default();
@@ -1435,9 +1554,12 @@ pub(crate) fn apply_ops(
                             idx,
                             total,
                             &item.old_string,
-                            with_fresh_read_nudge(format!(
-                                "old_string not found in file{detail}"
-                            )),
+                            drift_error_with_excerpt(
+                                format!("old_string not found in file{detail}"),
+                                validated_path,
+                                content,
+                                &item.old_string,
+                            ),
                         ));
                     }
                 }
@@ -1539,8 +1661,9 @@ fn translate_cite_range(
     total: usize,
 ) -> Result<(usize, usize)> {
     // The unperturbed case — no op before this cite, or the earlier ops
-    // netted back to the original bytes: the read's coordinates ARE the
-    // running coordinates, so the diff below is skipped entirely.
+    // netted back to the original bytes: the cite's pre-call (arrival)
+    // coordinates ARE the running coordinates, so the diff below is skipped
+    // entirely.
     if read_lines == current_lines {
         return Ok((cite.start, cite.end));
     }
@@ -1722,6 +1845,101 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The receipt id and line span an excerpt header advertises, so a test
+    /// can cite exactly what a miss served.
+    fn excerpt_header(excerpt: &str) -> (String, usize, usize) {
+        let header = excerpt.lines().next().expect("an excerpt has a header");
+        let id = header
+            .split("read receipt ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("the header names a receipt: {header}"))
+            .to_string();
+        let range = header
+            .split("(lines ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_else(|| panic!("the header names a range: {header}"));
+        let (start, end) = range.split_once('-').expect("a start-end span");
+        (id, start.parse().unwrap(), end.parse().unwrap())
+    }
+
+    /// Plan f89fd63d step 3: a literal miss with a near-miss position hands
+    /// back the current text in `read_files`' own numbered format plus a
+    /// receipt minted over exactly those lines — the whole point is that the
+    /// corrected retry cites it and never needs a full re-read.
+    #[test]
+    fn miss_with_near_miss_serves_numbered_excerpt_and_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha line\nbeta line\ngamma line\n";
+        let excerpt = near_miss_excerpt(&path, content, "alpha line\nbeta LINE\ngamma line")
+            .expect("a near miss serves the current text");
+        assert!(excerpt.starts_with(NEAR_MISS_EXCERPT_MARK), "{excerpt}");
+        let (id, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (1, 3));
+        // `read_files`' format: `N: text`, no padding.
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(
+            served,
+            vec!["1: alpha line", "2: beta line", "3: gamma line"]
+        );
+        // The minted receipt names exactly those lines and hash-verifies
+        // against the bytes on disk.
+        let (resolved_start, resolved_end) =
+            crate::tool::agent::read_registry::resolve(&id, &path, start, end, content)
+                .expect("the excerpt's receipt resolves against the file");
+        assert_eq!((resolved_start, resolved_end), (start, end));
+    }
+
+    /// The window is capped: a needle spanning many lines would otherwise
+    /// echo the whole file and re-create the context cost the excerpt is
+    /// meant to avoid.
+    #[test]
+    fn excerpt_capped_at_40_lines_around_the_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content: String = (1..=300).map(|n| format!("line {n}\n")).collect();
+        // 41 needle lines starting at line 100; the first difference is the
+        // first character of line 105.
+        let needle: String = (100..=140)
+            .map(|n| {
+                if n == 105 {
+                    "LINE 105\n".to_string()
+                } else {
+                    format!("line {n}\n")
+                }
+            })
+            .collect();
+        let excerpt = near_miss_excerpt(&path, &content, &needle).expect("a near miss");
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(served.len(), 40, "the window is capped at 40 lines");
+        let (_, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (85, 124), "40 lines centred on the difference");
+        assert_eq!(served[0], "85: line 85", "numbering follows the file");
+        assert_eq!(served[39], "124: line 124");
+    }
+
+    /// No near-miss position, no excerpt (and no receipt).
+    #[test]
+    fn no_excerpt_without_near_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha\nbeta\ngamma\n";
+        assert!(
+            near_miss_excerpt(&path, content, "zzz\nalpha").is_none(),
+            "no 8-char shared prefix means nothing useful to show"
+        );
+        assert!(
+            near_miss_excerpt(&path, content, "alp").is_none(),
+            "a needle shorter than the prefix threshold is never a near miss"
+        );
+        assert!(
+            near_miss_excerpt(&path, "", "alpha\nbeta").is_none(),
+            "an empty file has nothing to serve"
+        );
+    }
+
     /// Parse an ops array literal and apply it to `content`.
     fn apply(
         path: &str,
@@ -1729,7 +1947,7 @@ mod tests {
         values: &[serde_json::Value],
     ) -> Result<(String, Vec<String>)> {
         let ops = parse_ops(values)?;
-        apply_ops(path, content, &ops, false, true)
+        apply_ops(path, content, &ops, false, true, Path::new(path))
     }
 
     fn apply_ok(content: &str, values: &[serde_json::Value]) -> String {
@@ -1786,6 +2004,7 @@ mod tests {
             &ops,
             false,
             true,
+            Path::new("a.txt"),
         )
         .expect("the cite lands on the lines it cited");
         assert_eq!(

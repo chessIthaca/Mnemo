@@ -7745,6 +7745,23 @@ async fn broken_files_string_returns_example_error_without_running() {
         "the JSON error position must be named: {}",
         result.output
     );
+    // Review f-19f73567: the near-break snippet is named too — ONE escaped
+    // line around the error (the `\q` escape shows as `\\q`), never a raw
+    // multi-line echo of the payload.
+    let snippet = result
+        .output
+        .split("near `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .expect("the near-break snippet must be named");
+    assert!(
+        snippet.contains(r"\\q"),
+        "the snippet escapes the offending bytes: {snippet:?}"
+    );
+    assert!(
+        !snippet.contains('\n'),
+        "the snippet stays on one line: {snippet:?}"
+    );
     assert!(
         result.output.contains(
             r#""files":[{"path":"src/a.rs","ops":[{"old_string":"let x = 1;","new_string":"let x = 2;"}]}]"#
@@ -7856,6 +7873,189 @@ async fn read_files_string_recovery_unchanged() {
             .contains("must be a JSON array, but it arrived as a string"),
         "the seam's shape error must be exempt for read_files: {}",
         result.output
+    );
+}
+
+/// A loop with the REAL `multi_edit` and `file_edit` tools in a live plan
+/// (Executing, so the workflow ToolFilter admits write tools): nothing is
+/// stubbed — the seam, the schema repair, the stale-read gates and the tools
+/// all run. Returns the sandbox so a test can mint receipts on the same
+/// canonical path the tools resolve.
+async fn real_edit_agent(dir: &std::path::Path) -> (AgentLoop, Arc<Sandbox>) {
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.join("plans"))));
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("t", "g", "c", vec!["step one".into()])
+            .expect("create_plan starts the plan (Planning -> Executing)");
+    }
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(crate::tool::agent::multi_edit::MultiEditTool::new(
+        (*sandbox).clone(),
+    )));
+    registry.register(Box::new(crate::tool::agent::file_edit::FileEditTool::new(
+        (*sandbox).clone(),
+    )));
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+    (agent, sandbox)
+}
+
+/// Review f-81b42635 (1): a flattened `multi_edit` call names its file only
+/// in the top-level `path`. The seam normalises it BEFORE the gates and the
+/// freshness bookkeeping, so an armed gate still intercepts it, and a landed
+/// edit still clears that gate. Before the fix both read `files[].path` on
+/// the pre-normalisation args, missed it, wrote the file and left the gate
+/// armed after a successful edit.
+#[tokio::test]
+async fn flattened_multi_edit_is_gated_and_records_success() {
+    let dir = tempdir().unwrap();
+    let (agent, sandbox) = real_edit_agent(dir.path()).await;
+    std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let flattened = r#"{"files":[{"old_string":"a","new_string":"b"}],"path":"a.txt"}"#;
+
+    // Armed on a.txt: the flattened call is intercepted and writes nothing.
+    agent.steering.note_edit_drift(1, "a.txt");
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new("c1", "multi_edit", flattened.to_string()),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        result.output.contains("EDIT INTERCEPTED"),
+        "the gate must intercept the flattened call: {}",
+        result.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "a\nb\n",
+        "an intercepted call writes nothing"
+    );
+
+    // A cite-only entry cannot apply blindly, so the gate lets it through —
+    // and because the seam put the path into `files[0].path`, the landed edit
+    // reaches the bookkeeping and clears the armed gate.
+    let validated = sandbox.validate(std::path::Path::new("a.txt")).unwrap();
+    let receipt = crate::tool::agent::read_registry::mint(validated, 1, &["a", "b"]);
+    let cited = format!(
+        r#"{{"files":[{{"from_read":"{receipt}","lines":[2,2],"new_string":"B"}}],"path":"a.txt"}}"#
+    );
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new("c2", "multi_edit", cited),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    assert!(
+        result.output.contains("NOTE: files was sent flattened"),
+        "the seam's normalisation must still be reported: {}",
+        result.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "a\nB\n"
+    );
+    assert!(
+        agent.steering.should_gate_file_edit(1, "a.txt").is_none(),
+        "a landed flattened edit must clear the armed gate"
+    );
+}
+
+/// Review f-81b42635 (2): the flattened shape can carry the range as TEXT
+/// (`"108, 130"`). Normalising the file entry at the seam lets the schema
+/// repair coerce it inside `ops`, so the cite applies; before the fix the
+/// string reached the tool and the call failed while the declared shape
+/// would have been coerced.
+#[tokio::test]
+async fn flattened_multi_edit_lines_text_range_is_coerced() {
+    let dir = tempdir().unwrap();
+    let (agent, sandbox) = real_edit_agent(dir.path()).await;
+    let lines: Vec<String> = (1..=140).map(|n| format!("line {n}")).collect();
+    std::fs::write(dir.path().join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+    let served: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let validated = sandbox.validate(std::path::Path::new("a.rs")).unwrap();
+    let receipt = crate::tool::agent::read_registry::mint(validated, 1, &served);
+    let args = format!(
+        r#"{{"files":[{{"from_read":"{receipt}","lines":"108, 130","new_string":"x"}}],"path":"a.rs"}}"#
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new("c1", "multi_edit", args),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    let content = std::fs::read_to_string(dir.path().join("a.rs")).unwrap();
+    let now: Vec<&str> = content.lines().collect();
+    assert_eq!(now.len(), 118, "the 23 cited lines became one");
+    assert_eq!(now[107], "x", "the range's first line was replaced");
+    assert_eq!(now[108], "line 131", "the line after the range follows it");
+}
+
+/// Review f-19f73567: the acceptance scenario `lines: "108, 130"` runs as
+/// `[108,130]` end-to-end through the REAL `file_edit` — a from_read receipt
+/// plus a TEXT range replaces exactly those lines and nothing else.
+#[tokio::test]
+async fn file_edit_lines_text_range_runs_end_to_end() {
+    let dir = tempdir().unwrap();
+    let (agent, sandbox) = real_edit_agent(dir.path()).await;
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    let validated = sandbox.validate(std::path::Path::new("a.txt")).unwrap();
+    let receipt =
+        crate::tool::agent::read_registry::mint(validated, 1, &["one", "two", "three", "four"]);
+    let args = format!(
+        r#"{{"path":"a.txt","from_read":"{receipt}","lines":"2-3","new_string":"TWO\nTHREE"}}"#
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &crate::provider::ToolCall::new("c1", "file_edit", args),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "{}", result.output);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "one\nTWO\nTHREE\nfour\n",
+        "lines 2-3 replaced, lines 1 and 4 untouched"
     );
 }
 

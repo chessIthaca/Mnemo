@@ -272,6 +272,13 @@ fn write_failure_message(
     )
 }
 
+/// Plan f89fd63d step 4 (c): the one-line note a flattened call's success
+/// output ends with, naming the declared shape. Shared with the dispatch
+/// seam, which now normalises the flattened form before the tool sees it
+/// (review f-81b42635) and so has to say it on the tool's behalf.
+pub(crate) const FLATTENED_NOTE: &str =
+    "NOTE: files was sent flattened; the shape is {\"files\":[{\"path\":...,\"ops\":[...]}]}";
+
 /// Plan f89fd63d step 4 (c): the model sometimes sends a multi_edit call
 /// "flattened" — the ops of one file directly as `files` items with the
 /// target `path` beside them:
@@ -471,9 +478,7 @@ impl Tool for MultiEditTool {
                 if !output.is_empty() {
                     output.push('\n');
                 }
-                output.push_str(
-                    "NOTE: files was sent flattened; the shape is {\"files\":[{\"path\":...,\"ops\":[...]}]}",
-                );
+                output.push_str(FLATTENED_NOTE);
             }
             ToolResult {
                 success: true,

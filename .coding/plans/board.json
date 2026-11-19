@@ -2932,6 +2932,60 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Adds one prompt sentence and a settings warning, and fixes tool description text. Requirements of worker-brief, external-lead, dispatch-routing and tier-ladder are unchanged: briefs, routing and tiers behave as before."
+    },
+    {
+      "id": "d3336a8a",
+      "status": "open",
+      "created_at_ms": 1795096814665,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Settings has a Machine page",
+              "text": "The Settings dialog SHALL have a Machine page under All projects that edits how many heavy build and test commands may run at once across every Mnemo2 instance on the machine, and SHALL show whether a shared Rust build cache (sccache) was found and the shared model host's status.",
+              "scenarios": [
+                {
+                  "name": "Changing the build limit",
+                  "when": [
+                    "the user sets Builds and tests at once to 1 and saves"
+                  ],
+                  "then": [
+                    "config.toml carries [general.machine] heavy_commands = 1",
+                    "every running instance applies it to the next heavy command"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "The Models page says what the embedding models are for",
+              "text": "The Models page SHALL describe the memory embedding model as serving memory search over specs, decisions, bugs and HOW records, plan, review and backlog summaries, and routing and failure-triage examples, and SHALL describe the code-search model separately.",
+              "scenarios": [
+                {
+                  "name": "Reading the Models page",
+                  "when": [
+                    "the user opens Settings > Models"
+                  ],
+                  "then": [
+                    "the embedding section names memory search, routing examples and code search with their models"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Besides the settings-dialog deltas attached, endpoints.rs gains an optional max_concurrent field that does not change tier or ladder behaviour (tier-ladder), and no step changes dispatch-routing, external-lead, worker-brief, plan-board or llm-trace requirements."
     }
   ]
 }

@@ -377,7 +377,7 @@ pub struct ServerStatus {
 /// `&mut self` methods honest.
 pub struct McpManager {
     /// The configured servers — interior-mutable so a Settings save can
-    /// replace the set live (see [`Self::replace_servers`]).
+    /// replace the set live (see [`Self::set_servers`]).
     servers: std::sync::RwLock<Vec<McpServerDef>>,
     factory: ClientFactory,
     connections: tokio::sync::Mutex<HashMap<String, ServerConn>>,
@@ -441,21 +441,31 @@ impl McpManager {
             .cloned()
     }
 
-    /// Replace the configured servers (the Settings save path) and drop
-    /// every live connection, so the next call to any server reconnects
-    /// under the new definitions — always correct at Settings-save pacing.
+    /// Replace the configured servers — the LIST half of the Settings-save
+    /// swap (review finding mcpListAtomic). Sync on purpose: the caller writes
+    /// the manager's list inside the same apply lock and shared-config guard
+    /// as `config.mcp = ...`, so overlapping saves can never leave the list
+    /// different from the config. Follow with [`Self::drop_connections`],
+    /// which the caller awaits OUTSIDE those guards (review finding
+    /// mcpSwapUnderLock: the connections mutex can be held by a first-use
+    /// tool call for up to 300 s).
     /// NOTE: already-built agents keep the deferred-group table they were
     /// built with; agents built afterwards (subagents, or after a restart
     /// / project switch) see the new set.
-    pub async fn replace_servers(&self, servers: Vec<McpServerDef>) {
+    pub fn set_servers(&self, servers: Vec<McpServerDef>) {
         *self.servers.write().expect("mcp server list lock poisoned") = servers;
+    }
+
+    /// Drop every live connection and its status row (the CONNECTIONS half
+    /// of the Settings-save swap), so the next call to any server
+    /// reconnects under the definitions [`Self::set_servers`] installed.
+    /// A save invalidates every connection the status map describes (review
+    /// LOW 1): the Settings page must never render "connected" for a
+    /// connection the manager no longer holds, and a removed server's
+    /// stale row must not resurface if the name is re-added later.
+    /// Lock order: connections first, then status — no inversion.
+    pub async fn drop_connections(&self) {
         self.connections.lock().await.clear();
-        // A save invalidates every connection the status map describes —
-        // clear it too (review LOW 1): the Settings page must never render
-        // "connected" for a connection the manager no longer holds, and a
-        // removed server's stale row must not resurface if the name is
-        // re-added later. Lock order: status alone (connections already
-        // released by the expression above), so no inversion.
         self.status.lock().await.clear();
     }
 
@@ -465,7 +475,7 @@ impl McpManager {
     /// stall the finding describes. Announces on `held` once the mutex is
     /// held, so a test can prove a Settings save (or any other live-config
     /// writer) never holds its locks across
-    /// [`Self::replace_servers`]'s wait on it.
+    /// [`Self::drop_connections`]'s wait on it.
     #[cfg(test)]
     pub(crate) async fn test_hold_connections(
         &self,
@@ -651,7 +661,7 @@ impl McpManager {
     ///
     /// A connection can vanish between [`Self::ensure`] releasing the lock
     /// and this method re-acquiring it (another task's failed call removed
-    /// it, or a Settings save ran [`Self::replace_servers`]) — the gap is
+    /// it, or a Settings save ran [`Self::drop_connections`]) — the gap is
     /// re-ensured instead of panicking (review LOW 1: the manager is
     /// shared across agents, so calls genuinely interleave).
     pub async fn call_with_info(
@@ -1002,8 +1012,11 @@ mod tests {
             .any(|(n, s)| n == "fs" && s.connected));
 
         // Save a new set: the old fs row described a connection that no
-        // longer exists — gone.
-        mgr.replace_servers(vec![server("fs", true)]).await;
+        // longer exists — gone. The Settings-save swap is the split
+        // (review finding mcpListAtomic): the list write, then the
+        // connection/status drop.
+        mgr.set_servers(vec![server("fs", true)]);
+        mgr.drop_connections().await;
         assert!(mgr.statuses().await.is_empty(), "a save invalidates status");
 
         // A fresh connect under the new def starts clean — the save is

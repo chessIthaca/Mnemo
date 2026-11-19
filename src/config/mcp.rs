@@ -34,7 +34,7 @@ pub struct McpFile {
 /// names to pass through to the spawned process, and `headers_env` maps
 /// header names to environment variable names whose values are sent as those
 /// headers on remote connections. Everything in this struct is safe to log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct McpServerDef {
     /// The stable server id. Tool names (`mcp__<server>__<tool>`), the
     /// deferred tool group (`mcp.<server>`), and the Settings UI all

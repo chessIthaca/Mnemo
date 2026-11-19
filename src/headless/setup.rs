@@ -307,6 +307,11 @@ struct LiveHandles {
     /// autostart arm swaps it to the fresh sidecar endpoint, the same
     /// swap the GUI's `laya_setup` performs.
     classifier_slot: Option<ClassifierSlot>,
+    /// The project's MCP overrides file (the workspace's
+    /// `.coding/mcp.toml`) — the live-apply MCP leg re-merges the global
+    /// file with it before pushing the manager's list, the same wiring the
+    /// brain performs at startup, so a reload never strips project servers.
+    mcp_project_file: Option<PathBuf>,
 }
 
 impl fmt::Debug for LiveHandles {
@@ -681,6 +686,15 @@ impl Setup {
                 trace: brain.trace.clone(),
                 config: brain.config.clone(),
                 classifier_slot: Some(brain.classifier_slot.clone()),
+                // The brain wires the manager from global + project at
+                // startup; the live-apply MCP leg replays that merge, so it
+                // needs the same project file.
+                mcp_project_file: Some(
+                    engine
+                        .workspace_root()
+                        .join(".coding")
+                        .join("mcp.toml"),
+                ),
             }),
         }
     }
@@ -732,12 +746,19 @@ impl Setup {
         // (the GUI's contract); a live reload has no patch and applies both.
         let trace_limits =
             patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some();
-        self.apply_live(live, new_config, trace_limits).await;
+        let pending_mcp_drop = self.apply_live(live, new_config, trace_limits).await;
         // This instance applied the save itself: the live-settings watcher
         // must not reload it a second time. The stamped fingerprint is the
         // writer's own record of the bytes it saved, never a fresh disk read
         // that a concurrent edit could have moved past.
         self.mark_applied(self.saved_fingerprint());
+        // The connection drop awaits OUTSIDE the apply lock (review finding
+        // mcpSwapUnderLock): the connections mutex can be held for up to
+        // 300 s, and no Settings save may stall on it.
+        drop(_apply);
+        if let Some(manager) = pending_mcp_drop {
+            manager.drop_connections().await;
+        }
         Ok(())
     }
 
@@ -745,13 +766,26 @@ impl Setup {
     /// shared by [`Setup::patch_settings`] and [`Setup::reload_if_changed`]:
     /// the safety mode → the moved rewire core (vision + embedder + the
     /// factory's live toggles) → the model resolver → the factory's
-    /// core-operations/shell-filter handles → the trace limits → the brain's
-    /// shared config. Effective on the next request.
+    /// core-operations/shell-filter handles → the trace limits → the MCP leg
+    /// → the brain's shared config. Effective on the next request.
     ///
     /// `trace_limits` distinguishes the patch contract (the GUI sends the
     /// trace fields only when its trace page saved them) from a reload, which
     /// applies whatever the loaded file says.
-    async fn apply_live(&self, live: &LiveHandles, new_config: Config, trace_limits: bool) {
+    ///
+    /// Returns the manager whose connection drop is pending when the apply
+    /// changed the MCP server set (review findings reloadSkipsMcp +
+    /// mcpListAtomic): the list push happens HERE — under the same apply
+    /// lock and config guard as the config swap — and the caller awaits
+    /// [`McpManager::drop_connections`] only AFTER releasing the apply lock
+    /// (review finding mcpSwapUnderLock: the connections mutex can be held
+    /// by a first-use tool call for up to 300 s).
+    async fn apply_live(
+        &self,
+        live: &LiveHandles,
+        new_config: Config,
+        trace_limits: bool,
+    ) -> Option<Arc<crate::mcp::McpManager>> {
         // Safety mode (the engine's approval gates read the flag per
         // request; the app additionally auto-resolves pending IPC
         // approvals — a headless engine has none parked by the GUI).
@@ -795,8 +829,40 @@ impl Setup {
                 .set_request_body_cap(new_config.general.trace.request_body_cap_kb * 1024);
         }
         // The brain's shared config: every later spawn reads the reloaded
-        // values.
-        *live.config.lock().await = new_config;
+        // values. The MCP leg shares this critical section (review findings
+        // reloadSkipsMcp + mcpListAtomic): when the server set changed, the
+        // running manager gets the new list HERE — next to the config swap,
+        // under the same apply lock and config guard — because config.mcp
+        // alone changes nothing for built agents' tool groups, and a list
+        // push outside the guard could interleave a concurrent save and leave
+        // the manager different from the config.
+        let mut pending_mcp_drop = None;
+        {
+            let mut config = live.config.lock().await;
+            if config.mcp != new_config.mcp {
+                if let Some(manager) = live.factory.mcp_manager() {
+                    // The brain's startup wiring, replayed on a live apply
+                    // (brain.rs:1136-1138): the manager's set is the global
+                    // file merged with the project's `.coding/mcp.toml`
+                    // overrides, so a reload never strips project servers.
+                    // A missing/unparsable project file falls back to the
+                    // global set alone — the reload must not fail over a
+                    // file the engine tolerates at startup.
+                    let project = match &live.mcp_project_file {
+                        Some(path) => crate::config::mcp::load_or_default(path)
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    manager.set_servers(crate::config::mcp::merge_servers(
+                        &new_config.mcp,
+                        &project,
+                    ));
+                    pending_mcp_drop = Some(manager);
+                }
+            }
+            *config = new_config;
+        }
+        pending_mcp_drop
     }
 
     /// Record a fingerprint as this Setup's applied baseline — after a save
@@ -888,8 +954,15 @@ impl Setup {
         let laya_changed = live_laya != new_config.general.general.laya;
         new_config.general.general.laya = live_laya;
         // A reload applies the whole loaded file, trace limits included.
-        self.apply_live(live, new_config, true).await;
+        let pending_mcp_drop = self.apply_live(live, new_config, true).await;
         self.mark_applied(disk);
+        // The connection drop awaits OUTSIDE the apply lock (review finding
+        // mcpSwapUnderLock): the connections mutex can be held for up to
+        // 300 s, and no Settings save may stall on it.
+        drop(_apply);
+        if let Some(manager) = pending_mcp_drop {
+            manager.drop_connections().await;
+        }
         ReloadOutcome::Reloaded { laya_changed }
     }
 
@@ -1543,7 +1616,7 @@ impl Setup {
         // One live-config change at a time (see [`Setup::apply_lock`]): the
         // file write and the live config swap are one unit, so a concurrent
         // reload cannot interleave and leave an older set live.
-        let (merged, manager) = {
+        let pending = {
             let _apply = self.apply_lock.lock().await;
             let global_path = self.config_dir.join("mcp.toml");
             let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
@@ -1554,25 +1627,29 @@ impl Setup {
                             "saving the MCP servers failed: {e}"
                         ))
                     })?;
-            // The manager swap is deliberately OUTSIDE the apply lock and the
-            // shared-config guard (review finding mcpSwapUnderLock):
-            // replace_servers awaits the connections mutex, which a first-use
-            // tool call can hold across initialize + list_tools for up to
-            // 300 s — holding either guard across that would stall every
-            // Settings save, the watcher reload and every brain-config
-            // reader.
             let mut manager = None;
             if let Some(live) = &self.live {
                 let mut config = live.config.lock().await;
                 config.mcp = outcome.global;
                 manager = live.factory.mcp_manager();
+                // The list push shares the config swap's critical section
+                // (review findings mcpListAtomic + reloadSkipsMcp): a save is
+                // the one writer that owns both, so overlapping saves can
+                // never leave the manager's list different from config.mcp.
+                if let Some(manager) = &manager {
+                    manager.set_servers(outcome.merged);
+                }
             }
-            (outcome.merged, manager)
+            manager
             // Both guards drop here, at the end of the block — before the
-            // swap's await.
+            // connection drop's await.
         };
-        if let Some(manager) = manager {
-            manager.replace_servers(merged).await;
+        // The connection drop is the slow half — the connections mutex can
+        // be held by a first-use tool call for up to 300 s — and awaits
+        // OUTSIDE both guards (review finding mcpSwapUnderLock): no Settings
+        // save, reload or brain-config reader may stall on it.
+        if let Some(manager) = pending {
+            manager.drop_connections().await;
         }
         Ok(
             "saved — servers apply to agents built after this save (a restart always picks them \
@@ -2369,7 +2446,7 @@ mod tests {
             .expect("open")
             .for_engine(&engine);
         // Hold the manager's connections mutex the way a first-use tool call
-        // does, on a gate — the exact wait replace_servers blocks on.
+        // does, on a gate — the exact wait drop_connections blocks on.
         let manager = saving
             .live
             .as_ref()
@@ -2393,9 +2470,10 @@ mod tests {
             let saving = saving.clone();
             tokio::spawn(async move { saving.save_mcp_servers(None, vec![]).await })
         };
-        // replace_servers swaps the server list BEFORE it awaits the
-        // connections mutex — the emptied list proves the save is parked
-        // inside the swap, not before it.
+        // set_servers emptied the list inside the save's locked unit — the
+        // emptied list plus the unfinished task proves the save is past its
+        // guarded unit and parked in the blocked drop_connections, not
+        // before it.
         for _ in 0..50 {
             if manager.servers().is_empty() {
                 break;
@@ -2445,6 +2523,105 @@ mod tests {
             .expect("save task")
             .expect("the MCP save applies");
         assert!(!message.is_empty());
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding reloadSkipsMcp: a reload of `mcp.toml` must reach the
+    /// RUNNING manager, not just `config.mcp` — a hand edit (or another
+    /// instance's MCP save) changes nothing for built agents' tool groups
+    /// otherwise, contradicting the live-settings contract.
+    #[tokio::test]
+    async fn a_mcp_hand_edit_reaches_the_manager() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // A hand edit adds a server to mcp.toml (the fixture starts with
+        // none — the manager is live with an empty list).
+        std::fs::write(
+            cfg.path().join("mcp.toml"),
+            "[[server]]\nname = \"hand-added\"\ncommand = \"npx\"\nargs = [\"-y\"]\n",
+        )
+        .expect("hand edit");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Reloaded { laya_changed: false },
+            "the mcp.toml edit must reload"
+        );
+        let live = engine.brain().config.lock().await;
+        assert!(
+            live.mcp.iter().any(|server| server.name == "hand-added"),
+            "the edit reached the shared config"
+        );
+        drop(live);
+        let manager = setup
+            .live
+            .as_ref()
+            .and_then(|live| live.factory.mcp_manager())
+            .expect("the engine has an MCP manager");
+        assert!(
+            manager.servers().iter().any(|server| server.name == "hand-added"),
+            "the hand edit reached the RUNNING manager (the tool groups agents \
+             are built with)"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding mcpListAtomic: overlapping MCP saves must end with the
+    /// manager's list equal to `config.mcp` — the list push shares the
+    /// config swap's critical section, so no scheduling window can leave
+    /// them different.
+    #[tokio::test]
+    async fn overlapping_mcp_saves_keep_the_manager_list_equal_to_config() {
+        let (_root, cfg, engine) = ready_engine_with_mcp().await;
+        let a = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let b = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let single = |name: &str| {
+            McpServerWire {
+                def: toml::from_str(&format!(
+                    "name = \"{name}\"\ncommand = \"npx\"\nargs = [\"-y\"]\n"
+                ))
+                .expect("server def"),
+                source: crate::config::mcp::SOURCE_GLOBAL.to_string(),
+            }
+        };
+        // Two saves with different sets, racing.
+        let save_a = {
+            let a = a.clone();
+            tokio::spawn(async move { a.save_mcp_servers(None, vec![single("alpha")]).await })
+        };
+        let save_b = {
+            let b = b.clone();
+            tokio::spawn(async move { b.save_mcp_servers(None, vec![single("beta")]).await })
+        };
+        save_a.await.expect("save A task").expect("the first save applies");
+        save_b.await.expect("save B task").expect("the second save applies");
+        // The invariant: whichever save won, the manager's list equals the
+        // shared config's set.
+        let live = engine.brain().config.lock().await;
+        let mut config_names: Vec<String> =
+            live.mcp.iter().map(|server| server.name.clone()).collect();
+        config_names.sort();
+        drop(live);
+        let manager = a
+            .live
+            .as_ref()
+            .and_then(|live| live.factory.mcp_manager())
+            .expect("the engine has an MCP manager");
+        let mut manager_names: Vec<String> =
+            manager.servers().iter().map(|server| server.name.clone()).collect();
+        manager_names.sort();
+        assert_eq!(
+            manager_names, config_names,
+            "overlapping saves must leave the manager's list equal to config.mcp"
+        );
+        // Whichever save ran last, its set is what BOTH the config and the
+        // manager hold — exactly one winner, no divergence.
+        assert_eq!(config_names.len(), 1);
         engine.shutdown().await.expect("shutdown");
     }
 

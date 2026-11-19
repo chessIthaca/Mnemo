@@ -822,8 +822,8 @@ pub(crate) fn wire_brain(
     );
 
     // Vision client from config (shared helper — also used by Settings rewire).
-    // Still useful when the main provider is multimodal (describe_image tool
-    // for on-disk image files). Warn if configured but endpoint is missing.
+    // Still useful when the main provider is multimodal (the image tools read
+    // on-disk image files). Warn if configured but endpoint is missing.
     let vision = build_vision_client(&config);
     if config.general.general.vision_model.is_some() && vision.is_none() {
         if let Some(vm) = &config.general.general.vision_model {

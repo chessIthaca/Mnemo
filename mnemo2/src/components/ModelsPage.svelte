@@ -27,6 +27,8 @@
 
   let compaction = $state({ draft: emptyCompaction(), original: emptyCompaction(), saving: false, error: "", saved: false });
   let vision = $state({ draft: "", original: "", saving: false, error: "", saved: false });
+  /** Why the saved vision model yields no image tools (or may not) — from the snapshot. */
+  let visionWarning = $state<string | null>(null);
   let index = $state({ draft: "", original: "", saving: false, error: "", saved: false });
   let budget = $state({ draft: emptyBudget(), original: emptyBudget(), saving: false, error: "", saved: false });
 
@@ -69,6 +71,7 @@
         compaction.original = { ...settings.task_models };
         vision.draft = settings.vision_model ?? "";
         vision.original = settings.vision_model ?? "";
+        visionWarning = settings.vision_warning ?? null;
         index.draft = settings.embedding.selected;
         index.original = settings.embedding.selected;
         budget.draft = budgetDraft(settings.budget);
@@ -136,6 +139,15 @@
     });
   }
 
+  /** Re-read the vision warning after a save: it depends on the saved config. */
+  async function refreshVisionWarning(): Promise<void> {
+    try {
+      visionWarning = (await transport.get()).vision_warning ?? null;
+    } catch {
+      // The old warning stays; the next open refreshes it.
+    }
+  }
+
   async function saveVision(): Promise<void> {
     const value = vision.draft.trim();
     if (value !== "" && !isValidModelRef(value)) {
@@ -145,6 +157,7 @@
     await persist(vision, "vision", value === "" ? null : value, () => {
       vision.draft = value;
       vision.original = value;
+      void refreshVisionWarning();
     });
   }
 
@@ -296,6 +309,7 @@
             Default
           </button>
         </div>
+        {#if visionWarning}<p class="section-warning" role="status">{visionWarning}</p>{/if}
         <div class="section-actions">
           {#if vision.error}<p class="section-error" role="alert">{vision.error}</p>{/if}
           {#if vision.saved && !visionDirty}<p class="section-note">Applies after reopening the project.</p>{/if}
@@ -460,5 +474,6 @@
   .section-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 2px; }
   .section-error { margin: 0; color: var(--danger); font-size: var(--text-body); overflow-wrap: anywhere; flex: 1; }
   .section-note { margin: 0; color: var(--muted); font-size: var(--text-body); flex: 1; }
+  .section-warning { margin: 0; color: var(--warning); font-size: var(--text-body); line-height: 1.5; overflow-wrap: anywhere; }
   .section-buttons { display: flex; gap: 8px; flex-shrink: 0; }
 </style>

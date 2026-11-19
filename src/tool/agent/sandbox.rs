@@ -18,7 +18,8 @@
 //! multi-agent tool use.
 //!
 //! The six async file/search tools (`file_read`, `file_edit`, `file_write`,
-//! `file_append`, `search`, `describe_image`) now wrap their ENTRY-POINT
+//! `file_append`, `search`, and the image tools' `describe_image_file`) now
+//! wrap their ENTRY-POINT
 //! blocking work — including the `validate` call — in one `spawn_blocking`
 //! closure (they `clone()` the cheap `Sandbox` and move it in). Four sync-path
 //! callers remain in THIS crate's tool layer. Those four perform one

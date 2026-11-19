@@ -16,6 +16,7 @@ function sampleSettings(): ModelSettings {
       summarize: null,
     },
     vision_model: "openrouter/gpt-5.2",
+    vision_warning: null,
     embedding: {
       selected: "all-MiniLM-L6-v2",
       status: "missing",
@@ -174,6 +175,22 @@ describe("ModelsPage", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Use the default for Vision" }));
     await fireEvent.click(screen.getByRole("button", { name: "Save vision" }));
     await waitFor(() => expect(made.transport.save).toHaveBeenCalledWith("vision", null));
+  });
+
+  it("warns under the Vision field when the saved model cannot serve", async () => {
+    const made = makeTransport();
+    const warning =
+      "Vision endpoint 'gemini' is not in endpoints.toml, so workers and agents have no image tools.";
+    made.settings.vision_warning = warning;
+    render(ModelsPage, { props: { transport: made.transport, endpoints: sampleEndpoints() } });
+    const vision = await screen.findByRole("region", { name: "Vision" });
+    expect(within(vision).getByRole("status").textContent).toBe(warning);
+  });
+
+  it("shows no vision warning when the saved model resolves", async () => {
+    page();
+    await screen.findByLabelText("Vision model");
+    expect(within(screen.getByRole("region", { name: "Vision" })).queryByRole("status")).toBeNull();
   });
 
   it("saves the code-indexing selection and names the reopen note", async () => {

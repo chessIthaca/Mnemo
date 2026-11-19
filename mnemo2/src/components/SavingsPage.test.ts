@@ -13,6 +13,7 @@ function sampleSettings(): ModelSettings {
   return {
     task_models: { summarize: null },
     vision_model: null,
+    vision_warning: null,
     embedding: { selected: "hash", status: "keyword_only", options: [] },
     optimizer: {
       delta_reads: true,

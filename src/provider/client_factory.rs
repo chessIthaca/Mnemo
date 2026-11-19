@@ -268,6 +268,70 @@ pub fn context_manager_for_model(
     Some(ContextManager::new(max_context, fill_rate))
 }
 
+/// Why the configured `[general.vision_model]` cannot serve the image tools — or
+/// only a warning about a model that may still work.
+///
+/// The single rule shared by [`build_vision_client`] and the Settings surfaces
+/// (Mnemo2's Models page), so the image tools' availability and the warning a
+/// user sees can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionIssue {
+    /// The named endpoint is not in `endpoints.toml`.
+    MissingEndpoint,
+    /// The endpoint is Anthropic-kind; the vision client is OpenAI-only.
+    AnthropicEndpoint,
+    /// The endpoint lists models and the vision model id is not among them —
+    /// a warning only, since an unlisted id can still work.
+    UnlistedModel,
+}
+
+impl VisionIssue {
+    /// The user-facing one-liner for this issue (Settings → Models, under the
+    /// Vision field), naming the offending endpoint and model.
+    pub fn message(&self, endpoint: &str, model: &str) -> String {
+        match self {
+            Self::MissingEndpoint => format!(
+                "Vision endpoint '{endpoint}' is not in endpoints.toml, so workers and agents have no image tools."
+            ),
+            Self::AnthropicEndpoint => format!(
+                "Vision endpoint '{endpoint}' is an Anthropic endpoint, which the vision client does not support."
+            ),
+            Self::UnlistedModel => format!(
+                "Vision model '{model}' is not listed for endpoint '{endpoint}'; it may still work."
+            ),
+        }
+    }
+}
+
+/// Classify `[general.vision_model]` against the loaded endpoints: `None` when
+/// it is unset (the multimodal main model serves vision) or resolves cleanly.
+fn vision_issue(config: &Config) -> Option<VisionIssue> {
+    let vm = config.general.general.vision_model.as_ref()?;
+    let ep = match config.endpoint(&vm.endpoint) {
+        Some(ep) => ep,
+        None => return Some(VisionIssue::MissingEndpoint),
+    };
+    if ep.kind == EndpointKind::Anthropic {
+        return Some(VisionIssue::AnthropicEndpoint);
+    }
+    // An endpoint that lists no models makes no claim to contradict, and an
+    // unlisted id can still be served — a warning, never a disabled client.
+    if !ep.models.is_empty() && !ep.has_model(&vm.model) {
+        return Some(VisionIssue::UnlistedModel);
+    }
+    None
+}
+
+/// The Settings-facing reason `[general.vision_model]` yields no image tools, or
+/// a warning that it may not — `None` when vision is unset or resolves cleanly.
+///
+/// Mnemo2's Models page shows it under the Vision field, so an unresolvable
+/// vision model is visible where the user sets it instead of only on stderr.
+pub fn vision_warning(config: &Config) -> Option<String> {
+    let vm = config.general.general.vision_model.as_ref()?;
+    vision_issue(config).map(|issue| issue.message(&vm.endpoint, &vm.model))
+}
+
 /// Build the vision image-to-text client from config, if configured and the
 /// named endpoint exists. Returns `None` when `[general.vision_model]` is
 /// unset or its endpoint is missing. Shared by startup and Settings rewire.
@@ -279,15 +343,20 @@ pub fn context_manager_for_model(
 /// client that would fail at call time.
 pub fn build_vision_client(config: &Config) -> Option<Arc<dyn ImageDescriber>> {
     let vm = config.general.general.vision_model.as_ref()?;
-    let ep = config.endpoint(&vm.endpoint)?;
-    if ep.kind == EndpointKind::Anthropic {
-        eprintln!(
-            "warning: vision_model endpoint '{}' is kind 'anthropic' — vision is \
-             OpenAI-compatible only; image-to-text fallback disabled",
-            vm.endpoint
-        );
-        return None;
+    match vision_issue(config)? {
+        // A warning only — the client still builds (the id may well work).
+        VisionIssue::UnlistedModel => {}
+        VisionIssue::MissingEndpoint => return None,
+        VisionIssue::AnthropicEndpoint => {
+            eprintln!(
+                "warning: vision_model endpoint '{}' is kind 'anthropic' — vision is \
+                 OpenAI-compatible only; image-to-text fallback disabled",
+                vm.endpoint
+            );
+            return None;
+        }
     }
+    let ep = config.endpoint(&vm.endpoint)?;
     let client: Arc<dyn ImageDescriber> = Arc::new(VisionClient::new(openai_client_config(
         config, ep, &vm.model, true, None,
     )));

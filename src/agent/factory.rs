@@ -316,7 +316,7 @@ pub struct AgentLoopFactory {
     plans_dir: PathBuf,
     /// Shared swappable vision slot. Always present so Settings can enable,
     /// disable, or re-point the vision model at runtime; agents and the
-    /// `describe_image` tool all share this `Arc`.
+    /// image tools all share this `Arc`.
     vision: Arc<SwappableVision>,
     /// Shared swappable provider slot — a handle to the main LLM client that
     /// sees runtime model swaps. Held (not snapshotted) so tools that need an
@@ -974,7 +974,7 @@ impl AgentLoopFactory {
 
     /// Replace the vision client at runtime (Settings → Vision, or after an
     /// endpoint/key edit that the vision model uses). Shared with every live
-    /// agent loop and the `describe_image` tool via [`SwappableVision`].
+    /// agent loop and the image tools via [`SwappableVision`].
     pub fn set_vision(&self, vision: Option<Arc<dyn ImageDescriber>>) {
         self.vision.set(vision);
     }
@@ -2129,7 +2129,7 @@ mod tests {
     }
 
     /// Build a factory with an optional vision model (to exercise the
-    /// `describe_image` tool registration).
+    /// image-tool registration).
     fn make_factory_with(
         dir: &std::path::Path,
         vision: Option<Arc<dyn ImageDescriber>>,

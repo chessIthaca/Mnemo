@@ -48,6 +48,7 @@ use mnemo::config::settings_dto::{
 use mnemo::config::{Config, ModelRef, EMBEDDING_MODEL_SENTINEL_HASH};
 use mnemo::headless::{EventReceiver, RecvError, Setup, SetupEvent};
 use mnemo::memory::embedder::EmbedderStatus;
+use mnemo::provider::client_factory::vision_warning;
 
 use crate::mnemo2::ipc::{settings_refresh, settings_setup, Mnemo2State};
 
@@ -68,6 +69,11 @@ pub struct ModelSettingsWire {
     /// The vision model as `"endpoint/model"`, or `null` (a multimodal
     /// main model serves vision directly).
     pub vision_model: Option<String>,
+    /// Why the vision model yields no image tools (or only a warning that it
+    /// may not): the endpoint is missing from `endpoints.toml`, is
+    /// Anthropic-kind, or does not list the model. `null` when vision is unset
+    /// or resolves cleanly. Shown under the page's Vision field.
+    pub vision_warning: Option<String>,
     /// The code-indexing (bundled embedding) model state.
     pub embedding: EmbeddingWire,
     /// The token-optimizer levers + knobs (`[general.optimizer]`).
@@ -189,6 +195,9 @@ pub(crate) fn model_settings_read(setup: &Setup) -> Result<ModelSettingsWire, St
             .vision_model
             .as_ref()
             .map(|v| format!("{}/{}", v.endpoint, v.model)),
+        // One shared rule with the client factory, so the warning shown here
+        // and the tools the workers get never disagree.
+        vision_warning: vision_warning(&config),
         embedding: embedding_wire(setup, &config),
         optimizer: OptimizerWire {
             delta_reads: general.optimizer.delta_reads,
@@ -697,6 +706,106 @@ simple = ["ep1/exec-model"]
             .options
             .iter()
             .any(|o| o.id == "all-MiniLM-L6-v2" && !o.installed));
+    }
+
+    /// A temp config dir holding only a vision model and the endpoints it names
+    /// (plus an empty fixture where needed) — enough for the warning rules,
+    /// which read nothing else.
+    fn vision_fixture(
+        endpoint: &str,
+        model: &str,
+        endpoints: &str,
+    ) -> (tempfile::TempDir, Setup) {
+        let dir = tempfile::tempdir().expect("config dir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("[general.vision_model]\nendpoint = \"{endpoint}\"\nmodel = \"{model}\"\n"),
+        )
+        .expect("write config.toml");
+        std::fs::write(dir.path().join("endpoints.toml"), endpoints)
+            .expect("write endpoints.toml");
+        let setup = Setup::open(Some(dir.path().to_path_buf())).expect("setup");
+        (dir, setup)
+    }
+
+    /// With vision pointing at an endpoint `endpoints.toml` does not have (what
+    /// deleting an endpoint leaves behind), the page must SAY why the image tools
+    /// are missing instead of leaving the user with a silently dead feature.
+    #[test]
+    fn vision_warning_names_a_missing_endpoint() {
+        let (dir, setup) = fixture();
+        // The save path validates the endpoint, so seed the dangling one on disk.
+        let path = dir.path().join("config.toml");
+        let text = std::fs::read_to_string(&path).expect("read config.toml");
+        let seeded = text.replace(
+            "[general.vision_model]\nendpoint = \"ep1\"",
+            "[general.vision_model]\nendpoint = \"ghost\"",
+        );
+        assert_ne!(seeded, text, "the fixture carries the vision block");
+        std::fs::write(&path, seeded).expect("write config.toml");
+        let wire = model_settings_read(&setup).expect("read");
+        assert_eq!(
+            wire.vision_warning.as_deref(),
+            Some(
+                "Vision endpoint 'ghost' is not in endpoints.toml, so workers and agents have no image tools."
+            )
+        );
+    }
+
+    /// A vision model that resolves carries no warning — neither a listed model
+    /// nor an endpoint that lists no models at all.
+    #[test]
+    fn vision_warning_absent_for_a_valid_endpoint() {
+        let (_dir, setup) = fixture();
+        assert_eq!(model_settings_read(&setup).expect("read").vision_warning, None);
+        let (_listed, listed) = vision_fixture(
+            "ep1",
+            "vision-x",
+            "[[endpoint]]\nname = \"ep1\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = [\"plan-model\", \"vision-x\"]\n",
+        );
+        assert_eq!(model_settings_read(&listed).expect("read").vision_warning, None);
+        let (_empty, empty) = vision_fixture(
+            "ep1",
+            "any-model",
+            "[[endpoint]]\nname = \"ep1\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = []\n",
+        );
+        assert_eq!(model_settings_read(&empty).expect("read").vision_warning, None);
+    }
+
+    /// The vision client is OpenAI-compatible only, so an Anthropic-kind vision
+    /// endpoint yields no image tools — and the page says which endpoint it is.
+    #[test]
+    fn vision_warning_for_an_anthropic_endpoint() {
+        let (_dir, setup) = vision_fixture(
+            "claude",
+            "claude-sonnet-4-5",
+            "[[endpoint]]\nname = \"claude\"\nkind = \"anthropic\"\nbase_url = \"https://api.anthropic.com/v1/\"\nmodels = [\"claude-sonnet-4-5\"]\n",
+        );
+        let wire = model_settings_read(&setup).expect("read");
+        assert_eq!(
+            wire.vision_warning.as_deref(),
+            Some(
+                "Vision endpoint 'claude' is an Anthropic endpoint, which the vision client does not support."
+            )
+        );
+    }
+
+    /// An id the endpoint does not list is a warning, never a dead feature —
+    /// unlisted ids can still work (the reason this one is not an error).
+    #[test]
+    fn vision_warning_for_an_unlisted_model() {
+        let (_dir, setup) = vision_fixture(
+            "ep1",
+            "deepseek-v4.1-flash:1017",
+            "[[endpoint]]\nname = \"ep1\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = [\"plan-model\"]\n",
+        );
+        let wire = model_settings_read(&setup).expect("read");
+        assert_eq!(
+            wire.vision_warning.as_deref(),
+            Some(
+                "Vision model 'deepseek-v4.1-flash:1017' is not listed for endpoint 'ep1'; it may still work."
+            )
+        );
     }
 
     #[test]

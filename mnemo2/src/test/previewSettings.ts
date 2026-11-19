@@ -86,6 +86,7 @@ function previewSettings(): ModelSettings {
       summarize: null,
     },
     vision_model: "openrouter/gpt-5.2",
+    vision_warning: null,
     embedding: {
       selected: "all-MiniLM-L6-v2",
       status: "missing",

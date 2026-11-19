@@ -445,10 +445,13 @@ impl Config {
         for path in &paths {
             let _ = fs::remove_file(backup_path(path));
         }
-        // Remember what this process just put on disk: the live-settings
-        // watcher must not treat an instance's own save as an outside change
-        // (the calling save path already applied these values live).
-        record_written_fingerprint(config_dir, ConfigFingerprint::from_texts(texts));
+        // Remember what this process just put on disk, from the bytes it
+        // wrote: the live-settings watcher must not treat an instance's own
+        // save as an outside change (the calling save path already applied
+        // these values live).
+        for (path, text) in paths.iter().zip(texts.iter()) {
+            record_live_file_written(path, text);
+        }
         Ok(())
     }
 }
@@ -489,17 +492,6 @@ impl ConfigFingerprint {
                 Ok(bytes) => fingerprint_bytes(&bytes),
                 Err(_) => ABSENT_FILE_HASH,
             };
-        }
-        Self { hashes }
-    }
-
-    /// Fingerprint the exact bytes a save is about to commit, in
-    /// [`CONFIG_FILE_NAMES`] order — so the writer can record what lands on
-    /// disk without re-reading (and racing) the files it just wrote.
-    pub fn from_texts(texts: [&str; CONFIG_FILE_NAMES.len()]) -> Self {
-        let mut hashes = [0u64; CONFIG_FILE_NAMES.len()];
-        for (slot, text) in hashes.iter_mut().zip(texts) {
-            *slot = fingerprint_bytes(text.as_bytes());
         }
         Self { hashes }
     }
@@ -559,12 +551,32 @@ pub fn last_written_fingerprint(config_dir: &Path) -> Option<ConfigFingerprint> 
         .copied()
 }
 
-/// Record a completed [`Config::save_all`] for the live-settings watcher.
-fn record_written_fingerprint(config_dir: &Path, fingerprint: ConfigFingerprint) {
-    last_written()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(fingerprint_key(config_dir), fingerprint);
+/// Record that this process just wrote one live config file, from the exact
+/// text that was written — never a fresh disk read, which a concurrent edit
+/// could have moved past.
+///
+/// Every in-process writer of a live file calls this (`Config::save_all`,
+/// `KeyStore::save`, the tier-ladder and general-config writers, and through
+/// them the MCP token store and the load-time migration): a file event for a
+/// file this process wrote is its own save, and the calling save path already
+/// applied it — a reload would only duplicate the work and show a false
+/// "changed in another window" toast. A `path` that names no live config file
+/// is ignored, so a writer can call it unconditionally.
+pub(crate) fn record_live_file_written(path: &Path, text: &str) {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(index) = CONFIG_FILE_NAMES.iter().position(|file| *file == name) else {
+        return;
+    };
+    let Some(config_dir) = path.parent() else {
+        return;
+    };
+    let mut map = last_written().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map
+        .entry(fingerprint_key(config_dir))
+        .or_insert_with(|| ConfigFingerprint::read(config_dir));
+    entry.hashes[index] = fingerprint_bytes(text.as_bytes());
 }
 
 /// Path of the staging file for `path` (`foo.toml` → `foo.toml.tmp`).

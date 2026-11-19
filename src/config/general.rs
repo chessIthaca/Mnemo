@@ -1208,12 +1208,21 @@ impl GeneralConfig {
     /// sections are preserved verbatim from the loaded value, so editing one
     /// field (e.g. `default_provider`) does not clobber the others.
     pub fn save(&self, path: &Path) -> Result<()> {
-        crate::config::write_atomic(path, &self.to_toml_text()?)
+        let text = self.to_toml_text()?;
+        crate::config::write_atomic(path, &text)?;
+        // The live-settings watcher must treat this write as this process's own
+        // save, not as a hand edit.
+        crate::config::record_live_file_written(path, &text);
+        Ok(())
     }
 
     /// Write while the caller holds the shared config write lock.
     pub(crate) fn save_unlocked(&self, path: &Path) -> Result<()> {
-        crate::config::write_atomic_unlocked(path, &self.to_toml_text()?)
+        let text = self.to_toml_text()?;
+        crate::config::write_atomic_unlocked(path, &text)?;
+        // Covers the load-time migration's rewrite of config.toml.
+        crate::config::record_live_file_written(path, &text);
+        Ok(())
     }
 
     fn to_toml_text(&self) -> Result<String> {

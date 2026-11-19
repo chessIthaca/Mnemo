@@ -259,6 +259,9 @@ impl Mnemo2State {
         if let Some(forwarder) = self.indexing_forwarder.lock().await.take() {
             forwarder.abort();
         }
+        if let Some(forwarder) = self.settings_forwarder.lock().await.take() {
+            forwarder.abort();
+        }
         let marker_root = self.marker_root.lock().await.take();
         let runtime = self.runtime.lock().await.take();
         if let Some(runtime) = runtime {

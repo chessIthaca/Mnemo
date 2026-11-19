@@ -497,6 +497,47 @@ pub struct Setup {
     /// Shared across clones so a reload seen through the watcher's clone is
     /// the same baseline the owner sees.
     last_applied: Arc<std::sync::Mutex<Option<ConfigFingerprint>>>,
+    /// Serialises every live-config change ([`Setup::patch_settings`],
+    /// [`Setup::reload_if_changed`], [`Setup::classifier_setup`]): each ends by
+    /// swapping `live.config` and stamping its applied fingerprint, so two
+    /// writers interleaving there could leave an OLDER config live or stamp
+    /// state that was never applied.
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// A test-only checkpoint inside [`Setup::apply_live`] — see
+    /// [`ApplyPause`].
+    #[cfg(test)]
+    apply_pause: Option<Arc<ApplyPause>>,
+}
+
+/// A test-only gate that parks [`Setup::apply_live`] at its checkpoint: the
+/// writer announces itself on `entered` and waits on `release`, so a test can
+/// start a second live-config change while the first is mid-apply and prove
+/// the apply mutex serialises them (review finding reloadSaveRace).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct ApplyPause {
+    /// One permit is granted as soon as a writer parks at the checkpoint.
+    pub entered: Arc<tokio::sync::Semaphore>,
+    /// The parked writer continues once the test grants a permit here.
+    pub release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+impl ApplyPause {
+    /// A fresh gate: the writer blocks until the test releases it.
+    pub fn new() -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for ApplyPause {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Setup {
@@ -531,6 +572,9 @@ impl Setup {
             classifier_status,
             embedder_status_arc,
             last_applied: Arc::new(std::sync::Mutex::new(last_applied)),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            apply_pause: None,
         })
     }
 
@@ -546,6 +590,14 @@ impl Setup {
     /// refuse; inject the keys at construction instead.
     pub fn with_key_source(mut self, source: KeySource) -> Self {
         self.key_source = source;
+        self
+    }
+
+    /// Test seam: park [`Setup::apply_live`] at its checkpoint (see
+    /// [`ApplyPause`]) so a test can interleave two live-config changes.
+    #[cfg(test)]
+    fn with_apply_pause(mut self, pause: Arc<ApplyPause>) -> Self {
+        self.apply_pause = Some(pause);
         self
     }
 
@@ -608,6 +660,9 @@ impl Setup {
             classifier_status: brain.classifier_status.clone(),
             embedder_status_arc: brain.embedder_status.clone(),
             last_applied: Arc::clone(&self.last_applied),
+            apply_lock: Arc::clone(&self.apply_lock),
+            #[cfg(test)]
+            apply_pause: None,
             live: Some(LiveHandles {
                 factory: brain.factory.clone(),
                 memory_store: brain.own_memory_store.clone(),
@@ -642,6 +697,9 @@ impl Setup {
     /// which owns the full rewire leg; the GUI's two surfaces meet in
     /// one process, the headless two in one method).
     pub async fn patch_settings(&self, patch: SettingsSaveDto) -> Result<(), EngineError> {
+        // One live-config change at a time: the save, the live apply and the
+        // applied-fingerprint stamp are one unit (see [`Setup::apply_lock`]).
+        let _apply = self.apply_lock.lock().await;
         if patch.laya_enabled.is_some() {
             return Err(EngineError::unsupported_patch(
                 "laya_enabled does not ride the settings patch — use \
@@ -658,7 +716,7 @@ impl Setup {
             .map_err(|e| EngineError::start_failed(e.to_string()))?;
         let Some(live) = &self.live else {
             // Nothing live to apply: the save alone is the whole effect.
-            self.mark_applied();
+            self.mark_applied(self.saved_fingerprint());
             return Ok(());
         };
         // The trace limits ride the patch only when it carries trace fields
@@ -667,8 +725,10 @@ impl Setup {
             patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some();
         self.apply_live(live, new_config, trace_limits).await;
         // This instance applied the save itself: the live-settings watcher
-        // must not reload it a second time.
-        self.mark_applied();
+        // must not reload it a second time. The stamped fingerprint is the
+        // writer's own record of the bytes it saved, never a fresh disk read
+        // that a concurrent edit could have moved past.
+        self.mark_applied(self.saved_fingerprint());
         Ok(())
     }
 
@@ -688,6 +748,14 @@ impl Setup {
         // approvals — a headless engine has none parked by the GUI).
         *live.safety_mode.write().expect("safety mode lock poisoned") =
             new_config.general.general.safety;
+        // Test seam (review finding reloadSaveRace): park after the first live
+        // effect, while the apply mutex is held, so a test can start a second
+        // writer and prove it waits.
+        #[cfg(test)]
+        if let Some(pause) = &self.apply_pause {
+            pause.entered.add_permits(1);
+            let _ = pause.release.acquire().await;
+        }
         // The rewire core: vision + embedder + the live toggles. The
         // re-embed future spawns on tokio (the headless engine runs on
         // tokio by construction).
@@ -722,11 +790,21 @@ impl Setup {
         *live.config.lock().await = new_config;
     }
 
-    /// Record what is on disk as this Setup's applied baseline — after a save
-    /// (which already applied live) and after a successful reload.
-    fn mark_applied(&self) {
-        *self.last_applied.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(ConfigFingerprint::read(&self.config_dir));
+    /// Record a fingerprint as this Setup's applied baseline — after a save
+    /// (the writer's own record) and after a successful reload (the bytes it
+    /// loaded). Never a fresh disk read at mark time: an edit landing between
+    /// the load/apply and the mark would be stamped applied without ever being
+    /// applied.
+    fn mark_applied(&self, fingerprint: ConfigFingerprint) {
+        *self.last_applied.lock().unwrap_or_else(|e| e.into_inner()) = Some(fingerprint);
+    }
+
+    /// The fingerprint this process last saved under the config dir — from the
+    /// writer's own record ([`crate::config::last_written_fingerprint`]), which
+    /// every in-process writer of a live file updates.
+    fn saved_fingerprint(&self) -> ConfigFingerprint {
+        crate::config::last_written_fingerprint(&self.config_dir)
+            .unwrap_or_else(|| ConfigFingerprint::read(&self.config_dir))
     }
 
     /// One live-settings check: when the four config files on disk
@@ -749,6 +827,14 @@ impl Setup {
     /// A Setup without a live engine has nothing to apply and reports
     /// [`ReloadOutcome::Unchanged`].
     pub async fn reload_if_changed(&self) -> ReloadOutcome {
+        // One live-config change at a time (see [`Setup::apply_lock`]): the
+        // fingerprint read, the load, the live apply and the baseline stamp
+        // are one unit, so a Settings save cannot interleave and leave an
+        // older config live.
+        let _apply = self.apply_lock.lock().await;
+        // Fingerprint BEFORE the load: an edit landing in between makes the
+        // next check reload once more (safe), while fingerprinting after the
+        // load could stamp bytes as applied that never were.
         let disk = ConfigFingerprint::read(&self.config_dir);
         let baseline = *self.last_applied.lock().unwrap_or_else(|e| e.into_inner());
         if baseline == Some(disk) {
@@ -757,7 +843,7 @@ impl Setup {
         // This process's own save already applied its values live: the file
         // events it caused must not reload a second time.
         if crate::config::last_written_fingerprint(&self.config_dir) == Some(disk) {
-            self.mark_applied();
+            self.mark_applied(disk);
             return ReloadOutcome::Unchanged;
         }
         let files = match baseline {
@@ -790,7 +876,7 @@ impl Setup {
         new_config.general.general.laya = live_laya;
         // A reload applies the whole loaded file, trace limits included.
         self.apply_live(live, new_config, true).await;
-        self.mark_applied();
+        self.mark_applied(disk);
         ReloadOutcome::Reloaded { laya_changed }
     }
 
@@ -837,6 +923,10 @@ impl Setup {
         &self,
         enable: bool,
     ) -> Result<EventReceiver<SetupEvent>, EngineError> {
+        // One live-config change at a time (see [`Setup::apply_lock`]): this
+        // leg persists the flag and swaps `live.config` just like a settings
+        // save.
+        let _apply = self.apply_lock.lock().await;
         let (tx, rx) = tokio::sync::broadcast::channel::<SetupEvent>(64);
         // Persist the flip first — idempotent, so a concurrent second
         // enable is harmless before the guard rejects it.
@@ -845,6 +935,8 @@ impl Setup {
         config
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(format!("saving the config failed: {e}")))?;
+        // Its own save: the live-settings watcher must not reload it again.
+        self.mark_applied(self.saved_fingerprint());
         // The LIVE apply (review round 1, finding 2): the completing
         // pipeline + every later spawn re-reads the brain's shared Arc —
         // a flip that only reaches disk leaves an engine-backed enable
@@ -2030,6 +2122,136 @@ mod tests {
             Some("alt-model")
         );
         drop(shared);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding reloadSaveRace: a reload already mid-apply must not be
+    /// overtaken by a Settings save. The apply mutex serialises them, so the
+    /// final live config equals what is on disk — no older config wins, and no
+    /// fingerprint is stamped for bytes that were never applied.
+    #[tokio::test]
+    async fn a_reload_and_a_save_are_serialised_so_disk_wins() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // An external hand edit to reload.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"hand-edit\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+
+        let pause = Arc::new(ApplyPause::new());
+        let reload_setup = setup.clone().with_apply_pause(Arc::clone(&pause));
+        let reload = tokio::spawn(async move { reload_setup.reload_if_changed().await });
+        // Wait until the reload is parked INSIDE apply_live, holding the apply
+        // mutex.
+        let _entered = pause.entered.acquire().await.expect("the gate is open");
+
+        let patch_setup = setup.clone();
+        let patch = tokio::spawn(async move {
+            patch_setup
+                .patch_settings(SettingsSaveDto {
+                    safety: Some("autonomous".to_string()),
+                    ..Default::default()
+                })
+                .await
+        });
+        // The save must WAIT for the reload's apply to finish.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !patch.is_finished(),
+            "the save must wait for the in-flight reload"
+        );
+        pause.release.add_permits(1);
+        let outcome = reload.await.expect("reload task");
+        assert!(outcome.reloaded(), "{outcome:?}");
+        patch.await.expect("patch task").expect("the save applies");
+
+        // The final live config equals what is on disk: the save (loaded from
+        // the reloaded file) won, and nothing was stamped without applying.
+        let on_disk = Config::load(cfg.path()).expect("reload the saved config");
+        let live = engine.brain().config.lock().await.clone();
+        assert_eq!(live.general.general.safety, on_disk.general.general.safety);
+        assert_eq!(
+            live.general.general.vision_model, on_disk.general.general.vision_model,
+            "the hand edit survived the save"
+        );
+        assert_eq!(
+            live.general.general
+                .vision_model
+                .expect("vision model")
+                .model,
+            "hand-edit"
+        );
+        // And a follow-up check is quiet: the stamped baseline matches disk.
+        assert_eq!(setup.reload_if_changed().await, ReloadOutcome::Unchanged);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding ownSaveWriters: `set_tiers` writes `endpoints.toml`
+    /// through the tier-ladder writer — an in-process save, so the watcher must
+    /// not reload it (a false "changed in another window" toast + a full
+    /// rewire, embedder rebuild included).
+    #[tokio::test]
+    async fn a_set_tiers_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let mut tiers = setup.tiers().expect("tiers");
+        // A valid ladder change the fixture can resolve.
+        tiers.tiers[0].models = vec!["test/test-model".to_string()];
+        setup.set_tiers(tiers).await.expect("the tiers save");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "set_tiers is this instance's own save"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding ownSaveWriters: `set_api_key` writes `keys.toml` through
+    /// `KeyStore::save` — same rule.
+    #[tokio::test]
+    async fn a_set_api_key_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        setup
+            .set_api_key("test", Secret::new("sk-rotated"))
+            .expect("the key save");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "set_api_key is this instance's own save"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding ownSaveWriters: the MCP OAuth token store writes
+    /// `keys.toml` on every refresh — a background write, never a reload.
+    #[tokio::test]
+    async fn an_mcp_token_store_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let store = crate::mcp::oauth::McpTokenStore::new(cfg.path().join("keys.toml"));
+        store
+            .store(
+                "server",
+                &crate::mcp::oauth::OAuthTokens {
+                    access_token: "tok".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("the token write");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "an OAuth token refresh is this instance's own save"
+        );
         engine.shutdown().await.expect("shutdown");
     }
 

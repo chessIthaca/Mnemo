@@ -525,16 +525,23 @@ impl LeadRuntime {
                     if !outcome.changed() {
                         return;
                     }
+                    let mut notice = outcome.notice();
                     if outcome.reloaded() {
                         // A hand-added endpoint/model/tier reaches the next
-                        // dispatch without a restart.
+                        // dispatch without a restart; a failure to re-read
+                        // them is the window's business, not a silent stderr
+                        // line.
                         if let Err(error) = catalog.refresh().await {
-                            eprintln!(
-                                "mnemo2: catalog refresh after a config reload failed: {error}"
-                            );
+                            notice = Some(ReloadNotice {
+                                ok: false,
+                                message: format!(
+                                    "Settings reloaded, but the model list could not be refreshed: \
+                                     {error}"
+                                ),
+                            });
                         }
                     }
-                    if let Some(notice) = outcome.notice() {
+                    if let Some(notice) = notice {
                         // No window listening (a headless run) drops the
                         // notice — the reload itself already happened.
                         let _ = notices.send(notice);

@@ -7,6 +7,37 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
+## [2.7.0] — 2026-11-19
+
+Workers run long builds in one call, edit more reliably, prove their tests, and several Mnemo2 windows share one machine.
+
+### Added
+- Background jobs: `job_start` runs a build or test as a session-owned job, `job_wait` waits server-side for its exit or a matching line, `job_tail` shows progress and `job_kill` stops the whole process tree. Nothing a job starts outlives its session.
+- `run_checks` runs every `.coding/checks.toml` command in one call, reports pass or fail per check with the first errors and failing tests, and records the passing runs as merge checks.
+- Mnemo2 proves a bug fix's regression test fails without the fix, and for high-risk work runs a mutation check that reports changed code no test catches as findings.
+- Recurring review findings become proposals to enforce them, and the Quality tab shows how merged work holds up per tier and model, plus edit attempts and failures by cause.
+- Several Mnemo2 windows share one machine:
+  - one Laya server for all of them, ended by a watchdog once no window uses it;
+  - a machine-wide limit on heavy builds and tests (Settings → Machine);
+  - a per-endpoint "Max requests at once" limit and a shared pause after a rate-limit error;
+  - an automatic shared Rust build cache when sccache is installed;
+  - an overview of every running window in Mission Control;
+  - HOW and DECISION notes in `~/.mnemo/knowledge` that every project finds.
+- Hand edits of `~/.mnemo/*.toml` reach every running window without a restart.
+- Workers check visual changes with the image tools, and Settings → Models warns when the vision model cannot be used.
+
+### Changed
+- A shell command is killed after 20 minutes without output or 60 minutes in total, instead of after a fixed 5 minutes, and a killed command keeps the end of its output.
+- Memory search finds records by meaning, not only those whose words match.
+- Read receipts follow a worker's own earlier edits, a near-miss edit returns the current text with a fresh receipt, and misshapen tool arguments are repaired or explained with an example call.
+- Stale-read redirects no longer count toward the escalation nudge.
+
+### Fixed
+- `review_fix` matches line endings like the worker edit tool.
+- A missing mutation tool is reported once as a notice instead of as a worker error.
+- The memory index updates live when `.coding/` files change, and a leading UTF-8 BOM no longer breaks the record parsers.
+- Frontend tests pass on a fresh install again (jsdom pinned to 31.0.0).
+
 ## [2.6.0] — 2026-11-16
 
 Workers build faster, and the lead stops running every test suite twice.

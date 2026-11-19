@@ -346,6 +346,10 @@ pub struct TeamRuntime {
     /// The two proof commands, behind a seam a test can answer without a
     /// twenty-minute build.
     proofs: std::sync::RwLock<Arc<dyn proving::ProofRunner>>,
+    /// What this session already mutated and already reported: the tip each
+    /// worker's last automatic mutation run reached the runner at, and the
+    /// missing mutation tools it named (decision 2026-11-19). In memory only.
+    mutation_memory: Arc<std::sync::Mutex<proving::MutationMemory>>,
     signals: broadcast::Sender<BoardSignal>,
     /// The external lead's attach flag, notice queue and activity clock.
     external: std::sync::Mutex<ExternalLead>,
@@ -467,6 +471,7 @@ impl TeamRuntime {
             board: std::sync::Mutex::new(None),
             proving: proving::Proving::default(),
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs)),
+            mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
             external: std::sync::Mutex::new(ExternalLead::default()),
             external_wake: tokio::sync::Notify::new(),
@@ -591,6 +596,7 @@ impl TeamRuntime {
             proving: self.proving.clone(),
             board: self.board(),
             runner: Arc::clone(&*self.proofs.read().unwrap_or_else(|e| e.into_inner())),
+            mutation_memory: self.mutation_memory.clone(),
             merge_lock: self.merge_lock.clone(),
             live: self.live.clone(),
         }

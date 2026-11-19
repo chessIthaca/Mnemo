@@ -67,7 +67,10 @@ fix` when the test fails without the fix, the high finding `regression-not-red`
 when it still passes, or `regression-proof-inconclusive` (low, wontfixable with
 a written reason) when the run could not decide. For a high-risk worker, when
 the project configured `[mutation]` in `.coding/checks.toml`, it also reports
-every changed line no test catches as a low `No test catches: ...` finding.
+every changed line no test catches as a low `No test catches: ...` finding. An
+automatic mutation run is skipped when this session already mutated that tip
+or the change touches only test files, and a missing mutation tool is reported
+once as a notice, not as a worker error.
 Both are ordinary checks and findings: open ones block the merge, and the merge
 gate refuses a bug fix whose regression test has not been proven red at the tip
 being merged. Only a proof finding resolved `wontfix`, with a written reason,

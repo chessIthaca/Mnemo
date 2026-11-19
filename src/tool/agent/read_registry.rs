@@ -148,6 +148,13 @@ pub fn revoke(id: &str) {
         .remove(id);
 }
 
+/// The unknown-receipt marker: the "it is not in the registry" failure's
+/// leading text. A STEERING redirect, not a failure — the fix is to re-read the
+/// file, so `route_question::is_steering_redirect` keys on it and the stuck-
+/// worker strike counter ignores it (plan 5b85ab61 step 4). Public so the app
+/// crate's edit-outcome classifier reads the one source instead of its own copy.
+pub const UNKNOWN_RECEIPT_MARK: &str = "unknown read receipt";
+
 /// Resolve a from_read anchor against the CURRENT file bytes — the
 /// server-side validation that replaces the verbatim old_string.
 ///
@@ -185,7 +192,7 @@ pub fn resolve(
         .cloned();
     let Some(receipt) = receipt else {
         return Err(with_fresh_read_nudge(format!(
-            "unknown read receipt '{id}' — it is not in the registry (evicted by newer reads, \
+            "{UNKNOWN_RECEIPT_MARK} '{id}' — it is not in the registry (evicted by newer reads, \
              a new process, or never read)"
         )));
     };

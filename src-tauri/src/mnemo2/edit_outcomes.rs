@@ -27,6 +27,9 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 
+use mnemo::tool::agent::read_registry::UNKNOWN_RECEIPT_MARK;
+use mnemo::EDIT_GATE_MARK;
+
 /// The state-dir folder holding one transcript per worker.
 const TRANSCRIPTS_DIR: &str = "transcripts";
 
@@ -35,9 +38,6 @@ const EDIT_TOOLS: [&str; 4] = ["file_edit", "multi_edit", "file_write", "file_ap
 
 /// The path an edit whose arguments never parsed is filed under.
 const UNPARSED_PATH: &str = "(unparsed)";
-
-/// The stale-read gate's marker (see `src/agent/dispatch.rs`).
-const BLOCKED_MARKER: &str = "EDIT INTERCEPTED";
 
 /// Argument-shape markers: the call never ran because its arguments were
 /// misshapen (step 4 of this plan adds the first of them).
@@ -51,7 +51,7 @@ const SHAPE_MARKERS: [&str; 4] = [
 /// Read-receipt markers: the cites did not line up with the read they name.
 const RECEIPT_DRIFT_MARKERS: [&str; 4] = [
     "changed since read '",
-    "unknown read receipt",
+    UNKNOWN_RECEIPT_MARK,
     "rewritten by an edit since that read",
     "reach past the file's current end",
 ];
@@ -96,7 +96,7 @@ enum EditOutcome {
 /// tool error, and finally success.
 fn classify(content: &str) -> EditOutcome {
     let has = |markers: &[&str]| markers.iter().any(|marker| content.contains(marker));
-    if content.contains(BLOCKED_MARKER) {
+    if content.contains(EDIT_GATE_MARK) {
         EditOutcome::Blocked
     } else if has(&SHAPE_MARKERS) {
         EditOutcome::Shape

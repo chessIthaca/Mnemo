@@ -54,6 +54,7 @@ pub mod workspace;
 // `mnemo::host::*`/`mnemo::runtime`/`mnemo::agent`); add deliberately,
 // with the consumer named.
 pub use crate::agent::approval::needs_approval;
+pub use crate::agent::EDIT_GATE_MARK;
 pub use crate::agent::context::ContextManager;
 pub use crate::agent::factory::AgentLoopFactory;
 pub use crate::agent::failure_triage::{

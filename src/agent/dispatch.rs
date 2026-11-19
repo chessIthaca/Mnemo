@@ -1789,6 +1789,14 @@ fn multi_edit_entry_is_cite_only(entry: &serde_json::Value) -> bool {
     }
 }
 
+/// The stale-read gate's redirect marker: every intercepted `file_edit` /
+/// `multi_edit` result starts with this text. It is a STEERING redirect, not a
+/// failure — `route_question::is_steering_redirect` keys on it so following the
+/// gate's advice ("re-read, then retry") never counts toward the stuck-worker
+/// strike streak (plan 5b85ab61 step 4). Public so the app crate's edit-outcome
+/// classifier reads the one source instead of its own copy.
+pub const EDIT_GATE_MARK: &str = "EDIT INTERCEPTED";
+
 /// C5-family: the file_edit stale-read gate (backlog 714196da). When
 /// `file_edit` is called on `path` after a drift-class failure on THAT path
 /// (the "Re-read the file …" nudge, emitted on the tool's
@@ -1811,7 +1819,7 @@ pub(crate) fn file_edit_redirect(
     // still never feeds the fired count).
     steering.note_edit_gated(agent_id);
     Some(ToolResult::error(format!(
-        "EDIT INTERCEPTED: your last {fired} file_edit attempts failed because the \
+        "{EDIT_GATE_MARK}: your last {fired} file_edit attempts failed because the \
          old_string did not match — the file has drifted from your last read. Do not \
          retry blind. First re-read the file with read_files (this exact path: {path}), \
          then retry the edit with the exact current text."

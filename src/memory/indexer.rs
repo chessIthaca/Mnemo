@@ -56,8 +56,9 @@ use reviews::scan_reviews;
 // submodule and are re-exported here so `crate::memory::indexer::*` paths
 // are unchanged for every consumer.
 pub use knowledge::{
-    backlinks_for, knowledge_id, migrate_authored_typed_rows, reindex_knowledge_files,
-    resolve_link, MigrateReport, ResolvedLink,
+    backlinks_for, knowledge_id, knowledge_key, machine_knowledge_id, migrate_authored_typed_rows,
+    reindex_knowledge_files, resolve_link, MigrateReport, ResolvedLink, MACHINE_KEY_PREFIX,
+    MACHINE_SOURCE,
 };
 
 /// What an index run did — surfaced by the IPC layer as the completion
@@ -94,10 +95,17 @@ struct SourceRecord {
 /// (same memory id, re-embedded); vanished sources are removed. `progress`
 /// ticks `(done, total)` after each processed source — throttling is the
 /// caller's concern (the IPC layer uses its `should_forward_progress`).
+///
+/// `machine_knowledge_dir` is the machine-wide corpus (`<config dir>/
+/// knowledge/`, see [`machine_knowledge_dir`]): its `how/` and `decision/`
+/// records hold for every project on the machine and are indexed READ-ONLY
+/// here, in the SAME pass so removal detection sees their `machine:` keys
+/// (plan d3336a8a step 8). `None` means no machine tier is configured.
 pub async fn index_derived(
     store: &dyn MemoryStoreTrait,
     plans_dir: &Path,
     backlog_path: &Path,
+    machine_knowledge_dir: Option<&Path>,
     progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Result<IndexReport> {
     // The scan phase is blocking fs (hundreds of small files) — one hop onto
@@ -112,12 +120,26 @@ pub async fn index_derived(
     // Keep a handle for the INDEX.md regeneration after the loop — the scan
     // closure below takes ownership of the original.
     let knowledge_dir_for_index = knowledge_dir.clone();
+    let machine = machine_knowledge_dir.map(Path::to_path_buf);
     let config = store.memory_search_config();
-    let (sources, knowledge_records, scan_errors) = tokio::task::spawn_blocking(move || {
-        scan_sources(&plans, &backlog, knowledge_dir.as_deref(), &config)
+    let scanned = tokio::task::spawn_blocking(move || {
+        scan_sources(
+            &plans,
+            &backlog,
+            knowledge_dir.as_deref(),
+            machine.as_deref(),
+            &config,
+        )
     })
     .await
     .map_err(|e| Error::Memory(format!("index scan task failed: {e}")))?;
+    let (sources, knowledge_records, machine_records, scan_errors, machine_retained) = (
+        scanned.sources,
+        scanned.knowledge,
+        scanned.machine_knowledge,
+        scanned.errors,
+        scanned.machine_retained,
+    );
 
     let mut report = IndexReport {
         errors: scan_errors,
@@ -127,7 +149,14 @@ pub async fn index_derived(
     // supersede state) resolved from the FULL corpus — a successor file
     // changes its predecessor's row, so resolution happens before the
     // per-source hash loop.
-    let metas = build_knowledge_metas(&knowledge_records, &mut report.errors);
+    let mut metas = build_knowledge_metas(&knowledge_records, false, &mut report.errors);
+    // The machine corpus resolves its own supersede chains (its keys live in
+    // the `machine:` family), merged into the same key->meta map.
+    metas.extend(build_knowledge_metas(
+        &machine_records,
+        true,
+        &mut report.errors,
+    ));
     let mut knowledge_touched = false;
     let total = sources.len();
     let mut seen: HashSet<String> = HashSet::with_capacity(total);
@@ -202,13 +231,20 @@ pub async fn index_derived(
         progress(done + 1, total);
     }
     // Removal detection: state keys not seen this run lose memory + state.
+    // A machine corpus that could not be listed right now (absent root, a
+    // transient permission or mount failure) keeps its rows: the shared
+    // records must never be deleted because one scan could not see them.
     for key in store.index_state_keys().await? {
         if !seen.contains(&key) {
+            if machine_retained && key.starts_with(MACHINE_KEY_PREFIX) {
+                continue;
+            }
             if let Some((_, memory_id)) = store.index_state_get(&key).await? {
                 store.delete_memory(&memory_id).await?;
             }
             store.index_state_remove(&key).await?;
-            knowledge_touched |= key.starts_with("knowledge:");
+            knowledge_touched |=
+                key.starts_with("knowledge:") || key.starts_with(MACHINE_KEY_PREFIX);
             report.removed += 1;
         }
     }
@@ -250,11 +286,19 @@ pub async fn rebuild_derived(
     store: &dyn MemoryStoreTrait,
     plans_dir: &Path,
     backlog_path: &Path,
+    machine_knowledge_dir: Option<&Path>,
     progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Result<IndexReport> {
     store.delete_derived().await?;
     store.index_state_clear().await?;
-    index_derived(store, plans_dir, backlog_path, progress).await
+    index_derived(
+        store,
+        plans_dir,
+        backlog_path,
+        machine_knowledge_dir,
+        progress,
+    )
+    .await
 }
 
 /// Insert a new derived memory for a source. `record_type` is derived from
@@ -309,16 +353,35 @@ async fn row_matches_source(
 
 // ── Scanning ────────────────────────────────────────────────────────────────
 
+/// Everything one scan pass produced, plus the machine-corpus guard signal.
+struct ScannedSources {
+    /// Digest sources from every family, machine records included.
+    sources: Vec<SourceRecord>,
+    /// Parsed PROJECT knowledge records (supersede-metadata resolution).
+    knowledge: Vec<KnowledgeRecord>,
+    /// Parsed MACHINE knowledge records (same resolution, own key family).
+    machine_knowledge: Vec<KnowledgeRecord>,
+    /// Per-source problems (degraded parses, unreadable files).
+    errors: Vec<String>,
+    /// The machine root was configured but could not be listed: keep every
+    /// existing `machine:` state key instead of treating its records as
+    /// vanished.
+    machine_retained: bool,
+}
+
 /// Scan all source kinds into records (+ non-fatal per-source errors):
-/// plans, reviews, the knowledge corpus, and the backlog.
+/// plans, reviews, the knowledge corpus, the machine knowledge corpus, and
+/// the backlog.
 fn scan_sources(
     plans_dir: &Path,
     backlog_path: &Path,
     knowledge_dir: Option<&Path>,
+    machine_knowledge_dir: Option<&Path>,
     config: &MemorySearchConfig,
-) -> (Vec<SourceRecord>, Vec<KnowledgeRecord>, Vec<String>) {
+) -> ScannedSources {
     let mut out = Vec::new();
     let mut knowledge = Vec::new();
+    let mut machine_knowledge = Vec::new();
     let mut errors = Vec::new();
     scan_plans(plans_dir, &mut out, &mut errors, config);
     // The reviews dir is the plans dir's sibling (`.coding/reviews/`).
@@ -326,23 +389,62 @@ fn scan_sources(
         scan_reviews(&reviews_dir, &mut out, &mut errors, config);
     }
     if let Some(knowledge_dir) = knowledge_dir {
-        scan_knowledge(knowledge_dir, &mut out, &mut knowledge, &mut errors, config);
+        scan_knowledge(
+            knowledge_dir,
+            false,
+            &mut out,
+            &mut knowledge,
+            &mut errors,
+            config,
+        );
+    }
+    // The machine corpus (`<config dir>/knowledge/`) is shared by every
+    // project on the machine and indexed READ-ONLY, in the same pass, so the
+    // removal detection sees its `machine:` keys (plan d3336a8a step 8). A
+    // root that cannot be listed right now (never created, or a transient
+    // failure) keeps its rows rather than reading as "every machine record
+    // vanished".
+    let mut machine_retained = false;
+    if let Some(machine_dir) = machine_knowledge_dir {
+        if std::fs::read_dir(machine_dir).is_ok() {
+            scan_knowledge(
+                machine_dir,
+                true,
+                &mut out,
+                &mut machine_knowledge,
+                &mut errors,
+                config,
+            );
+        } else {
+            machine_retained = true;
+        }
     }
     if let Some(specs_dir) = plans_dir.parent().map(|p| p.join("openspec/specs")) {
         scan_openspec(&specs_dir, &mut out, &mut errors, config);
     }
     scan_backlog(backlog_path, &mut out, &mut errors, config);
-    (out, knowledge, errors)
+    ScannedSources {
+        sources: out,
+        knowledge,
+        machine_knowledge,
+        errors,
+        machine_retained,
+    }
 }
 
 /// Cheap staleness pre-check for the startup reconciliation: does the
-/// on-disk corpus (plans, reviews, knowledge, OpenSpec requirements, backlog) differ from
-/// what the derived index state already covers? Walks the same sources the
-/// indexer scans, compares content hashes against `derived_index_state`,
-/// and includes removal detection (a state key with no on-disk source is a
-/// change). A missing/empty state table (fresh project, or a deleted
-/// `memory.db` awaiting a rebuild) counts as stale — the run then rebuilds
-/// from the files, which are the truth.
+/// on-disk corpus (plans, reviews, knowledge, the machine knowledge corpus,
+/// OpenSpec requirements, backlog) differ from what the derived index state
+/// already covers? Walks the same sources the indexer scans, compares content
+/// hashes against `derived_index_state`, and includes removal detection (a
+/// state key with no on-disk source is a change). A missing/empty state table
+/// (fresh project, or a deleted `memory.db` awaiting a rebuild) counts as
+/// stale — the run then rebuilds from the files, which are the truth.
+///
+/// `machine_knowledge_dir` mirrors [`index_derived`]: a machine record
+/// written by ANOTHER instance makes this project's store stale, so the
+/// live-settings watcher's reconcile picks it up. A machine root that cannot
+/// be listed keeps its `machine:` keys (never "vanished").
 ///
 /// This is what lets the startup reconcile stay SILENT when nothing
 /// changed (no events, no dialog) and only stream progress + show the
@@ -352,22 +454,30 @@ pub async fn corpus_is_stale(
     store: &dyn MemoryStoreTrait,
     plans_dir: &Path,
     backlog_path: &Path,
+    machine_knowledge_dir: Option<&Path>,
 ) -> Result<bool> {
     let plans = plans_dir.to_path_buf();
     let backlog = backlog_path.to_path_buf();
     let knowledge_dir = plans_dir
         .parent()
         .map(|p| p.join(KNOWLEDGE_DIR_NAME));
+    let machine = machine_knowledge_dir.map(Path::to_path_buf);
     let config = store.memory_search_config();
-    let (sources, _knowledge, scan_errors) = tokio::task::spawn_blocking(move || {
-        scan_sources(&plans, &backlog, knowledge_dir.as_deref(), &config)
+    let scanned = tokio::task::spawn_blocking(move || {
+        scan_sources(
+            &plans,
+            &backlog,
+            knowledge_dir.as_deref(),
+            machine.as_deref(),
+            &config,
+        )
     })
     .await
     .map_err(|e| Error::Memory(format!("staleness scan task failed: {e}")))?;
 
     let state_keys = store.index_state_keys().await?;
-    let mut seen: HashSet<String> = HashSet::with_capacity(sources.len());
-    for source in &sources {
+    let mut seen: HashSet<String> = HashSet::with_capacity(scanned.sources.len());
+    for source in &scanned.sources {
         seen.insert(source.key.clone());
         match store.index_state_get(&source.key).await? {
             Some((old_hash, _)) if old_hash == content_hash(source) => {
@@ -383,15 +493,19 @@ pub async fn corpus_is_stale(
             _ => return Ok(true), // new or changed source
         }
     }
-    // Removal detection: any indexed key whose source vanished is stale.
-    if state_keys.iter().any(|k| !seen.contains(k)) {
+    // Removal detection: any indexed key whose source vanished is stale —
+    // except a `machine:` key while the machine root could not be listed.
+    if state_keys
+        .iter()
+        .any(|k| !seen.contains(k) && !(scanned.machine_retained && k.starts_with(MACHINE_KEY_PREFIX)))
+    {
         return Ok(true);
     }
     // A scan error (unreadable source) is not "stale" — the index run would
     // report it; treat it as unchanged so the dialog doesn't appear for a
     // transient read failure (the error surfaces in the report instead).
-    if !scan_errors.is_empty() {
-        eprintln!("warning: reconcile staleness scan: {:?}", scan_errors);
+    if !scanned.errors.is_empty() {
+        eprintln!("warning: reconcile staleness scan: {:?}", scanned.errors);
     }
     Ok(false)
 }

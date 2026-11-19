@@ -788,16 +788,31 @@ pub fn format_recall_context(memories: &[ScoredMemory]) -> String {
 }
 
 /// One full recalled-memory entry: tier, title, stable id, score, and the
-/// first 160 chars of content.
+/// first 160 chars of content. A record indexed from the machine-wide corpus
+/// carries the `[machine]` tag right after its title (plan d3336a8a step 8),
+/// so a shared claim is never mistaken for a project-specific one.
 fn format_recall_entry(sm: &ScoredMemory) -> String {
     format!(
-        "[{}] {} (id: {}, score: {:.2})\n  {}\n\n",
+        "[{}] {}{} (id: {}, score: {:.2})\n  {}\n\n",
         sm.memory.tier,
         sm.memory.title,
+        machine_tag(&sm.memory),
         sm.memory.id,
         sm.score,
         sm.memory.content.chars().take(160).collect::<String>(),
     )
+}
+
+/// The `[machine]` tag for a record indexed from the machine-wide knowledge
+/// corpus (`<config dir>/knowledge/`, plan d3336a8a step 8) — a claim that
+/// holds for every project on this machine. Empty for a project record.
+pub(crate) fn machine_tag(m: &crate::memory::Memory) -> &'static str {
+    if m.data.get("source").and_then(|v| v.as_str()) == Some(crate::memory::indexer::MACHINE_SOURCE)
+    {
+        " [machine]"
+    } else {
+        ""
+    }
 }
 
 /// Format recalled memories with the `recall_delta` lever applied: an entry
@@ -822,8 +837,13 @@ pub fn format_recall_context_delta(
     for (i, sm) in memories.iter().enumerate() {
         match elide(i, sm) {
             Some(turn) => out.push_str(&format!(
-                "[{}] {} (id: {}, score: {:.2}) — unchanged since injection (turn {}); re-read with memory_search if needed.\n\n",
-                sm.memory.tier, sm.memory.title, sm.memory.id, sm.score, turn,
+                "[{}] {}{} (id: {}, score: {:.2}) — unchanged since injection (turn {}); re-read with memory_search if needed.\n\n",
+                sm.memory.tier,
+                sm.memory.title,
+                machine_tag(&sm.memory),
+                sm.memory.id,
+                sm.score,
+                turn,
             )),
             None => out.push_str(&format_recall_entry(sm)),
         }

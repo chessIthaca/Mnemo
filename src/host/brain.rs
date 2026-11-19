@@ -542,6 +542,11 @@ pub(crate) fn wire_brain(
         let notifier = notifier.clone();
         let plans_dir = workspace.state_dir.join("plans");
         let backlog_path = workspace.state_dir.join("backlog.jsonl");
+        // The MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+        // d3336a8a step 8) — HOW/DECISION records shared by every project on
+        // the machine, indexed READ-ONLY into this project's store in the same
+        // pass as the project corpus.
+        let machine_knowledge_dir = crate::memory::knowledge::machine_knowledge_dir(&config_dir);
         rt.spawn(async move {
             // Console mode (no app handle) has no frontend to notify — the
             // reconcile still runs, but silently (the events are dropped).
@@ -562,6 +567,7 @@ pub(crate) fn wire_brain(
                     store_for_index.as_ref(),
                     &plans_dir,
                     &backlog_path,
+                    Some(&machine_knowledge_dir),
                     &noop,
                 )
                 .await
@@ -692,6 +698,7 @@ pub(crate) fn wire_brain(
                 store_for_index.as_ref(),
                 &plans_dir,
                 &backlog_path,
+                Some(&machine_knowledge_dir),
             )
             .await
             {
@@ -715,6 +722,7 @@ pub(crate) fn wire_brain(
                 store_for_index.as_ref(),
                 &plans_dir,
                 &backlog_path,
+                Some(&machine_knowledge_dir),
                 &progress,
             )
             .await
@@ -1081,6 +1089,15 @@ pub(crate) fn wire_brain(
     // each plan-step gate by every agent built from this factory (a Settings
     // save flips the mirror live).
     .with_budget_config(budget_config)
+    // Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    // d3336a8a step 8): the HOW/DECISION records shared by every project on
+    // the machine. The memory tools route `[machine]` edits to it and accept
+    // `memory_write scope=machine`; the derived-index runs index it read-only.
+    .with_machine_knowledge(Some(Arc::new(
+        crate::memory::KnowledgeStore::new_machine(
+            crate::memory::knowledge::machine_knowledge_dir(&config_dir),
+        ),
+    )))
     // Wire the shared Laya auto-typing gate (backlog a147b63c):
     // memory_write reads the classifier slot + flag at call time, and
     // Settings saves flip the flag via `set_auto_typing_enabled` — no
@@ -1171,6 +1188,10 @@ pub(crate) fn wire_brain(
         match crate::host::memory_watcher::MemoryWatcher::spawn(
             store,
             workspace.state_dir.clone(),
+            // The machine corpus is a second watched root (plan d3336a8a
+            // step 8): a machine record written by another instance or by
+            // hand reaches this project's store without a restart.
+            Some(crate::memory::knowledge::machine_knowledge_dir(&config_dir)),
             std::time::Duration::from_millis(1500),
         ) {
             Ok(w) => {

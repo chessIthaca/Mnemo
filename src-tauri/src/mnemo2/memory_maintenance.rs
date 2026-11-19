@@ -314,6 +314,10 @@ pub async fn memory_rebuild_index(
         .map(|coding| coding.join("plans"))
         .unwrap_or_default();
     let backlog_path = engine.workspace_root().join(".coding").join("backlog.jsonl");
+    // The machine knowledge corpus (`<config dir>/knowledge/`, plan d3336a8a
+    // step 8) is re-indexed read-only alongside the project corpus.
+    let machine_knowledge =
+        mnemo::memory::knowledge::machine_knowledge_dir(&mnemo::config::resolve_config_dir(None));
     let guard = claim(&app, MaintenanceOp::Index)?;
 
     tauri::async_runtime::spawn(async move {
@@ -338,7 +342,7 @@ pub async fn memory_rebuild_index(
                     },
                 );
             };
-            api.rebuild_index(&plans_dir, &backlog_path, &report)
+            api.rebuild_index(&plans_dir, &backlog_path, Some(&machine_knowledge), &report)
                 .await
         });
         match run.await {

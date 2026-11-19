@@ -376,6 +376,70 @@ pub(super) fn counted_check(
     Some((command.to_string(), tree_before.to_string()))
 }
 
+/// Every allow-listed passing check a tool result carries, with the unchanged
+/// content tree it measured (plan 5b85ab61 step 3).
+///
+/// `shell` yields at most one run ([`counted_check`]); `run_checks` yields one
+/// per entry of `data.checks` that exited 0, ran the exact allow-listed command
+/// from the checkout root, and measured a tree equal before and after — the
+/// same rules a counted `shell` run obeys, so both tools record identically.
+pub(super) fn counted_checks(
+    tool: &str,
+    args: &Value,
+    result: &ToolResult,
+    checkout: &Path,
+    check_commands: &[String],
+) -> Vec<(String, String)> {
+    if tool == "shell" {
+        return counted_check(tool, args, result, checkout, check_commands)
+            .into_iter()
+            .collect();
+    }
+    if tool != "run_checks" || !result.success {
+        return Vec::new();
+    }
+    let Some(entries) = result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("checks"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let Ok(checkout) = checkout.canonicalize() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.get("exit_code")?.as_i64()? != 0 {
+                return None;
+            }
+            let command = validated_check_command(entry.get("command")?.as_str()?)?;
+            if !check_commands.iter().any(|allowed| allowed == command) {
+                return None;
+            }
+            // `run_checks` always runs from the checkout root; an entry naming
+            // anything else is not this worker's checkout.
+            let cwd = Path::new(entry.get("cwd")?.as_str()?);
+            let cwd = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                checkout.join(cwd)
+            };
+            if cwd.canonicalize().ok()? != checkout {
+                return None;
+            }
+            let tree_before = entry.get("tree_before")?.as_str()?;
+            let tree_after = entry.get("tree_after")?.as_str()?;
+            if tree_before.is_empty() || tree_before != tree_after {
+                return None;
+            }
+            Some((command.to_string(), tree_before.to_string()))
+        })
+        .collect()
+}
+
 async fn record_turn_checks(
     worker_id: &str,
     generation: u64,
@@ -767,7 +831,7 @@ pub(super) async fn pump_worker(
                             .map(|worker| worker.worktree.clone())
                     };
                     if let Some(checkout) = checkout {
-                        if let Some((check, tree)) = counted_check(
+                        for (check, tree) in counted_checks(
                             &name,
                             &parsed,
                             result,

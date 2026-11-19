@@ -50,6 +50,9 @@ cite that instead of re-reading.
 - For a build or test that may run longer than a few minutes, or to work on \
 while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
 Never poll with sleep or Start-Sleep, and never start detached processes.
+- Run the project checks with run_checks before you report: it runs every \
+check and records the passing ones; a check typed into shell counts only when \
+it is the exact command from the checkout root.
 - Send files, ops and lines as real JSON arrays, never as a quoted string. For \
 a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
@@ -498,6 +501,9 @@ cite that instead of re-reading.
 - For a build or test that may run longer than a few minutes, or to work on \
 while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
 Never poll with sleep or Start-Sleep, and never start detached processes.
+- Run the project checks with run_checks before you report: it runs every \
+check and records the passing ones; a check typed into shell counts only when \
+it is the exact command from the checkout root.
 - Send files, ops and lines as real JSON arrays, never as a quoted string. For \
 a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
@@ -1106,8 +1112,11 @@ mod tests {
         // Bumped 2026-11-19 (plan 5b85ab61 step 2): the job-tool bullet —
         // job_start a long build, then job_wait; never poll with sleep and
         // never start detached processes.
+        // Bumped 2026-11-19 (plan 5b85ab61 step 3): the run_checks bullet —
+        // run every project check in one call, and only the exact command from
+        // the checkout root counts in `shell`.
         const GOLDEN_HEAD: &str =
-            "len=13530|sha256=5542b3de3d51e92e6963e29f29730220f4f78c424783bff88fae91e75f98f921";
+            "len=13730|sha256=5e6084c3b152dccda5c3a40d04925119a16cba94799d08f6e4b06017ef4b6794";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",
@@ -2366,6 +2375,9 @@ string. For a change to one file, use file_edit.",
             "- For a build or test that may run longer than a few minutes, or to \
 work on while it runs: job_start it, then job_wait (with a pattern to stop at a \
 line). Never poll with sleep or Start-Sleep, and never start detached processes.",
+            "- Run the project checks with run_checks before you report: it runs \
+every check and records the passing ones; a check typed into shell counts only \
+when it is the exact command from the checkout root.",
         ] {
             assert!(
                 CODING_SYSTEM_PREAMBLE.contains(bullet),

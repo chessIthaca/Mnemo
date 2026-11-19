@@ -889,6 +889,14 @@ pub(crate) fn wire_brain(
     // each plan-step gate) — a save_settings call flips it via
     // factory.set_budget_config.
     let budget_config = Arc::new(std::sync::RwLock::new(config.general.general.budget.clone()));
+    // Machine-wide heavy-command slots (plan d3336a8a step 3): live mirror of
+    // `[general.machine]` plus the machine's slot directory, shared with every
+    // command-running tool the factory builds (read per command) — a
+    // save_settings call flips it via factory.set_machine_config.
+    let machine_config = Arc::new(std::sync::RwLock::new(
+        config.general.general.machine.clone(),
+    ));
+    let machine_dir = crate::host::machine_slots::default_dir(&config_dir);
     // The per-project code knowledge graph (GitNexus-style). Opened here and
     // indexed on a background thread — startup must never block on parsing
     // the codebase. A DB-open failure disables the graph outright (the
@@ -1098,6 +1106,10 @@ pub(crate) fn wire_brain(
             crate::memory::knowledge::machine_knowledge_dir(&config_dir),
         ),
     )))
+    // Wire the machine-wide heavy-command slots ([general.machine]): the limit
+    // and the slot directory are read per command by shell / run_checks / jobs /
+    // step_verify, so a Settings save lands on the next heavy command.
+    .with_machine_config(machine_config, machine_dir)
     // Wire the shared Laya auto-typing gate (backlog a147b63c):
     // memory_write reads the classifier slot + flag at call time, and
     // Settings saves flip the flag via `set_auto_typing_enabled` — no

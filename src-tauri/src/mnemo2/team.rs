@@ -470,7 +470,7 @@ impl TeamRuntime {
             transcript_revs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             board: std::sync::Mutex::new(None),
             proving: proving::Proving::default(),
-            proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs)),
+            proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
             external: std::sync::Mutex::new(ExternalLead::default()),

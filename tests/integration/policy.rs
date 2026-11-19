@@ -146,6 +146,10 @@ const WINDOWS_CFG_FILES: &[(&str, &str)] = &[
         "Windows user-only DACL via windows-sys and icacls",
     ),
     (
+        "src/host/disk.rs",
+        "free space via GetDiskFreeSpaceExW vs statvfs — each platform's own API",
+    ),
+    (
         "src/host/laya.rs",
         "Job Objects, CREATE_NO_WINDOW, process-tree kill",
     ),

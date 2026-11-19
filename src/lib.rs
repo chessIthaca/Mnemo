@@ -86,6 +86,11 @@ pub use crate::host::rewire;
 pub use crate::host::brain;
 pub use crate::host::notifier;
 pub use crate::host::startup;
+// Machine-wide limits shared by every instance on a computer (plan d3336a8a
+// step 3): the app's Machine page reads the free-disk status and the Mnemo2
+// proofs take a heavy-command slot, both on BARE crate-root paths.
+pub use crate::host::disk;
+pub use crate::host::machine_slots;
 pub use crate::runtime::turn_resolve;
 
 #[cfg(test)]

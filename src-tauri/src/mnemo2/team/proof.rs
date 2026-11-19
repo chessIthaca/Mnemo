@@ -31,6 +31,8 @@ use std::os::windows::process::CommandExt;
 
 use serde::Deserialize;
 
+use mnemo::machine_slots::{HeavySlots, SlotGuard};
+
 #[cfg(windows)]
 use mnemo::process_tree::KillOnCloseJob;
 
@@ -450,7 +452,20 @@ impl Drop for TreeKillGuard {
 /// The command's whole process TREE is owned by a [`TreeKillGuard`], so a run
 /// that outlives `limit` — or a proof future dropped mid-run — leaves nothing
 /// behind in the checkout.
-async fn run_shell(script: &str, cwd: &Path, limit: Duration) -> Result<ShellRun, String> {
+async fn run_shell(
+    script: &str,
+    cwd: &Path,
+    limit: Duration,
+    slots: Option<&HeavySlots>,
+) -> Result<ShellRun, String> {
+    // Plan d3336a8a step 3: a proof builds and tests, so it is HEAVY. Wait for
+    // one of the machine's slots BEFORE the timeout clock starts, so a proof
+    // queued behind another instance's build is never reported as a timed-out
+    // proof. The guard lives until this function returns.
+    let _slot = match slots {
+        Some(slots) => slots.acquire(|_| {}).await,
+        None => SlotGuard::none(),
+    };
     let mut command = shell_command(script);
     command
         .current_dir(cwd)
@@ -616,6 +631,7 @@ pub async fn prove_regression(
     tip: String,
     cfg: RegressionCfg,
     test: String,
+    slots: Option<&HeavySlots>,
 ) -> Result<RedOutcome, String> {
     // 1. Preconditions: the proof owns the checkout only while it is exactly at
     //    the tip; anything else is left untouched.
@@ -638,7 +654,7 @@ pub async fn prove_regression(
     let ran = cfg.ran.replace("{name}", &test);
 
     // 2. The test must pass at the tip, or there is nothing to prove.
-    match run_shell(&script, &checkout, REGRESSION_LIMIT).await? {
+    match run_shell(&script, &checkout, REGRESSION_LIMIT, slots).await? {
         ShellRun::TimedOut => {
             return Ok(RedOutcome::Inconclusive {
                 reason: "the regression test did not finish within 20 minutes at the tip"
@@ -719,7 +735,7 @@ pub async fn prove_regression(
         // 4. The test must now fail. A non-zero exit is the proof; a passing
         //    run is the finding; a passing run that no longer reports the test
         //    proves nothing either way.
-        match run_shell(&script, &checkout, REGRESSION_LIMIT).await {
+        match run_shell(&script, &checkout, REGRESSION_LIMIT, slots).await {
             Err(error) => Err(error),
             Ok(ShellRun::TimedOut) => Ok(RedOutcome::Inconclusive {
                 reason: "the regression test did not finish within 20 minutes without the fix"
@@ -848,6 +864,7 @@ pub async fn run_mutation(
     tip: String,
     cfg: MutationCfg,
     worker_id: String,
+    slots: Option<&HeavySlots>,
 ) -> Result<Vec<Mutant>, String> {
     // 1. The run lasts hours: refuse a checkout that is not exactly the tip, so
     //    a stale or dirty tree is never mutated.
@@ -897,7 +914,7 @@ pub async fn run_mutation(
         .replace("{diff}", &diff_file.to_string_lossy())
         .replace("{out}", &out_text);
     let missed_file = cfg.missed.replace("{out}", &out_text);
-    let run = run_shell(&script, &checkout, MUTATION_LIMIT).await?;
+    let run = run_shell(&script, &checkout, MUTATION_LIMIT, slots).await?;
     let output_tail = match &run {
         ShellRun::Finished { output, .. } => tail(output, OUTPUT_TAIL),
         ShellRun::TimedOut => "the run was killed after 3 hours".to_string(),
@@ -1208,7 +1225,7 @@ mod tests {
         let (base, tip) = demo_repo(&root);
         std::fs::create_dir_all(root.join("target")).expect("target dir");
         std::fs::write(root.join("target/warm.txt"), "warm\n").expect("warm cache");
-        let outcome = prove_regression(root.clone(), base, tip.clone(), cfg_for(red_script()), "demo".to_string())
+        let outcome = prove_regression(root.clone(), base, tip.clone(), cfg_for(red_script()), "demo".to_string(), None)
             .await
             .expect("proof");
         match outcome {
@@ -1242,6 +1259,7 @@ mod tests {
             tip.clone(),
             cfg_for(blind_script()),
             "demo".to_string(),
+            None,
         )
         .await
         .expect("proof");
@@ -1268,6 +1286,7 @@ mod tests {
             tip.clone(),
             cfg_for(silent_script()),
             "demo".to_string(),
+            None,
         )
         .await
         .expect("proof");
@@ -1294,6 +1313,7 @@ mod tests {
             tip.clone(),
             cfg_for(scribbling_script()),
             "demo".to_string(),
+            None,
         )
         .await
         .expect("proof");
@@ -1323,6 +1343,7 @@ mod tests {
             tip.clone(),
             cfg_for(red_script()),
             "demo".to_string(),
+            None,
         )
         .await
         .expect("proof");
@@ -1352,6 +1373,7 @@ mod tests {
             tip.clone(),
             cfg_for(mixed_script()),
             "demo".to_string(),
+            None,
         )
         .await
         .expect("proof");
@@ -1381,6 +1403,7 @@ mod tests {
             tip.clone(),
             cfg_for(crlf_red_script()),
             "demo".to_string(),
+            None,
         )
         .await
         .expect("proof");
@@ -1431,6 +1454,7 @@ mod tests {
             tip.clone(),
             cfg_for(slow_second_run_script()),
             "demo".to_string(),
+            None,
         );
         // The second run hangs, so the future is dropped while the checkout is
         // reverse-applied: the guard's drop must put it back.
@@ -1478,7 +1502,7 @@ mod tests {
             .expect("child script");
             format!("sh '{}' & sleep 60", child.display())
         };
-        let run = run_shell(&script, &root, Duration::from_secs(1))
+        let run = run_shell(&script, &root, Duration::from_secs(1), None)
             .await
             .expect("run");
         assert!(matches!(run, ShellRun::TimedOut), "the run must time out");
@@ -1513,6 +1537,7 @@ mod tests {
             tip.clone(),
             cfg,
             "worker-1".to_string(),
+            None,
         )
         .await
         .expect_err("a dirty checkout must be refused");
@@ -1523,6 +1548,47 @@ mod tests {
         );
         assert!(!root.join("ran.txt").exists(), "the tool must not have run");
         assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
+    }
+
+    /// Plan d3336a8a (finding proofConfigDir): a proof takes its machine slot in
+    /// the RUNTIME's config dir — the same pool as the instance's own heavy
+    /// commands — never in a re-resolved `~/.mnemo`. A held slot in the temp
+    /// config dir makes the proof wait, and the real home directory is never
+    /// touched.
+    #[tokio::test]
+    async fn a_proof_takes_its_slot_in_the_runtime_config_dir() {
+        let dir = tempfile::tempdir().expect("dir");
+        let config_dir = dir.path().to_path_buf();
+        let slots_dir = mnemo::machine_slots::default_dir(&config_dir);
+        let slots = HeavySlots::new(slots_dir.clone(), 1);
+        let held = slots
+            .try_take()
+            .guard()
+            .expect("the temp dir's only slot is free");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(held);
+        });
+        let probe = HeavySlots::new(slots_dir, 1);
+        let started = std::time::Instant::now();
+        let run = run_shell(
+            "echo proof",
+            &config_dir,
+            Duration::from_secs(120),
+            Some(&probe),
+        )
+        .await
+        .expect("the proof command runs");
+        let elapsed = started.elapsed();
+        release.join().expect("release thread");
+        assert!(
+            matches!(run, ShellRun::Finished { success: true, .. }),
+            "the proof ran to completion"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "the proof queued for the slot held in its own config dir, took {elapsed:?}"
+        );
     }
 
     #[test]

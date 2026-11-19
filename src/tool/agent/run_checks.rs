@@ -36,6 +36,7 @@
 //! become a way around the `never_auto_for` gate `shell` and `git` enforce. The
 //! remaining checks still run.
 
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,8 @@ use super::shell::{
     combine_streams, command_is_core_git_op, run_command, validated_check_command, RunLimits,
     RunOutcome, DEFAULT_SILENCE, DEFAULT_TOTAL,
 };
+use crate::config::MachineConfig;
+use crate::host::machine_slots::{wait_note, HeavySlots};
 use crate::project::git_ops::content_tree;
 use crate::provider::ToolSchema;
 use crate::tool::agent::read_files::invalid_args_error;
@@ -94,6 +97,13 @@ pub struct RunChecksTool {
     /// The silence limit and the hard cap applied to every check run (plan
     /// 5b85ab61): the shell defaults unless a test overrides them.
     limits: RunLimits,
+    /// Machine-wide heavy-command limit (the `[general.machine]` section, plan
+    /// d3336a8a). Every check run is heavy, so every check waits for one of the
+    /// machine's slots.
+    machine: Arc<RwLock<MachineConfig>>,
+    /// The machine's heavy-slot directory (`<config dir>/run/heavy`). `None`
+    /// (headless, unit tests) runs checks unslotted.
+    slots_dir: Option<PathBuf>,
 }
 
 impl RunChecksTool {
@@ -108,7 +118,31 @@ impl RunChecksTool {
                 silence: Some(DEFAULT_SILENCE),
                 total: DEFAULT_TOTAL,
             },
+            machine: Arc::new(RwLock::new(MachineConfig::default())),
+            slots_dir: None,
         }
+    }
+
+    /// Wire the shared `[general.machine]` handle and the machine's slot
+    /// directory: EVERY check command is heavy, so each one waits for a free
+    /// machine slot before it spawns (plan d3336a8a step 3). The slot is taken
+    /// per command, so two instances can interleave their check runs.
+    pub fn with_machine(mut self, cfg: Arc<RwLock<MachineConfig>>, slots_dir: PathBuf) -> Self {
+        self.machine = cfg;
+        self.slots_dir = Some(slots_dir);
+        self
+    }
+
+    /// The heavy-slot policy for one check command: `None` when the machine
+    /// handle is not wired.
+    fn heavy_slots(&self) -> Option<HeavySlots> {
+        let dir = self.slots_dir.clone()?;
+        let slots = self
+            .machine
+            .read()
+            .expect("machine config lock poisoned")
+            .heavy_commands;
+        Some(HeavySlots::new(dir, slots))
     }
 
     /// The session's check commands to run, in order. Invalid entries (chained,
@@ -228,8 +262,19 @@ impl Tool for RunChecksTool {
             // copies the index and writes nothing into the checkout, so the two
             // hashes describe exactly what the command changed.
             let tree_before = content_tree(&cwd).await.unwrap_or_default();
+            // Every check command is heavy (plan d3336a8a step 3): it waits for
+            // one of the machine's slots, held for exactly this command.
+            let slots = self.heavy_slots();
             let started = Instant::now();
-            let outcome = run_command(command, &cwd, self.limits, None, None).await;
+            let (outcome, waited) = run_command(
+                command,
+                &cwd,
+                self.limits,
+                None,
+                None,
+                slots.as_ref(),
+            )
+            .await;
             let elapsed = started.elapsed();
             let tree_after = content_tree(&cwd).await.unwrap_or_default();
             let (exit_code, headline, combined) = match outcome {
@@ -286,6 +331,12 @@ impl Tool for RunChecksTool {
                     block.push('\n');
                     block.push_str(&diagnostics);
                 }
+            }
+            // Plan d3336a8a step 3: a check that queued behind another
+            // instance's build says how long it waited.
+            if let Some(note) = wait_note(waited) {
+                block.push('\n');
+                block.push_str(&note);
             }
             blocks.push(block);
             entries.push(json!({

@@ -63,7 +63,8 @@ use super::shell::{
     JobLogTap, RunLimits, RunOutcome,
 };
 use super::shell_filter::filter_shell_output;
-use crate::config::ShellFilterConfig;
+use crate::config::{MachineConfig, ShellFilterConfig};
+use crate::host::machine_slots::{is_heavy, wait_note, HeavySlots};
 use crate::provider::ToolSchema;
 use crate::tool::agent::read_files::invalid_args_error;
 use crate::tool::agent::tool_contract;
@@ -282,6 +283,15 @@ pub struct JobRegistry {
     /// Shared with the shell tool: a job's tail must be filtered exactly like a
     /// shell result, and a Settings save must reach both.
     filter_config: Arc<RwLock<ShellFilterConfig>>,
+    /// Machine-wide heavy-command limit (the `[general.machine]` section, plan
+    /// d3336a8a). Read when a job starts, so a Settings save applies to the
+    /// next job without a registry rebuild.
+    machine: Arc<RwLock<MachineConfig>>,
+    /// The machine's heavy-slot directory (`<config dir>/run/heavy`). `None`
+    /// (headless, unit tests) runs jobs unslotted.
+    slots_dir: Option<PathBuf>,
+    /// The session's exact check commands: a job running one counts as heavy.
+    check_commands: Vec<String>,
     inner: Mutex<RegistryState>,
 }
 
@@ -302,12 +312,48 @@ impl JobRegistry {
         Self {
             sandbox,
             filter_config,
+            machine: Arc::new(RwLock::new(MachineConfig::default())),
+            slots_dir: None,
+            check_commands: Vec::new(),
             inner: Mutex::new(RegistryState {
                 next_id: 0,
                 dir: None,
                 jobs: BTreeMap::new(),
             }),
         }
+    }
+
+    /// Wire the shared `[general.machine]` handle and the machine's slot
+    /// directory: a job running a HEAVY command waits for a machine slot before
+    /// its run starts (plan d3336a8a step 3).
+    pub fn with_machine(mut self, cfg: Arc<RwLock<MachineConfig>>, slots_dir: PathBuf) -> Self {
+        self.machine = cfg;
+        self.slots_dir = Some(slots_dir);
+        self
+    }
+
+    /// The session's exact check commands: a job running one is heavy.
+    pub fn with_check_commands(mut self, commands: Vec<String>) -> Self {
+        self.check_commands = commands
+            .into_iter()
+            .filter_map(|command| validated_check_command(&command).map(str::to_string))
+            .collect();
+        self
+    }
+
+    /// The heavy-slot policy for a job's command: `None` when the machine
+    /// handle is not wired or the command is light.
+    fn heavy_slots(&self, command: &str) -> Option<HeavySlots> {
+        let dir = self.slots_dir.clone()?;
+        if !is_heavy(command, &self.check_commands) {
+            return None;
+        }
+        let slots = self
+            .machine
+            .read()
+            .expect("machine config lock poisoned")
+            .heavy_commands;
+        Some(HeavySlots::new(dir, slots))
     }
 
     /// Resolve and sandbox-validate the working directory — the same contract
@@ -362,6 +408,7 @@ impl JobRegistry {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let writer = tokio::spawn(write_job_log(rx, log_path, state.clone()));
         let tap = JobLogTap::new(tx.clone());
+        let slots = self.heavy_slots(command);
         let task = tokio::spawn(run_job(
             state.clone(),
             command.to_string(),
@@ -369,6 +416,7 @@ impl JobRegistry {
             tx,
             writer,
             tap,
+            slots,
         ));
 
         let mut inner = self.inner.lock().expect("job registry lock poisoned");
@@ -515,12 +563,18 @@ async fn run_job(
     tx: tokio::sync::mpsc::UnboundedSender<(ToolOutputStream, String)>,
     writer: tokio::task::JoinHandle<()>,
     tap: JobLogTap,
+    slots: Option<HeavySlots>,
 ) {
     let limits = RunLimits {
         silence: None,
         total: JOB_TOTAL,
     };
-    let outcome = run_command(&command, &cwd, limits, None, Some(tap)).await;
+    let (outcome, waited) = run_command(&command, &cwd, limits, None, Some(tap), slots.as_ref()).await;
+    // Plan d3336a8a step 3: a job that queued for a machine build slot says so
+    // in its own log — the model reading the log is the one who sees it.
+    if let Some(note) = wait_note(waited) {
+        let _ = tx.send((ToolOutputStream::Stdout, format!("{note}\n")));
+    }
     // No more senders from this task: the writer drains what the readers sent
     // and closes the file, so a query never races the last lines.
     drop(tx);

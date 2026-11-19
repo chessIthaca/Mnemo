@@ -54,6 +54,7 @@ use crate::tool::agent::{
     file_write::FileWriteTool,
     git::GitTool,
     git_read_tool::GitReadTool,
+    jobs::{JobKillTool, JobRegistry, JobStartTool, JobTailTool, JobWaitTool},
     image_tools::tools::{
         ImageAnalysisTool, ImageAnalyzeChartTool, ImageDiagnoseErrorTool, ImageExtractTextTool,
         ImageUiDiffTool, ImageUiToArtifactTool, ImageUnderstandDiagramTool,
@@ -1590,6 +1591,36 @@ impl AgentLoopFactory {
                     .with_optimizer(Arc::clone(&self.optimizer)),
             ));
         }
+        // Long commands without polling (plan 5b85ab61 step 2): ONE registry per
+        // agent session's tool set, so every job's tree dies with the session
+        // (stop, merge, app exit) instead of outliving its call.
+        let wants_jobs = ["job_start", "job_wait", "job_tail", "job_kill"]
+            .iter()
+            .any(|name| want(ToolGroup::Shell, name));
+        if wants_jobs {
+            let jobs = Arc::new(JobRegistry::new(
+                sandbox.clone(),
+                Arc::clone(&self.shell_filter),
+            ));
+            if want(ToolGroup::Shell, "job_start") {
+                registry.register(Box::new(
+                    JobStartTool::new(Arc::clone(&jobs), Arc::clone(&self.core_operations))
+                        .with_check_commands(
+                            root.map(|spec| spec.check_commands.clone())
+                                .unwrap_or_default(),
+                        ),
+                ));
+            }
+            if want(ToolGroup::Shell, "job_wait") {
+                registry.register(Box::new(JobWaitTool::new(Arc::clone(&jobs))));
+            }
+            if want(ToolGroup::Shell, "job_tail") {
+                registry.register(Box::new(JobTailTool::new(Arc::clone(&jobs))));
+            }
+            if want(ToolGroup::Shell, "job_kill") {
+                registry.register(Box::new(JobKillTool::new(jobs)));
+            }
+        }
         let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone())
             .with_staleness_log(self.staleness_log.clone());
         let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone())
@@ -2707,7 +2738,12 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Planning at 17_568 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Planning, 17_800),
+            // 17_800 → 18_900 (2026-11-19): the job tools (plan 5b85ab61
+            // step 2) — job_wait/job_tail/job_kill are Agent + AutoRun, so
+            // they ride the Planning set; measures Planning at 18_379 chars
+            // after their descriptions were trimmed. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Planning, 18_900),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -2836,7 +2872,11 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Executing at 31_562 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Executing, 31_700),
+            // 31_700 → 33_400 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // ride the shell surface — Executing carries all four schemas;
+            // measures Executing at 32_906 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::Executing, 33_400),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -2905,7 +2945,12 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures PlanFrozen at 32_455 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::PlanFrozen, 32_600),
+            // 32_600 → 34_700 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // — same cause and figure class as the Executing raise above
+            // (PlanFrozen = Executing ∪ finish); measures PlanFrozen at 33_799
+            // chars after their descriptions were trimmed. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 34_700),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -2977,7 +3022,11 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures ExecutingResearch at 23_079 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::ExecutingResearch, 23_300),
+            // 23_300 → 25_400 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // ride the shell surface into the research set too; measures
+            // ExecutingResearch at 24_423 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::ExecutingResearch, 25_400),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -3067,7 +3116,11 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Reviewing at 25_579 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Reviewing, 25_700),
+            // 25_700 → 27_400 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // share the advertised array (Reviewing carries every Agent tool's
+            // schema); measures Reviewing at 26_923 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Reviewing, 27_400),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -3116,7 +3169,10 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Complete at 17_568 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Complete, 17_800),
+            // 17_800 → 18_900 (2026-11-19): same cause as the Planning raise
+            // (plan 5b85ab61 step 2 — Complete carries the same read-only job
+            // readers). Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Complete, 18_900),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(
@@ -3545,6 +3601,12 @@ mod tests {
             "file_write",
             "convert_line_endings",
             "shell",
+            // long commands without polling (plan 5b85ab61 step 2): one job
+            // registry per session, four tools on the shell surface.
+            "job_start",
+            "job_wait",
+            "job_tail",
+            "job_kill",
             "search",
             "search_read",
             "git",
@@ -3719,6 +3781,12 @@ mod tests {
             "file_edit",
             "file_write",
             "shell",
+            // The job tools ride the shell surface, so the free agent gets
+            // them too (plan 5b85ab61 step 2).
+            "job_start",
+            "job_wait",
+            "job_tail",
+            "job_kill",
             "search",
             "web_fetch",
             "load_tools",
@@ -3736,7 +3804,7 @@ mod tests {
         // platform (the on-screen WebView2 tools are gone).
         // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
         let browser = if cfg!(feature = "browser") { 10 } else { 0 };
-        let expected = 26 + browser;
+        let expected = 30 + browser;
         assert_eq!(
             count,
             expected,
@@ -3831,7 +3899,7 @@ mod tests {
         // platform (the on-screen WebView2 tools are gone).
         // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
         let browser = if cfg!(feature = "browser") { 10 } else { 0 };
-        let expected = 25 + browser;
+        let expected = 29 + browser;
         assert_eq!(
             count,
             expected,
@@ -3981,6 +4049,13 @@ mod tests {
             vec![
                 "expand_result",
                 "git_read",
+                // The three job readers/watchdogs are Agent+AutoRun on purpose
+                // (plan 5b85ab61 step 2): they only read or stop THIS session's
+                // own jobs and start no process — `job_start` is the
+                // NeedsApproval half and stays behind the allow-list.
+                "job_kill",
+                "job_tail",
+                "job_wait",
                 "load_tools",
                 "read_files",
                 "search",

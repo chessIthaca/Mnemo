@@ -100,7 +100,7 @@ pub(crate) fn audit_prompt() -> PromptSpec {
 /// shell, no git writes, no spawning, no user questions, no plan-board or
 /// step ticks, and no durable-memory mutations (writes, amendments, or
 /// consolidation).
-fn audit_guardrails() -> Guardrails {
+pub(super) fn audit_guardrails() -> Guardrails {
     let mut tools = ToolSelection::all();
     tools.exclude = vec![
         "create_plan".to_string(),
@@ -113,6 +113,13 @@ fn audit_guardrails() -> Guardrails {
         "multi_edit".to_string(),
         "convert_line_endings".to_string(),
         "shell".to_string(),
+        // A job runs commands too, so the whole job surface is a mutation
+        // path: an audit worker must not be able to start, wait on, tail or
+        // kill a job (plan 5b85ab61 step 2).
+        "job_start".to_string(),
+        "job_wait".to_string(),
+        "job_tail".to_string(),
+        "job_kill".to_string(),
         "git".to_string(),
         "memory_write".to_string(),
         "memory_amend".to_string(),
@@ -189,23 +196,27 @@ fn executor_gate_rules() -> Vec<GateRule> {
         "git",
         r#"(?i)"action":"(?:push|merge|checkout)""#.to_string(),
     ));
-    // The `shell` tool: any git invocation, however chained or qualified.
+    // The `shell` tool and `job_start` — a job runs the same commands, so it
+    // must not become a way around the gate: any git invocation, however
+    // chained or qualified.
     let pre = SHELL_CMD_PREFIX;
     let git = SHELL_GIT;
-    for sub in [
-        r"(?:push|merge|rebase|switch|worktree)\b",
-        // Branch deletion: `-d`, `-D`, a combined short flag, or `--delete`.
-        r#"branch\s+(?:[^;&|\\"]*\s)?(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)(?:\s|[;&|\\"]|$)"#,
-    ] {
-        rules.push(deny_rule("shell", format!("{pre}{git}{sub}")));
+    for tool in ["shell", "job_start"] {
+        for sub in [
+            r"(?:push|merge|rebase|switch|worktree)\b",
+            // Branch deletion: `-d`, `-D`, a combined short flag, or `--delete`.
+            r#"branch\s+(?:[^;&|\\"]*\s)?(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)(?:\s|[;&|\\"]|$)"#,
+        ] {
+            rules.push(deny_rule(tool, format!("{pre}{git}{sub}")));
+        }
+        // `checkout` of a branch; `checkout -- paths` and `checkout rev -- paths`
+        // restore files and stay allowed.
+        rules.push(deny_rule(
+            tool,
+            format!("{pre}{git}checkout(?:\\s+{SHELL_ARG_NOT_DASHDASH})+{SHELL_CMD_END}"),
+        ));
+        rules.push(deny_rule(tool, format!(r"{pre}gh\s+pr\b")));
     }
-    // `checkout` of a branch; `checkout -- paths` and `checkout rev -- paths`
-    // restore files and stay allowed.
-    rules.push(deny_rule(
-        "shell",
-        format!("{pre}{git}checkout(?:\\s+{SHELL_ARG_NOT_DASHDASH})+{SHELL_CMD_END}"),
-    ));
-    rules.push(deny_rule("shell", format!(r"{pre}gh\s+pr\b")));
     rules
 }
 

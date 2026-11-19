@@ -22,7 +22,7 @@ use super::deletion::{
 use super::dispatch::{
     dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
 };
-use super::guardrails::executor_guardrails;
+use super::guardrails::{audit_guardrails, executor_guardrails};
 use super::lead_tools::worker_status_view;
 use super::merge::{delete_merged_branch, merge_tip, validate_merge, WORKTREE_CLEANUP_ERROR};
 use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
@@ -330,6 +330,63 @@ async fn executor_gate_denies_integration_through_the_shell() {
         )
         .await
     );
+}
+
+/// A job runs the same commands as `shell`, so the gate that keeps workers out
+/// of integration must cover `job_start` too (plan 5b85ab61 step 2) — otherwise
+/// a worker could push or merge by wrapping the command in a job.
+#[tokio::test]
+async fn executor_gate_denies_integration_through_job_start() {
+    for command in [
+        "git push",
+        "git -C ../repo push",
+        "cargo test && git push",
+        "git merge wt/other",
+        "git checkout main",
+        "gh pr create",
+    ] {
+        assert!(
+            executor_denies(
+                "job_start",
+                json!({"command": command, "purpose": "building"})
+            )
+            .await,
+            "{command}"
+        );
+    }
+    for command in [
+        "cargo test --workspace",
+        "cargo clippy --workspace --all-targets",
+        "git status",
+    ] {
+        assert!(
+            !executor_denies(
+                "job_start",
+                json!({"command": command, "purpose": "building"})
+            )
+            .await,
+            "{command}"
+        );
+    }
+}
+
+/// The audit worker is read-only by construction: the job tools ride
+/// `ToolGroup::Shell`, so they must be excluded from its surface by name
+/// (plan 5b85ab61 step 2).
+#[test]
+fn audit_surface_excludes_the_job_tools() {
+    let audit = audit_guardrails().tools.exclude;
+    let executor = executor_guardrails().tools.exclude;
+    for tool in ["job_start", "job_wait", "job_tail", "job_kill"] {
+        assert!(
+            audit.iter().any(|excluded| excluded == tool),
+            "the audit surface still allows {tool}"
+        );
+        assert!(
+            !executor.iter().any(|excluded| excluded == tool),
+            "the executor surface lost {tool}"
+        );
+    }
 }
 
 #[test]

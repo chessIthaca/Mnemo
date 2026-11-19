@@ -76,24 +76,38 @@ impl EndpointLimits {
         }
     }
 
-    /// Take one of the endpoint's slots, waiting while every one is held by
-    /// another request on this machine (this process or any other instance).
+    /// Take one of the endpoint's slots for one send, honouring the shared
+    /// cooldown on BOTH sides of the wait.
+    ///
+    /// 1. Sleep out a cooldown another request (any instance) left behind.
+    /// 2. Take a slot, waiting while every one is held.
+    /// 3. Re-read the cooldown and sleep out whatever remains — WITH the slot
+    ///    held.
+    ///
+    /// Step 3 is what keeps a queued request honest (finding
+    /// queuedIgnoresCooldown): the request that releases a slot is often the
+    /// one whose 429 armed the cooldown, so a request that only checked before
+    /// queuing would send straight into the new cooldown. Sleeping here keeps
+    /// the queue ordered: nobody behind the 429 slips past it.
     ///
     /// An unlimited endpoint and an unusable run folder both return
-    /// [`SlotGuard::none`] — the request goes out immediately.
+    /// [`SlotGuard::none`]; both still honour the cooldown.
     pub async fn acquire(&self) -> SlotGuard {
+        self.wait_cooldown().await;
         let Some(max) = self.max_concurrent else {
             return SlotGuard::none();
         };
         let slots = HeavySlots::with_slots(self.dir.clone(), max.max(1) as usize);
         let name = self.name.clone();
-        slots
+        let slot = slots
             .acquire(move |count| {
                 eprintln!(
                     "waiting for a request slot at endpoint '{name}' ({count} in flight)"
                 );
             })
-            .await
+            .await;
+        self.wait_cooldown().await;
+        slot
     }
 
     /// Sleep out a cooldown another request (any instance) left behind.
@@ -359,6 +373,15 @@ fn human_duration(wait: Duration) -> String {
 mod tests {
     use super::*;
 
+    /// A unique run dir under the OS temp folder, removed by the caller.
+    fn temp_run_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "mnemo-endpoint-limits-{}-{}",
+            std::process::id(),
+            now_ms()
+        ))
+    }
+
     #[test]
     fn retry_after_delta_seconds() {
         assert_eq!(parse_retry_after("120", 1_000), Some(121_000));
@@ -403,16 +426,54 @@ mod tests {
 
     #[test]
     fn cooldown_file_round_trips_through_the_guard() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mnemo-endpoint-limits-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let tmp = temp_run_dir();
         let limits = EndpointLimits::new(&tmp, "ep", Some(2));
         assert_eq!(cooldown_until_ms(&limits.dir), None);
         std::fs::create_dir_all(&limits.dir).unwrap();
         crate::config::write_atomic(&limits.dir.join(COOLDOWN_FILE), "1234\n").unwrap();
         assert_eq!(cooldown_until_ms(&limits.dir), Some(1234));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Finding cooldownMaxUntested: `note_rate_limited` keeps the LARGER of
+    /// the stored and the new value, so a short `Retry-After` arriving while
+    /// a long cooldown is armed can never shrink it (every instance would
+    /// otherwise start sending again early), while a longer one extends it.
+    #[tokio::test]
+    async fn a_shorter_retry_after_never_shrinks_the_cooldown() {
+        let tmp = temp_run_dir();
+        let limits = EndpointLimits::new(&tmp, "ep", None);
+
+        limits.note_rate_limited(Some("120")).await;
+        let long = cooldown_until_ms(&limits.dir).expect("the first 429 writes a cooldown");
+        let now = now_ms();
+        assert!(
+            long >= now + 110_000 && long <= now + 130_000,
+            "~120 s out, got {long} vs now {now}"
+        );
+
+        // A second 429 asking for ONE second must not shrink it.
+        limits.note_rate_limited(Some("1")).await;
+        assert_eq!(
+            cooldown_until_ms(&limits.dir),
+            Some(long),
+            "a shorter Retry-After must keep the longer cooldown"
+        );
+
+        // A 429 without a usable Retry-After (the 30 s default) must not
+        // shrink it either.
+        limits.note_rate_limited(None).await;
+        assert_eq!(cooldown_until_ms(&limits.dir), Some(long));
+
+        // A LONGER Retry-After does extend it.
+        limits.note_rate_limited(Some("600")).await;
+        let extended = cooldown_until_ms(&limits.dir).expect("still armed");
+        let now = now_ms();
+        assert!(
+            extended > long && extended >= now + 590_000,
+            "~600 s out, got {extended} vs now {now} (old {long})"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -5342,3 +5342,56 @@ async fn no_limit_no_lock() {
     );
     assert_eq!(peak_and_count(&stub), (1, 1));
 }
+
+/// Finding queuedIgnoresCooldown: a request queued for a slot must not slip
+/// past a cooldown armed by the request it queued behind. With
+/// `max_concurrent = 1`, A holds the only slot and gets a 429 with
+/// `Retry-After: 1`; B is already waiting for the slot, so it acquires the
+/// moment A releases it — the very release the 429 causes. B must then sleep
+/// out the remainder of the cooldown WITH the slot held, so its send reaches
+/// the stub at least ~900 ms after A's, not straight away.
+#[tokio::test]
+async fn a_request_queued_behind_a_429_waits_out_the_cooldown() {
+    let run_dir = tempfile::tempdir().expect("temp run dir");
+    let stub = LimitsStub::start(
+        vec![
+            LimitsResponse {
+                status: 429,
+                content_type: "application/json",
+                headers: "retry-after: 1\r\n",
+                body: "{\"error\":{\"message\":\"rate limited\"}}",
+            },
+            LimitsResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: "",
+                body: SSE_OK,
+            },
+        ],
+        // Hold every response briefly, so B is queued on the slot before A's
+        // 429 releases it — the exact interleaving of the finding.
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    let first = limits_client(&stub, run_dir.path(), Some(1));
+    let second = limits_client(&stub, run_dir.path(), Some(1));
+    let (a_msgs, b_msgs) = ([Message::user_text("a")], [Message::user_text("b")]);
+    let (a, b) = tokio::join!(
+        first.complete(&a_msgs, &[], None),
+        second.complete(&b_msgs, &[], None),
+    );
+    assert!(a.is_err(), "the first request ends with the 429");
+    drain_completion(b.expect("the queued request still goes out")).await;
+
+    let (peak, count) = peak_and_count(&stub);
+    assert_eq!(count, 2, "both requests reached the stub");
+    assert_eq!(peak, 1, "max_concurrent = 1 holds across the whole exchange");
+    let gap = {
+        let arrivals = stub.arrivals.lock().expect("arrivals lock");
+        arrivals[1].duration_since(arrivals[0])
+    };
+    assert!(
+        gap >= std::time::Duration::from_millis(900),
+        "the queued send must wait out the cooldown, but it arrived {gap:?} after the 429ing one"
+    );
+}

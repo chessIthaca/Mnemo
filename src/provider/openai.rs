@@ -694,16 +694,16 @@ impl OpenAiClient {
         prepared: &PreparedRequest,
         sent_at: std::time::Instant,
     ) -> Result<(reqwest::Response, SlotGuard)> {
-        // Machine-wide limits (plan d3336a8a step 4): wait out a cooldown
-        // another instance left on this endpoint, then take one of the
-        // endpoint's request slots. The slot travels WITH the response so the
-        // caller holds it until the body is fully read (the stream task drops
-        // it at EOF, on error or on cancel).
+        // Machine-wide limits (plan d3336a8a step 4): `acquire` sleeps out
+        // any cooldown another instance left on this endpoint, takes one of the
+        // endpoint's request slots, then re-checks the cooldown ONCE THE SLOT
+        // IS OURS — the request that released it is usually the 429ing one, so
+        // a request that only checked before queuing would send inside the new
+        // cooldown (finding queuedIgnoresCooldown). The slot travels WITH the
+        // response so the caller holds it until the body is fully read (the
+        // stream task drops it at EOF, on error or on cancel).
         let slot = match &self.limits {
-            Some(limits) => {
-                limits.wait_cooldown().await;
-                limits.acquire().await
-            }
+            Some(limits) => limits.acquire().await,
             None => SlotGuard::none(),
         };
         // The (log, record id) pair the body wrapper stamps into.

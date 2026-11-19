@@ -144,12 +144,17 @@ pub fn validate_endpoint(draft: EndpointDraft) -> Result<Endpoint, String> {
         })
         .collect::<Vec<_>>();
     // Machine-wide concurrency cap (plan d3336a8a step 4): empty means
-    // unlimited. `0` would block every request forever, so it is rejected
-    // rather than silently treated as unlimited; 64 is the ceiling the
-    // Endpoints page offers. Anthropic endpoints clear it, mirroring
-    // `workspace_id` above: the cap is an OpenAI/Local feature, so a stale
-    // value on an Anthropic endpoint would be invisible once the form hides
-    // the field.
+    // unlimited. The cap is an OpenAI/Local feature and the Endpoints form
+    // hides the field on an Anthropic endpoint, so a value left over from
+    // another kind is cleared BEFORE the bounds check — a hidden field must
+    // never block the save (finding hiddenFieldValidation). `0` would block
+    // every request forever, so it is rejected rather than silently treated
+    // as unlimited; 64 is the ceiling the page offers.
+    let max_concurrent = if kind == EndpointKind::Anthropic {
+        None
+    } else {
+        max_concurrent
+    };
     let max_concurrent = match max_concurrent {
         None => None,
         Some(0) => {
@@ -160,7 +165,6 @@ pub fn validate_endpoint(draft: EndpointDraft) -> Result<Endpoint, String> {
         Some(n) if n > 64 => {
             return Err(format!("endpoint '{name}': max_concurrent must be at most 64"));
         }
-        Some(_) if kind == EndpointKind::Anthropic => None,
         Some(n) => Some(n),
     };
     Ok(Endpoint {
@@ -582,6 +586,31 @@ mod tests {
         })
         .unwrap();
         assert_eq!(anthropic.max_concurrent, None, "anthropic kinds drop it");
+    }
+
+    /// Finding hiddenFieldValidation: the Endpoints form hides the cap on an
+    /// Anthropic endpoint, so a value left over from another kind must be
+    /// cleared BEFORE the bounds check — an out-of-range number in a field the
+    /// user cannot see must never block saving the endpoint.
+    #[test]
+    fn anthropic_draft_with_a_stale_cap_still_saves() {
+        for stale in [0, 65, 1_000] {
+            let ep = validate_endpoint(EndpointDraft {
+                name: "claude".into(),
+                kind: "anthropic".into(),
+                base_url: "https://api.anthropic.com/v1/".into(),
+                models: vec!["claude-sonnet-4-5".to_string()],
+                max_concurrent: Some(stale),
+                ..Default::default()
+            })
+            .unwrap_or_else(|error| {
+                panic!("a stale Anthropic cap ({stale}) must not block the save: {error}")
+            });
+            assert_eq!(
+                ep.max_concurrent, None,
+                "the hidden cap must be cleared, not persisted"
+            );
+        }
     }
 
     #[test]

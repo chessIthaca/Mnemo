@@ -106,6 +106,21 @@ pub struct MachineWire {
     /// dir's when it lives on a different volume. Empty when neither volume
     /// can be read.
     pub disks: Vec<DiskWire>,
+    /// The read-only shared-build-cache line (plan d3336a8a step 7).
+    pub sccache: SccacheWire,
+}
+
+/// The Machine page's read-only "Shared Rust build cache" line.
+///
+/// `sccache` is discovered on `PATH`, never configured: when it is there, every
+/// agent command, verification and proof run gets `RUSTC_WRAPPER` pointing at
+/// it, so the whole machine compiles each dependency graph once.
+#[derive(Debug, Clone, Serialize)]
+pub struct SccacheWire {
+    /// Whether an `sccache` binary is on `PATH`.
+    pub found: bool,
+    /// The resolved binary, for the page to name it; `null` when not found.
+    pub path: Option<String>,
 }
 
 /// One "Free disk" line of the Machine page.
@@ -276,8 +291,20 @@ pub(crate) fn model_settings_read_for(
             min_heavy_commands: mnemo::config::MIN_HEAVY_COMMANDS,
             max_heavy_commands: mnemo::config::MAX_HEAVY_COMMANDS,
             disks: disk_wires(setup.config_dir(), project_root),
+            sccache: sccache_wire(),
         },
     })
+}
+
+/// The Machine page's build-cache line: re-resolved on every Settings read, so
+/// a `cargo install sccache` done while the app runs shows up the next time the
+/// page opens, without a restart (plan d3336a8a step 7).
+fn sccache_wire() -> SccacheWire {
+    let found = mnemo::sccache::refresh();
+    SccacheWire {
+        path: found.as_ref().map(|path| path.display().to_string()),
+        found: found.is_some(),
+    }
 }
 
 /// The Machine page's disk lines: the open project's volume, plus the config

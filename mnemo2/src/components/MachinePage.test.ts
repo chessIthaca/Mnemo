@@ -37,6 +37,7 @@ function sampleSettings(machine?: Partial<ModelSettings["machine"]>): ModelSetti
       min_heavy_commands: 1,
       max_heavy_commands: 16,
       disks: [{ role: "project", volume: "C:", free_gb: 123 }],
+      sccache: { found: false, path: null },
       ...machine,
     },
   };
@@ -99,5 +100,19 @@ describe("MachinePage", () => {
       "Builds and tests at once must be a whole number from 1 to 16",
     );
     expect(transport.save).not.toHaveBeenCalled();
+  });
+
+  it("names sccache when the shared build cache was found", async () => {
+    page(sampleSettings({ sccache: { found: true, path: "C:\\Users\\me\\.cargo\\bin\\sccache.exe" } }));
+    expect(
+      await screen.findByText("Shared Rust build cache: sccache (C:\\Users\\me\\.cargo\\bin\\sccache.exe)"),
+    ).toBeTruthy();
+  });
+
+  it("says how to install sccache when none was found", async () => {
+    page();
+    expect(
+      await screen.findByText("Shared Rust build cache: off; install it with cargo install sccache"),
+    ).toBeTruthy();
   });
 });

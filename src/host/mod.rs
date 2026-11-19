@@ -19,6 +19,7 @@ pub mod index_progress;
 pub mod disk;
 pub mod laya;
 pub mod machine_slots;
+pub mod sccache;
 pub mod maintenance;
 pub mod memory_watcher;
 pub mod notifier;

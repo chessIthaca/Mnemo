@@ -28,6 +28,7 @@
     draft: emptyDraft(),
     original: emptyDraft(),
     disks: [] as MachineSection["disks"],
+    sccache: { found: false, path: null } as MachineSection["sccache"],
     saving: false,
     error: "",
     saved: false,
@@ -52,6 +53,7 @@
         machine.draft = machineDraft(settings.machine);
         machine.original = machineDraft(settings.machine);
         machine.disks = settings.machine.disks;
+        machine.sccache = settings.machine.sccache;
         loaded = true;
       })
       .catch((failure) => {
@@ -65,6 +67,14 @@
   /** The one read-only line the page shows per volume. */
   function diskLine(disk: MachineSection["disks"][number]): string {
     return `Free disk: ${disk.free_gb} GB on ${disk.volume}`;
+  }
+
+  /** The one read-only build-cache line: found names the binary, absent
+   * explains how to install it (plan d3336a8a step 7). */
+  function sccacheLine(cache: MachineSection["sccache"]): string {
+    return cache.found
+      ? `Shared Rust build cache: sccache (${cache.path ?? ""})`
+      : "Shared Rust build cache: off; install it with cargo install sccache";
   }
 
   /** What the volume is used for, next to its number. */
@@ -134,6 +144,16 @@
         </div>
       </section>
 
+      <section class="group" aria-label="Build cache">
+        <header>
+          <h3>Build cache</h3>
+          <p class="micro">
+            One Rust build cache shared by every window on this computer, so a dependency is compiled once instead of once per window.
+          </p>
+        </header>
+        <p class="cache-line">{sccacheLine(machine.sccache)}</p>
+      </section>
+
       <section class="group" aria-label="Disk space">
         <header>
           <h3>Disk space</h3>
@@ -184,6 +204,8 @@
     font-size: var(--text-body);
   }
   .limit-row .micro { grid-column: 1 / -1; }
+
+  .cache-line { margin: 0; font-size: var(--text-body); overflow-wrap: anywhere; }
 
   .disk-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
   .disk-row { display: flex; align-items: baseline; gap: 10px; font-size: var(--text-body); }

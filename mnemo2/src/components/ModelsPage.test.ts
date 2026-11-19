@@ -48,6 +48,7 @@ function sampleSettings(): ModelSettings {
       min_heavy_commands: 1,
       max_heavy_commands: 16,
       disks: [{ role: "project", volume: "C:", free_gb: 250 }],
+      sccache: { found: false, path: null },
     },
   };
 }

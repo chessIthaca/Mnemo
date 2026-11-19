@@ -98,6 +98,21 @@ export interface MachineSection {
   max_heavy_commands: number;
   /** One line per volume worth showing; empty when none could be read. */
   disks: DiskLine[];
+  /** The read-only shared-build-cache line. */
+  sccache: SccacheLine;
+}
+
+/**
+ * Whether the machine has `sccache` — the shared Rust build cache that every
+ * agent command, verification and proof run uses automatically (plan d3336a8a
+ * step 7). Read-only: there is no toggle, and a user's own `RUSTC_WRAPPER` is
+ * never replaced.
+ */
+export interface SccacheLine {
+  /** Whether an `sccache` binary was found on PATH. */
+  found: boolean;
+  /** The resolved binary path, or `null` when none was found. */
+  path: string | null;
 }
 
 /** The full `model_settings_get` response. */

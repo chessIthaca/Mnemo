@@ -17,12 +17,12 @@ Workers run long builds in one call, edit more reliably, prove their tests, and 
 - Mnemo2 proves a bug fix's regression test fails without the fix, and for high-risk work runs a mutation check that reports changed code no test catches as findings.
 - Recurring review findings become proposals to enforce them, and the Quality tab shows how merged work holds up per tier and model, plus edit attempts and failures by cause.
 - Several Mnemo2 windows share one machine:
-- one Laya server for all of them, ended by a watchdog once no window uses it;
-- a machine-wide limit on heavy builds and tests (Settings → Machine);
-- a per-endpoint "Max requests at once" limit and a shared pause after a rate-limit error;
-- an automatic shared Rust build cache when sccache is installed;
-- an overview of every running window in Mission Control;
-- HOW and DECISION notes in `~/.mnemo/knowledge` that every project finds.
+  - one Laya server for all of them, ended by a watchdog once no window uses it;
+  - a machine-wide limit on heavy builds and tests (Settings → Machine);
+  - a per-endpoint "Max requests at once" limit and a shared pause after a rate-limit error;
+  - an automatic shared Rust build cache when sccache is installed;
+  - an overview of every running window in Mission Control;
+  - HOW and DECISION notes in `~/.mnemo/knowledge` that every project finds.
 - Hand edits of `~/.mnemo/*.toml` reach every running window without a restart.
 - Workers check visual changes with the image tools, and Settings → Models warns when the vision model cannot be used.
 

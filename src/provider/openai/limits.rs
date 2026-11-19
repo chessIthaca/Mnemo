@@ -373,13 +373,17 @@ fn human_duration(wait: Duration) -> String {
 mod tests {
     use super::*;
 
-    /// A unique run dir under the OS temp folder, removed by the caller.
-    fn temp_run_dir() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "mnemo-endpoint-limits-{}-{}",
-            std::process::id(),
-            now_ms()
-        ))
+    /// A FRESH, uniquely named run dir under the OS temp folder, removed when
+    /// the returned guard drops.
+    ///
+    /// `tempfile::tempdir` guarantees the uniqueness (random name + exclusive
+    /// create, retried on a clash), so two tests calling this in the same
+    /// millisecond can never land on one cooldown file (finding
+    /// tempRunDirCollision) — a hand-built `temp_dir()/<pid>-<now_ms>` could.
+    /// The guard also removes the folder, which the manual
+    /// `remove_dir_all` tail of each test would otherwise have to do.
+    fn temp_run_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp run dir")
     }
 
     #[test]
@@ -427,12 +431,11 @@ mod tests {
     #[test]
     fn cooldown_file_round_trips_through_the_guard() {
         let tmp = temp_run_dir();
-        let limits = EndpointLimits::new(&tmp, "ep", Some(2));
+        let limits = EndpointLimits::new(tmp.path(), "ep", Some(2));
         assert_eq!(cooldown_until_ms(&limits.dir), None);
         std::fs::create_dir_all(&limits.dir).unwrap();
         crate::config::write_atomic(&limits.dir.join(COOLDOWN_FILE), "1234\n").unwrap();
         assert_eq!(cooldown_until_ms(&limits.dir), Some(1234));
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Finding cooldownMaxUntested: `note_rate_limited` keeps the LARGER of
@@ -442,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn a_shorter_retry_after_never_shrinks_the_cooldown() {
         let tmp = temp_run_dir();
-        let limits = EndpointLimits::new(&tmp, "ep", None);
+        let limits = EndpointLimits::new(tmp.path(), "ep", None);
 
         limits.note_rate_limited(Some("120")).await;
         let long = cooldown_until_ms(&limits.dir).expect("the first 429 writes a cooldown");
@@ -473,7 +476,5 @@ mod tests {
             extended > long && extended >= now + 590_000,
             "~600 s out, got {extended} vs now {now} (old {long})"
         );
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

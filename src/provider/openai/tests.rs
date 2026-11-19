@@ -5273,10 +5273,17 @@ async fn cooldown_written_on_429_and_honoured() {
     .await;
 
     let first = limits_client(&stub, run_dir.path(), None);
+    // Bracket the request with wall-clock reads: the cooldown is written
+    // somewhere between them, so `before + 1 s <= until <= after + 1 s` is
+    // exact for a `Retry-After: 1` — a `now` read after the fact would make
+    // the window too tight whenever the machine stalls the test between the
+    // write and the read (it did under load: until - now = 419 ms).
+    let before = wall_now_ms();
     let outcome = first
         .complete(&[Message::user_text("a")], &[], None)
         .await;
     assert!(outcome.is_err(), "a 429 is a request error");
+    let after = wall_now_ms();
 
     // The 429 armed the machine-wide cooldown: now + Retry-After (1 s).
     let dir = super::limits::endpoint_dir(run_dir.path(), "test");
@@ -5285,13 +5292,9 @@ async fn cooldown_written_on_429_and_honoured() {
         .trim()
         .parse()
         .expect("an until-ms timestamp");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock")
-        .as_millis() as u64;
     assert!(
-        until >= now + 800 && until <= now + 1_500,
-        "cooldown should be ~1 s out, got {until} vs now {now}"
+        until >= before + 1_000 && until <= after + 1_000,
+        "cooldown should be 1 s after the 429, got {until} (request spanned {before}..{after})"
     );
 
     // A second handle (the "other instance") waits it out before sending.
@@ -5341,6 +5344,14 @@ async fn no_limit_no_lock() {
         "an unlimited endpoint must not create a slot folder"
     );
     assert_eq!(peak_and_count(&stub), (1, 1));
+}
+
+/// Wall-clock milliseconds since the epoch — the unit the cooldown file uses.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64
 }
 
 /// Finding queuedIgnoresCooldown: a request queued for a slot must not slip

@@ -154,6 +154,10 @@ const WINDOWS_CFG_FILES: &[(&str, &str)] = &[
         "Job Objects, CREATE_NO_WINDOW, process-tree kill",
     ),
     (
+        "src/host/shared_service.rs",
+        "CREATE_NO_WINDOW and taskkill for a server that outlives its spawner",
+    ),
+    (
         "src/process_tree.rs",
         "Windows Job Objects for process-tree ownership",
     ),

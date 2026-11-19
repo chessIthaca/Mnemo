@@ -83,6 +83,7 @@ pub use crate::host::index_progress;
 pub use crate::host::laya;
 pub use crate::host::maintenance;
 pub use crate::host::rewire;
+pub use crate::host::shared_service;
 pub use crate::host::brain;
 pub use crate::host::notifier;
 pub use crate::host::startup;

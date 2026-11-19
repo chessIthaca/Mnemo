@@ -1119,7 +1119,6 @@ impl Setup {
     /// The gate re-reads the LIVE config (the brain's shared Arc — the
     /// same live view [`Setup::live_laya_enabled`] serves) and requires
     /// `[general.laya] enabled` AND `is_checkpoint_installed` for the
-    /// English checkpoint. On the gate passing: allocate a loopback
     /// port, park the shared status on `Starting`, build the managed
     /// classifier client (constructing it does no I/O — startup is
     /// never blocked, brain.rs:543-546), write it into the brain's live
@@ -1137,10 +1136,23 @@ impl Setup {
     /// A STANDALONE Setup (no engine attached) no-ops too — nothing
     /// consumes a sidecar until an engine starts (the install-only
     /// philosophy of [`Setup::classifier_setup`]'s standalone arm). The
-    /// gate leg (marker/venv file stats + the port probe) is offline
-    /// and instant; the spawn leg is a REAL child — never exercised in
-    /// tests (the network-bound discipline at [`Setup::classifier_setup`]'s
-    /// doc).
+    /// gate leg (marker/venv file stats) is offline and instant.
+    ///
+    ///
+    /// The server itself can come from the machine-wide share: this instance
+    /// first probes the shared `laya-serve` another instance may already run
+    /// (`LayaManager::attach_shared` — one health probe, at most two seconds,
+    /// and only when a descriptor exists). A server that answers is filled
+    /// `Ready` immediately; a LIVE one that does not answer yet (another
+    /// instance's cold start, loading its model) is leased too — the client
+    /// points at its port, the status parks on `Starting`, and a background
+    /// task runs the ordinary readiness wait, falling back to a spawn only if
+    /// that server dies. With no shared server it takes today's path
+    /// unchanged: allocate a loopback port, fill the no-I/O client, then
+    /// fire-and-forget the spawn; that task (`LayaManager::finish_start`)
+    /// re-runs the shared decision under the spawn lock, so two instances
+    /// starting at the same moment still end up with one server and one
+    /// attach — and it re-points this slot when the other instance won.
     pub async fn attach_laya(&self) -> Option<u16> {
         let live = self.live.as_ref()?;
         let checkpoint = crate::host::laya::english_checkpoint();
@@ -1162,6 +1174,77 @@ impl Setup {
             }
             return None;
         }
+        let models = checkpoint.id;
+        // The liveness monitor re-points this slot at a replacement server
+        // when the shared one dies.
+        self.laya
+            .provide_classifier_slot(live.classifier_slot.clone());
+        // Attach leg: only the probe of an existing descriptor costs anything.
+        let probing = Arc::clone(&self.laya);
+        let shared = tokio::task::spawn_blocking(move || probing.attach_shared(models))
+            .await
+            .unwrap_or(None);
+        let attached = match shared {
+            Some(crate::host::laya::LayaServer::Attached { port }) => Some(port),
+            Some(crate::host::laya::LayaServer::Attaching { port, pid }) => {
+                // Another instance's server is live but still loading: lease
+                // it, point the client at it, and let the background task
+                // drive Ready (falling back only if the server dies).
+                *self
+                    .classifier_status
+                    .write()
+                    .expect("classifier status lock poisoned") = ClassifierStatus::Starting;
+                let classifier = crate::host::laya::build_managed_classifier(
+                    port,
+                    Arc::clone(&self.classifier_status),
+                );
+                if let Some(slot) = &live.classifier_slot {
+                    *slot.write().expect("classifier slot lock poisoned") = classifier;
+                }
+                let manager = Arc::clone(&self.laya);
+                let slot = live.classifier_slot.clone();
+                tokio::spawn(async move {
+                    crate::host::laya::await_shared_ready(
+                        &None,
+                        manager,
+                        models,
+                        port,
+                        pid,
+                        slot,
+                        Some(checkpoint),
+                    )
+                    .await;
+                });
+                // A cold start is NOT ready: only the spawned readiness task
+                // may promote it (and arm the monitor) when it answers.
+                return Some(port);
+            }
+            // `try_attach` never spawns; this arm only keeps the match
+            // exhaustive, treating the impossible outcome as "no attach".
+            Some(crate::host::laya::LayaServer::Spawned { .. }) => None,
+            None => None,
+        };
+        if let Some(port) = attached {
+            // A shared server answered its health probe before we leased it:
+            // it is ready by definition.
+            *self
+                .classifier_status
+                .write()
+                .expect("classifier status lock poisoned") = ClassifierStatus::Ready;
+            let classifier = crate::host::laya::build_managed_classifier(
+                port,
+                Arc::clone(&self.classifier_status),
+            );
+            if let Some(slot) = &live.classifier_slot {
+                *slot.write().expect("classifier slot lock poisoned") = classifier;
+            }
+            self.laya.ensure_shared_monitor();
+            eprintln!("info: attached to the shared laya-serve on port {port}");
+            return Some(port);
+        }
+        // Today's path, unchanged: park Starting, build the no-I/O client
+        // (main.rs:96-102's twin), swap the slot, fire-and-forget the start
+        // (main.rs:816-830) — the caller never waits on the child.
         let Some(port) = LayaManager::alloc_free_port() else {
             eprintln!(
                 "warning: no free loopback port for the managed laya-serve; \
@@ -1169,9 +1252,6 @@ impl Setup {
             );
             return None;
         };
-        // The fill is I/O-free (main.rs:96-102's twin): park Starting,
-        // build the no-I/O client, swap the slot — the spawned start
-        // below drives Starting → Ready/Failed.
         *self
             .classifier_status
             .write()
@@ -1183,12 +1263,11 @@ impl Setup {
         if let Some(slot) = &live.classifier_slot {
             *slot.write().expect("classifier slot lock poisoned") = classifier;
         }
-        // Fire-and-forget the server start (main.rs:816-830): the
-        // classifier client already points at the pre-allocated port,
-        // and the caller never waits on the child.
         let manager = Arc::clone(&self.laya);
+        let slot = live.classifier_slot.clone();
         tokio::spawn(async move {
-            crate::host::laya::start_managed_server(&None, manager, checkpoint, port).await;
+            crate::host::laya::finish_start(&None, manager, models, port, slot, Some(checkpoint))
+                .await;
         });
         Some(port)
     }
@@ -3053,6 +3132,87 @@ mod tests {
             "live_config() re-roots onto the brain's Arc"
         );
         engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Regression (attachLayaReadyOnColdStart): a LIVE shared server that has
+    /// not answered yet leaves attach_laya at Starting. The single spawned
+    /// readiness task owns the later Ready promotion and monitor arming; the
+    /// Attached-only block must not run for this arm.
+    #[tokio::test]
+    async fn attach_laya_cold_start_stays_starting_with_one_readiness_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        enable_laya_in_config(cfg.path());
+        doctor_installed_laya(cfg.path());
+        // Hold the port without answering: connect succeeds, but both the
+        // health probe and the readiness request time out. This pid is the
+        // live test process, so try_attach sees a live same-model server.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pid = std::process::id();
+        crate::host::shared_service::write_service(
+            &crate::host::shared_service::service_dir(cfg.path(), "laya"),
+            &crate::host::shared_service::ServiceInfo {
+                pid,
+                port,
+                token: String::new(),
+                version: "test".into(),
+                started_ms: crate::host::shared_service::now_ms(),
+                created: crate::process_tree::process_creation_id(pid).unwrap_or_default(),
+                models: vec!["english".into()],
+            },
+        )
+        .unwrap();
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        assert_eq!(setup.attach_laya().await, Some(port));
+        assert_eq!(
+            *setup
+                .classifier_status
+                .read()
+                .expect("classifier status lock"),
+            ClassifierStatus::Starting,
+            "a still-loading shared server must not be marked Ready"
+        );
+        assert!(
+            !setup.laya.is_monitor_running(),
+            "the readiness task arms the monitor only after the server answers"
+        );
+        // Wait for the one spawned readiness task to enter; a silent server
+        // cannot promote the status, and no second wait is spawned by a fake
+        // Ready monitor/recovery cycle.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while setup.laya.shared_ready_task_count() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            setup.laya.shared_ready_task_count(),
+            1,
+            "exactly one shared readiness task must be spawned"
+        );
+        assert_eq!(
+            *setup
+                .classifier_status
+                .read()
+                .expect("classifier status lock"),
+            ClassifierStatus::Starting
+        );
+        assert!(!setup.laya.is_monitor_running());
+        engine.shutdown().await.expect("shutdown");
+        drop(listener);
     }
 
     /// Design §3's "disabled changes nothing" pin: an ABSENT

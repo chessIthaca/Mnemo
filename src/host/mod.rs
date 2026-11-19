@@ -25,4 +25,5 @@ pub mod memory_watcher;
 pub mod notifier;
 pub mod rewire;
 pub mod runtime;
+pub mod shared_service;
 pub mod startup;

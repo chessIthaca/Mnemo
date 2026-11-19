@@ -120,6 +120,50 @@ impl Drop for KillOnCloseJob {
     }
 }
 
+/// The Win32 creation flags of a detached child: a hidden console
+/// (`CREATE_NO_WINDOW`) in its own process group. `DETACHED_PROCESS` is
+/// deliberately absent — see [`detach_command`].
+#[cfg(windows)]
+pub const DETACHED_CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_0200;
+
+/// The flag `DETACHED_PROCESS`, named only for the assertion that it is NOT
+/// part of [`DETACHED_CREATION_FLAGS`] (test-visible documentation of the
+/// console-window fix: a console-less child makes every console-subsystem
+/// grandchild pop a NEW console window).
+#[cfg(windows)]
+pub const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+/// Detach a child from this process: on Windows `CREATE_NO_WINDOW |
+/// CREATE_NEW_PROCESS_GROUP` (a HIDDEN console the child and every
+/// console-subsystem grandchild inherit, and a `CTRL_C` for this process's
+/// group never reaches it), on Unix its own process group. The caller must NOT
+/// assign the child to a kill-on-close job — surviving the spawn that started
+/// it is the whole point.
+///
+/// Deliberately NOT `DETACHED_PROCESS`: a detached process has NO console, so
+/// every console-subsystem grandchild it starts makes the OS allocate a NEW
+/// one — on Windows that is a popping Terminal window per grandchild (the
+/// user saw a swarm of them). `CREATE_NO_WINDOW` gives the child a hidden
+/// console instead, which its grandchildren inherit invisibly.
+///
+/// THE one place the detached spawn flags are defined: the shared services
+/// ([`crate::host::shared_service::detach`]) and the detached helpers
+/// ([`detached_command`]) both come through here.
+pub fn detach_command(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(DETACHED_CREATION_FLAGS);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    #[cfg(not(any(windows, unix)))]
+    let _ = command;
+}
+
 /// A `Command` for a helper process that must OUTLIVE its caller and every
 /// command tree the caller starts (the shared `sccache` server, plan
 /// d3336a8a step 7): no console window on Windows, its own process group on
@@ -127,26 +171,124 @@ impl Drop for KillOnCloseJob {
 /// started it is the whole point.
 pub fn detached_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(program);
-    platform_detach(&mut command);
+    detach_command(&mut command);
     command
 }
 
-/// The platform half of [`detached_command`]: Win32 creation flags on Windows,
-/// a fresh process group on Unix.
-#[cfg(windows)]
-fn platform_detach(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+/// Is the process `pid` still running?
+///
+/// On Windows a hard-stopped process can leave its handle open somewhere, so
+/// the pid counts as live only when `GetExitCodeProcess` yields `STILL_ACTIVE`
+/// (a process that really exits with code 259 is indistinguishable — accepted:
+/// every caller uses this as a hint, never as a lock). On Unix it is `ps -p`.
+///
+/// The one implementation every caller shares (the app's instance markers, the
+/// shared-service leases and their watchdog), so liveness can never differ
+/// between the components that must agree on it.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: fixed flags, no handle inheritance; the handle is
+        // closed on every path below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: the handle comes from OpenProcess above and outlives
+        // this call; query access suffices for GetExitCodeProcess.
+        let mut exit_code: u32 = 0;
+        let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: the handle is no longer used.
+        unsafe { CloseHandle(handle) };
+        probed != 0 && exit_code == STILL_ACTIVE as u32
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
 }
 
-/// The platform half of [`detached_command`]: a fresh process group, so no
-/// group signal aimed at a command tree reaches the helper.
-#[cfg(not(windows))]
-fn platform_detach(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
+/// A string identifying WHEN the process `pid` was created — the pid-reuse
+/// guard for every "kill pid" decision a shared service makes.
+///
+/// Pids are recycled: a server dies, another process inherits its pid, and a
+/// stale lease or descriptor would name an innocent process. The creation
+/// identity is captured at spawn/publish time and compared again before any
+/// kill, so a reused pid never gets signalled. It is only ever COMPARED for
+/// equality — never parsed — so any stable per-process value works:
+///
+/// - **Windows**: the process creation `FILETIME` (`GetProcessTimes`, 100 ns
+///   intervals since 1601) as a decimal string — unique per process.
+/// - **Unix**: `ps -p <pid> -o lstart=` — the start time as text. Second
+///   granularity, so a pid would have to be reused within the same second to
+///   fool it; deliberate reuse that fast is not a real scenario.
+///
+/// `None` when the identity cannot be determined (a dead pid, an unopenable
+/// process, a `ps`-less Unix). Callers treat `None` as "unproven" and skip
+/// the kill, never as "safe".
+pub fn process_creation_id(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: fixed flags, no handle inheritance; the handle is
+        // closed on every path below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        // SAFETY: the handle comes from OpenProcess above and outlives this
+        // call; the four FILETIMEs are valid out-parameters.
+        let probed = unsafe {
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
+        };
+        // SAFETY: the handle is no longer used.
+        unsafe { CloseHandle(handle) };
+        (probed != 0).then(|| {
+            ((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+                .to_string()
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?;
+        (output.status.success() && !output.stdout.is_empty()).then(|| {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        })
+    }
 }
 
 #[cfg(all(test, windows))]

@@ -2921,6 +2921,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Only dispatch-routing changes (its spec delta is attached). external-lead, tier-ladder and worker-brief requirements are unchanged: lead attachment, tiers and the worker brief behave as before; pump.rs, nudge.rs and tests.rs are touched only for strike counting and check recording."
+    },
+    {
+      "id": "873a756d",
+      "status": "open",
+      "created_at_ms": 1795092807339,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds one prompt sentence and a settings warning, and fixes tool description text. Requirements of worker-brief, external-lead, dispatch-routing and tier-ladder are unchanged: briefs, routing and tiers behave as before."
     }
   ]
 }

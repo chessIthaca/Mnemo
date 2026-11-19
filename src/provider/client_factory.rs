@@ -343,17 +343,23 @@ pub fn vision_warning(config: &Config) -> Option<String> {
 /// client that would fail at call time.
 pub fn build_vision_client(config: &Config) -> Option<Arc<dyn ImageDescriber>> {
     let vm = config.general.general.vision_model.as_ref()?;
-    match vision_issue(config)? {
-        // A warning only — the client still builds (the id may well work).
-        VisionIssue::UnlistedModel => {}
-        VisionIssue::MissingEndpoint => return None,
-        VisionIssue::AnthropicEndpoint => {
-            eprintln!(
-                "warning: vision_model endpoint '{}' is kind 'anthropic' — vision is \
-                 OpenAI-compatible only; image-to-text fallback disabled",
-                vm.endpoint
-            );
-            return None;
+    // A clean config MUST build — `vision_issue` returns `None` when there is
+    // no problem, so never `?` it here: an early return on `None` would starve
+    // every worker of the image tools for a perfectly valid vision model. Only
+    // a missing or Anthropic-kind endpoint disables the client; an unlisted
+    // model is a warning (the endpoint may still serve it).
+    if let Some(issue) = vision_issue(config) {
+        match issue {
+            VisionIssue::UnlistedModel => {}
+            VisionIssue::MissingEndpoint => return None,
+            VisionIssue::AnthropicEndpoint => {
+                eprintln!(
+                    "warning: vision_model endpoint '{}' is kind 'anthropic' — vision is \
+                     OpenAI-compatible only; image-to-text fallback disabled",
+                    vm.endpoint
+                );
+                return None;
+            }
         }
     }
     let ep = config.endpoint(&vm.endpoint)?;
@@ -656,6 +662,75 @@ mod tests {
         assert!(
             build_vision_client(&config).is_none(),
             "Anthropic-kind vision endpoint must not build a VisionClient"
+        );
+    }
+
+    /// A config that resolves cleanly MUST build a client. Regression: an early
+    /// `?` on the issue classifier returned `None` for a *healthy* config, so a
+    /// valid vision model (Ollama Cloud / `deepseek-v4.1-flash:1017`) silently
+    /// left every worker without the image tools. Fails without the fix.
+    #[test]
+    fn build_vision_client_builds_for_a_valid_endpoint() {
+        let config = Config {
+            general: crate::config::GeneralConfig {
+                general: crate::config::GeneralSection {
+                    vision_model: Some(crate::config::VisionModel {
+                        endpoint: "ollama-cloud".into(),
+                        model: "deepseek-v4.1-flash:1017".into(),
+                    }),
+                    ..crate::config::GeneralSection::default()
+                },
+                ..crate::config::GeneralConfig::default()
+            },
+            endpoints: vec![Endpoint {
+                name: "ollama-cloud".into(),
+                kind: EndpointKind::OpenAI,
+                base_url: "https://ollama.com/v1/".into(),
+                models: vec!["deepseek-v4.1-flash:1017".into()],
+                ..Endpoint::test_default()
+            }],
+            ..Config::default()
+        };
+        assert_eq!(vision_issue(&config), None, "the fixture must resolve cleanly");
+        assert!(
+            build_vision_client(&config).is_some(),
+            "a resolvable vision config must build a VisionClient — without it no worker has image tools"
+        );
+        assert_eq!(vision_warning(&config), None);
+    }
+
+    /// An endpoint that lists models but not the vision model is a WARNING, not
+    /// a disable: the id can still be served, so the client must build.
+    #[test]
+    fn build_vision_client_builds_for_an_unlisted_model() {
+        let config = Config {
+            general: crate::config::GeneralConfig {
+                general: crate::config::GeneralSection {
+                    vision_model: Some(crate::config::VisionModel {
+                        endpoint: "ep1".into(),
+                        model: "deepseek-v4.1-flash:1017".into(),
+                    }),
+                    ..crate::config::GeneralSection::default()
+                },
+                ..crate::config::GeneralConfig::default()
+            },
+            endpoints: vec![Endpoint {
+                name: "ep1".into(),
+                kind: EndpointKind::OpenAI,
+                base_url: "http://127.0.0.1:9/v1/".into(),
+                models: vec!["plan-model".into()],
+                ..Endpoint::test_default()
+            }],
+            ..Config::default()
+        };
+        assert_eq!(vision_issue(&config), Some(VisionIssue::UnlistedModel));
+        assert!(
+            build_vision_client(&config).is_some(),
+            "an unlisted model is a warning only — the client still builds"
+        );
+        assert!(
+            vision_warning(&config).is_some(),
+            "and that warning is what the Models page shows"
         );
     }
 

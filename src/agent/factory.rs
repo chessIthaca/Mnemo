@@ -3287,6 +3287,53 @@ mod tests {
         assert!(factory_no_vision.vision_slot().is_configured());
     }
 
+    /// End-to-end from a *config*, not an injected mock: a valid
+    /// `[general.vision_model]` must reach the factory as a configured vision
+    /// slot, which is what puts the deferred `image` group in the tool index.
+    /// Regression for the `?`-on-the-classifier bug that built no client (hence
+    /// offered no image tools) for a healthy config.
+    #[test]
+    fn a_valid_vision_config_offers_the_image_group() {
+        let config = crate::config::Config {
+            general: crate::config::GeneralConfig {
+                general: crate::config::GeneralSection {
+                    vision_model: Some(crate::config::VisionModel {
+                        endpoint: "ollama-cloud".into(),
+                        model: "deepseek-v4.1-flash:1017".into(),
+                    }),
+                    ..crate::config::GeneralSection::default()
+                },
+                ..crate::config::GeneralConfig::default()
+            },
+            endpoints: vec![crate::config::Endpoint {
+                name: "ollama-cloud".into(),
+                kind: crate::config::EndpointKind::OpenAI,
+                base_url: "https://ollama.com/v1/".into(),
+                models: vec!["deepseek-v4.1-flash:1017".into()],
+                ..crate::config::Endpoint::test_default()
+            }],
+            ..crate::config::Config::default()
+        };
+        let vision = crate::provider::client_factory::build_vision_client(&config);
+        assert!(vision.is_some(), "a valid vision config must build a client");
+        let dir = tempdir().unwrap();
+        let factory = make_factory_with(dir.path(), vision);
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
+        assert!(
+            registry
+                .hidden_groups_for(&crate::tool::ToolFilter::Executing)
+                .iter()
+                .any(|(g, _)| *g == "image"),
+            "a valid vision config must offer the image group to the model"
+        );
+    }
+
     /// A mock descendant tracker that always reports "no descendants running".
     struct MockDescendantTracker;
 

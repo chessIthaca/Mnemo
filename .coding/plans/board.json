@@ -2986,6 +2986,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Besides the settings-dialog deltas attached, endpoints.rs gains an optional max_concurrent field that does not change tier or ladder behaviour (tier-ladder), and no step changes dispatch-routing, external-lead, worker-brief, plan-board or llm-trace requirements."
+    },
+    {
+      "id": "4b4377ce",
+      "status": "open",
+      "created_at_ms": 1795112665951,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Changes a shell default only; no requirement of any OpenSpec capability is affected."
     }
   ]
 }

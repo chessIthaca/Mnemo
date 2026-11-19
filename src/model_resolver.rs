@@ -277,6 +277,11 @@ pub struct ConfigModelResolver {
     /// pointing at the same endpoint+model with different efforts must not
     /// share a provider.
     cache: ClientCache,
+    /// The machine-wide run folder (`<config dir>/run`, plan d3336a8a):
+    /// every provider this resolver builds honours the endpoint request
+    /// slots and the shared 429 cooldown under it. `None` = no machine limits
+    /// (tests, callers without a config dir).
+    run_dir: Option<std::path::PathBuf>,
 }
 
 impl ConfigModelResolver {
@@ -291,7 +296,18 @@ impl ConfigModelResolver {
             config,
             trace,
             cache: RwLock::new(HashMap::new()),
+            run_dir: None,
         }
+    }
+
+    /// Point every provider this resolver builds at the machine-wide run
+    /// folder (`<config dir>/run`), so per-context model overrides honour the
+    /// same endpoint slots and shared cooldowns as the startup provider
+    /// (plan d3336a8a step 4). Builder form: a caller without a config dir
+    /// keeps today's unconstrained behaviour.
+    pub fn with_run_dir(mut self, run_dir: Option<std::path::PathBuf>) -> Self {
+        self.run_dir = run_dir;
+        self
     }
 
     /// Replace the config (after a Settings save reloads config). The resolver
@@ -498,6 +514,7 @@ impl ModelResolver for ConfigModelResolver {
             &config,
             model,
             Some(self.trace.clone()),
+            self.run_dir.clone(),
         )?;
         let max_context = provider.capabilities().max_context;
         let cm = ContextManager::new(max_context, fill_rate)

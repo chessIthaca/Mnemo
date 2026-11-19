@@ -26,9 +26,12 @@
 //!   filter;
 //! - [`stream`] — the spawned parse loop and its captured state;
 //! - [`guard`] — the client-side stream guard (stop-boundary truncation);
+//! - [`limits`] — the machine-wide endpoint limits (request slots + the
+//!   shared 429 cooldown every instance on the machine honours);
 //! - [`tests`] — the test module.
 
 mod guard;
+mod limits;
 mod request;
 mod sse;
 mod stream;
@@ -44,6 +47,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{Error, Result};
+use crate::host::machine_slots::SlotGuard;
 use crate::provider::sse_util::{header_str, provider_error};
 use crate::provider::trace::LlmRequestLog;
 use crate::provider::upload_stamp::{stamping_body, UploadStamps};
@@ -126,6 +130,16 @@ pub struct OpenAiClientConfig {
     /// Arbitrary extra body parameters merged into the request payload.
     /// Merged last: keys here can override any request field including model/messages/stop.
     pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The machine-wide run folder (`<config dir>/run`, plan d3336a8a): the
+    /// endpoint request slots and the shared 429 cooldown live under it.
+    /// `None` = no machine limits (tests, and callers without a config dir),
+    /// which is the unconstrained behaviour.
+    pub run_dir: Option<std::path::PathBuf>,
+    /// The endpoint's machine-wide concurrency cap (`max_concurrent` in
+    /// `endpoints.toml`): a request holds one of that many OS file-lock slots
+    /// across every running instance until its response body is fully read.
+    /// `None` (or no `run_dir`) = unlimited.
+    pub max_concurrent: Option<u32>,
 }
 
 impl Default for OpenAiClientConfig {
@@ -149,6 +163,8 @@ impl Default for OpenAiClientConfig {
             stop_token_ids: Vec::new(),
             stop_boundary_strings: Vec::new(),
             extra_body: None,
+            run_dir: None,
+            max_concurrent: None,
         }
     }
 }
@@ -226,6 +242,10 @@ pub struct OpenAiClient {
     /// otherwise silently disable the optimization while staying green.
     #[cfg(test)]
     hit_count: std::sync::atomic::AtomicUsize,
+    /// Machine-wide endpoint limits (plan d3336a8a step 4): the request slots
+    /// and the shared 429 cooldown every instance honours. `None` when the
+    /// caller passed no run dir — today's unconstrained behaviour.
+    limits: Option<limits::EndpointLimits>,
 }
 
 impl OpenAiClient {
@@ -293,6 +313,9 @@ impl OpenAiClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let limits = config.run_dir.as_ref().map(|run_dir| {
+            limits::EndpointLimits::new(run_dir, &config.provider, config.max_concurrent)
+        });
         Self {
             config,
             caps,
@@ -305,6 +328,7 @@ impl OpenAiClient {
             prefix_cache: std::sync::Mutex::new(None),
             #[cfg(test)]
             hit_count: std::sync::atomic::AtomicUsize::new(0),
+            limits,
         }
     }
 
@@ -438,10 +462,10 @@ impl LlmClient for OpenAiClient {
         let mut prepared =
             self.prepare_request_with_context(messages, tools, tool_choice.clone(), context)
                 .await?;
-        let response = self
+        let (response, slot) = self
             .open_stream(&mut prepared, messages, tools, tool_choice)
             .await?;
-        Ok(self.spawn_stream(prepared, response))
+        Ok(self.spawn_stream(prepared, response, slot))
     }
 }
 
@@ -669,7 +693,19 @@ impl OpenAiClient {
         &self,
         prepared: &PreparedRequest,
         sent_at: std::time::Instant,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, SlotGuard)> {
+        // Machine-wide limits (plan d3336a8a step 4): wait out a cooldown
+        // another instance left on this endpoint, then take one of the
+        // endpoint's request slots. The slot travels WITH the response so the
+        // caller holds it until the body is fully read (the stream task drops
+        // it at EOF, on error or on cancel).
+        let slot = match &self.limits {
+            Some(limits) => {
+                limits.wait_cooldown().await;
+                limits.acquire().await
+            }
+            None => SlotGuard::none(),
+        };
         // The (log, record id) pair the body wrapper stamps into.
         let body_trace = match (&prepared.trace, prepared.rec_id) {
             (Some(log), Some(id)) => Some((log.clone(), id)),
@@ -696,6 +732,19 @@ impl OpenAiClient {
             .await;
         match response {
             Ok(response) => {
+                if let Some(limits) = &self.limits {
+                    // A 429 arms the machine-wide cooldown, which every
+                    // instance honours before its next send. The loop's own
+                    // 429 fallback still runs on THIS request.
+                    if response.status().as_u16() == 429 {
+                        let retry_after = response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        limits.note_rate_limited(retry_after.as_deref()).await;
+                    }
+                }
                 // Response headers just arrived: close the server-wait
                 // window (upload done → headers) and stamp it live.
                 if let (Some(log), Some(id)) = (&prepared.trace, prepared.rec_id) {
@@ -709,7 +758,7 @@ impl OpenAiClient {
                         log.set_server_ms(id, server_ms);
                     }
                 }
-                Ok(response)
+                Ok((response, slot))
             }
             Err(e) => {
                 if let (Some(log), Some(id)) = (&prepared.trace, prepared.rec_id) {
@@ -750,13 +799,13 @@ impl OpenAiClient {
         messages: &[Message],
         tools: &[ToolSchema],
         tool_choice: Option<ToolChoice>,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<(reqwest::Response, SlotGuard)> {
         // POST-send anchor (perf review L1): stamped immediately before the
         // FIRST send — the reasoning_effort fallback retry below does NOT
         // re-stamp, so a retry's extra wait lands in ttft (the honest
         // user-perceived first-token wait).
         prepared.post_sent = std::time::Instant::now();
-        let mut response = self
+        let (mut response, mut slot) = self
             .send_with_stamps(prepared, prepared.post_sent)
             .await?;
 
@@ -833,13 +882,19 @@ impl OpenAiClient {
                 } else {
                     self.build_request_body(messages, tools, tool_choice, true)?
                 };
+                // The failed attempt's body was fully read above, so its slot
+                // is released BEFORE the retry sends: with `max_concurrent =
+                // 1` re-acquiring while still holding it would self-deadlock.
+                drop(std::mem::replace(&mut slot, SlotGuard::none()));
                 // The retry's own send anchor: `post_sent` still points at
                 // the FIRST attempt, so the retry's upload window would be
                 // misattributed (first send → the retry's upload-done) —
                 // pass this attempt's own instant instead.
-                response = self
+                let (retry_response, retry_slot) = self
                     .send_with_stamps(prepared, std::time::Instant::now())
                     .await?;
+                response = retry_response;
+                slot = retry_slot;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body_text = response.text().await.unwrap_or_default();
@@ -852,7 +907,7 @@ impl OpenAiClient {
         if let (Some(log), Some(id)) = (&prepared.trace, prepared.rec_id) {
             log.set_status(id, response.status().as_u16());
         }
-        Ok(response)
+        Ok((response, slot))
     }
 
     /// Stage 3 of the pipeline: bridge the SSE byte stream into the
@@ -866,6 +921,7 @@ impl OpenAiClient {
         &self,
         prepared: PreparedRequest,
         response: reqwest::Response,
+        slot: SlotGuard,
     ) -> BoxStream<'static, LlmEvent> {
         let PreparedRequest {
             trace,
@@ -939,6 +995,7 @@ impl OpenAiClient {
             think_tags_enabled,
             use_responses_api,
             stop_boundaries: stream_stop_boundaries,
+            slot,
         };
         tokio::spawn(pump_sse_stream(response, task));
 

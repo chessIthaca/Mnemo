@@ -443,6 +443,12 @@
             <summary><span class="micro">ADVANCED</span></summary>
             <div class="grid-adv">
               <label class="field"><span>Max context</span><input type="number" min="0" step="1" aria-label="Endpoint max context" bind:value={draft.max_context} /></label>
+              {#if draft.kind !== "anthropic"}
+                <label class="field"><span>Max requests at once (all windows)</span>
+                  <input type="number" min="1" max="64" step="1" placeholder="unlimited" aria-label="Endpoint max concurrent requests" bind:value={draft.max_concurrent} />
+                  <span class="hint">Shared by every Mnemo2 window on this machine; empty means unlimited. Anthropic endpoints ignore it.</span>
+                </label>
+              {/if}
               <label class="field"><span>Max output tokens</span><input type="number" min="0" step="1" aria-label="Endpoint max output tokens" bind:value={draft.max_output_tokens} /></label>
               <label class="field"><span>Temperature</span><input type="number" min="0" step="any" aria-label="Endpoint temperature" bind:value={draft.temperature} /></label>
               <label class="field"><span>Vision default</span>

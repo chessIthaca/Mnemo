@@ -278,6 +278,7 @@ pub(crate) fn wire_brain(
             ep.multimodal_for(&model),
             ep.effective_reasoning_effort_for(Some(&model)),
             Some(trace.clone()),
+            Some(config_dir.join("run")),
         )
     } else {
         eprintln!("warning: no endpoint configured; using a dummy provider");
@@ -851,10 +852,15 @@ pub(crate) fn wire_brain(
     // sync handle to the config (separate from the async `state.project.config`
     // mutex) so the turn driver can read it without an await; the IPC layer
     // pushes reloaded config into it after a Settings save.
-    let model_resolver = Arc::new(crate::model_resolver::ConfigModelResolver::new(
-        Arc::new(RwLock::new(config.clone())),
-        trace.clone(),
-    ));
+    let model_resolver = Arc::new(
+        crate::model_resolver::ConfigModelResolver::new(
+            Arc::new(RwLock::new(config.clone())),
+            trace.clone(),
+        )
+        // Per-context model overrides honour the same machine-wide endpoint
+        // slots and shared 429 cooldowns as the startup provider.
+        .with_run_dir(Some(config_dir.join("run"))),
+    );
     // The shared headless debug browser — one instance for the agent tools
     // and the host's browser UI. Lazily spawned on first use.
     // 3a.1 (D1): browser-feature only (the bare build has no browser module).

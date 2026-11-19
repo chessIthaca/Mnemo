@@ -62,7 +62,7 @@ use crate::mnemo2::project;
 use crate::mnemo2::runtime::LeadRuntime;
 use crate::mnemo2::run_file;
 use crate::mnemo2::team::{
-    MessageSender, TeamRuntime, WorkerStatus, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
+    MessageSender, TeamRuntime, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 
 /// Asks the frontend to open a registered project (`{"root": String}`).
@@ -600,30 +600,6 @@ fn canonical(path: &Path) -> PathBuf {
     project::canonical_root(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Whether this worker has active work in progress.
-fn is_running(status: WorkerStatus) -> bool {
-    matches!(
-        status,
-        WorkerStatus::Dispatching
-            | WorkerStatus::Working
-            | WorkerStatus::Fixing
-            | WorkerStatus::Merging
-    )
-}
-
-/// Whether this worker is blocked on the person's review or intervention.
-fn waiting_on_user(status: WorkerStatus) -> bool {
-    matches!(
-        status,
-        WorkerStatus::Completed
-            | WorkerStatus::InReview
-            | WorkerStatus::NeedsYou
-            | WorkerStatus::Failed
-            | WorkerStatus::Conflict
-            | WorkerStatus::Interrupted
-    )
-}
-
 /// Today's spend for the open project, priced the way the Cost tab prices it:
 /// the durable ledger at the project's `[[pricing]]`, restricted to the
 /// engine's row for the UTC day of `now`.
@@ -747,22 +723,11 @@ impl Shared {
             );
         };
         let project = lead.workspace_root().to_string_lossy().into_owned();
+        // Counts only: this route is polled every 10 s by every other window,
+        // and `snapshot()` would clone every worker's transcript for the same
+        // two numbers.
         let (workers_running, workers_waiting) = match lead.team_handle().await {
-            Ok(team) => {
-                let snapshot = team.snapshot().await;
-                (
-                    snapshot
-                        .workers
-                        .iter()
-                        .filter(|worker| is_running(worker.status))
-                        .count(),
-                    snapshot
-                        .workers
-                        .iter()
-                        .filter(|worker| waiting_on_user(worker.status))
-                        .count(),
-                )
-            }
+            Ok(team) => team.activity_counts().await,
             Err(_) => (0, 0),
         };
         Response::json(
@@ -901,12 +866,12 @@ impl Shared {
         let running = snapshot
             .workers
             .iter()
-            .filter(|worker| is_running(worker.status))
+            .filter(|worker| worker.status.is_running())
             .count();
         let waiting = snapshot
             .workers
             .iter()
-            .filter(|worker| waiting_on_user(worker.status))
+            .filter(|worker| worker.status.waiting_on_user())
             .count();
         let workers: Vec<Value> = snapshot
             .workers
@@ -925,7 +890,7 @@ impl Shared {
                     "model_short": model_short,
                     "tier": worker.tier,
                     "status": worker.status,
-                    "needs_you": waiting_on_user(worker.status),
+                    "needs_you": worker.status.waiting_on_user(),
                     "elapsed_ms": worker.elapsed_ms,
                     "last_activity_ms": worker.created_at_ms + worker.elapsed_ms,
                 })
@@ -1657,6 +1622,7 @@ mod tests {
     use mnemo::tool::Tool as _;
 
     use crate::mnemo2::runtime::LeadRuntimeOptions;
+    use crate::mnemo2::team::WorkerStatus;
 
     /// A provider whose every turn is one short reply (a worker "finishing").
     struct QuietLlm {
@@ -2465,8 +2431,8 @@ mod tests {
             (WorkerStatus::Conflict, false, true),
             (WorkerStatus::Cancelled, false, false),
         ] {
-            assert_eq!(is_running(status), running, "running: {status:?}");
-            assert_eq!(waiting_on_user(status), waiting, "waiting: {status:?}");
+            assert_eq!(status.is_running(), running, "running: {status:?}");
+            assert_eq!(status.waiting_on_user(), waiting, "waiting: {status:?}");
         }
     }
 

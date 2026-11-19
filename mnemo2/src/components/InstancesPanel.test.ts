@@ -1,6 +1,8 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { get } from "svelte/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { INSTANCES_REFRESH_MS, type InstanceRow, type InstancesTransport } from "../lib/instances";
+import { app } from "../lib/store";
 import InstancesPanel from "./InstancesPanel.svelte";
 
 /** A self window, another live window, and one that stopped answering. */
@@ -99,11 +101,16 @@ describe("InstancesPanel", () => {
   it("shows an error when the window cannot be brought forward", async () => {
     const transport = transportOf();
     transport.show.mockRejectedValue(new Error("instance 12 is not running"));
+    app.update((state) => ({ ...state, toast: null }));
     render(InstancesPanel, { transport });
 
     await fireEvent.click(await screen.findByRole("button", { name: /FactoryGame/ }));
 
     expect(transport.show).toHaveBeenCalledWith(12);
+    await waitFor(() =>
+      expect(get(app).toast?.message).toContain("instance 12 is not running"),
+    );
+    expect(get(app).toast?.level).toBe("error");
   });
 
   it("refreshes every 10 seconds while it is mounted", async () => {

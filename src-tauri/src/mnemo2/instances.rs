@@ -15,6 +15,7 @@
 //! is information, never a reason to hide its row.
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -135,9 +136,26 @@ pub async fn list_with(
     self_pid: u32,
     alive: impl Fn(u32) -> bool,
 ) -> Vec<InstanceRow> {
+    list_with_client(config_dir, self_pid, alive, probe_client()).await
+}
+
+/// [`list_with`] with the probe client injected, so the "client could not be
+/// built" branch is tested: every row is then reported as not answering
+/// instead of the command panicking.
+async fn list_with_client(
+    config_dir: &Path,
+    self_pid: u32,
+    alive: impl Fn(u32) -> bool,
+    client: ProbeClient,
+) -> Vec<InstanceRow> {
     run_file::prune_stale(config_dir, &alive);
     let files = run_file::list(config_dir);
-    let client = probe_client();
+    let Ok(client) = client else {
+        return files
+            .iter()
+            .map(|file| InstanceRow::new(file, self_pid, None))
+            .collect();
+    };
     let mut probes = tokio::task::JoinSet::new();
     for (index, file) in files.iter().enumerate() {
         let client = client.clone();
@@ -166,12 +184,22 @@ pub async fn list_with(
 /// Returns the reason when the instance is not running or does not answer, so
 /// the caller can show it instead of a silent no-op.
 pub async fn show(config_dir: &Path, pid: u32) -> Result<(), String> {
+    show_with_client(config_dir, pid, probe_client()).await
+}
+
+/// [`show`] with the probe client injected (see [`list_with_client`]).
+async fn show_with_client(
+    config_dir: &Path,
+    pid: u32,
+    client: ProbeClient,
+) -> Result<(), String> {
     let file = run_file::list(config_dir)
         .into_iter()
         .find(|file| file.pid == pid)
         .filter(|_| crate::instance_marker::pid_alive(pid))
         .ok_or_else(|| format!("instance {pid} is not running"))?;
-    let response = probe_client()
+    let client = client?;
+    let response = client
         .post(url(file.port, SHOW_PATH))
         .bearer_auth(&file.token)
         .send()
@@ -192,14 +220,30 @@ fn url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
 
-/// The client every probe uses: a system HTTP proxy must never intercept a
-/// loopback call, and the probe timeout bounds each step.
-fn probe_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(PROBE_TIMEOUT)
-        .build()
-        .unwrap_or_default()
+/// The probe client, built once for the process.
+///
+/// Building a `reqwest` client can fail (its TLS backend or resolver init
+/// fails), and `Client::default()` panics on exactly that failure, so the
+/// outcome is cached: a failure marks every instance as not answering and
+/// makes [`show`] return the error — never a panic inside the command.
+static PROBE_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+/// The result of building the probe client: the client, or why it failed.
+type ProbeClient = Result<&'static reqwest::Client, String>;
+
+/// The cached probe client: no system proxy (a loopback call must never be
+/// intercepted) and [`PROBE_TIMEOUT`] on every step.
+fn probe_client() -> ProbeClient {
+    PROBE_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(PROBE_TIMEOUT)
+                .build()
+                .map_err(|error| format!("could not build the loopback HTTP client: {error}"))
+        })
+        .as_ref()
+        .map_err(|error| error.clone())
 }
 
 /// Ask one instance for its summary; `None` when it does not answer, answers
@@ -390,5 +434,54 @@ mod tests {
 
         show(config.path(), me).await.expect("shown");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_client_that_cannot_be_built_reports_every_row_as_not_answering() {
+        let config = tempfile::tempdir().expect("config dir");
+        let me = std::process::id();
+        let other = me.wrapping_add(3);
+        run_file_for(config.path(), me, dead_port().await, "token-g", None);
+        run_file_for(
+            config.path(),
+            other,
+            dead_port().await,
+            "token-h",
+            Some("C:/work/other"),
+        );
+
+        let rows = list_with_client(
+            config.path(),
+            me,
+            |pid| pid == me || pid == other,
+            Err("could not build the loopback HTTP client: TLS init failed".to_string()),
+        )
+        .await;
+
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|row| !row.answered), "{rows:?}");
+        let other_row = rows.iter().find(|row| row.pid == other).expect("other row");
+        assert_eq!(other_row.project.as_deref(), Some("C:/work/other"));
+        assert_eq!(other_row.version, "1.2.3");
+
+        let error = show_with_client(
+            config.path(),
+            me,
+            Err("could not build the loopback HTTP client: TLS init failed".to_string()),
+        )
+        .await
+        .expect_err("the build failure is returned, not a panic");
+        assert!(error.contains("TLS init failed"), "{error}");
+    }
+
+    #[test]
+    fn the_probe_client_is_built_once_and_never_panics() {
+        let first = probe_client();
+        let second = probe_client();
+        match (first, second) {
+            (Ok(first), Ok(second)) => assert!(std::ptr::eq(first, second), "the client is cached"),
+            (Err(first), Err(second)) => assert_eq!(first, second, "the failure is cached"),
+            _ => panic!("the cached client must be the same on every call"),
+        }
     }
 }

@@ -50,6 +50,32 @@ pub enum WorkerStatus {
     Cancelled,
 }
 
+impl WorkerStatus {
+    /// Whether this worker has active work in progress.
+    ///
+    /// One definition for the MCP summaries and the machine-wide instances
+    /// overview, so the two can never count differently.
+    pub(crate) fn is_running(self) -> bool {
+        matches!(
+            self,
+            Self::Dispatching | Self::Working | Self::Fixing | Self::Merging
+        )
+    }
+
+    /// Whether this worker is blocked on the person's review or intervention.
+    pub(crate) fn waiting_on_user(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::InReview
+                | Self::NeedsYou
+                | Self::Failed
+                | Self::Conflict
+                | Self::Interrupted
+        )
+    }
+}
+
 /// A real check result bound to the worker commit on which it ran.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerCheck {

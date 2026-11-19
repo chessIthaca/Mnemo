@@ -105,7 +105,7 @@ pub struct McpTestResult {
     /// The failure detail (None on success).
     pub error: Option<String>,
 }
-use crate::config::{Config, EndpointKind, SafetyMode};
+use crate::config::{Config, ConfigFingerprint, EndpointKind, SafetyMode};
 use crate::headless::error::EngineError;
 use crate::headless::types::EventReceiver;
 pub use crate::host::embed_download::EmbeddingModelDto;
@@ -382,6 +382,89 @@ pub struct SetupStatus {
     pub missing: Vec<SetupStep>,
 }
 
+/// What one live-settings check did — the result of
+/// [`Setup::reload_if_changed`], and what the instance tells the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// The files on disk match what this instance already applied (or this
+    /// process itself wrote them): nothing ran.
+    Unchanged,
+    /// The freshly loaded config was applied through the same live-apply a
+    /// Settings save runs.
+    Reloaded {
+        /// The hand edit touched `[general.laya]`, whose runtime leg only runs
+        /// through [`Setup::classifier_setup`] — it applies at the next engine
+        /// start, and the notice says so.
+        laya_changed: bool,
+    },
+    /// The files changed but could not be loaded: the old config stays live
+    /// (never a half-parsed apply).
+    Failed {
+        /// The live config files whose content differs from the applied set.
+        files: Vec<&'static str>,
+        /// The load error (the parser's message).
+        error: String,
+    },
+}
+
+impl ReloadOutcome {
+    /// Whether the check found a change worth reporting (a reload or a
+    /// failure) — `false` for an unchanged file set.
+    pub fn changed(&self) -> bool {
+        !matches!(self, ReloadOutcome::Unchanged)
+    }
+
+    /// Whether a reload ran and applied — the caller refreshes its model
+    /// catalog on this.
+    pub fn reloaded(&self) -> bool {
+        matches!(self, ReloadOutcome::Reloaded { .. })
+    }
+
+    /// The notice the window shows, or `None` when nothing changed.
+    pub fn notice(&self) -> Option<ReloadNotice> {
+        match self {
+            ReloadOutcome::Unchanged => None,
+            ReloadOutcome::Reloaded { laya_changed: false } => Some(ReloadNotice {
+                ok: true,
+                message: RELOADED_NOTICE.to_string(),
+            }),
+            ReloadOutcome::Reloaded { laya_changed: true } => Some(ReloadNotice {
+                ok: true,
+                message: format!("{RELOADED_NOTICE} {LAYA_RESTART_NOTICE}"),
+            }),
+            ReloadOutcome::Failed { files, error } => Some(ReloadNotice {
+                ok: false,
+                message: format!("Could not reload {}: {error}", notice_files(files)),
+            }),
+        }
+    }
+}
+
+/// The toast one live-settings check produces, as the window shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadNotice {
+    /// `true` for an applied reload, `false` for a rejected one.
+    pub ok: bool,
+    /// The text to show.
+    pub message: String,
+}
+
+/// The notice text after a live settings reload.
+pub const RELOADED_NOTICE: &str = "Settings changed in another window or by hand; reloaded.";
+/// The extra sentence when the hand edit touched `[general.laya]`.
+pub const LAYA_RESTART_NOTICE: &str =
+    "Laya changes take effect after a restart or a save in Settings.";
+
+/// The file list of a failure notice: the changed files, or "the settings"
+/// when the check could not name any (a Setup with no baseline).
+fn notice_files(files: &[&'static str]) -> String {
+    if files.is_empty() {
+        "the settings".to_string()
+    } else {
+        files.join(", ")
+    }
+}
+
 /// The standalone setup + config handle (§5.8 :525-527) — a pure
 /// config-dir handle in D1 (no engine state); the mutating surface
 /// (D2+) grows on it, and `for_engine` (D4) attaches a live engine for
@@ -409,6 +492,11 @@ pub struct Setup {
     /// fresh `Checking` (no live embedder yet); `for_engine` re-roots
     /// it to the brain's shared Arc.
     embedder_status_arc: Arc<std::sync::RwLock<EmbedderStatus>>,
+    /// The fingerprint of the config files this Setup last loaded or applied
+    /// ([`ConfigFingerprint`]) — [`Setup::reload_if_changed`]'s baseline.
+    /// Shared across clones so a reload seen through the watcher's clone is
+    /// the same baseline the owner sees.
+    last_applied: Arc<std::sync::Mutex<Option<ConfigFingerprint>>>,
 }
 
 impl Setup {
@@ -432,6 +520,9 @@ impl Setup {
             config_dir.join("laya"),
             Arc::clone(&classifier_status),
         ));
+        // What is on disk right now is this Setup's applied baseline: a check
+        // right after opening sees no change.
+        let last_applied = Some(ConfigFingerprint::read(&config_dir));
         Ok(Self {
             config_dir,
             key_source: KeySource::default(),
@@ -439,6 +530,7 @@ impl Setup {
             laya,
             classifier_status,
             embedder_status_arc,
+            last_applied: Arc::new(std::sync::Mutex::new(last_applied)),
         })
     }
 
@@ -515,6 +607,7 @@ impl Setup {
             )),
             classifier_status: brain.classifier_status.clone(),
             embedder_status_arc: brain.embedder_status.clone(),
+            last_applied: Arc::clone(&self.last_applied),
             live: Some(LiveHandles {
                 factory: brain.factory.clone(),
                 memory_store: brain.own_memory_store.clone(),
@@ -564,8 +657,32 @@ impl Setup {
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(e.to_string()))?;
         let Some(live) = &self.live else {
+            // Nothing live to apply: the save alone is the whole effect.
+            self.mark_applied();
             return Ok(());
         };
+        // The trace limits ride the patch only when it carries trace fields
+        // (the GUI's contract); a live reload has no patch and applies both.
+        let trace_limits =
+            patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some();
+        self.apply_live(live, new_config, trace_limits).await;
+        // This instance applied the save itself: the live-settings watcher
+        // must not reload it a second time.
+        self.mark_applied();
+        Ok(())
+    }
+
+    /// The live-apply sequence a settings change runs on a live engine —
+    /// shared by [`Setup::patch_settings`] and [`Setup::reload_if_changed`]:
+    /// the safety mode → the moved rewire core (vision + embedder + the
+    /// factory's live toggles) → the model resolver → the factory's
+    /// core-operations/shell-filter handles → the trace limits → the brain's
+    /// shared config. Effective on the next request.
+    ///
+    /// `trace_limits` distinguishes the patch contract (the GUI sends the
+    /// trace fields only when its trace page saved them) from a reload, which
+    /// applies whatever the loaded file says.
+    async fn apply_live(&self, live: &LiveHandles, new_config: Config, trace_limits: bool) {
         // Safety mode (the engine's approval gates read the flag per
         // request; the app additionally auto-resolves pending IPC
         // approvals — a headless engine has none parked by the GUI).
@@ -593,18 +710,88 @@ impl Setup {
             .set_core_operations(new_config.general.git.core_operations.clone());
         live.factory
             .set_shell_filter_config(new_config.general.shell_filter.clone());
-        // The trace limits (retroactive budget; the cap from now on) —
-        // only when the patch carries trace fields (the GUI's contract).
-        if patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some() {
+        // The trace limits (retroactive budget; the cap from now on).
+        if trace_limits {
             live.trace
                 .set_memory_budget(new_config.general.trace.memory_budget_mb * 1024 * 1024);
             live.trace
                 .set_request_body_cap(new_config.general.trace.request_body_cap_kb * 1024);
         }
-        // The brain's shared config: every later spawn reads the
-        // reloaded values.
+        // The brain's shared config: every later spawn reads the reloaded
+        // values.
         *live.config.lock().await = new_config;
-        Ok(())
+    }
+
+    /// Record what is on disk as this Setup's applied baseline — after a save
+    /// (which already applied live) and after a successful reload.
+    fn mark_applied(&self) {
+        *self.last_applied.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(ConfigFingerprint::read(&self.config_dir));
+    }
+
+    /// One live-settings check: when the four config files on disk
+    /// ([`crate::config::CONFIG_FILE_NAMES`]) differ from what this Setup last
+    /// applied, load them and apply them through the same live-apply sequence
+    /// a Settings save runs ([`Setup::apply_live`]).
+    ///
+    /// - A file set whose fingerprint still matches the applied baseline is
+    ///   unchanged: nothing runs. The same holds for a set this process itself
+    ///   just wrote ([`crate::config::last_written_fingerprint`]) — the save
+    ///   already applied its values live, so its file events reload nothing.
+    /// - A load error (broken TOML, a half-written file) keeps the old config
+    ///   live — never a half-parsed apply — and reports the changed file(s)
+    ///   plus the error.
+    /// - `[general.laya]` stays at its live value: the flag rides
+    ///   [`Setup::classifier_setup`] (sidecar stop/start, slot, status), so a
+    ///   hand edit there takes effect at the next engine start — the notice
+    ///   says so.
+    ///
+    /// A Setup without a live engine has nothing to apply and reports
+    /// [`ReloadOutcome::Unchanged`].
+    pub async fn reload_if_changed(&self) -> ReloadOutcome {
+        let disk = ConfigFingerprint::read(&self.config_dir);
+        let baseline = *self.last_applied.lock().unwrap_or_else(|e| e.into_inner());
+        if baseline == Some(disk) {
+            return ReloadOutcome::Unchanged;
+        }
+        // This process's own save already applied its values live: the file
+        // events it caused must not reload a second time.
+        if crate::config::last_written_fingerprint(&self.config_dir) == Some(disk) {
+            self.mark_applied();
+            return ReloadOutcome::Unchanged;
+        }
+        let files = match baseline {
+            Some(baseline) => baseline.changed_files(&disk),
+            // No baseline (a Setup built without one): name every file.
+            None => crate::config::CONFIG_FILE_NAMES.to_vec(),
+        };
+        // A first-run Setup has no live pieces — nothing to reload.
+        let Some(live) = &self.live else {
+            return ReloadOutcome::Unchanged;
+        };
+        let new_config = match self.load_config() {
+            Ok(config) => config,
+            Err(error) => {
+                return ReloadOutcome::Failed {
+                    files,
+                    error: error.to_string(),
+                }
+            }
+        };
+        let mut new_config = new_config;
+        // Keep the live Laya block (see the docs above): the runtime leg is
+        // classifier_setup's, and a brain that claims an enabled classifier it
+        // does not run would half-apply the flag.
+        let live_laya = {
+            let live_config = live.config.lock().await;
+            live_config.general.general.laya.clone()
+        };
+        let laya_changed = live_laya != new_config.general.general.laya;
+        new_config.general.general.laya = live_laya;
+        // A reload applies the whole loaded file, trace limits included.
+        self.apply_live(live, new_config, true).await;
+        self.mark_applied();
+        ReloadOutcome::Reloaded { laya_changed }
     }
 
     /// The managed-Laya runtime handle for this Setup's config dir
@@ -1843,6 +2030,225 @@ mod tests {
             Some("alt-model")
         );
         drop(shared);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A ready engine over fresh temp dirs: the config fixture answers
+    /// [`Setup::open`] and the engine starts offline (the `"hash"` embedder).
+    /// The caller keeps both `TempDir`s alive for the engine's lifetime.
+    async fn ready_engine() -> (tempfile::TempDir, tempfile::TempDir, Engine) {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        (root, cfg, engine)
+    }
+
+    /// Live settings (plan d3336a8a step 6): a hand edit of `config.toml` — no
+    /// Settings save in this process — reloads through the same live-apply,
+    /// rebuilds the vision client and swaps the brain's shared config.
+    #[tokio::test]
+    async fn external_edit_reloads_and_rewires_vision() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let factory = Arc::clone(&engine.brain().factory);
+        assert!(
+            !factory.vision_slot().is_configured(),
+            "the fixture has no vision fallback"
+        );
+        // A hand edit in an editor: add the vision fallback model.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"alt-model\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+
+        let outcome = setup.reload_if_changed().await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Reloaded {
+                laya_changed: false
+            },
+            "the hand edit must reload"
+        );
+        // The live vision slot was rebuilt from the reloaded config…
+        assert!(
+            factory.vision_slot().is_configured(),
+            "the rewire installed the vision fallback"
+        );
+        // …and the brain's shared config (the next spawn's) carries it.
+        assert_eq!(
+            engine
+                .brain()
+                .config
+                .lock()
+                .await
+                .general
+                .general
+                .vision_model,
+            Some(crate::config::VisionModel {
+                endpoint: "test".to_string(),
+                model: "alt-model".to_string(),
+            })
+        );
+        assert_eq!(
+            outcome.notice().expect("a change is reported"),
+            ReloadNotice {
+                ok: true,
+                message: RELOADED_NOTICE.to_string()
+            }
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// An instance's OWN save must not reload a second time: the save records
+    /// the fingerprint it wrote (process-wide) and its Setup's baseline, so the
+    /// watcher's immediate check sees nothing new — no toast, no re-apply.
+    #[tokio::test]
+    async fn own_save_does_not_reload_twice() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        setup
+            .patch_settings(SettingsSaveDto {
+                safety: Some("autonomous".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("patch applies");
+        assert_eq!(
+            crate::config::last_written_fingerprint(cfg.path()),
+            Some(ConfigFingerprint::read(cfg.path())),
+            "the save must record the fingerprint it wrote"
+        );
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "this instance's own save must not reload again"
+        );
+        // A second check stays quiet too — a stray event cannot ping-pong.
+        assert_eq!(setup.reload_if_changed().await, ReloadOutcome::Unchanged);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A broken hand edit keeps the old config live (never a half-parsed
+    /// apply) and reports the changed file plus the parser's error.
+    #[tokio::test]
+    async fn broken_toml_keeps_old_config() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let before = engine
+            .brain()
+            .config
+            .lock()
+            .await
+            .general
+            .general
+            .default_model
+            .clone();
+        std::fs::write(
+            cfg.path().join("config.toml"),
+            "[general\ndefault_model = = 3\n",
+        )
+        .expect("broken hand edit");
+
+        let outcome = setup.reload_if_changed().await;
+        let ReloadOutcome::Failed { files, error } = &outcome else {
+            panic!("a broken config must fail the reload, got {outcome:?}");
+        };
+        assert_eq!(files, &["config.toml"], "the toast names the changed file");
+        assert!(!error.is_empty(), "the parser's message is reported");
+        // The OLD config is still live — nothing was half-applied.
+        assert_eq!(
+            engine
+                .brain()
+                .config
+                .lock()
+                .await
+                .general
+                .general
+                .default_model,
+            before,
+            "a failed reload never swaps the live config"
+        );
+        let notice = outcome.notice().expect("a failure is reported");
+        assert!(!notice.ok);
+        assert!(
+            notice.message.contains("config.toml") && notice.message.contains(error.as_str()),
+            "the notice names the file and the error: {}",
+            notice.message
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A hand edit of `keys.toml` reloads: the rotated key reaches the brain's
+    /// shared config (the next spawn's key store).
+    #[tokio::test]
+    async fn keys_change_reloads() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        std::fs::write(cfg.path().join("keys.toml"), "[test]\napi_key = \"sk-rotated\"\n")
+            .expect("key rotation");
+
+        let outcome = setup.reload_if_changed().await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Reloaded {
+                laya_changed: false
+            },
+            "a keys-only edit must reload"
+        );
+        assert_eq!(
+            engine.brain().config.lock().await.keys.get("test"),
+            Some("sk-rotated"),
+            "the rotated key is live"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A hand edit of `[general.laya]` keeps the live block: the runtime leg
+    /// (sidecar, slot, status) belongs to `classifier_setup`, so the reload
+    /// defers it and the notice says a restart is needed.
+    #[tokio::test]
+    async fn laya_hand_edit_is_deferred_to_the_next_start() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        enable_laya_in_config(cfg.path());
+
+        let outcome = setup.reload_if_changed().await;
+        assert_eq!(outcome, ReloadOutcome::Reloaded { laya_changed: true });
+        assert!(
+            !engine
+                .brain()
+                .config
+                .lock()
+                .await
+                .general
+                .general
+                .laya
+                .enabled,
+            "the live Laya block never claims a runtime it does not have"
+        );
+        let notice = outcome.notice().expect("a change is reported");
+        assert!(notice.ok);
+        assert!(notice.message.contains(LAYA_RESTART_NOTICE));
         engine.shutdown().await.expect("shutdown");
     }
 

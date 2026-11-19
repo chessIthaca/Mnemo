@@ -13,6 +13,12 @@
 //!
 //! `Config::load()` merges all of them. `keys.toml` is loaded last and never
 //! included in `Debug` output.
+//!
+//! The four live files are also what the live-settings watcher
+//! ([`crate::host::config_watcher`]) fingerprints: a hand edit — or another
+//! instance's save — reloads a running engine through
+//! [`crate::headless::Setup::reload_if_changed`], the same live-apply a
+//! Settings save uses. [`ConfigFingerprint`] is that check's currency.
 
 pub mod endpoints;
 pub mod general;
@@ -33,8 +39,10 @@ pub use keys::KeyStore;
 pub use mcp::McpServerDef;
 pub use projects::{ProjectEntry, ProjectRegistry};
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::Result;
 
@@ -437,8 +445,126 @@ impl Config {
         for path in &paths {
             let _ = fs::remove_file(backup_path(path));
         }
+        // Remember what this process just put on disk: the live-settings
+        // watcher must not treat an instance's own save as an outside change
+        // (the calling save path already applied these values live).
+        record_written_fingerprint(config_dir, ConfigFingerprint::from_texts(texts));
         Ok(())
     }
+}
+
+/// The four live config files the global config merges — the set whose
+/// content a hand edit or another instance's save can change under a running
+/// engine.
+///
+/// `projects.toml` is deliberately absent: the known-projects registry is not
+/// live config, and a hand edit there (a project added or renamed) takes
+/// effect the next time a window reads the list, not through a reload.
+pub const CONFIG_FILE_NAMES: [&str; 4] =
+    ["config.toml", "endpoints.toml", "keys.toml", "mcp.toml"];
+
+/// The content fingerprint of the four live config files
+/// ([`CONFIG_FILE_NAMES`]) — the live-settings watcher compares a fingerprint
+/// of what is on disk with the one this instance last applied, and reloads only
+/// when they differ.
+///
+/// It hashes the raw file bytes, never the parsed config: a file that is
+/// missing, half-written by an editor, or invalid TOML still fingerprints
+/// cleanly, so the comparison never depends on the reload succeeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigFingerprint {
+    /// One hash per [`CONFIG_FILE_NAMES`] entry, in that order.
+    hashes: [u64; CONFIG_FILE_NAMES.len()],
+}
+
+impl ConfigFingerprint {
+    /// Fingerprint the four live config files under `config_dir`.
+    ///
+    /// A missing file hashes differently from an empty one, so deleting a
+    /// config file is a change the watcher sees.
+    pub fn read(config_dir: &Path) -> Self {
+        let mut hashes = [0u64; CONFIG_FILE_NAMES.len()];
+        for (slot, name) in hashes.iter_mut().zip(CONFIG_FILE_NAMES) {
+            *slot = match fs::read(config_dir.join(name)) {
+                Ok(bytes) => fingerprint_bytes(&bytes),
+                Err(_) => ABSENT_FILE_HASH,
+            };
+        }
+        Self { hashes }
+    }
+
+    /// Fingerprint the exact bytes a save is about to commit, in
+    /// [`CONFIG_FILE_NAMES`] order — so the writer can record what lands on
+    /// disk without re-reading (and racing) the files it just wrote.
+    pub fn from_texts(texts: [&str; CONFIG_FILE_NAMES.len()]) -> Self {
+        let mut hashes = [0u64; CONFIG_FILE_NAMES.len()];
+        for (slot, text) in hashes.iter_mut().zip(texts) {
+            *slot = fingerprint_bytes(text.as_bytes());
+        }
+        Self { hashes }
+    }
+
+    /// The files whose content differs between this fingerprint and `other`,
+    /// named in [`CONFIG_FILE_NAMES`] order.
+    pub fn changed_files(&self, other: &Self) -> Vec<&'static str> {
+        CONFIG_FILE_NAMES
+            .iter()
+            .zip(self.hashes.iter().zip(other.hashes.iter()))
+            .filter(|(_, (mine, theirs))| mine != theirs)
+            .map(|(name, _)| *name)
+            .collect()
+    }
+}
+
+/// FNV-1a's offset basis — also the hash of a missing file.
+const ABSENT_FILE_HASH: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a's prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// One FNV-1a hash of `bytes`, starting from a present-file basis.
+///
+/// FNV-1a is deliberate: stable across processes and Rust releases (unlike
+/// `DefaultHasher`), tiny, and good enough to tell config files apart.
+fn fingerprint_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = ABSENT_FILE_HASH ^ 0x9e37_79b9_7f4a_7c15;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The fingerprint of the live config files as THIS process last wrote them,
+/// per config dir — how a running instance recognises its own save (the save
+/// that triggered the file event already applied the values live).
+fn last_written() -> &'static Mutex<HashMap<PathBuf, ConfigFingerprint>> {
+    static LAST_WRITTEN: OnceLock<Mutex<HashMap<PathBuf, ConfigFingerprint>>> = OnceLock::new();
+    LAST_WRITTEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The registry key: the canonical dir when it resolves, so a Setup and a
+/// watcher that spell the same directory differently still meet.
+fn fingerprint_key(config_dir: &Path) -> PathBuf {
+    fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf())
+}
+
+/// The fingerprint of the live config files as this process last wrote them
+/// under `config_dir` (`None` before the first save) — the live-settings
+/// watcher ignores an event whose files match it.
+pub fn last_written_fingerprint(config_dir: &Path) -> Option<ConfigFingerprint> {
+    last_written()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&fingerprint_key(config_dir))
+        .copied()
+}
+
+/// Record a completed [`Config::save_all`] for the live-settings watcher.
+fn record_written_fingerprint(config_dir: &Path, fingerprint: ConfigFingerprint) {
+    last_written()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(fingerprint_key(config_dir), fingerprint);
 }
 
 /// Path of the staging file for `path` (`foo.toml` → `foo.toml.tmp`).
@@ -1086,6 +1212,60 @@ api_key = "sk-super-secret"
         );
         // But it is still accessible via the key store.
         assert_eq!(cfg.key_for("openai"), Some("sk-super-secret"));
+    }
+
+    #[test]
+    fn fingerprint_names_the_changed_files() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join("config.toml"), "[general]\n");
+        let first = ConfigFingerprint::read(dir.path());
+        assert!(first.changed_files(&first).is_empty());
+        write(&dir.path().join("endpoints.toml"), "pricing = []\n");
+        let second = ConfigFingerprint::read(dir.path());
+        assert_eq!(second.changed_files(&first), vec!["endpoints.toml"]);
+        // A rewrite with identical content is not a change.
+        write(&dir.path().join("config.toml"), "[general]\n");
+        assert!(ConfigFingerprint::read(dir.path())
+            .changed_files(&second)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_missing_file_fingerprints_differently_from_an_empty_one() {
+        let dir = tempdir().unwrap();
+        let missing = ConfigFingerprint::read(dir.path());
+        write(&dir.path().join("config.toml"), "");
+        assert_eq!(
+            ConfigFingerprint::read(dir.path()).changed_files(&missing),
+            vec!["config.toml"],
+            "deleting a file must be a change; an empty file is not the same as none"
+        );
+    }
+
+    #[test]
+    fn save_all_records_the_fingerprint_it_wrote() {
+        let dir = tempdir().unwrap();
+        assert_eq!(last_written_fingerprint(dir.path()), None);
+        Config::default().save_all(dir.path()).unwrap();
+        assert_eq!(
+            last_written_fingerprint(dir.path()),
+            Some(ConfigFingerprint::read(dir.path())),
+            "a save must record exactly what landed on disk"
+        );
+    }
+
+    #[test]
+    fn unwatched_files_do_not_change_the_fingerprint() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join("config.toml"), "[general]\n");
+        let before = ConfigFingerprint::read(dir.path());
+        write(&dir.path().join("projects.toml"), "[[project]]\npath = 'x'\n");
+        assert!(
+            ConfigFingerprint::read(dir.path())
+                .changed_files(&before)
+                .is_empty(),
+            "projects.toml is not live config"
+        );
     }
 
     #[test]

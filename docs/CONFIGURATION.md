@@ -21,6 +21,8 @@ How to configure Mnemo2: the global files in `~/.mnemo/` (or `$MNEMO_HOME`), end
 
 The system prompts (preamble, workflow lifecycle, app rules, tool strategy, memory records, per-state workflow guidance) and the tools-array descriptions are compiled constants — not configurable per install. Installs predating the rename are migrated from `~/.myharness` automatically on first launch.
 
+**Live settings.** A running Mnemo2 watches the four live files — `config.toml`, `endpoints.toml`, `keys.toml` and `mcp.toml` — and applies a hand edit (or another instance's save) through the same live-apply a Settings save uses, in every open window and without a restart; the window shows `Settings changed in another window or by hand; reloaded.` A file with a syntax error keeps the old config live and the toast names the file and the parser's error. An instance's own save is recognised by content fingerprint, so it never reloads twice. `projects.toml` is not live config — a hand edit there is read the next time a window loads its project list. A hand-edited `[general.laya] enabled` is the one deferred key: it applies at the next start (or a save on Settings → Tiers), because the flag starts and stops the classifier sidecar.
+
 ## config.toml
 
 ### Memory and context

@@ -40,6 +40,7 @@ pub mod git_diff;
 pub mod git_read;
 pub mod git_read_tool;
 pub mod image_tools;
+pub mod jobs;
 pub mod line_endings;
 pub mod list_models;
 pub mod load_tools;

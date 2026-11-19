@@ -47,6 +47,9 @@ and multi_edit edits need no re-read: read receipts follow them.
 whole block. Several small edits beat one large one. If an edit misses near \
 the right spot, the error shows the current text there with a read receipt: \
 cite that instead of re-reading.
+- For a build or test that may run longer than a few minutes, or to work on \
+while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
+Never poll with sleep or Start-Sleep, and never start detached processes.
 - Send files, ops and lines as real JSON arrays, never as a quoted string. For \
 a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
@@ -492,6 +495,9 @@ and multi_edit edits need no re-read: read receipts follow them.
 whole block. Several small edits beat one large one. If an edit misses near \
 the right spot, the error shows the current text there with a read receipt: \
 cite that instead of re-reading.
+- For a build or test that may run longer than a few minutes, or to work on \
+while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
+Never poll with sleep or Start-Sleep, and never start detached processes.
 - Send files, ops and lines as real JSON arrays, never as a quoted string. For \
 a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
@@ -1097,8 +1103,11 @@ mod tests {
         // bullets joined the `Be precise` bullet — re-read after a formatter
         // or shell rewrite, keep old_string short and cite the near-miss
         // excerpt instead of re-reading, and send arrays as arrays.
+        // Bumped 2026-11-19 (plan 5b85ab61 step 2): the job-tool bullet —
+        // job_start a long build, then job_wait; never poll with sleep and
+        // never start detached processes.
         const GOLDEN_HEAD: &str =
-            "len=13301|sha256=bdb1eb9ad2e33081feddfc773f1c3b95f7b45f7d0f65dd1ff0bc88bbcf0936a6";
+            "len=13530|sha256=5542b3de3d51e92e6963e29f29730220f4f78c424783bff88fae91e75f98f921";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",
@@ -2354,6 +2363,9 @@ near the right spot, the error shows the current text there with a read \
 receipt: cite that instead of re-reading.",
             "- Send files, ops and lines as real JSON arrays, never as a quoted \
 string. For a change to one file, use file_edit.",
+            "- For a build or test that may run longer than a few minutes, or to \
+work on while it runs: job_start it, then job_wait (with a pattern to stop at a \
+line). Never poll with sleep or Start-Sleep, and never start detached processes.",
         ] {
             assert!(
                 CODING_SYSTEM_PREAMBLE.contains(bullet),

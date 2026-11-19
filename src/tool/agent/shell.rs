@@ -197,7 +197,7 @@ const SHELL_FILE_WRITE_NOTE: &str = "NOTE: change files with file_edit or file_w
 /// an echoed string, a commit message) is never gated. Known residual, matching
 /// the one the git tool's own guard documents: an alias, a wrapper script, or
 /// `sh -c "git push"` still evades.
-fn command_is_core_git_op(command: &str, core_operations: &[String]) -> bool {
+pub(crate) fn command_is_core_git_op(command: &str, core_operations: &[String]) -> bool {
     // LF and CR are built from bytes: an escaped char literal in this spot was
     // mangled by the editing tooling once already, and a byte-built char is
     // exact for ASCII.
@@ -540,19 +540,30 @@ impl ShellTool {
     /// - Otherwise the path is validated via [`Sandbox::validate`]; traversal
     ///   (`..`), absolute paths outside the root, and non-directories fail.
     fn resolve_cwd(&self, cwd: Option<&str>) -> Result<std::path::PathBuf, String> {
-        let cwd = cwd.map(str::trim).filter(|s| !s.is_empty());
-        let path = match cwd {
-            None => self.sandbox.root().to_path_buf(),
-            Some(c) => self
-                .sandbox
-                .validate(Path::new(c))
-                .map_err(|e| format!("cwd validation failed: {e}"))?,
-        };
-        if !path.is_dir() {
-            return Err(format!("cwd is not a directory: {}", path.display()));
-        }
-        Ok(path)
+        resolve_cwd(&self.sandbox, cwd)
     }
+}
+
+/// Resolve and sandbox-validate a working directory — the shared contract of
+/// `shell` and the job tools (plan 5b85ab61 step 2 reuses it instead of
+/// copying the rules, so `job_start`'s `cwd` is validated exactly like
+/// `shell`'s).
+///
+/// - `None` / empty → the sandbox root.
+/// - Otherwise the path goes through [`Sandbox::validate`]; traversal (`..`),
+///   absolute paths outside the root, and non-directories fail.
+pub(crate) fn resolve_cwd(sandbox: &Sandbox, cwd: Option<&str>) -> Result<std::path::PathBuf, String> {
+    let cwd = cwd.map(str::trim).filter(|s| !s.is_empty());
+    let path = match cwd {
+        None => sandbox.root().to_path_buf(),
+        Some(c) => sandbox
+            .validate(Path::new(c))
+            .map_err(|e| format!("cwd validation failed: {e}"))?,
+    };
+    if !path.is_dir() {
+        return Err(format!("cwd is not a directory: {}", path.display()));
+    }
+    Ok(path)
 }
 
 #[async_trait]
@@ -663,7 +674,10 @@ impl Tool for ShellTool {
         // the deadline kill and the reader join; this tool keeps the shaping —
         // argument parsing, cwd validation, filtering, notes, caps and the
         // structured `data`.
-        let outcome = run_command(&args.command, &cwd, self.limits, Some(sink)).await;
+        // `None` for the job-log tap: the shell tool's own result is the whole
+        // record of a call that completes here (plan 5b85ab61 step 2 added the
+        // tap for the job tools, which outlive their call).
+        let outcome = run_command(&args.command, &cwd, self.limits, Some(sink), None).await;
         let (code, stdout_bytes, stderr_bytes, background_held, translated) = match outcome {
             RunOutcome::SpawnFailed(message) => return ToolResult::error(message),
             RunOutcome::SilenceTimeout {
@@ -676,7 +690,7 @@ impl Tool for ShellTool {
                     format!(
                         "command printed nothing for {label} and was killed (silence \
                          timeout); a command that works silently for long should print \
-                         progress"
+                         progress, or run it with job_start"
                     ),
                     "silence",
                     stdout,
@@ -946,6 +960,7 @@ pub(crate) async fn run_command(
     cwd: &Path,
     limits: RunLimits,
     sink: Option<OutputSink>,
+    log: Option<JobLogTap>,
 ) -> RunOutcome {
     let (program, flag) = if cfg!(target_os = "windows") {
         ("powershell", "-Command")
@@ -1040,6 +1055,7 @@ pub(crate) async fn run_command(
         sink.clone(),
         state.clone(),
         stop_out_rx,
+        log.clone(),
     ));
     let err_task = tokio::spawn(pump_stream(
         stderr_pipe,
@@ -1047,6 +1063,7 @@ pub(crate) async fn run_command(
         sink,
         state.clone(),
         stop_err_rx,
+        log,
     ));
     // Abort the readers if this run never reaches a join: an agent interrupt
     // DROPS this future, and dropping a `JoinHandle` does not cancel its task —
@@ -1233,7 +1250,7 @@ fn killed_result(reason: String, killed: &str, stdout: Vec<u8>, stderr: Vec<u8>)
 
 /// The last `cap` bytes of `text`, advanced to the next char boundary so the
 /// slice is always valid UTF-8.
-fn tail_of(text: &str, cap: usize) -> &str {
+pub(crate) fn tail_of(text: &str, cap: usize) -> &str {
     if text.len() <= cap {
         return text;
     }
@@ -1247,13 +1264,48 @@ fn tail_of(text: &str, cap: usize) -> &str {
 /// The model-facing text of a run: stderr LEADS (plan 75b41222), with the
 /// `[stderr]` / `[stdout]` labels only when both streams have something to
 /// show. Shared by the exit path and the killed-command path.
-fn combine_streams(stdout: &str, stderr: &str) -> String {
+pub(crate) fn combine_streams(stdout: &str, stderr: &str) -> String {
     if stderr.is_empty() {
         stdout.to_string()
     } else if stdout.is_empty() {
         format!("[stderr]\n{stderr}")
     } else {
         format!("[stderr]\n{stderr}\n[stdout]\n{stdout}")
+    }
+}
+
+/// A line-preserving tap on a run's output — the job log's source (plan
+/// 5b85ab61 step 2).
+///
+/// The live-view [`OutputSink`] is the wrong source for a job log: it is
+/// throttled ([`STREAM_FLUSH_INTERVAL`]) and byte-capped ([`STREAM_CAP`]), so a
+/// chatty build's log would be silently truncated. This tap is the opposite —
+/// every COMPLETE line the readers see is handed on, in arrival order, tagged
+/// with its stream; the trailing partial line at EOF is handed on too so
+/// nothing is lost, and nothing here is capped.
+///
+/// The tap carries no deadline logic of its own: the run still ends through
+/// [`run_command`]'s wait loop, so a job needs only different [`RunLimits`].
+#[derive(Clone)]
+pub(crate) struct JobLogTap {
+    tx: tokio::sync::mpsc::UnboundedSender<(ToolOutputStream, String)>,
+}
+
+impl JobLogTap {
+    /// A tap that hands every line to `tx` (the job registry's log writer).
+    pub(crate) fn new(tx: tokio::sync::mpsc::UnboundedSender<(ToolOutputStream, String)>) -> Self {
+        Self { tx }
+    }
+
+    /// Hand one line to the writer — with or without its terminating newline;
+    /// the writer makes every record end in exactly one.
+    fn push(&self, stream: ToolOutputStream, line: &[u8]) {
+        if line.is_empty() {
+            return;
+        }
+        // A closed receiver (the writer task already ended) drops the line; the
+        // run's own result is unaffected either way.
+        let _ = self.tx.send((stream, String::from_utf8_lossy(line).into_owned()));
     }
 }
 
@@ -1399,12 +1451,15 @@ async fn pump_stream<R>(
     sink: OutputSink,
     state: StreamState,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    log: Option<JobLogTap>,
 ) -> Vec<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut all: Vec<u8> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
+    // Complete lines not yet handed to the job log (see [`JobLogTap`]).
+    let mut log_pending: Vec<u8> = Vec::new();
     let mut last_emit = Instant::now();
     let live = sink.is_active();
     let mut buf = [0u8; 4096];
@@ -1427,6 +1482,18 @@ where
                     state.started.elapsed().as_millis() as u64,
                     Ordering::Relaxed,
                 );
+                // Job log (plan 5b85ab61 step 2): the readers are the only place
+                // every byte of both streams passes through, so the
+                // line-preserving tap lives here — complete lines as they
+                // arrive, the remainder at EOF. Uncapped, and filled whether or
+                // not a live sink is attached.
+                if let Some(log) = &log {
+                    log_pending.extend_from_slice(&buf[..n]);
+                    while let Some(idx) = log_pending.iter().position(|b| *b == b'\n') {
+                        log.push(stream, &log_pending[..=idx]);
+                        log_pending.drain(..=idx);
+                    }
+                }
                 if !live {
                     continue;
                 }
@@ -1462,6 +1529,11 @@ where
                 last_emit = Instant::now();
             }
         }
+    }
+    if let Some(log) = &log {
+        // The trailing partial line at EOF carries no newline; the writer adds
+        // one so the log stays line-oriented.
+        log.push(stream, &log_pending);
     }
     if live {
         // Final flush: decode the whole remainder (nothing follows it, so an
@@ -1548,6 +1620,39 @@ fn format_duration(d: Duration) -> String {
         format!("{secs:.1}s")
     } else {
         format!("{}ms", d.as_millis())
+    }
+}
+
+/// Test-only shell snippets whose syntax differs by platform (plan 5b85ab61
+/// step 2).
+///
+/// The job tools' tests need a `sleep` and an endless heartbeat loop, and this
+/// file is the one that already owns the Windows/macOS command split — the
+/// multi-platform policy forbids a second library file from repeating
+/// `cfg(windows)`, so the split lives here and `jobs.rs` asks for a finished
+/// command string.
+///
+/// A shell command that sleeps for `duration`.
+#[cfg(test)]
+pub(crate) fn test_sleep(duration: Duration) -> String {
+    if cfg!(windows) {
+        format!("Start-Sleep -Milliseconds {}", duration.as_millis())
+    } else {
+        format!("sleep {:.1}", duration.as_secs_f64())
+    }
+}
+
+/// A shell loop that appends one line to `path` (relative to the run's cwd)
+/// every 200 ms, forever — the heartbeat a test watches to prove a job's
+/// process tree is dead.
+#[cfg(test)]
+pub(crate) fn test_heartbeat(path: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "while ($true) {{ Add-Content -Path {path} -Value x; Start-Sleep -Milliseconds 200 }}"
+        )
+    } else {
+        format!("while true; do echo x >> {path}; sleep 0.2; done")
     }
 }
 

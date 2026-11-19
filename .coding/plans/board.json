@@ -2873,6 +2873,54 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Edit-tool robustness, review_fix matching and a Quality-tab metric; no OpenSpec capability governs these files' specified behavior."
+    },
+    {
+      "id": "5b85ab61",
+      "status": "open",
+      "created_at_ms": 1795085061064,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Stale-read redirects are not strikes",
+              "text": "The system SHALL NOT count a failed tool result that is a stale-read gate redirect (EDIT INTERCEPTED) or an unknown read receipt error toward a worker's strike streak, and SHALL NOT let it reset the streak either. An exact repeat of the previous call SHALL still count as a strike.",
+              "scenarios": [
+                {
+                  "name": "Intercepted edit followed by a re-read",
+                  "when": [
+                    "a worker's edit is intercepted by the stale-read gate",
+                    "the worker re-reads the file and edits again"
+                  ],
+                  "then": [
+                    "no strike nudge is sent for those calls"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Repeated identical intercepted call",
+                  "when": [
+                    "a worker sends the same intercepted edit call three times in a row"
+                  ],
+                  "then": [
+                    "the repeats count as strikes as before"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Only dispatch-routing changes (its spec delta is attached). external-lead, tier-ladder and worker-brief requirements are unchanged: lead attachment, tiers and the worker brief behave as before; pump.rs, nudge.rs and tests.rs are touched only for strike counting and check recording."
     }
   ]
 }

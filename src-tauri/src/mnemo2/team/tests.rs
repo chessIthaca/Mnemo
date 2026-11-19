@@ -6558,6 +6558,79 @@ async fn three_failing_tool_calls_nudge_once() {
     fixture.team.shutdown().await;
 }
 
+/// A stale-read redirect is steering, not a strike (plan 5b85ab61 step 4).
+/// One drift-class failure arms the gate on README.md; the worker then retries
+/// with THREE different `old_string`s, so every retry is a fresh call that the
+/// gate intercepts (EDIT INTERCEPTED). Before the fix each interception counted
+/// toward the strike streak, so the third one nudged the lead with "looks
+/// stuck" — while the worker was doing exactly what the gate told it to.
+#[tokio::test]
+async fn stale_read_redirects_do_not_nudge_the_lead() {
+    let edit = |id: &str, old_string: &str| {
+        tool_call_batch(
+            id,
+            "file_edit",
+            &format!(
+                "{{\"path\":\"README.md\",\"old_string\":\"{old_string}\",\"new_string\":\"X\"}}"
+            ),
+        )
+    };
+    let responses = vec![
+        // The read the edit needs to be judged a drift, not a blind write.
+        tool_call_batch("call-read", "read_files", "{\"path\":\"README.md\"}"),
+        // A drift-class failure: old_string not found. Arms the gate.
+        edit("call-drift", "missing-one"),
+        // Three intercepted retries with distinct arguments — no exact repeat.
+        edit("call-e1", "missing-two"),
+        edit("call-e2", "missing-three"),
+        edit("call-e3", "missing-four"),
+        vec![
+            mnemo::provider::LlmEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            },
+        ],
+    ];
+    let (fixture, _notices) = nudge_fixture(responses).await;
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+
+    let rows = fixture.rows();
+    assert!(
+        !rows
+            .iter()
+            .any(|row| matches!(row, DispatchRoutingRow::Nudge { .. })),
+        "intercepted retries must not nudge the lead: {rows:?}"
+    );
+    assert!(
+        !matches!(settled.status, WorkerStatus::Failed),
+        "the worker finished normally: {settled:?}"
+    );
+
+    // The redirects really happened: the worker's transcript carries the
+    // gate's marker, so "no nudge" is not "the gate never ran".
+    let transcript = fixture
+        .state
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join("routingworker.json");
+    let saved = eventually(|| async {
+        std::fs::read_to_string(&transcript)
+            .ok()
+            .filter(|text| text.contains(mnemo::EDIT_GATE_MARK))
+    })
+    .await;
+    assert_eq!(
+        saved.matches(mnemo::EDIT_GATE_MARK).count(),
+        3,
+        "all three retries were intercepted (not drift failures): {saved}"
+    );
+    fixture.team.shutdown().await;
+}
+
 /// The failing-tool streak keeps the last three calls, collapses each
 /// output's whitespace, cuts it at the character limit without splitting a
 /// character, and a successful call clears it.

@@ -733,10 +733,28 @@ pub(super) async fn pump_worker(
                         previous_signature.as_deref() == Some(signature.as_str());
                     previous_signature = Some(signature.clone());
                     let failed = !result.success;
-                    if strikes.lock().await.observe(signature, failed) {
+                    // A steering redirect (the stale-read gate's EDIT
+                    // INTERCEPTED, an unknown read receipt) is neither a
+                    // failure nor a success (plan 5b85ab61 step 4): it leaves
+                    // the strike count exactly as it was, so following the
+                    // gate's "re-read, then retry" advice cannot push the
+                    // worker toward the stuck nudge. An exact repeat of the
+                    // previous call still strikes.
+                    let steering = route_question::is_steering_redirect(result);
+                    let fired = if steering {
+                        strikes.lock().await.observe_neutral(signature)
+                    } else {
+                        strikes.lock().await.observe(signature, failed)
+                    };
+                    if fired {
                         strike_fired = Some(repeated);
                     }
-                    tool_outcome = Some((name.clone(), result.success, result.output.clone()));
+                    // Only a real outcome feeds the nudge's error list: a
+                    // redirect adds nothing and clears nothing.
+                    if !steering {
+                        tool_outcome =
+                            Some((name.clone(), result.success, result.output.clone()));
+                    }
                     let checkout = {
                         let records = records.lock().await;
                         records

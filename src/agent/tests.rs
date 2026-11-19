@@ -22043,3 +22043,133 @@ async fn a_switch_after_an_in_turn_compaction_reports_next_request() {
     assert!(!agent.has_pending_swap());
     while let Ok((_id, _event)) = fanin_rx.try_recv() {}
 }
+// ---------------------------------------------------------------------------
+// Steering redirects are neutral (plan 5b85ab61 step 4): the stale-read
+// gate's EDIT INTERCEPTED and an unknown read receipt are the harness
+// pointing the model at its next step, so they must not count toward the
+// stuck worker's counters — not as a strike, not as a tool error, and not
+// toward the repeat-failure "your call shape is wrong" correction.
+// ---------------------------------------------------------------------------
+
+/// One `file_edit` call: `path`, a `old_string` that will not match, and a
+/// one-byte replacement. The building block of the stale-read-gate tests.
+fn drift_file_edit_call(index: u32, id: &str, path: &str, old_string: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index,
+            id: id.into(),
+            name: "file_edit".into(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index,
+            fragment: format!(
+                r#"{{"path":"{path}","old_string":"{old_string}","new_string":"X"}}"#
+            ),
+        },
+    ]
+}
+
+/// One scripted batch ending in a tool-call finish.
+fn drift_batch(mut calls: Vec<LlmEvent>) -> Vec<LlmEvent> {
+    calls.push(LlmEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    calls
+}
+
+/// Run one turn with the REAL `read_files` and `file_edit` tools in a live
+/// plan (Executing, so the workflow ToolFilter admits write tools) and a
+/// scripted provider. Returns the provider-facing message list.
+async fn drift_gate_turn_harness(
+    responses: Vec<Vec<LlmEvent>>,
+    dir: &std::path::Path,
+) -> Vec<Message> {
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.join("plans"))));
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("t", "g", "c", vec!["step one".into()])
+            .expect("create_plan starts the plan (Planning -> Executing)");
+    }
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
+    registry.register(Box::new(crate::tool::agent::file_edit::FileEditTool::new(
+        (*sandbox).clone(),
+    )));
+    let provider = Arc::new(MockProvider::sequence(responses));
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("fix the file")];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("the turn must finish");
+    assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    messages
+}
+
+/// Is `m` the harness's repeat-failure correction, not a user message?
+fn is_harness_correction(m: &Message) -> bool {
+    m.role == Role::User
+        && m.content
+            .as_text()
+            .contains("[harness tool-call correction")
+}
+
+#[tokio::test]
+async fn steering_redirects_never_queue_the_call_shape_correction() {
+    // Regression (plan 5b85ab61 step 4). A worker re-calls `file_edit` with
+    // the same arguments after the gate intercepted it: the gate answers with
+    // the SAME "EDIT INTERCEPTED … re-read the file" text both times, which
+    // the repeat-failure breaker used to read as "your call shape is wrong"
+    // and answer with a harness correction. That advice is false for a
+    // "re-read, then retry" answer the worker is already following, so a
+    // steering redirect must not reach the breaker.
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("drift.txt"), "one\ntwo\n").unwrap();
+    let responses = vec![
+        // The read that arms nothing and mints the freshness the edit needs.
+        drift_batch(read_files_call(0, "call_read", "drift.txt")),
+        // Drift-class failure: arms the gate on drift.txt.
+        drift_batch(drift_file_edit_call(0, "call_e1", "drift.txt", "nope")),
+        // Two identical intercepted retries.
+        drift_batch(drift_file_edit_call(0, "call_e2", "drift.txt", "nope")),
+        drift_batch(drift_file_edit_call(0, "call_e3", "drift.txt", "nope")),
+        text_stop("done"),
+    ];
+    let messages = drift_gate_turn_harness(responses, dir.path()).await;
+
+    let tool_texts: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.content.as_text())
+        .collect();
+    assert_eq!(tool_texts.len(), 4, "all four calls must run: {tool_texts:?}");
+    assert!(
+        tool_texts[1].contains("old_string not found"),
+        "the first edit must be the drift failure that arms the gate: {}",
+        tool_texts[1]
+    );
+    assert!(
+        tool_texts[2].contains(crate::agent::EDIT_GATE_MARK),
+        "the retry must be intercepted: {}",
+        tool_texts[2]
+    );
+    assert_eq!(
+        tool_texts[2], tool_texts[3],
+        "the two interceptions are byte-identical (the breaker's repeat condition)"
+    );
+    assert!(
+        !messages.iter().any(is_harness_correction),
+        "an intercepted retry must not draw a call-shape correction: {messages:?}"
+    );
+    // The file is untouched: nothing was written by an intercepted call.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("drift.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+}

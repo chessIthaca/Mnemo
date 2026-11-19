@@ -2560,6 +2560,7 @@ impl AgentLoop {
             // keeps its pre-classifier behavior byte-for-byte.
             if !result.success
                 && !is_domain_tool_error(&result)
+                && !super::route_question::is_steering_redirect(&result)
                 && !is_user_denial_tool_output(&result.output)
                 && batch_triage.is_none()
                 && stop_signal.is_none()
@@ -2734,10 +2735,17 @@ impl AgentLoop {
             // batch-level outcomes here; tool_error_count is applied ONCE
             // after the loop. User denials / DenyAll skips are deliberate
             // safety choices, not a stuck model (Quality H1 / Phase 1
-            // review) — they neither count nor reset the counter.
+            // review) — they neither count nor reset the counter. A STEERING
+            // redirect (`route_question::is_steering_redirect`: the stale-read
+            // gate, an unknown read receipt) has the same shape (plan 5b85ab61
+            // step 4): the harness pointed the model at its next step, so it
+            // neither adds an error nor resets the streak, and a batch made
+            // only of redirects is a neutral batch.
             if result.success {
                 batch_had_success = true;
-            } else if !is_user_denial_tool_output(&result.output) {
+            } else if !super::route_question::is_steering_redirect(&result)
+                && !is_user_denial_tool_output(&result.output)
+            {
                 batch_had_error = true;
                 if !failed_tools.contains(&tc.name) {
                     failed_tools.push(tc.name.clone());
@@ -2919,9 +2927,14 @@ impl AgentLoop {
             // against a prior failure (a same-batch duplicate counts).
             // User denials / interrupts are deliberate safety choices,
             // not a stuck model — excluded, mirroring the MAX_RETRIES
-            // rule at the top of this loop.
+            // rule at the top of this loop. Steering redirects are
+            // excluded too (plan 5b85ab61 step 4): the model repeating a
+            // stale-read interception is following the harness's own
+            // "re-read, then retry" advice, so a "your call shape is
+            // wrong" correction would be false advice.
             if !result.success
                 && !is_domain_tool_error(&result)
+                && !super::route_question::is_steering_redirect(&result)
                 && !is_user_denial_tool_output(&result.output)
                 && pending_correction.is_none()
                 && repeated_tool_failure(messages, &tc.name, &tool_content)

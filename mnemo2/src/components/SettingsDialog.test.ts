@@ -523,6 +523,7 @@ describe("SettingsDialog", () => {
       get: vi.fn(async () => ({
         task_models: { summarize: null },
         vision_model: null,
+        vision_warning: null,
         embedding: {
           selected: "hash",
           status: "keyword_only",
@@ -657,6 +658,7 @@ describe("unsaved edits", () => {
       get: vi.fn(async () => ({
         task_models: { summarize: null },
         vision_model: null,
+        vision_warning: null,
         embedding: {
           selected: "hash",
           status: "keyword_only",

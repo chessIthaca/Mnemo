@@ -23,7 +23,11 @@ pub(crate) fn executor_prompt() -> PromptSpec {
             "arrives later as a new message that starts with a [From …] header; do not assume ",
             "or invent a reply — continue your task or end your turn. Never modify ",
             "TeamManager state or use Git/files as worker lifecycle status. Run relevant ",
-            "checks, commit on the assigned worker branch, and report the actual commit and checks."
+            "checks, commit on the assigned worker branch, and report the actual commit and checks.",
+            " After a visual change (UI, rendering, animation), when the image tools are ",
+            "available (load_tools image), take a screenshot with the project's own tool or a ",
+            "browser screenshot, check it with image_analysis or compare before and after with ",
+            "image_ui_diff, and report what you saw."
         )
         .to_string(),
         blocks: vec![PromptBlock::FileToolRules],
@@ -77,7 +81,9 @@ pub(crate) fn audit_prompt() -> PromptSpec {
             "files, run shell commands, commit, merge, push, spawn work, ask the user, or tick ",
             "plan steps. Audit correctness, error handling, integration with neighbouring ",
             "contracts, persistence, concurrency, security, and test quality against the plan's ",
-            "intent and acceptance scenarios. Report findings with file/line evidence through ",
+            "intent and acceptance scenarios. When the change is visual and the image tools are ",
+            "available, look at the screenshots the worker or the project produced with ",
+            "image_analysis before you judge it. Report findings with file/line evidence through ",
             "message_parent, then end your turn; the lead adjudicates your audit on the ",
             "implementation worker's review. Never merge, never mutate files, and never use ",
             "Git or files as lifecycle status."
@@ -201,4 +207,43 @@ fn executor_gate_rules() -> Vec<GateRule> {
     ));
     rules.push(deny_rule("shell", format!(r"{pre}gh\s+pr\b")));
     rules
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Workers check visual work themselves: the executor prompt names the
+    /// deferred `image` group and the two tools a visual change needs, so a
+    /// screenshot the worker takes is actually looked at.
+    #[test]
+    fn executor_prompt_asks_for_a_visual_check_with_the_image_tools() {
+        let identity = executor_prompt().identity;
+        assert!(
+            identity.contains("when the image tools are available (load_tools image)"),
+            "executor prompt must gate the visual check on the image group: {identity}"
+        );
+        assert!(
+            identity.contains("image_analysis") && identity.contains("image_ui_diff"),
+            "executor prompt must name image_analysis and image_ui_diff: {identity}"
+        );
+    }
+
+    /// The audit worker looks at the screenshots itself instead of trusting a
+    /// worker's description of them.
+    #[test]
+    fn audit_prompt_looks_at_screenshots_with_the_image_tools() {
+        let identity = audit_prompt().identity;
+        assert!(
+            identity.contains(
+                "When the change is visual and the image tools are available, look at the \
+                 screenshots"
+            ),
+            "audit prompt must ask for a look at the screenshots: {identity}"
+        );
+        assert!(
+            identity.contains("image_analysis"),
+            "audit prompt must name image_analysis: {identity}"
+        );
+    }
 }

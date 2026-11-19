@@ -2787,7 +2787,7 @@ impl AgentLoop {
             // Silently record the tool event as working memory (no
             // approval, no event — just background capture for recall).
             // Only DURABLE actions are recorded: read-only tools
-            // (file_read, search, browser_*, describe_image, …) produce
+            // (file_read, search, browser_*, image_*, …) produce
             // noise that crowds out distilled facts in recall, so they are
             // skipped. The full output of every tool already lives in the
             // conversation history; working memory only needs the durable
@@ -6236,7 +6236,7 @@ fn render_correction_schema(schema: &ToolSchema) -> String {
 
 /// Whether a tool call is "durable" — worth recording as a working-memory
 /// event for later consolidation. Read-only tools (file_read, search,
-/// browser_*, describe_image, memory_recall, …) are skipped: their output
+/// browser_*, image_*, memory_recall, …) are skipped: their output
 /// already lives in the conversation history, and recording them floods the
 /// working tier with raw snapshots that match common keywords and crowd out
 /// distilled facts in recall. Only actions that *change* project state or
@@ -6270,7 +6270,7 @@ pub(crate) fn is_durable_tool(name: &str, args: &serde_json::Value) -> bool {
             Some("commit") | Some("merge") | Some("push")
         ),
         // Everything else (file_read, read_files, search, search_read,
-        // browser_*, describe_image, memory_recall, memory_consolidate,
+        // browser_*, image_*, memory_recall, memory_consolidate,
         // ask_user, shell, git status/diff/log/branch/stash/checkout, …) is
         // read-only or noise and is NOT recorded.
         _ => false,

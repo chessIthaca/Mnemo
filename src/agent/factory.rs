@@ -316,7 +316,7 @@ pub struct AgentLoopFactory {
     plans_dir: PathBuf,
     /// Shared swappable vision slot. Always present so Settings can enable,
     /// disable, or re-point the vision model at runtime; agents and the
-    /// `describe_image` tool all share this `Arc`.
+    /// image tools all share this `Arc`.
     vision: Arc<SwappableVision>,
     /// Shared swappable provider slot — a handle to the main LLM client that
     /// sees runtime model swaps. Held (not snapshotted) so tools that need an
@@ -974,7 +974,7 @@ impl AgentLoopFactory {
 
     /// Replace the vision client at runtime (Settings → Vision, or after an
     /// endpoint/key edit that the vision model uses). Shared with every live
-    /// agent loop and the `describe_image` tool via [`SwappableVision`].
+    /// agent loop and the image tools via [`SwappableVision`].
     pub fn set_vision(&self, vision: Option<Arc<dyn ImageDescriber>>) {
         self.vision.set(vision);
     }
@@ -2129,7 +2129,7 @@ mod tests {
     }
 
     /// Build a factory with an optional vision model (to exercise the
-    /// `describe_image` tool registration).
+    /// image-tool registration).
     fn make_factory_with(
         dir: &std::path::Path,
         vision: Option<Arc<dyn ImageDescriber>>,
@@ -3285,6 +3285,53 @@ mod tests {
         // Runtime rewire enables the slot.
         factory_no_vision.set_vision(Some(Arc::new(MockDescriber)));
         assert!(factory_no_vision.vision_slot().is_configured());
+    }
+
+    /// End-to-end from a *config*, not an injected mock: a valid
+    /// `[general.vision_model]` must reach the factory as a configured vision
+    /// slot, which is what puts the deferred `image` group in the tool index.
+    /// Regression for the `?`-on-the-classifier bug that built no client (hence
+    /// offered no image tools) for a healthy config.
+    #[test]
+    fn a_valid_vision_config_offers_the_image_group() {
+        let config = crate::config::Config {
+            general: crate::config::GeneralConfig {
+                general: crate::config::GeneralSection {
+                    vision_model: Some(crate::config::VisionModel {
+                        endpoint: "ollama-cloud".into(),
+                        model: "deepseek-v4.1-flash:1017".into(),
+                    }),
+                    ..crate::config::GeneralSection::default()
+                },
+                ..crate::config::GeneralConfig::default()
+            },
+            endpoints: vec![crate::config::Endpoint {
+                name: "ollama-cloud".into(),
+                kind: crate::config::EndpointKind::OpenAI,
+                base_url: "https://ollama.com/v1/".into(),
+                models: vec!["deepseek-v4.1-flash:1017".into()],
+                ..crate::config::Endpoint::test_default()
+            }],
+            ..crate::config::Config::default()
+        };
+        let vision = crate::provider::client_factory::build_vision_client(&config);
+        assert!(vision.is_some(), "a valid vision config must build a client");
+        let dir = tempdir().unwrap();
+        let factory = make_factory_with(dir.path(), vision);
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
+        assert!(
+            registry
+                .hidden_groups_for(&crate::tool::ToolFilter::Executing)
+                .iter()
+                .any(|(g, _)| *g == "image"),
+            "a valid vision config must offer the image group to the model"
+        );
     }
 
     /// A mock descendant tracker that always reports "no descendants running".

@@ -79,6 +79,9 @@ export interface BudgetCaps {
 export interface ModelSettings {
   task_models: TaskModels;
   vision_model: string | null;
+  /** Why the vision model yields no image tools (or may not) — shown under the
+   * Vision field; `null` when vision is unset or resolves cleanly. */
+  vision_warning: string | null;
   embedding: EmbeddingSection;
   optimizer: OptimizerSettings;
   budget: BudgetCaps;

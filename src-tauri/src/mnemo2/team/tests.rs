@@ -12090,6 +12090,10 @@ async fn unregistered_pool_is_rejected_before_worker_cleanliness_or_tip_probes()
 struct ScriptedProofs {
     outcome: proof::RedOutcome,
     mutants: Vec<proof::Mutant>,
+    /// The error a mutation run answers with, when it is scripted to fail.
+    mutate_error: Option<String>,
+    /// Whether that failing run first leaves an untracked file in the checkout.
+    mutate_leaves_dirt: bool,
     prove_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     mutate_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -12099,6 +12103,8 @@ impl ScriptedProofs {
         Self {
             outcome,
             mutants: Vec::new(),
+            mutate_error: None,
+            mutate_leaves_dirt: false,
             prove_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             mutate_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -12113,6 +12119,21 @@ impl ScriptedProofs {
             })
         }
     }
+
+    /// A runner whose mutation run fails with `error`, the way a run that could
+    /// not run does (a missing tool, a command that failed).
+    fn with_mutate_error(mut self, error: String) -> Self {
+        self.mutate_error = Some(error);
+        self
+    }
+
+    /// A runner whose mutation run leaves an untracked file in the checkout and
+    /// then fails: the checkout itself is off its tip.
+    fn with_dirty_mutate_error(mut self, error: String) -> Self {
+        self.mutate_error = Some(error);
+        self.mutate_leaves_dirt = true;
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -12122,8 +12143,15 @@ impl proving::ProofRunner for ScriptedProofs {
         Ok(self.outcome.clone())
     }
 
-    async fn mutate(&self, _request: proving::MutateRequest) -> Result<Vec<proof::Mutant>, String> {
+    async fn mutate(&self, request: proving::MutateRequest) -> Result<Vec<proof::Mutant>, String> {
         self.mutate_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = &self.mutate_error {
+            if self.mutate_leaves_dirt {
+                std::fs::write(request.checkout.join("left-by-the-run.txt"), "dirt\n")
+                    .expect("a file the run left behind");
+            }
+            return Err(error.clone());
+        }
         Ok(self.mutants.clone())
     }
 }
@@ -12148,9 +12176,23 @@ async fn drain_notice(
 
 /// A team whose board holds a `bug_fixing` plan naming `regression_proves_red`
 /// as its regression test, with a provisioned worker whose checkout carries a
-/// commit that adds that name.
+/// commit that adds that name in `fix.rs`.
 async fn proof_fixture(
     id: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<TeamRuntime>,
+    String,
+) {
+    proof_fixture_with_change(id, "fix.rs").await
+}
+
+/// The same fixture, whose worker's one commit adds `rel` instead of `fix.rs`,
+/// so a proof can be exercised on a change of another shape (a test-only one).
+async fn proof_fixture_with_change(
+    id: &str,
+    rel: &str,
 ) -> (
     tempfile::TempDir,
     tempfile::TempDir,
@@ -12194,12 +12236,12 @@ async fn proof_fixture(
     let team = Arc::new(open_test_team(root.path(), state.path(), Vec::new()).await);
     team.attach_board(Arc::new(board));
     let worker = provision_pool_worker(&team, id).await;
-    std::fs::write(
-        worker.worktree.join("fix.rs"),
-        "fn regression_proves_red() {}\n",
-    )
-    .expect("worker change");
-    run_git(&worker.worktree, &["add", "fix.rs"]);
+    let change = worker.worktree.join(rel);
+    if let Some(parent) = change.parent() {
+        std::fs::create_dir_all(parent).expect("change parent");
+    }
+    std::fs::write(&change, "fn regression_proves_red() {}\n").expect("worker change");
+    run_git(&worker.worktree, &["add", rel]);
     run_git(
         &worker.worktree,
         &["commit", "-m", "add the regression test"],
@@ -13618,5 +13660,238 @@ async fn wontfix_mutant_survives_rerun() {
         Some("the branch is unreachable under test"),
         "the lead's justification is untouched"
     );
+    team.shutdown().await;
+}
+// --- The quiet mutation check: a run that cannot run is a notice, and a turn
+// that owes nothing new starts no run (decision 2026-11-19) ---
+
+/// The error a run against a machine without the mutation tool leaves: no
+/// missed-mutant file, and the shell's own missing-command line.
+const MISSING_MUTATION_TOOL: &str = "the mutation run wrote no missed-mutant file at \
+     C:\\tmp\\missed.txt: the system cannot find the file specified\n\
+     error: no such command: `mutants`";
+
+/// A worker in `proof_fixture` that owes the mutation run: its review risk is
+/// high, which is what triggers the automatic run.
+async fn high_risk(team: &TeamRuntime, worker_id: &str) {
+    team.update_worker(worker_id, |current| {
+        current.review_risk = "high".to_string();
+    })
+    .await;
+}
+
+/// Every notice text already queued for the test.
+fn notice_texts(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+) -> Vec<String> {
+    let mut texts = Vec::new();
+    while let Ok(signal) = receiver.try_recv() {
+        if let BoardSignal::Notice { text, .. } = signal {
+            texts.push(text);
+        }
+    }
+    texts
+}
+
+/// The first queued notice whose text contains `needle`. Every proof sends its
+/// notice before it releases the claim, so a caller that waited for the claim
+/// to end finds it here.
+fn notice_with(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> Option<String> {
+    notice_texts(receiver)
+        .into_iter()
+        .find(|text| text.contains(needle))
+}
+
+/// A missing mutation tool is a notice, not a worker error: the run could not
+/// run, which says nothing about the worker (decision 2026-11-19). The
+/// automatic run names it once per session; the lead's own request is always
+/// answered, even about a tool already reported.
+#[tokio::test]
+async fn missing_mutation_tool_is_a_notice_not_a_worker_error() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantMissing1").await;
+    high_risk(&team, &worker_id).await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    })
+    .with_mutate_error(MISSING_MUTATION_TOOL.to_string());
+    let mutate_calls = proofs.mutate_calls.clone();
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    let mut notices = team.subscribe_board();
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    eventually(|| async { (!team.proof_ctx().proving.is_active(&worker_id)).then_some(()) }).await;
+    assert_eq!(mutate_calls.load(Ordering::SeqCst), 1);
+    let notice = notice_with(&mut notices, "not installed")
+        .expect("the lead is told the tool is missing");
+    assert!(notice.contains("cargo install cargo-mutants"), "{notice}");
+    assert!(
+        notice.contains("no such command"),
+        "the notice names the line that said so: {notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(
+        worker.error.is_none(),
+        "a missing tool is not a worker error: {:?}",
+        worker.error
+    );
+    assert!(
+        worker.findings.is_empty(),
+        "a run that could not run opens no finding: {:?}",
+        worker.findings
+    );
+
+    // A new tip is worth a second automatic run, but the session already named
+    // the missing tool: no second notice.
+    let worker = team.worker(&worker_id).await.expect("worker");
+    std::fs::write(worker.worktree.join("later.rs"), "fn later() {}\n").expect("source change");
+    run_git(&worker.worktree, &["add", "later.rs"]);
+    run_git(
+        &worker.worktree,
+        &["commit", "-m", "a later source change"],
+    );
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    eventually(|| async { (!team.proof_ctx().proving.is_active(&worker_id)).then_some(()) }).await;
+    assert_eq!(
+        mutate_calls.load(Ordering::SeqCst),
+        2,
+        "the new tip really reaches the runner"
+    );
+    let seen = notice_texts(&mut notices);
+    assert!(
+        seen.iter().all(|text| !text.contains("not installed")),
+        "the automatic run repeats no missing-tool notice: {seen:?}"
+    );
+
+    // The lead's own request is answered even about a tool already reported.
+    team.mutation_check_tool(&worker_id)
+        .await
+        .expect("the lead's own mutation run starts");
+    eventually(|| async { (!team.proof_ctx().proving.is_active(&worker_id)).then_some(()) }).await;
+    let notice = notice_with(&mut notices, "not installed")
+        .expect("the lead's request is answered");
+    assert!(notice.contains("cargo install cargo-mutants"), "{notice}");
+    assert_eq!(mutate_calls.load(Ordering::SeqCst), 3);
+    team.shutdown().await;
+}
+
+/// A mutation run that fails while leaving the checkout clean is a notice: the
+/// worker is not at fault for a command that could not run (decision
+/// 2026-11-19).
+#[tokio::test]
+async fn failed_mutation_run_with_clean_checkout_is_a_notice() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantFail1").await;
+    high_risk(&team, &worker_id).await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    })
+    .with_mutate_error(
+        "the mutation run wrote no missed-mutant file at C:\\tmp\\missed.txt: \
+         the process exited with code 2"
+            .to_string(),
+    );
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    let mut notices = team.subscribe_board();
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    eventually(|| async { (!team.proof_ctx().proving.is_active(&worker_id)).then_some(()) }).await;
+    let notice = notice_with(&mut notices, "could not run").expect("the failed run is a notice");
+    assert!(
+        notice.contains("the mutation run wrote no missed-mutant file"),
+        "{notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(
+        worker.error.is_none(),
+        "a failed run with a clean checkout is not a worker error: {:?}",
+        worker.error
+    );
+    team.shutdown().await;
+}
+
+/// A run that leaves the checkout dirty is still the worker's error: the
+/// checkout itself is off its tip, which is what `fail` was written for.
+#[tokio::test]
+async fn mutation_run_leaving_a_dirty_checkout_still_fails_the_worker() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantDirty1").await;
+    high_risk(&team, &worker_id).await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    })
+    .with_dirty_mutate_error("the mutation run changed the checkout".to_string());
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    let worker = eventually(|| async {
+        team.worker(&worker_id)
+            .await
+            .ok()
+            .and_then(|worker| worker.error.is_some().then_some(worker))
+    })
+    .await;
+    assert_eq!(
+        worker.error.as_deref(),
+        Some("the mutation run changed the checkout")
+    );
+    team.shutdown().await;
+}
+
+/// A second turn end at the same tip starts no second mutation run: the session
+/// already mutated that tip (decision 2026-11-19).
+#[tokio::test]
+async fn automatic_mutation_skips_an_unchanged_tip() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveMutantSameTip1").await;
+    high_risk(&team, &worker_id).await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    });
+    let mutate_calls = proofs.mutate_calls.clone();
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    eventually(|| async { (mutate_calls.load(Ordering::SeqCst) == 1).then_some(()) }).await;
+    eventually(|| async { (!team.proof_ctx().proving.is_active(&worker_id)).then_some(()) }).await;
+
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    // A second run would reach the runner well inside this window; the tip it
+    // would mutate is the one the session already did, so none may start.
+    for _ in 0..160 {
+        if mutate_calls.load(Ordering::SeqCst) != 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        mutate_calls.load(Ordering::SeqCst),
+        1,
+        "the tip was already mutated in this session"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(worker.error.is_none(), "{:?}", worker.error);
+    team.shutdown().await;
+}
+
+/// A change of only test files starts no automatic mutation run: there is no
+/// new code for the tool to change. The lead's own request still runs
+/// (decision 2026-11-19).
+#[tokio::test]
+async fn automatic_mutation_skips_a_test_only_change() {
+    let (_root, _state, team, worker_id) =
+        proof_fixture_with_change("proveMutantTests1", "tests/x.rs").await;
+    high_risk(&team, &worker_id).await;
+    let proofs = ScriptedProofs::new(proof::RedOutcome::Red {
+        output: "test regression_proves_red ... FAILED".to_string(),
+    });
+    let mutate_calls = proofs.mutate_calls.clone();
+    team.set_proof_runner_for_test(Arc::new(proofs));
+    proving::spawn_turn_proofs(&team.proof_ctx(), worker_id.clone()).await;
+    eventually(|| async { (!team.proof_ctx().proving.is_active(&worker_id)).then_some(()) }).await;
+    assert_eq!(
+        mutate_calls.load(Ordering::SeqCst),
+        0,
+        "a test-only change is not mutated"
+    );
+    team.mutation_check_tool(&worker_id)
+        .await
+        .expect("the lead asked for the run");
+    eventually(|| async { (mutate_calls.load(Ordering::SeqCst) == 1).then_some(()) }).await;
     team.shutdown().await;
 }

@@ -216,6 +216,9 @@ pub(super) enum ProofJob {
     Regression,
     /// The mutation check over the change's diff.
     Mutation,
+    /// The same check, asked for by the lead: the automatic skip rules and the
+    /// missing-tool deduplication do not apply, because the lead asked.
+    MutationRequested,
 }
 
 /// What the merge gate needs to know about a worker's proofs.
@@ -232,6 +235,45 @@ pub(super) struct MergeProof {
     /// Only that waives the gate: a finding closed `fixed` must be backed by
     /// the red check at the tip being merged (finding proofPerTip).
     pub(super) regression_waived: bool,
+}
+
+/// What one session remembers between automatic mutation runs: the tip each
+/// worker's last attempt reached the runner at, and the `[mutation]` commands
+/// whose missing tool it already reported (decision 2026-11-19).
+///
+/// It lives on the runtime, not on [`ProofCtx`], which is rebuilt per call, and
+/// in memory only: a restart repeats one run or one notice, which is fine.
+#[derive(Debug, Default)]
+pub(super) struct MutationMemory {
+    /// Worker id to the tip its last attempt reached the runner at.
+    last_tip: HashMap<String, String>,
+    /// The `[mutation]` commands whose missing tool was already reported.
+    missing_noticed: HashSet<String>,
+}
+
+impl MutationMemory {
+    /// The tip `worker_id`'s last mutation attempt reached the runner at.
+    fn last_tip(&self, worker_id: &str) -> Option<&str> {
+        self.last_tip.get(worker_id).map(String::as_str)
+    }
+
+    /// Record that `worker_id`'s attempt reached the runner at `tip`.
+    fn record_tip(&mut self, worker_id: &str, tip: &str) {
+        self.last_tip
+            .insert(worker_id.to_string(), tip.to_string());
+    }
+
+    /// Remember that `command`'s tool was reported missing; `true` when this is
+    /// the first report in this session.
+    fn notice_missing(&mut self, command: &str) -> bool {
+        self.missing_noticed.insert(command.to_string())
+    }
+
+    /// Forget `command`'s missing report: a run that worked proves the tool is
+    /// installed, so a later failure is a new situation.
+    fn clear_missing(&mut self, command: &str) {
+        self.missing_noticed.remove(command);
+    }
 }
 
 /// The data the proofs read from the runtime: the ledger handles, the plan
@@ -256,6 +298,11 @@ pub(crate) struct ProofCtx {
     pub(super) board: Option<Arc<PlanBoard>>,
     /// The proof commands.
     pub(super) runner: Arc<dyn ProofRunner>,
+    /// What this session already mutated and already reported: the automatic
+    /// skip rules and the missing-tool deduplication read it (decision
+    /// 2026-11-19). It lives on the runtime, because [`ProofCtx`] is rebuilt per
+    /// call.
+    pub(super) mutation_memory: Arc<StdMutex<MutationMemory>>,
     /// The merge lock: the same lock every entry point that starts a turn or
     /// moves a checkout takes (finding claimRace).
     pub(super) merge_lock: Arc<Mutex<()>>,
@@ -372,18 +419,27 @@ impl ProofCtx {
             // for both, and the busy guard keeps the checkout still.
             let _guard = guard;
             for job in jobs {
+                // `None` is a result with nothing to report — a missing tool
+                // this session already named — so no empty notice is sent.
                 let notice = match job {
-                    ProofJob::Regression => ctx.run_regression(&id).await,
-                    ProofJob::Mutation => ctx.run_mutation(&id).await,
+                    ProofJob::Regression => Some(ctx.run_regression(&id).await),
+                    ProofJob::Mutation => ctx.run_mutation(&id, false).await,
+                    ProofJob::MutationRequested => ctx.run_mutation(&id, true).await,
                 };
-                ctx.notice(format!("proof:{id}:{}", now_key()), notice);
+                if let Some(text) = notice.filter(|text| !text.is_empty()) {
+                    ctx.notice(format!("proof:{id}:{}", now_key()), text);
+                }
             }
         });
         Ok(())
     }
 
-    /// Send the lead one finished-proof notice.
+    /// Send the lead one finished-proof notice. A job with nothing to report
+    /// returns no notice at all, so empty text is never sent.
     fn notice(&self, key: String, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
         let _ = self.signals.send(BoardSignal::Notice { key, text });
     }
 
@@ -716,25 +772,36 @@ impl ProofCtx {
 
     /// Run the mutation tool over the change's diff and report what no test
     /// caught.
-    async fn run_mutation(&self, worker_id: &str) -> String {
-        match self.mutate(worker_id).await {
+    ///
+    /// `None` means the run has nothing to tell the lead: a missing tool this
+    /// session already named, and the lead did not ask for this run.
+    async fn run_mutation(&self, worker_id: &str, requested: bool) -> Option<String> {
+        match self.mutate(worker_id, requested).await {
             Ok(notice) => notice,
             Err(error) => {
+                // Only a checkout the run left off its tip or dirty is a worker
+                // error; a run that could not run is a notice (decision
+                // 2026-11-19).
                 self.fail(worker_id, &error).await;
-                format!("mutation check for {worker_id} failed: {error}")
+                Some(format!("mutation check for {worker_id} failed: {error}"))
             }
         }
     }
 
-    /// The mutation check itself. `Err` means the run left the checkout dirty.
-    async fn mutate(&self, worker_id: &str) -> Result<String, String> {
+    /// The mutation check itself. `Ok(None)` means there is nothing to report;
+    /// `Err` means the run left the checkout off its tip or dirty.
+    async fn mutate(&self, worker_id: &str, requested: bool) -> Result<Option<String>, String> {
         let worker = self.worker(worker_id).await?;
         let Some(cfg) = proof::load_proof_config(&self.workspace_root).mutation else {
-            return Ok(format!(
+            return Ok(Some(format!(
                 "mutation check for {worker_id} skipped: configure [mutation] in \
                  .coding/checks.toml"
-            ));
+            )));
         };
+        // The configured command keys the missing-tool deduplication: the
+        // substituted command carries this worker's own `{out}` path, so it
+        // never repeats.
+        let command = cfg.command.clone();
         let tip = phase3::tip(&worker.worktree).await?;
         let base = phase3::git_value(&self.workspace_root, &["merge-base", "HEAD", &tip]).await?;
         let request = MutateRequest {
@@ -745,17 +812,40 @@ impl ProofCtx {
             cfg,
             worker_id: worker_id.to_string(),
         };
-        let mutants = if !self.still_claimable(worker_id).await {
-            return Ok(format!(
+        if !self.still_claimable(worker_id).await {
+            // The run never reached the runner, so it owes no memory either.
+            return Ok(Some(format!(
                 "mutation check for {worker_id} skipped: the worker started a turn"
-            ));
-        } else {
-            self.runner.mutate(request).await?
+            )));
+        }
+        // Recorded before the run: every attempt that reached the runner counts
+        // for this worker at this tip, whatever its outcome, so a turn end at
+        // the same tip starts no second run (decision 2026-11-19).
+        self.remember_mutation_tip(worker_id, &tip);
+        let mutants = match self.runner.mutate(request).await {
+            Ok(mutants) => {
+                // A run that worked proves the tool is installed: a later
+                // failure is a new situation, not a repeat.
+                self.forget_missing_tool(&command);
+                mutants
+            }
+            Err(error) => {
+                return self
+                    .mutation_failure(
+                        worker_id,
+                        &worker.worktree,
+                        &tip,
+                        &command,
+                        &error,
+                        requested,
+                    )
+                    .await;
+            }
         };
         if !checkout_at(&worker.worktree, &tip).await {
-            return Ok(format!(
+            return Ok(Some(format!(
                 "mutation check for {worker_id} discarded: the tip moved while it ran"
-            ));
+            )));
         }
         if mutants.is_empty() {
             // Nothing is uncaught now: every open mutant finding — the
@@ -764,9 +854,9 @@ impl ProofCtx {
             self.close_absent_mutants(worker_id, &[], &tip).await?;
             self.record_check(worker_id, MUTATION_CLEAN_CHECK, None, &tip)
                 .await?;
-            return Ok(format!(
+            return Ok(Some(format!(
                 "mutation check for {worker_id}: every changed line is caught by a test"
-            ));
+            )));
         }
         let fallback = self.fallback_file(&worker).await;
         let findings = mutant_findings(&mutants, &tip, &fallback);
@@ -784,10 +874,84 @@ impl ProofCtx {
         }
         self.open_findings(worker_id, findings).await?;
         self.close_absent_mutants(worker_id, &reported, &tip).await?;
-        Ok(format!(
+        Ok(Some(format!(
             "mutation check for {worker_id}: {} uncaught changes, findings opened",
             mutants.len()
-        ))
+        )))
+    }
+
+    /// What a mutation run that could not run reports. A failed run that left
+    /// the checkout exactly at its tip and clean is not a worker error — a
+    /// missing tool or a failing command says nothing about the worker — so it
+    /// is a notice; only a checkout the run left off its tip or dirty stays an
+    /// error, which the caller turns into the worker's error (decision
+    /// 2026-11-19).
+    async fn mutation_failure(
+        &self,
+        worker_id: &str,
+        checkout: &Path,
+        tip: &str,
+        command: &str,
+        error: &str,
+        requested: bool,
+    ) -> Result<Option<String>, String> {
+        let clean = checkout_at(checkout, tip).await
+            && matches!(
+                phase3::git_value(checkout, &["status", "--porcelain", "-uall"]).await,
+                Ok(status) if status.is_empty()
+            );
+        if !clean {
+            return Err(error.to_string());
+        }
+        let Some(line) = missing_tool(error) else {
+            return Ok(Some(format!(
+                "mutation check for {worker_id} could not run: {error}"
+            )));
+        };
+        let first = self.notice_missing_tool(command);
+        // The lead's own request is always answered, even about a tool already
+        // reported: only the automatic run repeats nothing.
+        if !requested && !first {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "mutation check for {worker_id} skipped: the mutation tool is not installed \
+             ({line}). Install it (for Rust: cargo install cargo-mutants) or remove \
+             [mutation] from .coding/checks.toml."
+        )))
+    }
+
+    /// Record that `worker_id`'s mutation attempt reached the runner at `tip`.
+    fn remember_mutation_tip(&self, worker_id: &str, tip: &str) {
+        self.lock_mutation_memory().record_tip(worker_id, tip);
+    }
+
+    /// The tip `worker_id`'s last mutation attempt in this session reached the
+    /// runner at.
+    fn last_mutated_tip(&self, worker_id: &str) -> Option<String> {
+        self.lock_mutation_memory()
+            .last_tip(worker_id)
+            .map(str::to_string)
+    }
+
+    /// Remember that `command`'s mutation tool is missing; `true` when this is
+    /// the first such report in this session.
+    fn notice_missing_tool(&self, command: &str) -> bool {
+        self.lock_mutation_memory().notice_missing(command)
+    }
+
+    /// Forget a missing-tool report: a run that worked proves the tool exists.
+    fn forget_missing_tool(&self, command: &str) {
+        self.lock_mutation_memory().clear_missing(command);
+    }
+
+    /// The session's mutation memory. A poisoned lock is tolerated: the data is
+    /// a plain map and set of strings, so a panic elsewhere leaves it
+    /// consistent.
+    fn lock_mutation_memory(&self) -> std::sync::MutexGuard<'_, MutationMemory> {
+        self.mutation_memory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Whether this worker's current tip still needs its regression test proven
@@ -805,6 +969,47 @@ impl ProofCtx {
             return false;
         }
         self.diff_adds(&tip, &test).await
+    }
+
+    /// Whether this turn owes an automatic mutation run: the project configured
+    /// `[mutation]`, no attempt of this session already reached the runner at
+    /// this tip, and the change touches a file that is not a test. A test-only
+    /// change has no new code for the mutation tool to change (decision
+    /// 2026-11-19).
+    pub(super) async fn mutation_due(&self, worker: &WorkerRecord) -> bool {
+        if proof::load_proof_config(&self.workspace_root)
+            .mutation
+            .is_none()
+        {
+            return false;
+        }
+        let Ok(tip) = phase3::tip(&worker.worktree).await else {
+            return false;
+        };
+        if self.last_mutated_tip(&worker.id).as_deref() == Some(tip.as_str()) {
+            return false;
+        }
+        // A probe that fails means the run is not due: no runner call, no
+        // notice, no worker error. A checkout this broken cannot be mutated,
+        // and the lead can still ask for the run with team_mutation_check.
+        self.change_touches_source(&worker.worktree, &tip).await
+    }
+
+    /// Whether the change from the worker's merge base to `tip` touches a file
+    /// that is not a test file ([`proof::is_test_path`]).
+    async fn change_touches_source(&self, checkout: &Path, tip: &str) -> bool {
+        let Ok(base) = phase3::git_value(&self.workspace_root, &["merge-base", "HEAD", tip]).await
+        else {
+            return false;
+        };
+        let args = ["diff", "--name-only", &base, tip];
+        match phase3::git(checkout, &args).await {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .any(|path| !path.is_empty() && !proof::is_test_path(path)),
+            _ => false,
+        }
     }
 
     /// Whether the worker already carries a proof result for this tip: the
@@ -926,7 +1131,9 @@ impl TeamRuntime {
                 "worker '{worker_id}' is busy; the mutation check copies its checkout while it is idle"
             ));
         }
-        self.proof_ctx().spawn(worker_id, &[ProofJob::Mutation]).await?;
+        self.proof_ctx()
+            .spawn(worker_id, &[ProofJob::MutationRequested])
+            .await?;
         Ok(format!(
             "mutation check started for {worker_id}; it finishes with a notice and opens a finding per uncaught change"
         ))
@@ -952,8 +1159,10 @@ pub(super) async fn spawn_turn_proofs(ctx: &ProofCtx, worker_id: String) {
         return;
     }
     let red_due = ctx.regression_due(&worker).await;
-    let mutation_due = worker.review_risk == "high"
-        && proof::load_proof_config(&ctx.workspace_root).mutation.is_some();
+    // Only a high-risk worker owes a mutation run, and only when the session
+    // has not already mutated this tip and the change carries new code, not
+    // just tests (decision 2026-11-19).
+    let mutation_due = worker.review_risk == "high" && ctx.mutation_due(&worker).await;
     let mut jobs = Vec::new();
     if red_due {
         jobs.push(ProofJob::Regression);
@@ -1206,4 +1415,20 @@ fn output_tail(output: &str) -> String {
         .collect();
     let start = lines.len().saturating_sub(KEPT);
     lines[start..].join("\n")
+}
+
+/// Whether a failed proof command says its tool is not installed: the first
+/// line of `error` carrying one of the markers a shell uses for a missing
+/// command.
+fn missing_tool(error: &str) -> Option<&str> {
+    const MARKERS: [&str; 4] = [
+        "no such command",
+        "is not recognized as",
+        "command not found",
+        "not found in path",
+    ];
+    error.lines().find(|line| {
+        let lower = line.to_lowercase();
+        MARKERS.iter().any(|marker| lower.contains(marker))
+    })
 }

@@ -120,6 +120,9 @@ pub(super) fn audit_guardrails() -> Guardrails {
         "job_wait".to_string(),
         "job_tail".to_string(),
         "job_kill".to_string(),
+        // `run_checks` executes the project's commands too, so an audit worker
+        // must not be able to run them either (plan 5b85ab61 step 3).
+        "run_checks".to_string(),
         "git".to_string(),
         "memory_write".to_string(),
         "memory_amend".to_string(),

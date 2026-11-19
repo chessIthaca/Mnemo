@@ -62,6 +62,7 @@ use crate::tool::agent::{
     list_models::ListModelsTool,
     multi_edit::MultiEditTool,
     read_files::ReadFilesTool,
+    run_checks::RunChecksTool,
     search::SearchTool,
     search_read::SearchReadTool,
     shell::ShellTool,
@@ -1590,6 +1591,21 @@ impl AgentLoopFactory {
                     // save lands on the next command without a rebuild.
                     .with_optimizer(Arc::clone(&self.optimizer)),
             ));
+        }
+        // Plan 5b85ab61 step 3: ONE call runs every configured check command
+        // and reports which passed. Registered only when the session HAS
+        // checks, so a project without `.coding/checks.toml` never sees it;
+        // `NeedsApproval` and the validated allow-list are shell's own.
+        if want(ToolGroup::Shell, "run_checks") {
+            let checks = RunChecksTool::new(sandbox.clone()).with_check_commands(
+                root.map(|spec| spec.check_commands.clone())
+                    .unwrap_or_default(),
+            );
+            if checks.has_checks() {
+                registry.register(Box::new(
+                    checks.with_core_operations(Arc::clone(&self.core_operations)),
+                ));
+            }
         }
         // Long commands without polling (plan 5b85ab61 step 2): ONE registry per
         // agent session's tool set, so every job's tree dies with the session

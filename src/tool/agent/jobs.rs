@@ -120,7 +120,7 @@ const STDERR_TAG: &str = "[err] ";
 /// commands: such a run cannot certify the tip, so the model is pointed at the
 /// path that does record one.
 const CHECK_NOT_RECORDED_NOTE: &str =
-    "this run is not recorded as a check; run it with shell from the checkout root to record it";
+    "this run is not recorded as a check; run the exact command with run_checks to record it";
 
 /// How long `job_kill` waits for the log writer to close the file after an
 /// abort, so the reported tail includes what the readers had captured.

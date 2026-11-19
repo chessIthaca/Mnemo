@@ -30,7 +30,8 @@ use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
 };
 use super::pump::{
-    counted_check, cost_notice_due, usage_cost_micros, worker_host_tool_result, pump_worker,
+    counted_check, counted_checks, cost_notice_due, usage_cost_micros, worker_host_tool_result,
+    pump_worker,
 };
 use super::review::CheckRecorder;
 use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
@@ -2268,6 +2269,161 @@ async fn a_real_shell_check_run_records_a_check_at_turn_end() {
     assert_eq!(check.tip, tip);
     let detail = check.detail.as_deref().expect("worker detail");
     assert!(detail.contains("run by the worker"), "{detail}");
+    team.shutdown().await;
+}
+
+/// One `data.checks` entry of the `run_checks` fixture: command, exit code,
+/// tree before, tree after (`None` is a JSON `null` / a missing tree).
+type CheckEntry<'a> = (&'a str, Option<i64>, Option<&'a str>, Option<&'a str>);
+
+/// A `run_checks` result: one `data.checks` entry per command, each claiming
+/// `checkout` as its cwd, exactly as `RunChecksTool` writes them.
+fn run_checks_result(checkout: &Path, entries: &[CheckEntry<'_>]) -> ToolResult {
+    let checks: Vec<Value> = entries
+        .iter()
+        .map(|(command, exit_code, tree_before, tree_after)| {
+            json!({
+                "command": command,
+                "exit_code": exit_code,
+                "tree_before": tree_before.unwrap_or(""),
+                "tree_after": tree_after.unwrap_or(""),
+                "cwd": checkout.display().to_string(),
+            })
+        })
+        .collect();
+    ToolResult::success("checks ran").with_data(json!({ "checks": checks }))
+}
+
+/// One `run_checks` result yields one observation per PASSING check, so the
+/// turn records every passing check of the run, and no failing one.
+#[test]
+fn run_checks_result_counts_each_passing_check() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let checkout = checkout.path();
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    let result = run_checks_result(
+        checkout,
+        &[
+            ("cargo test --workspace", Some(0), Some(tree), Some(tree)),
+            (
+                "cargo clippy --workspace --all-targets",
+                Some(0),
+                Some(tree),
+                Some(tree),
+            ),
+            ("npm test --workspace mnemo2", Some(1), Some(tree), Some(tree)),
+        ],
+    );
+
+    assert_eq!(
+        counted_checks(
+            "run_checks",
+            &json!({ "purpose": "run the checks" }),
+            &result,
+            checkout,
+            &allow_list(),
+        ),
+        vec![
+            ("cargo test --workspace".to_string(), tree.to_string()),
+            (
+                "cargo clippy --workspace --all-targets".to_string(),
+                tree.to_string()
+            ),
+        ]
+    );
+}
+
+/// A run_checks entry that changed the tree, never exited (`exit_code: null`,
+/// a killed check), or could not be measured records nothing.
+#[test]
+fn run_checks_tree_change_is_not_counted() {
+    let checkout = tempfile::tempdir().expect("checkout");
+    let checkout = checkout.path();
+    let tree = "0123456789abcdef0123456789abcdef01234567";
+    let result = run_checks_result(
+        checkout,
+        &[
+            (
+                "cargo test --workspace",
+                Some(0),
+                Some(tree),
+                Some("fedcba9876543210"),
+            ),
+            (
+                "cargo clippy --workspace --all-targets",
+                None,
+                Some(tree),
+                Some(tree),
+            ),
+            ("npm test --workspace mnemo2", Some(0), Some(tree), Some("")),
+        ],
+    );
+
+    assert!(
+        counted_checks(
+            "run_checks",
+            &json!({ "purpose": "run the checks" }),
+            &result,
+            checkout,
+            &allow_list(),
+        )
+        .is_empty(),
+        "none of these runs may certify the tip"
+    );
+}
+
+/// A real `run_checks` tool call rides the whole pump path like a counted
+/// `shell` run: the worker session executes every allow-listed check for real,
+/// and the finished turn records each passing one against the committed tip.
+#[tokio::test]
+async fn a_real_run_checks_run_records_every_passing_check_at_turn_end() {
+    let (root, _state, _config, team, mut events) = report_streak_team(vec![tool_call_batch(
+        "check-1",
+        "run_checks",
+        r#"{"purpose":"run the checks"}"#,
+    )])
+    .await;
+    std::fs::create_dir_all(root.path().join(".coding")).expect("checks dir");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        "commands = [\"git status\", \"git diff --stat\"]\n",
+    )
+    .expect("checks.toml");
+    let worker = team
+        .dispatch("run the checks".to_string(), None)
+        .await
+        .expect("the worker dispatches");
+    loop {
+        let forwarded = forwarded_events(&mut events).await;
+        if forwarded
+            .iter()
+            .any(|event| matches!(event, SerializableAgentEvent::Finished { .. }))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let finished = team.worker(&worker.id).await.expect("worker record");
+
+    let mut names: Vec<&str> = finished
+        .checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["git diff --stat", "git status"],
+        "{:?}",
+        finished.checks
+    );
+    let tip = phase3::tip(&finished.worktree).await.expect("worker tip");
+    for check in &finished.checks {
+        assert_eq!(check.status, "passed", "{:?}", finished.checks);
+        assert_eq!(check.tip, tip, "{:?}", finished.checks);
+        let detail = check.detail.as_deref().expect("worker detail");
+        assert!(detail.contains("run by the worker"), "{detail}");
+    }
     team.shutdown().await;
 }
 

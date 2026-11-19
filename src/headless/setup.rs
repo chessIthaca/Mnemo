@@ -498,10 +498,16 @@ pub struct Setup {
     /// the same baseline the owner sees.
     last_applied: Arc<std::sync::Mutex<Option<ConfigFingerprint>>>,
     /// Serialises every live-config change ([`Setup::patch_settings`],
-    /// [`Setup::reload_if_changed`], [`Setup::classifier_setup`]): each ends by
+    /// [`Setup::reload_if_changed`], [`Setup::classifier_setup`],
+    /// [`Setup::refresh_live`], [`Setup::save_mcp_servers`]): each ends by
     /// swapping `live.config` and stamping its applied fingerprint, so two
     /// writers interleaving there could leave an OLDER config live or stamp
     /// state that was never applied.
+    ///
+    /// Process-global, keyed by the config dir (review finding reloadSaveRace):
+    /// every settings IPC opens a FRESH Setup, so a per-Setup lock would never
+    /// contend with the watcher's long-lived one. Every Setup this process
+    /// opens on the same dir shares the same [`tokio::sync::Mutex`].
     apply_lock: Arc<tokio::sync::Mutex<()>>,
     /// A test-only checkpoint inside [`Setup::apply_live`] — see
     /// [`ApplyPause`].
@@ -564,6 +570,9 @@ impl Setup {
         // What is on disk right now is this Setup's applied baseline: a check
         // right after opening sees no change.
         let last_applied = Some(ConfigFingerprint::read(&config_dir));
+        // The live-config apply lock is PROCESS-global, keyed by the config
+        // dir (every settings IPC opens a fresh Setup; see apply_lock's doc).
+        let apply_lock = crate::config::live_config_apply_lock(&config_dir);
         Ok(Self {
             config_dir,
             key_source: KeySource::default(),
@@ -572,7 +581,7 @@ impl Setup {
             classifier_status,
             embedder_status_arc,
             last_applied: Arc::new(std::sync::Mutex::new(last_applied)),
-            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            apply_lock,
             #[cfg(test)]
             apply_pause: None,
         })
@@ -799,12 +808,11 @@ impl Setup {
         *self.last_applied.lock().unwrap_or_else(|e| e.into_inner()) = Some(fingerprint);
     }
 
-    /// The fingerprint this process last saved under the config dir — from the
-    /// writer's own record ([`crate::config::last_written_fingerprint`]), which
-    /// every in-process writer of a live file updates.
+    /// The fingerprint this process last saved under the config dir — the
+    /// writer's own record ([`crate::config::saved_fingerprint`]), which every
+    /// in-process writer of a live file updates.
     fn saved_fingerprint(&self) -> ConfigFingerprint {
-        crate::config::last_written_fingerprint(&self.config_dir)
-            .unwrap_or_else(|| ConfigFingerprint::read(&self.config_dir))
+        crate::config::saved_fingerprint(&self.config_dir)
     }
 
     /// One live-settings check: when the four config files on disk
@@ -813,9 +821,10 @@ impl Setup {
     /// a Settings save runs ([`Setup::apply_live`]).
     ///
     /// - A file set whose fingerprint still matches the applied baseline is
-    ///   unchanged: nothing runs. The same holds for a set this process itself
-    ///   just wrote ([`crate::config::last_written_fingerprint`]) — the save
-    ///   already applied its values live, so its file events reload nothing.
+    ///   unchanged: nothing runs. The same holds for a change set this
+    ///   process itself wrote
+    ///   ([`crate::config::disk_changes_are_own_writes`]) — the save already
+    ///   applied its values live, so its file events reload nothing.
     /// - A load error (broken TOML, a half-written file) keeps the old config
     ///   live — never a half-parsed apply — and reports the changed file(s)
     ///   plus the error.
@@ -841,8 +850,12 @@ impl Setup {
             return ReloadOutcome::Unchanged;
         }
         // This process's own save already applied its values live: the file
-        // events it caused must not reload a second time.
-        if crate::config::last_written_fingerprint(&self.config_dir) == Some(disk) {
+        // events it caused must not reload a second time. Only files this
+        // process itself wrote can match — a file it never wrote never does,
+        // so an external edit that landed before its first write still
+        // reloads (review findings ownSaveWriters + seedAbsorbsEdit).
+        let applied = baseline.unwrap_or_else(|| ConfigFingerprint::read(&self.config_dir));
+        if crate::config::disk_changes_are_own_writes(&self.config_dir, &applied, &disk) {
             self.mark_applied(disk);
             return ReloadOutcome::Unchanged;
         }
@@ -1527,6 +1540,10 @@ impl Setup {
         project: Option<&Path>,
         servers: Vec<McpServerWire>,
     ) -> Result<String, EngineError> {
+        // One live-config change at a time (see [`Setup::apply_lock`]): the
+        // file write and the live config swap are one unit, so a concurrent
+        // reload cannot interleave and leave an older set live.
+        let _apply = self.apply_lock.lock().await;
         let global_path = self.config_dir.join("mcp.toml");
         let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
         let outcome =
@@ -2177,14 +2194,186 @@ mod tests {
             "the hand edit survived the save"
         );
         assert_eq!(
-            live.general.general
+            live.general
+                .general
                 .vision_model
-                .expect("vision model")
-                .model,
-            "hand-edit"
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("hand-edit"),
+            "the hand edit is the live vision model"
         );
         // And a follow-up check is quiet: the stamped baseline matches disk.
         assert_eq!(setup.reload_if_changed().await, ReloadOutcome::Unchanged);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding reloadSaveRace (delta audit F1/F2), through the
+    /// production shape: every settings IPC opens a FRESH Setup
+    /// (ipc.rs `settings_setup`), so the lock must be process-global — three
+    /// SEPARATELY OPENED Setups on one config dir (one reloading, one saving
+    /// via patch_settings, one via upsert_endpoint_detail) serialise on it,
+    /// and the live config equals what is on disk at the end.
+    #[tokio::test]
+    async fn separately_opened_setups_serialise_and_disk_wins() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let reloading = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let saving = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let upserting = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // The external hand edit lands AFTER the Setups opened (each stamps
+        // its baseline), exactly like a hand edit mid-session.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"hand-edit\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+
+        let pause = Arc::new(ApplyPause::new());
+        let reload_setup = reloading.with_apply_pause(Arc::clone(&pause));
+        let reload = tokio::spawn(async move { reload_setup.reload_if_changed().await });
+        // The reload is parked INSIDE apply_live, holding the process-global
+        // apply lock.
+        let _entered = pause.entered.acquire().await.expect("the gate is open");
+
+        let patch = {
+            let saving = saving.clone();
+            tokio::spawn(async move {
+                saving
+                    .patch_settings(SettingsSaveDto {
+                        safety: Some("autonomous".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+            })
+        };
+        let upsert = {
+            let upserting = upserting.clone();
+            tokio::spawn(async move {
+                let mut dto = upserting.endpoints_detail().expect("details").remove(0);
+                dto.temperature = Some(0.7);
+                upserting.upsert_endpoint_detail(dto, None).await
+            })
+        };
+        // Neither a save nor an upsert on ANOTHER Setup may interleave with
+        // the in-flight reload: both must wait for the apply lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !patch.is_finished(),
+            "a patch_settings on a fresh Setup must wait for the in-flight reload"
+        );
+        assert!(
+            !upsert.is_finished(),
+            "an upsert on a fresh Setup must wait for the in-flight reload"
+        );
+        pause.release.add_permits(1);
+        assert!(reload.await.expect("reload task").reloaded());
+        patch.await.expect("patch task").expect("the save applies");
+        upsert.await.expect("upsert task").expect("the upsert applies");
+
+        // The final live config equals what is on disk — every change is in
+        // (the hand edit survived both saves) and nothing older won.
+        let on_disk = Config::load(cfg.path()).expect("reload the saved config");
+        let live = engine.brain().config.lock().await.clone();
+        assert_eq!(live.general.general.safety, on_disk.general.general.safety);
+        assert_eq!(live.general.general.safety, SafetyMode::Autonomous);
+        assert_eq!(
+            live.general.general.vision_model,
+            on_disk.general.general.vision_model,
+            "the hand edit survived both saves"
+        );
+        assert_eq!(
+            live.general
+                .general
+                .vision_model
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("hand-edit"),
+            "the hand edit is the live vision model"
+        );
+        assert_eq!(
+            live.endpoint("test").expect("endpoint").temperature,
+            on_disk.endpoint("test").expect("endpoint").temperature,
+            "the upsert's change is live"
+        );
+        assert_eq!(live.endpoint("test").expect("endpoint").temperature, Some(0.7));
+        // A follow-up check on the saving Setup is quiet: the stamped
+        // baseline matches disk.
+        assert_eq!(saving.reload_if_changed().await, ReloadOutcome::Unchanged);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding mcpSaveUnrecorded: `save_mcp_servers` writes `mcp.toml`
+    /// through the MCP writer — an in-process save, so the watcher must not
+    /// reload it (a false "changed in another window" toast + a full rewire,
+    /// embedder rebuild included).
+    #[tokio::test]
+    async fn a_mcp_servers_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let def: crate::config::mcp::McpServerDef = toml::from_str(
+            "name = \"filesystem\"\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n",
+        )
+        .expect("server def");
+        setup
+            .save_mcp_servers(
+                None,
+                vec![McpServerWire {
+                    def,
+                    source: crate::config::mcp::SOURCE_GLOBAL.to_string(),
+                }],
+            )
+            .await
+            .expect("the MCP save");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "save_mcp_servers is this instance's own save"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding seedAbsorbsEdit: an external edit that landed BEFORE
+    /// this process's first own write must not be absorbed as an own save —
+    /// the registry's never-written slots can never match disk, so the edit
+    /// still reloads and applies.
+    #[tokio::test]
+    async fn an_external_edit_before_an_own_save_still_reloads() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // 1. An external hand edit to config.toml.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"hand-edit\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+        // 2. This process writes keys.toml (its own save, recorded) — the
+        // first write must NOT stamp the other slots from disk.
+        setup
+            .set_api_key("test", Secret::new("sk-rotated"))
+            .expect("the key save");
+        // 3. The own write must not absorb the hand edit: it still reloads.
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Reloaded { laya_changed: false },
+            "the hand edit before the own save must still be applied"
+        );
+        let live = engine.brain().config.lock().await;
+        assert_eq!(
+            live.general
+                .general
+                .vision_model
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("hand-edit"),
+            "the hand edit was applied live"
+        );
+        assert_eq!(live.keys.get("test"), Some("sk-rotated"));
+        drop(live);
         engine.shutdown().await.expect("shutdown");
     }
 
@@ -2350,8 +2539,8 @@ mod tests {
             .await
             .expect("patch applies");
         assert_eq!(
-            crate::config::last_written_fingerprint(cfg.path()),
-            Some(ConfigFingerprint::read(cfg.path())),
+            crate::config::saved_fingerprint(cfg.path()),
+            ConfigFingerprint::read(cfg.path()),
             "the save must record the fingerprint it wrote"
         );
         assert_eq!(

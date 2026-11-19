@@ -230,6 +230,11 @@ impl Setup {
     /// one): the shared config + the model resolver, so the very next spawn
     /// sees new endpoints, models and keys.
     pub async fn refresh_live(&self) {
+        // One live-config change at a time (see [`Setup::apply_lock`]): this
+        // swaps the shared config, so it must not interleave with a reload or
+        // a settings save on another Setup of the same config dir (every
+        // settings IPC opens a fresh one).
+        let _apply = self.apply_lock.lock().await;
         let Some(live) = &self.live else { return };
         if let Ok(cfg) = self.load_config() {
             crate::host::rewire::sync_model_resolver(Some(&live.model_resolver), &cfg);

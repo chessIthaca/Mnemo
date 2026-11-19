@@ -1053,6 +1053,10 @@ pub(crate) fn save_unlocked(
     };
     let text = toml::to_string_pretty(&file)?;
     crate::config::write_atomic_unlocked(path, &text)?;
+    // The live-settings watcher must treat this write as this process's own
+    // save (the endpoints writer behind the upsert/patch paths; the caller's
+    // refresh_live applies it live).
+    crate::config::record_live_file_written(path, &text);
     Ok(())
 }
 

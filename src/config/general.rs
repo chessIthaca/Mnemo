@@ -619,9 +619,9 @@ impl VerifyConfig {
     }
 }
 
-/// The out-of-box verification timeout: the same 5-minute bound the `shell`
-/// tool applies. Named fn so the serde default, the `Default` impl and the
-/// `skip_serializing_if` guard agree.
+/// The out-of-box verification timeout: five minutes, a bound of its own (the
+/// `shell` tool's silence limit is longer, 20 minutes). Named fn so the serde
+/// default, the `Default` impl and the `skip_serializing_if` guard agree.
 fn default_verify_timeout_secs() -> u64 {
     300
 }

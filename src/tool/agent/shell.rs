@@ -73,11 +73,15 @@ use crate::project::git_ops::content_tree;
 use crate::tool::agent::tool_contract;
 use crate::tool::{OutputSink, SafetyLevel, Tool, ToolCategory, ToolOutputStream, ToolResult};
 
-/// Default SILENCE limit (plan 5b85ab61): a shell command that writes nothing
-/// to stdout or stderr for this long is killed. Five minutes is long enough
-/// that a genuinely stuck process does not hold the agent forever, and short
-/// enough that a worker notices quickly when a command wedges silently.
-pub(crate) const DEFAULT_SILENCE: Duration = Duration::from_secs(5 * 60);
+/// Default SILENCE limit (plan 5b85ab61, bug 4b4377ce): a shell command that
+/// writes nothing to stdout or stderr for this long is killed. Twenty minutes
+/// is long enough that one large crate's silent rustc run is never killed as
+/// a healthy build — cargo prints "Compiling <crate>" and then nothing until
+/// that crate finishes, which takes longer than five minutes on a cold
+/// workspace (seen live: a worker killed twice right after "Compiling mnemo").
+/// It stays short enough that a genuinely stuck process does not hold the
+/// agent forever, and it beats detaching a build and polling with `sleep`.
+pub(crate) const DEFAULT_SILENCE: Duration = Duration::from_secs(20 * 60);
 
 /// Default HARD CAP (plan 5b85ab61): no shell command runs longer than this in
 /// total, however chatty it is — the backstop for a runaway command. One hour
@@ -626,7 +630,7 @@ impl Tool for ShellTool {
                  KiB) with a truncation note; well-known commands (cargo \
                  build/test, npm test/build, git status) are noise-filtered, \
                  keeping errors, warnings and summaries. A command is killed \
-                 after 5 minutes without output or 60 minutes in total.",
+                 after 20 minutes without output or 60 minutes in total.",
                 tool_contract::contract(
                     "`command` + `purpose`",
                     "{\"command\":\"cargo test\",\"purpose\":\"running tests\"}"
@@ -2754,6 +2758,33 @@ mod tests {
         );
         let data = result.data.expect("data");
         assert_eq!(data["killed"].as_str(), Some("silence"), "{data}");
+    }
+
+    /// Bug 4b4377ce: rustc compiles ONE large crate (mnemo, mnemo-app, a Bevy
+    /// crate) in silence — cargo's "Compiling <crate>" line lands, then nothing
+    /// until that crate finishes, which takes longer than five minutes cold.
+    /// The default silence limit must outlast one such crate run, or a healthy
+    /// build is killed as if it had hung (seen live: a worker killed twice
+    /// right after "Compiling mnemo v2.6.0"); and `ShellTool::new` must be the
+    /// thing that applies it.
+    #[test]
+    fn default_silence_outlasts_a_long_single_crate_compile() {
+        assert!(
+            DEFAULT_SILENCE >= Duration::from_secs(20 * 60),
+            "a cold single-crate compile prints nothing for more than five minutes, \
+             so the default silence limit must be at least 20 minutes, got {DEFAULT_SILENCE:?}"
+        );
+        let sandbox = Sandbox::new(std::env::temp_dir()).expect("temp dir sandbox");
+        let tool = ShellTool::new(sandbox);
+        assert_eq!(
+            tool.limits.silence,
+            Some(DEFAULT_SILENCE),
+            "ShellTool::new must apply DEFAULT_SILENCE"
+        );
+        assert_eq!(
+            tool.limits.total, DEFAULT_TOTAL,
+            "ShellTool::new must apply DEFAULT_TOTAL"
+        );
     }
 
     /// Plan 5b85ab61: a killed command's error keeps the END of what it printed

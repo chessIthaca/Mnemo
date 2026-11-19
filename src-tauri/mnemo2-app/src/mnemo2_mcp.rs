@@ -275,6 +275,18 @@ fn main() -> ExitCode {
                 }
             }
         }
+        // The shared-service watchdog: started detached by the instance that
+        // spawned a machine-wide service (Laya today), it ends that service
+        // once no live instance leases it any more, then exits. Hidden from
+        // USAGE on purpose — users never run it, and the lease directory
+        // carries everything it needs.
+        "laya-watchdog" => match mnemo::shared_service::run_watchdog_command(rest) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(reason) => {
+                eprintln!("{reason}");
+                ExitCode::FAILURE
+            }
+        },
         _ => usage(),
     }
 }

@@ -1225,8 +1225,9 @@ impl LeadRuntime {
     /// every worker session. A disabled or uninstalled Laya changes
     /// nothing — the slot stays empty, a byte-identical pre-Laya
     /// startup — and no error here ever fails the engine start. The
-    /// manager Arc is held on the runtime: dropping it would kill the
-    /// `laya-serve` child, so it must outlive this call.
+    /// manager Arc is held on the runtime: dropping it releases this
+    /// instance's lease on the machine-wide shared `laya-serve` (or ends a
+    /// private child), so it must outlive this call.
     async fn attach_laya(&self, engine: &Arc<Engine>) {
         let setup = match mnemo::headless::Setup::open(Some(self.config_dir.clone())) {
             Ok(setup) => setup.for_engine(engine),

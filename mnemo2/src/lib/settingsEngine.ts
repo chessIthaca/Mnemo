@@ -34,6 +34,8 @@ export interface EndpointDetailDto {
   has_api_key: boolean;
   max_context: number | null;
   max_output_tokens: number | null;
+  /** Machine-wide cap on concurrent requests (OpenAI/Local only); null = unlimited. */
+  max_concurrent: number | null;
   multimodal: boolean;
   supports_reasoning_effort: boolean;
   reasoning_effort: string | null;
@@ -201,6 +203,7 @@ export function emptyEndpoint(): EndpointDetailDto {
     has_api_key: false,
     max_context: null,
     max_output_tokens: null,
+    max_concurrent: null,
     multimodal: false,
     supports_reasoning_effort: true,
     reasoning_effort: null,

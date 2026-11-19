@@ -31,6 +31,8 @@ pub struct EndpointDraft {
     pub model_configs: Vec<crate::config::ModelSpec>,
     pub max_context: Option<usize>,
     pub max_output_tokens: Option<usize>,
+    /// The endpoint's machine-wide concurrency cap (`None` = unlimited).
+    pub max_concurrent: Option<u32>,
     pub multimodal: bool,
     pub supports_reasoning_effort: bool,
     pub reasoning_effort: Option<String>,
@@ -55,6 +57,7 @@ pub fn validate_endpoint(draft: EndpointDraft) -> Result<Endpoint, String> {
         model_configs,
         max_context,
         max_output_tokens,
+        max_concurrent,
         multimodal,
         supports_reasoning_effort,
         reasoning_effort,
@@ -140,6 +143,30 @@ pub fn validate_endpoint(draft: EndpointDraft) -> Result<Endpoint, String> {
                 .unwrap_or_else(|| crate::config::ModelSpec::from(id))
         })
         .collect::<Vec<_>>();
+    // Machine-wide concurrency cap (plan d3336a8a step 4): empty means
+    // unlimited. The cap is an OpenAI/Local feature and the Endpoints form
+    // hides the field on an Anthropic endpoint, so a value left over from
+    // another kind is cleared BEFORE the bounds check — a hidden field must
+    // never block the save (finding hiddenFieldValidation). `0` would block
+    // every request forever, so it is rejected rather than silently treated
+    // as unlimited; 64 is the ceiling the page offers.
+    let max_concurrent = if kind == EndpointKind::Anthropic {
+        None
+    } else {
+        max_concurrent
+    };
+    let max_concurrent = match max_concurrent {
+        None => None,
+        Some(0) => {
+            return Err(format!(
+                "endpoint '{name}': max_concurrent must be at least 1 (leave it empty for unlimited)"
+            ));
+        }
+        Some(n) if n > 64 => {
+            return Err(format!("endpoint '{name}': max_concurrent must be at most 64"));
+        }
+        Some(n) => Some(n),
+    };
     Ok(Endpoint {
         name,
         kind,
@@ -147,6 +174,7 @@ pub fn validate_endpoint(draft: EndpointDraft) -> Result<Endpoint, String> {
         models,
         max_context,
         max_output_tokens,
+        max_concurrent,
         multimodal,
         supports_strict_schema: None,
         supports_reasoning_effort,
@@ -505,6 +533,84 @@ mod tests {
         })
         .unwrap();
         assert_eq!(cleared.workspace_id, None, "non-anthropic kinds drop it");
+    }
+
+    #[test]
+    fn validate_endpoint_checks_max_concurrent() {
+        // Plan d3336a8a step 4: `0` would block every request forever, so it
+        // is rejected instead of silently meaning unlimited; 64 is the
+        // Endpoints page ceiling. Anthropic endpoints drop the field — the
+        // form hides it, so a persisted value would be invisible.
+        let bad = validate_endpoint(EndpointDraft {
+            name: "openai".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            models: vec!["gpt-4o".to_string()],
+            max_concurrent: Some(0),
+            ..Default::default()
+        });
+        assert!(bad
+            .unwrap_err()
+            .contains("max_concurrent must be at least 1"));
+
+        let too_many = validate_endpoint(EndpointDraft {
+            name: "openai".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            models: vec!["gpt-4o".to_string()],
+            max_concurrent: Some(65),
+            ..Default::default()
+        });
+        assert!(too_many
+            .unwrap_err()
+            .contains("max_concurrent must be at most 64"));
+
+        let ok = validate_endpoint(EndpointDraft {
+            name: "openai".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            models: vec!["gpt-4o".to_string()],
+            max_concurrent: Some(64),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(ok.max_concurrent, Some(64));
+
+        let anthropic = validate_endpoint(EndpointDraft {
+            name: "claude".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1/".into(),
+            models: vec!["claude-sonnet-4-5".to_string()],
+            max_concurrent: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(anthropic.max_concurrent, None, "anthropic kinds drop it");
+    }
+
+    /// Finding hiddenFieldValidation: the Endpoints form hides the cap on an
+    /// Anthropic endpoint, so a value left over from another kind must be
+    /// cleared BEFORE the bounds check — an out-of-range number in a field the
+    /// user cannot see must never block saving the endpoint.
+    #[test]
+    fn anthropic_draft_with_a_stale_cap_still_saves() {
+        for stale in [0, 65, 1_000] {
+            let ep = validate_endpoint(EndpointDraft {
+                name: "claude".into(),
+                kind: "anthropic".into(),
+                base_url: "https://api.anthropic.com/v1/".into(),
+                models: vec!["claude-sonnet-4-5".to_string()],
+                max_concurrent: Some(stale),
+                ..Default::default()
+            })
+            .unwrap_or_else(|error| {
+                panic!("a stale Anthropic cap ({stale}) must not block the save: {error}")
+            });
+            assert_eq!(
+                ep.max_concurrent, None,
+                "the hidden cap must be cleared, not persisted"
+            );
+        }
     }
 
     #[test]

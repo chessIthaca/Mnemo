@@ -22,6 +22,7 @@ function endpoint(name: string, models: string[]): EndpointDetailDto {
     has_api_key: true,
     max_context: null,
     max_output_tokens: null,
+    max_concurrent: null,
     multimodal: false,
     supports_reasoning_effort: true,
     reasoning_effort: null,

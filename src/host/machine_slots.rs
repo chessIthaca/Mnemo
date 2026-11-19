@@ -132,8 +132,7 @@ fn warn_unusable_once(dir: &Path, error: &io::Error) {
         .insert(key.clone());
     if first {
         eprintln!(
-            "warning: machine build slots at {key} are unusable ({error}); heavy commands \
-             run without a slot"
+            "warning: machine slots at {key} are unusable ({error}); running without a slot"
         );
     }
 }
@@ -147,6 +146,17 @@ impl HeavySlots {
             dir,
             slots: MachineConfig::clamp_heavy_commands(slots),
         }
+    }
+
+    /// Slots under `dir` taken VERBATIM, with no clamp.
+    ///
+    /// The endpoint concurrency cap (`max_concurrent` in `endpoints.toml`,
+    /// plan d3336a8a step 4) has its own range — validated at save time as
+    /// 1-64 — so it must never be squeezed into the heavy-command setting's
+    /// 1-16. Callers keep the [`MachineConfig::clamp_heavy_commands`] bounds
+    /// for the heavy setting by using [`Self::new`].
+    pub fn with_slots(dir: PathBuf, slots: usize) -> Self {
+        Self { dir, slots }
     }
 
     /// The directory the slot files live in.

@@ -223,6 +223,9 @@ pub struct EndpointDto {
     pub max_context: Option<usize>,
     /// The endpoint-level output-token cap, if known.
     pub max_output_tokens: Option<usize>,
+    /// Machine-wide cap on concurrent requests to this endpoint (`None` =
+    /// unlimited; OpenAI/Local kinds only, cleared for Anthropic).
+    pub max_concurrent: Option<u32>,
     /// Whether the endpoint serves a multimodal default model.
     pub multimodal: bool,
     /// Whether the endpoint accepts reasoning-effort overrides.
@@ -249,6 +252,7 @@ impl EndpointDto {
             model_configs: Vec::new(),
             max_context: self.max_context,
             max_output_tokens: self.max_output_tokens,
+            max_concurrent: self.max_concurrent,
             multimodal: self.multimodal,
             supports_reasoning_effort: self.supports_reasoning_effort,
             reasoning_effort: self.reasoning_effort,
@@ -625,6 +629,7 @@ impl Setup {
             models: e.models.iter().map(|m| m.id.clone()).collect(),
             max_context: e.max_context,
             max_output_tokens: e.max_output_tokens,
+            max_concurrent: e.max_concurrent,
             multimodal: e.multimodal,
             supports_reasoning_effort: e.supports_reasoning_effort,
             reasoning_effort: e.reasoning_effort.clone(),

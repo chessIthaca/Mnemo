@@ -105,7 +105,7 @@ pub struct McpTestResult {
     /// The failure detail (None on success).
     pub error: Option<String>,
 }
-use crate::config::{Config, EndpointKind, SafetyMode};
+use crate::config::{Config, ConfigFingerprint, EndpointKind, SafetyMode};
 use crate::headless::error::EngineError;
 use crate::headless::types::EventReceiver;
 pub use crate::host::embed_download::EmbeddingModelDto;
@@ -307,6 +307,11 @@ struct LiveHandles {
     /// autostart arm swaps it to the fresh sidecar endpoint, the same
     /// swap the GUI's `laya_setup` performs.
     classifier_slot: Option<ClassifierSlot>,
+    /// The project's MCP overrides file (the workspace's
+    /// `.coding/mcp.toml`) — the live-apply MCP leg re-merges the global
+    /// file with it before pushing the manager's list, the same wiring the
+    /// brain performs at startup, so a reload never strips project servers.
+    mcp_project_file: Option<PathBuf>,
 }
 
 impl fmt::Debug for LiveHandles {
@@ -382,6 +387,89 @@ pub struct SetupStatus {
     pub missing: Vec<SetupStep>,
 }
 
+/// What one live-settings check did — the result of
+/// [`Setup::reload_if_changed`], and what the instance tells the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// The files on disk match what this instance already applied (or this
+    /// process itself wrote them): nothing ran.
+    Unchanged,
+    /// The freshly loaded config was applied through the same live-apply a
+    /// Settings save runs.
+    Reloaded {
+        /// The hand edit touched `[general.laya]`, whose runtime leg only runs
+        /// through [`Setup::classifier_setup`] — it applies at the next engine
+        /// start, and the notice says so.
+        laya_changed: bool,
+    },
+    /// The files changed but could not be loaded: the old config stays live
+    /// (never a half-parsed apply).
+    Failed {
+        /// The live config files whose content differs from the applied set.
+        files: Vec<&'static str>,
+        /// The load error (the parser's message).
+        error: String,
+    },
+}
+
+impl ReloadOutcome {
+    /// Whether the check found a change worth reporting (a reload or a
+    /// failure) — `false` for an unchanged file set.
+    pub fn changed(&self) -> bool {
+        !matches!(self, ReloadOutcome::Unchanged)
+    }
+
+    /// Whether a reload ran and applied — the caller refreshes its model
+    /// catalog on this.
+    pub fn reloaded(&self) -> bool {
+        matches!(self, ReloadOutcome::Reloaded { .. })
+    }
+
+    /// The notice the window shows, or `None` when nothing changed.
+    pub fn notice(&self) -> Option<ReloadNotice> {
+        match self {
+            ReloadOutcome::Unchanged => None,
+            ReloadOutcome::Reloaded { laya_changed: false } => Some(ReloadNotice {
+                ok: true,
+                message: RELOADED_NOTICE.to_string(),
+            }),
+            ReloadOutcome::Reloaded { laya_changed: true } => Some(ReloadNotice {
+                ok: true,
+                message: format!("{RELOADED_NOTICE} {LAYA_RESTART_NOTICE}"),
+            }),
+            ReloadOutcome::Failed { files, error } => Some(ReloadNotice {
+                ok: false,
+                message: format!("Could not reload {}: {error}", notice_files(files)),
+            }),
+        }
+    }
+}
+
+/// The toast one live-settings check produces, as the window shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadNotice {
+    /// `true` for an applied reload, `false` for a rejected one.
+    pub ok: bool,
+    /// The text to show.
+    pub message: String,
+}
+
+/// The notice text after a live settings reload.
+pub const RELOADED_NOTICE: &str = "Settings changed in another window or by hand; reloaded.";
+/// The extra sentence when the hand edit touched `[general.laya]`.
+pub const LAYA_RESTART_NOTICE: &str =
+    "Laya changes take effect after a restart or a save in Settings.";
+
+/// The file list of a failure notice: the changed files, or "the settings"
+/// when the check could not name any (a Setup with no baseline).
+fn notice_files(files: &[&'static str]) -> String {
+    if files.is_empty() {
+        "the settings".to_string()
+    } else {
+        files.join(", ")
+    }
+}
+
 /// The standalone setup + config handle (§5.8 :525-527) — a pure
 /// config-dir handle in D1 (no engine state); the mutating surface
 /// (D2+) grows on it, and `for_engine` (D4) attaches a live engine for
@@ -409,6 +497,58 @@ pub struct Setup {
     /// fresh `Checking` (no live embedder yet); `for_engine` re-roots
     /// it to the brain's shared Arc.
     embedder_status_arc: Arc<std::sync::RwLock<EmbedderStatus>>,
+    /// The fingerprint of the config files this Setup last loaded or applied
+    /// ([`ConfigFingerprint`]) — [`Setup::reload_if_changed`]'s baseline.
+    /// Shared across clones so a reload seen through the watcher's clone is
+    /// the same baseline the owner sees.
+    last_applied: Arc<std::sync::Mutex<Option<ConfigFingerprint>>>,
+    /// Serialises every live-config change ([`Setup::patch_settings`],
+    /// [`Setup::reload_if_changed`], [`Setup::classifier_setup`],
+    /// [`Setup::refresh_live`], [`Setup::save_mcp_servers`]): each ends by
+    /// swapping `live.config` and stamping its applied fingerprint, so two
+    /// writers interleaving there could leave an OLDER config live or stamp
+    /// state that was never applied.
+    ///
+    /// Process-global, keyed by the config dir (review finding reloadSaveRace):
+    /// every settings IPC opens a FRESH Setup, so a per-Setup lock would never
+    /// contend with the watcher's long-lived one. Every Setup this process
+    /// opens on the same dir shares the same [`tokio::sync::Mutex`].
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// A test-only checkpoint inside [`Setup::apply_live`] — see
+    /// [`ApplyPause`].
+    #[cfg(test)]
+    apply_pause: Option<Arc<ApplyPause>>,
+}
+
+/// A test-only gate that parks [`Setup::apply_live`] at its checkpoint: the
+/// writer announces itself on `entered` and waits on `release`, so a test can
+/// start a second live-config change while the first is mid-apply and prove
+/// the apply mutex serialises them (review finding reloadSaveRace).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct ApplyPause {
+    /// One permit is granted as soon as a writer parks at the checkpoint.
+    pub entered: Arc<tokio::sync::Semaphore>,
+    /// The parked writer continues once the test grants a permit here.
+    pub release: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(test)]
+impl ApplyPause {
+    /// A fresh gate: the writer blocks until the test releases it.
+    pub fn new() -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for ApplyPause {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Setup {
@@ -432,6 +572,12 @@ impl Setup {
             config_dir.join("laya"),
             Arc::clone(&classifier_status),
         ));
+        // What is on disk right now is this Setup's applied baseline: a check
+        // right after opening sees no change.
+        let last_applied = Some(ConfigFingerprint::read(&config_dir));
+        // The live-config apply lock is PROCESS-global, keyed by the config
+        // dir (every settings IPC opens a fresh Setup; see apply_lock's doc).
+        let apply_lock = crate::config::live_config_apply_lock(&config_dir);
         Ok(Self {
             config_dir,
             key_source: KeySource::default(),
@@ -439,6 +585,10 @@ impl Setup {
             laya,
             classifier_status,
             embedder_status_arc,
+            last_applied: Arc::new(std::sync::Mutex::new(last_applied)),
+            apply_lock,
+            #[cfg(test)]
+            apply_pause: None,
         })
     }
 
@@ -454,6 +604,14 @@ impl Setup {
     /// refuse; inject the keys at construction instead.
     pub fn with_key_source(mut self, source: KeySource) -> Self {
         self.key_source = source;
+        self
+    }
+
+    /// Test seam: park [`Setup::apply_live`] at its checkpoint (see
+    /// [`ApplyPause`]) so a test can interleave two live-config changes.
+    #[cfg(test)]
+    fn with_apply_pause(mut self, pause: Arc<ApplyPause>) -> Self {
+        self.apply_pause = Some(pause);
         self
     }
 
@@ -515,6 +673,10 @@ impl Setup {
             )),
             classifier_status: brain.classifier_status.clone(),
             embedder_status_arc: brain.embedder_status.clone(),
+            last_applied: Arc::clone(&self.last_applied),
+            apply_lock: Arc::clone(&self.apply_lock),
+            #[cfg(test)]
+            apply_pause: None,
             live: Some(LiveHandles {
                 factory: brain.factory.clone(),
                 memory_store: brain.own_memory_store.clone(),
@@ -524,6 +686,15 @@ impl Setup {
                 trace: brain.trace.clone(),
                 config: brain.config.clone(),
                 classifier_slot: Some(brain.classifier_slot.clone()),
+                // The brain wires the manager from global + project at
+                // startup; the live-apply MCP leg replays that merge, so it
+                // needs the same project file.
+                mcp_project_file: Some(
+                    engine
+                        .workspace_root()
+                        .join(".coding")
+                        .join("mcp.toml"),
+                ),
             }),
         }
     }
@@ -549,6 +720,9 @@ impl Setup {
     /// which owns the full rewire leg; the GUI's two surfaces meet in
     /// one process, the headless two in one method).
     pub async fn patch_settings(&self, patch: SettingsSaveDto) -> Result<(), EngineError> {
+        // One live-config change at a time: the save, the live apply and the
+        // applied-fingerprint stamp are one unit (see [`Setup::apply_lock`]).
+        let _apply = self.apply_lock.lock().await;
         if patch.laya_enabled.is_some() {
             return Err(EngineError::unsupported_patch(
                 "laya_enabled does not ride the settings patch — use \
@@ -564,13 +738,67 @@ impl Setup {
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(e.to_string()))?;
         let Some(live) = &self.live else {
+            // Nothing live to apply: the save alone is the whole effect.
+            self.mark_applied(self.saved_fingerprint());
             return Ok(());
         };
+        // The trace limits ride the patch only when it carries trace fields
+        // (the GUI's contract); a live reload has no patch and applies both.
+        let trace_limits =
+            patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some();
+        let pending_mcp_drop = self.apply_live(live, new_config, trace_limits).await;
+        // This instance applied the save itself: the live-settings watcher
+        // must not reload it a second time. The stamped fingerprint is the
+        // writer's own record of the bytes it saved, never a fresh disk read
+        // that a concurrent edit could have moved past.
+        self.mark_applied(self.saved_fingerprint());
+        // The connection drop awaits OUTSIDE the apply lock (review finding
+        // mcpSwapUnderLock): the connections mutex can be held for up to
+        // 300 s, and no Settings save may stall on it.
+        drop(_apply);
+        if let Some(manager) = pending_mcp_drop {
+            manager.drop_connections().await;
+        }
+        Ok(())
+    }
+
+    /// The live-apply sequence a settings change runs on a live engine —
+    /// shared by [`Setup::patch_settings`] and [`Setup::reload_if_changed`]:
+    /// the safety mode → the moved rewire core (vision + embedder + the
+    /// factory's live toggles) → the model resolver → the factory's
+    /// core-operations/shell-filter handles → the trace limits → the MCP leg
+    /// → the brain's shared config. Effective on the next request.
+    ///
+    /// `trace_limits` distinguishes the patch contract (the GUI sends the
+    /// trace fields only when its trace page saved them) from a reload, which
+    /// applies whatever the loaded file says.
+    ///
+    /// Returns the manager whose connection drop is pending when the apply
+    /// changed the MCP server set (review findings reloadSkipsMcp +
+    /// mcpListAtomic): the list push happens HERE — under the same apply
+    /// lock and config guard as the config swap — and the caller awaits
+    /// [`McpManager::drop_connections`] only AFTER releasing the apply lock
+    /// (review finding mcpSwapUnderLock: the connections mutex can be held
+    /// by a first-use tool call for up to 300 s).
+    async fn apply_live(
+        &self,
+        live: &LiveHandles,
+        new_config: Config,
+        trace_limits: bool,
+    ) -> Option<Arc<crate::mcp::McpManager>> {
         // Safety mode (the engine's approval gates read the flag per
         // request; the app additionally auto-resolves pending IPC
         // approvals — a headless engine has none parked by the GUI).
         *live.safety_mode.write().expect("safety mode lock poisoned") =
             new_config.general.general.safety;
+        // Test seam (review finding reloadSaveRace): park after the first live
+        // effect, while the apply mutex is held, so a test can start a second
+        // writer and prove it waits.
+        #[cfg(test)]
+        if let Some(pause) = &self.apply_pause {
+            pause.entered.add_permits(1);
+            let _ = pause.release.acquire().await;
+        }
         // The rewire core: vision + embedder + the live toggles. The
         // re-embed future spawns on tokio (the headless engine runs on
         // tokio by construction).
@@ -593,18 +821,149 @@ impl Setup {
             .set_core_operations(new_config.general.git.core_operations.clone());
         live.factory
             .set_shell_filter_config(new_config.general.shell_filter.clone());
-        // The trace limits (retroactive budget; the cap from now on) —
-        // only when the patch carries trace fields (the GUI's contract).
-        if patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some() {
+        // The trace limits (retroactive budget; the cap from now on).
+        if trace_limits {
             live.trace
                 .set_memory_budget(new_config.general.trace.memory_budget_mb * 1024 * 1024);
             live.trace
                 .set_request_body_cap(new_config.general.trace.request_body_cap_kb * 1024);
         }
-        // The brain's shared config: every later spawn reads the
-        // reloaded values.
-        *live.config.lock().await = new_config;
-        Ok(())
+        // The brain's shared config: every later spawn reads the reloaded
+        // values. The MCP leg shares this critical section (review findings
+        // reloadSkipsMcp + mcpListAtomic): when the server set changed, the
+        // running manager gets the new list HERE — next to the config swap,
+        // under the same apply lock and config guard — because config.mcp
+        // alone changes nothing for built agents' tool groups, and a list
+        // push outside the guard could interleave a concurrent save and leave
+        // the manager different from the config.
+        let mut pending_mcp_drop = None;
+        {
+            let mut config = live.config.lock().await;
+            if config.mcp != new_config.mcp {
+                if let Some(manager) = live.factory.mcp_manager() {
+                    // The brain's startup wiring, replayed on a live apply
+                    // (brain.rs:1136-1138): the manager's set is the global
+                    // file merged with the project's `.coding/mcp.toml`
+                    // overrides, so a reload never strips project servers.
+                    // A missing/unparsable project file falls back to the
+                    // global set alone — the reload must not fail over a
+                    // file the engine tolerates at startup.
+                    let project = match &live.mcp_project_file {
+                        Some(path) => crate::config::mcp::load_or_default(path)
+                            .unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    manager.set_servers(crate::config::mcp::merge_servers(
+                        &new_config.mcp,
+                        &project,
+                    ));
+                    pending_mcp_drop = Some(manager);
+                }
+            }
+            *config = new_config;
+        }
+        pending_mcp_drop
+    }
+
+    /// Record a fingerprint as this Setup's applied baseline — after a save
+    /// (the writer's own record) and after a successful reload (the bytes it
+    /// loaded). Never a fresh disk read at mark time: an edit landing between
+    /// the load/apply and the mark would be stamped applied without ever being
+    /// applied.
+    fn mark_applied(&self, fingerprint: ConfigFingerprint) {
+        *self.last_applied.lock().unwrap_or_else(|e| e.into_inner()) = Some(fingerprint);
+    }
+
+    /// The fingerprint this process last saved under the config dir — the
+    /// writer's own record ([`crate::config::saved_fingerprint`]), which every
+    /// in-process writer of a live file updates.
+    fn saved_fingerprint(&self) -> ConfigFingerprint {
+        crate::config::saved_fingerprint(&self.config_dir)
+    }
+
+    /// One live-settings check: when the four config files on disk
+    /// ([`crate::config::CONFIG_FILE_NAMES`]) differ from what this Setup last
+    /// applied, load them and apply them through the same live-apply sequence
+    /// a Settings save runs ([`Setup::apply_live`]).
+    ///
+    /// - A file set whose fingerprint still matches the applied baseline is
+    ///   unchanged: nothing runs. The same holds for a change set this
+    ///   process itself wrote
+    ///   ([`crate::config::disk_changes_are_own_writes`]) — the save already
+    ///   applied its values live, so its file events reload nothing.
+    /// - A load error (broken TOML, a half-written file) keeps the old config
+    ///   live — never a half-parsed apply — and reports the changed file(s)
+    ///   plus the error.
+    /// - `[general.laya]` stays at its live value: the flag rides
+    ///   [`Setup::classifier_setup`] (sidecar stop/start, slot, status), so a
+    ///   hand edit there takes effect at the next engine start — the notice
+    ///   says so.
+    ///
+    /// A Setup without a live engine has nothing to apply and reports
+    /// [`ReloadOutcome::Unchanged`].
+    pub async fn reload_if_changed(&self) -> ReloadOutcome {
+        // One live-config change at a time (see [`Setup::apply_lock`]): the
+        // fingerprint read, the load, the live apply and the baseline stamp
+        // are one unit, so a Settings save cannot interleave and leave an
+        // older config live.
+        let _apply = self.apply_lock.lock().await;
+        // Fingerprint BEFORE the load: an edit landing in between makes the
+        // next check reload once more (safe), while fingerprinting after the
+        // load could stamp bytes as applied that never were.
+        let disk = ConfigFingerprint::read(&self.config_dir);
+        let baseline = *self.last_applied.lock().unwrap_or_else(|e| e.into_inner());
+        if baseline == Some(disk) {
+            return ReloadOutcome::Unchanged;
+        }
+        // This process's own save already applied its values live: the file
+        // events it caused must not reload a second time. Only files this
+        // process itself wrote can match — a file it never wrote never does,
+        // so an external edit that landed before its first write still
+        // reloads (review findings ownSaveWriters + seedAbsorbsEdit).
+        let applied = baseline.unwrap_or_else(|| ConfigFingerprint::read(&self.config_dir));
+        if crate::config::disk_changes_are_own_writes(&self.config_dir, &applied, &disk) {
+            self.mark_applied(disk);
+            return ReloadOutcome::Unchanged;
+        }
+        let files = match baseline {
+            Some(baseline) => baseline.changed_files(&disk),
+            // No baseline (a Setup built without one): name every file.
+            None => crate::config::CONFIG_FILE_NAMES.to_vec(),
+        };
+        // A first-run Setup has no live pieces — nothing to reload.
+        let Some(live) = &self.live else {
+            return ReloadOutcome::Unchanged;
+        };
+        let new_config = match self.load_config() {
+            Ok(config) => config,
+            Err(error) => {
+                return ReloadOutcome::Failed {
+                    files,
+                    error: error.to_string(),
+                }
+            }
+        };
+        let mut new_config = new_config;
+        // Keep the live Laya block (see the docs above): the runtime leg is
+        // classifier_setup's, and a brain that claims an enabled classifier it
+        // does not run would half-apply the flag.
+        let live_laya = {
+            let live_config = live.config.lock().await;
+            live_config.general.general.laya.clone()
+        };
+        let laya_changed = live_laya != new_config.general.general.laya;
+        new_config.general.general.laya = live_laya;
+        // A reload applies the whole loaded file, trace limits included.
+        let pending_mcp_drop = self.apply_live(live, new_config, true).await;
+        self.mark_applied(disk);
+        // The connection drop awaits OUTSIDE the apply lock (review finding
+        // mcpSwapUnderLock): the connections mutex can be held for up to
+        // 300 s, and no Settings save may stall on it.
+        drop(_apply);
+        if let Some(manager) = pending_mcp_drop {
+            manager.drop_connections().await;
+        }
+        ReloadOutcome::Reloaded { laya_changed }
     }
 
     /// The managed-Laya runtime handle for this Setup's config dir
@@ -650,6 +1009,10 @@ impl Setup {
         &self,
         enable: bool,
     ) -> Result<EventReceiver<SetupEvent>, EngineError> {
+        // One live-config change at a time (see [`Setup::apply_lock`]): this
+        // leg persists the flag and swaps `live.config` just like a settings
+        // save.
+        let _apply = self.apply_lock.lock().await;
         let (tx, rx) = tokio::sync::broadcast::channel::<SetupEvent>(64);
         // Persist the flip first — idempotent, so a concurrent second
         // enable is harmless before the guard rejects it.
@@ -658,6 +1021,8 @@ impl Setup {
         config
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(format!("saving the config failed: {e}")))?;
+        // Its own save: the live-settings watcher must not reload it again.
+        self.mark_applied(self.saved_fingerprint());
         // The LIVE apply (review round 1, finding 2): the completing
         // pipeline + every later spawn re-reads the brain's shared Arc —
         // a flip that only reaches disk leaves an engine-backed enable
@@ -1248,19 +1613,43 @@ impl Setup {
         project: Option<&Path>,
         servers: Vec<McpServerWire>,
     ) -> Result<String, EngineError> {
-        let global_path = self.config_dir.join("mcp.toml");
-        let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
-        let outcome =
-            crate::config::mcp::save_split(&global_path, project_path.as_deref(), servers)
-                .map_err(|e| {
-                    EngineError::start_failed(format!("saving the MCP servers failed: {e}"))
-                })?;
-        if let Some(live) = &self.live {
-            let mut config = live.config.lock().await;
-            config.mcp = outcome.global;
-            if let Some(manager) = live.factory.mcp_manager() {
-                manager.replace_servers(outcome.merged.clone()).await;
+        // One live-config change at a time (see [`Setup::apply_lock`]): the
+        // file write and the live config swap are one unit, so a concurrent
+        // reload cannot interleave and leave an older set live.
+        let pending = {
+            let _apply = self.apply_lock.lock().await;
+            let global_path = self.config_dir.join("mcp.toml");
+            let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
+            let outcome =
+                crate::config::mcp::save_split(&global_path, project_path.as_deref(), servers)
+                    .map_err(|e| {
+                        EngineError::start_failed(format!(
+                            "saving the MCP servers failed: {e}"
+                        ))
+                    })?;
+            let mut manager = None;
+            if let Some(live) = &self.live {
+                let mut config = live.config.lock().await;
+                config.mcp = outcome.global;
+                manager = live.factory.mcp_manager();
+                // The list push shares the config swap's critical section
+                // (review findings mcpListAtomic + reloadSkipsMcp): a save is
+                // the one writer that owns both, so overlapping saves can
+                // never leave the manager's list different from config.mcp.
+                if let Some(manager) = &manager {
+                    manager.set_servers(outcome.merged);
+                }
             }
+            manager
+            // Both guards drop here, at the end of the block — before the
+            // connection drop's await.
+        };
+        // The connection drop is the slow half — the connections mutex can
+        // be held by a first-use tool call for up to 300 s — and awaits
+        // OUTSIDE both guards (review finding mcpSwapUnderLock): no Settings
+        // save, reload or brain-config reader may stall on it.
+        if let Some(manager) = pending {
+            manager.drop_connections().await;
         }
         Ok(
             "saved — servers apply to agents built after this save (a restart always picks them \
@@ -1843,6 +2232,749 @@ mod tests {
             Some("alt-model")
         );
         drop(shared);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding reloadSaveRace: a reload already mid-apply must not be
+    /// overtaken by a Settings save. The apply mutex serialises them, so the
+    /// final live config equals what is on disk — no older config wins, and no
+    /// fingerprint is stamped for bytes that were never applied.
+    #[tokio::test]
+    async fn a_reload_and_a_save_are_serialised_so_disk_wins() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // An external hand edit to reload.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"hand-edit\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+
+        let pause = Arc::new(ApplyPause::new());
+        let reload_setup = setup.clone().with_apply_pause(Arc::clone(&pause));
+        let reload = tokio::spawn(async move { reload_setup.reload_if_changed().await });
+        // Wait until the reload is parked INSIDE apply_live, holding the apply
+        // mutex.
+        let _entered = pause.entered.acquire().await.expect("the gate is open");
+
+        let patch_setup = setup.clone();
+        let patch = tokio::spawn(async move {
+            patch_setup
+                .patch_settings(SettingsSaveDto {
+                    safety: Some("autonomous".to_string()),
+                    ..Default::default()
+                })
+                .await
+        });
+        // The save must WAIT for the reload's apply to finish.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !patch.is_finished(),
+            "the save must wait for the in-flight reload"
+        );
+        pause.release.add_permits(1);
+        let outcome = reload.await.expect("reload task");
+        assert!(outcome.reloaded(), "{outcome:?}");
+        patch.await.expect("patch task").expect("the save applies");
+
+        // The final live config equals what is on disk: the save (loaded from
+        // the reloaded file) won, and nothing was stamped without applying.
+        let on_disk = Config::load(cfg.path()).expect("reload the saved config");
+        let live = engine.brain().config.lock().await.clone();
+        assert_eq!(live.general.general.safety, on_disk.general.general.safety);
+        assert_eq!(
+            live.general.general.vision_model, on_disk.general.general.vision_model,
+            "the hand edit survived the save"
+        );
+        assert_eq!(
+            live.general
+                .general
+                .vision_model
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("hand-edit"),
+            "the hand edit is the live vision model"
+        );
+        // And a follow-up check is quiet: the stamped baseline matches disk.
+        assert_eq!(setup.reload_if_changed().await, ReloadOutcome::Unchanged);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding reloadSaveRace (delta audit F1/F2), through the
+    /// production shape: every settings IPC opens a FRESH Setup
+    /// (ipc.rs `settings_setup`), so the lock must be process-global — three
+    /// SEPARATELY OPENED Setups on one config dir (one reloading, one saving
+    /// via patch_settings, one via upsert_endpoint_detail) serialise on it,
+    /// and the live config equals what is on disk at the end.
+    #[tokio::test]
+    async fn separately_opened_setups_serialise_and_disk_wins() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let reloading = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let saving = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let upserting = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // The external hand edit lands AFTER the Setups opened (each stamps
+        // its baseline), exactly like a hand edit mid-session.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"hand-edit\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+
+        let pause = Arc::new(ApplyPause::new());
+        let reload_setup = reloading.with_apply_pause(Arc::clone(&pause));
+        let reload = tokio::spawn(async move { reload_setup.reload_if_changed().await });
+        // The reload is parked INSIDE apply_live, holding the process-global
+        // apply lock.
+        let _entered = pause.entered.acquire().await.expect("the gate is open");
+
+        let patch = {
+            let saving = saving.clone();
+            tokio::spawn(async move {
+                saving
+                    .patch_settings(SettingsSaveDto {
+                        safety: Some("autonomous".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+            })
+        };
+        let upsert = {
+            let upserting = upserting.clone();
+            tokio::spawn(async move {
+                let mut dto = upserting.endpoints_detail().expect("details").remove(0);
+                dto.temperature = Some(0.7);
+                upserting.upsert_endpoint_detail(dto, None).await
+            })
+        };
+        // Neither a save nor an upsert on ANOTHER Setup may interleave with
+        // the in-flight reload: both must wait for the apply lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !patch.is_finished(),
+            "a patch_settings on a fresh Setup must wait for the in-flight reload"
+        );
+        assert!(
+            !upsert.is_finished(),
+            "an upsert on a fresh Setup must wait for the in-flight reload"
+        );
+        pause.release.add_permits(1);
+        assert!(reload.await.expect("reload task").reloaded());
+        patch.await.expect("patch task").expect("the save applies");
+        upsert.await.expect("upsert task").expect("the upsert applies");
+
+        // The final live config equals what is on disk — every change is in
+        // (the hand edit survived both saves) and nothing older won.
+        let on_disk = Config::load(cfg.path()).expect("reload the saved config");
+        let live = engine.brain().config.lock().await.clone();
+        assert_eq!(live.general.general.safety, on_disk.general.general.safety);
+        assert_eq!(live.general.general.safety, SafetyMode::Autonomous);
+        assert_eq!(
+            live.general.general.vision_model,
+            on_disk.general.general.vision_model,
+            "the hand edit survived both saves"
+        );
+        assert_eq!(
+            live.general
+                .general
+                .vision_model
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("hand-edit"),
+            "the hand edit is the live vision model"
+        );
+        assert_eq!(
+            live.endpoint("test").expect("endpoint").temperature,
+            on_disk.endpoint("test").expect("endpoint").temperature,
+            "the upsert's change is live"
+        );
+        assert_eq!(live.endpoint("test").expect("endpoint").temperature, Some(0.7));
+        // A follow-up check on the saving Setup is quiet: the stamped
+        // baseline matches disk.
+        assert_eq!(saving.reload_if_changed().await, ReloadOutcome::Unchanged);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding mcpSaveUnrecorded: `save_mcp_servers` writes `mcp.toml`
+    /// through the MCP writer — an in-process save, so the watcher must not
+    /// reload it (a false "changed in another window" toast + a full rewire,
+    /// embedder rebuild included).
+    #[tokio::test]
+    async fn a_mcp_servers_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let def: crate::config::mcp::McpServerDef = toml::from_str(
+            "name = \"filesystem\"\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n",
+        )
+        .expect("server def");
+        setup
+            .save_mcp_servers(
+                None,
+                vec![McpServerWire {
+                    def,
+                    source: crate::config::mcp::SOURCE_GLOBAL.to_string(),
+                }],
+            )
+            .await
+            .expect("the MCP save");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "save_mcp_servers is this instance's own save"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding mcpSwapUnderLock: the manager swap can wait on the
+    /// connections mutex for a first-use tool call (up to 300 s across
+    /// initialize + list_tools), so the MCP save must not hold the
+    /// process-global apply lock — or the shared-config guard — across it:
+    /// a Settings save on another Setup completes while the swap is still
+    /// blocked.
+    #[tokio::test]
+    async fn an_mcp_save_does_not_stall_other_settings_saves() {
+        let (_root, cfg, engine) = ready_engine_with_mcp().await;
+        let saving = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let patching = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // Hold the manager's connections mutex the way a first-use tool call
+        // does, on a gate — the exact wait drop_connections blocks on.
+        let manager = saving
+            .live
+            .as_ref()
+            .and_then(|live| live.factory.mcp_manager())
+            .expect("the fixture engine has an MCP manager");
+        let held = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let holder = {
+            let manager = Arc::clone(&manager);
+            let held = Arc::clone(&held);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                manager.test_hold_connections(&held, &release).await;
+            })
+        };
+        let _ = held.acquire().await; // the connections mutex is held
+
+        // The MCP save: its file write + live config swap complete, but the
+        // manager swap blocks on the connections mutex.
+        let save = {
+            let saving = saving.clone();
+            tokio::spawn(async move { saving.save_mcp_servers(None, vec![]).await })
+        };
+        // set_servers emptied the list inside the save's locked unit — the
+        // emptied list plus the unfinished task proves the save is past its
+        // guarded unit and parked in the blocked drop_connections, not
+        // before it.
+        for _ in 0..50 {
+            if manager.servers().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            manager.servers().is_empty(),
+            "the save is parked inside the blocked manager swap"
+        );
+        assert!(!save.is_finished());
+
+        // A Settings save on another Setup completes WHILE the swap is
+        // blocked — the apply lock was released before the swap's await.
+        let patch = {
+            let patching = patching.clone();
+            tokio::spawn(async move {
+                patching
+                    .patch_settings(SettingsSaveDto {
+                        safety: Some("autonomous".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), patch)
+            .await
+            .expect("a Settings save completes while the MCP swap is blocked")
+            .expect("patch task")
+            .expect("the patch applies");
+        // And a brain-config reader is not stalled either — the
+        // shared-config guard was released before the swap too.
+        let _guard = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.brain().config.lock(),
+        )
+        .await
+        .expect("the shared-config guard is free while the swap is blocked");
+        drop(_guard);
+
+        // Release the gate: the save completes with its message.
+        release.add_permits(1);
+        holder.await.expect("the holder task ends");
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), save)
+            .await
+            .expect("the MCP save completes once the gate opens")
+            .expect("save task")
+            .expect("the MCP save applies");
+        assert!(!message.is_empty());
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding reloadSkipsMcp: a reload of `mcp.toml` must reach the
+    /// RUNNING manager, not just `config.mcp` — a hand edit (or another
+    /// instance's MCP save) changes nothing for built agents' tool groups
+    /// otherwise, contradicting the live-settings contract.
+    #[tokio::test]
+    async fn a_mcp_hand_edit_reaches_the_manager() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // A hand edit adds a server to mcp.toml (the fixture starts with
+        // none — the manager is live with an empty list).
+        std::fs::write(
+            cfg.path().join("mcp.toml"),
+            "[[server]]\nname = \"hand-added\"\ncommand = \"npx\"\nargs = [\"-y\"]\n",
+        )
+        .expect("hand edit");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Reloaded { laya_changed: false },
+            "the mcp.toml edit must reload"
+        );
+        let live = engine.brain().config.lock().await;
+        assert!(
+            live.mcp.iter().any(|server| server.name == "hand-added"),
+            "the edit reached the shared config"
+        );
+        drop(live);
+        let manager = setup
+            .live
+            .as_ref()
+            .and_then(|live| live.factory.mcp_manager())
+            .expect("the engine has an MCP manager");
+        assert!(
+            manager.servers().iter().any(|server| server.name == "hand-added"),
+            "the hand edit reached the RUNNING manager (the tool groups agents \
+             are built with)"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding mcpListAtomic: overlapping MCP saves must end with the
+    /// manager's list equal to `config.mcp` — the list push shares the
+    /// config swap's critical section, so no scheduling window can leave
+    /// them different.
+    #[tokio::test]
+    async fn overlapping_mcp_saves_keep_the_manager_list_equal_to_config() {
+        let (_root, cfg, engine) = ready_engine_with_mcp().await;
+        let a = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let b = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let single = |name: &str| {
+            McpServerWire {
+                def: toml::from_str(&format!(
+                    "name = \"{name}\"\ncommand = \"npx\"\nargs = [\"-y\"]\n"
+                ))
+                .expect("server def"),
+                source: crate::config::mcp::SOURCE_GLOBAL.to_string(),
+            }
+        };
+        // Two saves with different sets, racing.
+        let save_a = {
+            let a = a.clone();
+            tokio::spawn(async move { a.save_mcp_servers(None, vec![single("alpha")]).await })
+        };
+        let save_b = {
+            let b = b.clone();
+            tokio::spawn(async move { b.save_mcp_servers(None, vec![single("beta")]).await })
+        };
+        save_a.await.expect("save A task").expect("the first save applies");
+        save_b.await.expect("save B task").expect("the second save applies");
+        // The invariant: whichever save won, the manager's list equals the
+        // shared config's set.
+        let live = engine.brain().config.lock().await;
+        let mut config_names: Vec<String> =
+            live.mcp.iter().map(|server| server.name.clone()).collect();
+        config_names.sort();
+        drop(live);
+        let manager = a
+            .live
+            .as_ref()
+            .and_then(|live| live.factory.mcp_manager())
+            .expect("the engine has an MCP manager");
+        let mut manager_names: Vec<String> =
+            manager.servers().iter().map(|server| server.name.clone()).collect();
+        manager_names.sort();
+        assert_eq!(
+            manager_names, config_names,
+            "overlapping saves must leave the manager's list equal to config.mcp"
+        );
+        // Whichever save ran last, its set is what BOTH the config and the
+        // manager hold — exactly one winner, no divergence.
+        assert_eq!(config_names.len(), 1);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding seedAbsorbsEdit: an external edit that landed BEFORE
+    /// this process's first own write must not be absorbed as an own save —
+    /// the registry's never-written slots can never match disk, so the edit
+    /// still reloads and applies.
+    #[tokio::test]
+    async fn an_external_edit_before_an_own_save_still_reloads() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // 1. An external hand edit to config.toml.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"hand-edit\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+        // 2. This process writes keys.toml (its own save, recorded) — the
+        // first write must NOT stamp the other slots from disk.
+        setup
+            .set_api_key("test", Secret::new("sk-rotated"))
+            .expect("the key save");
+        // 3. The own write must not absorb the hand edit: it still reloads.
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Reloaded { laya_changed: false },
+            "the hand edit before the own save must still be applied"
+        );
+        let live = engine.brain().config.lock().await;
+        assert_eq!(
+            live.general
+                .general
+                .vision_model
+                .as_ref()
+                .map(|model| model.model.as_str()),
+            Some("hand-edit"),
+            "the hand edit was applied live"
+        );
+        assert_eq!(live.keys.get("test"), Some("sk-rotated"));
+        drop(live);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding ownSaveWriters: `set_tiers` writes `endpoints.toml`
+    /// through the tier-ladder writer — an in-process save, so the watcher must
+    /// not reload it (a false "changed in another window" toast + a full
+    /// rewire, embedder rebuild included).
+    #[tokio::test]
+    async fn a_set_tiers_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let mut tiers = setup.tiers().expect("tiers");
+        // A valid ladder change the fixture can resolve.
+        tiers.tiers[0].models = vec!["test/test-model".to_string()];
+        setup.set_tiers(tiers).await.expect("the tiers save");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "set_tiers is this instance's own save"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding ownSaveWriters: `set_api_key` writes `keys.toml` through
+    /// `KeyStore::save` — same rule.
+    #[tokio::test]
+    async fn a_set_api_key_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        setup
+            .set_api_key("test", Secret::new("sk-rotated"))
+            .expect("the key save");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "set_api_key is this instance's own save"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding ownSaveWriters: the MCP OAuth token store writes
+    /// `keys.toml` on every refresh — a background write, never a reload.
+    #[tokio::test]
+    async fn an_mcp_token_store_save_is_not_reloaded() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let store = crate::mcp::oauth::McpTokenStore::new(cfg.path().join("keys.toml"));
+        store
+            .store(
+                "server",
+                &crate::mcp::oauth::OAuthTokens {
+                    access_token: "tok".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("the token write");
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "an OAuth token refresh is this instance's own save"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A ready engine over fresh temp dirs: the config fixture answers
+    /// [`Setup::open`] and the engine starts offline (the `"hash"` embedder).
+    /// The caller keeps both `TempDir`s alive for the engine's lifetime.
+    async fn ready_engine() -> (tempfile::TempDir, tempfile::TempDir, Engine) {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        (root, cfg, engine)
+    }
+
+    /// A ready engine over fresh temp dirs WITH one configured MCP server —
+    /// the brain wires a live `McpManager` (brain.rs:1138) so the save path
+    /// has a manager to swap. The server is never connected: the manager is
+    /// inert until a tool call first uses it, so the fixture is offline.
+    async fn ready_engine_with_mcp() -> (tempfile::TempDir, tempfile::TempDir, Engine) {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        std::fs::write(
+            cfg.path().join("mcp.toml"),
+            "[[server]]\nname = \"filesystem\"\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n",
+        )
+        .unwrap();
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        (root, cfg, engine)
+    }
+
+    /// Live settings (plan d3336a8a step 6): a hand edit of `config.toml` — no
+    /// Settings save in this process — reloads through the same live-apply,
+    /// rebuilds the vision client and swaps the brain's shared config.
+    #[tokio::test]
+    async fn external_edit_reloads_and_rewires_vision() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let factory = Arc::clone(&engine.brain().factory);
+        assert!(
+            !factory.vision_slot().is_configured(),
+            "the fixture has no vision fallback"
+        );
+        // A hand edit in an editor: add the vision fallback model.
+        let mut text = std::fs::read_to_string(cfg.path().join("config.toml")).expect("fixture");
+        text.push_str("\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"alt-model\"\n");
+        std::fs::write(cfg.path().join("config.toml"), text).expect("hand edit");
+
+        let outcome = setup.reload_if_changed().await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Reloaded {
+                laya_changed: false
+            },
+            "the hand edit must reload"
+        );
+        // The live vision slot was rebuilt from the reloaded config…
+        assert!(
+            factory.vision_slot().is_configured(),
+            "the rewire installed the vision fallback"
+        );
+        // …and the brain's shared config (the next spawn's) carries it.
+        assert_eq!(
+            engine
+                .brain()
+                .config
+                .lock()
+                .await
+                .general
+                .general
+                .vision_model,
+            Some(crate::config::VisionModel {
+                endpoint: "test".to_string(),
+                model: "alt-model".to_string(),
+            })
+        );
+        assert_eq!(
+            outcome.notice().expect("a change is reported"),
+            ReloadNotice {
+                ok: true,
+                message: RELOADED_NOTICE.to_string()
+            }
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// An instance's OWN save must not reload a second time: the save records
+    /// the fingerprint it wrote (process-wide) and its Setup's baseline, so the
+    /// watcher's immediate check sees nothing new — no toast, no re-apply.
+    #[tokio::test]
+    async fn own_save_does_not_reload_twice() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        setup
+            .patch_settings(SettingsSaveDto {
+                safety: Some("autonomous".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("patch applies");
+        assert_eq!(
+            crate::config::saved_fingerprint(cfg.path()),
+            ConfigFingerprint::read(cfg.path()),
+            "the save must record the fingerprint it wrote"
+        );
+        assert_eq!(
+            setup.reload_if_changed().await,
+            ReloadOutcome::Unchanged,
+            "this instance's own save must not reload again"
+        );
+        // A second check stays quiet too — a stray event cannot ping-pong.
+        assert_eq!(setup.reload_if_changed().await, ReloadOutcome::Unchanged);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A broken hand edit keeps the old config live (never a half-parsed
+    /// apply) and reports the changed file plus the parser's error.
+    #[tokio::test]
+    async fn broken_toml_keeps_old_config() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let before = engine
+            .brain()
+            .config
+            .lock()
+            .await
+            .general
+            .general
+            .default_model
+            .clone();
+        std::fs::write(
+            cfg.path().join("config.toml"),
+            "[general\ndefault_model = = 3\n",
+        )
+        .expect("broken hand edit");
+
+        let outcome = setup.reload_if_changed().await;
+        let ReloadOutcome::Failed { files, error } = &outcome else {
+            panic!("a broken config must fail the reload, got {outcome:?}");
+        };
+        assert_eq!(files, &["config.toml"], "the toast names the changed file");
+        assert!(!error.is_empty(), "the parser's message is reported");
+        // The OLD config is still live — nothing was half-applied.
+        assert_eq!(
+            engine
+                .brain()
+                .config
+                .lock()
+                .await
+                .general
+                .general
+                .default_model,
+            before,
+            "a failed reload never swaps the live config"
+        );
+        let notice = outcome.notice().expect("a failure is reported");
+        assert!(!notice.ok);
+        assert!(
+            notice.message.contains("config.toml") && notice.message.contains(error.as_str()),
+            "the notice names the file and the error: {}",
+            notice.message
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A hand edit of `keys.toml` reloads: the rotated key reaches the brain's
+    /// shared config (the next spawn's key store).
+    #[tokio::test]
+    async fn keys_change_reloads() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        std::fs::write(cfg.path().join("keys.toml"), "[test]\napi_key = \"sk-rotated\"\n")
+            .expect("key rotation");
+
+        let outcome = setup.reload_if_changed().await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Reloaded {
+                laya_changed: false
+            },
+            "a keys-only edit must reload"
+        );
+        assert_eq!(
+            engine.brain().config.lock().await.keys.get("test"),
+            Some("sk-rotated"),
+            "the rotated key is live"
+        );
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// A hand edit of `[general.laya]` keeps the live block: the runtime leg
+    /// (sidecar, slot, status) belongs to `classifier_setup`, so the reload
+    /// defers it and the notice says a restart is needed.
+    #[tokio::test]
+    async fn laya_hand_edit_is_deferred_to_the_next_start() {
+        let (_root, cfg, engine) = ready_engine().await;
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        enable_laya_in_config(cfg.path());
+
+        let outcome = setup.reload_if_changed().await;
+        assert_eq!(outcome, ReloadOutcome::Reloaded { laya_changed: true });
+        assert!(
+            !engine
+                .brain()
+                .config
+                .lock()
+                .await
+                .general
+                .general
+                .laya
+                .enabled,
+            "the live Laya block never claims a runtime it does not have"
+        );
+        let notice = outcome.notice().expect("a change is reported");
+        assert!(notice.ok);
+        assert!(notice.message.contains(LAYA_RESTART_NOTICE));
         engine.shutdown().await.expect("shutdown");
     }
 

@@ -312,6 +312,10 @@ pub(crate) fn save_tier_ladder_unlocked(path: &Path, ladder: &TierLadder) -> Res
     file.legacy_tiers = None;
     let text = toml::to_string_pretty(&file)?;
     crate::config::write_atomic_unlocked(path, &text)?;
+    // The live-settings watcher must treat this write as this process's own
+    // save: the tier ladder is applied through the caller's own read (the
+    // dispatch tiers), not through a config reload.
+    crate::config::record_live_file_written(path, &text);
     Ok(())
 }
 
@@ -1049,6 +1053,10 @@ pub(crate) fn save_unlocked(
     };
     let text = toml::to_string_pretty(&file)?;
     crate::config::write_atomic_unlocked(path, &text)?;
+    // The live-settings watcher must treat this write as this process's own
+    // save (the endpoints writer behind the upsert/patch paths; the caller's
+    // refresh_live applies it live).
+    crate::config::record_live_file_written(path, &text);
     Ok(())
 }
 

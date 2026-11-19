@@ -60,6 +60,11 @@ pub const BOARD_CHANGED_CHANNEL: &str = "mnemo2://board-changed";
 /// answer: the full list, which may be empty when a stale question closes.
 pub const LAYA_LEARNINGS_CHANNEL: &str = "mnemo2://laya-learnings";
 
+/// Live settings: a hand edit of `~/.mnemo/*.toml` (or another instance's
+/// save) was reloaded into this instance, or the edit was rejected. Payload is
+/// a [`mnemo::headless::ReloadNotice`] — the window shows it as a toast.
+pub const SETTINGS_RELOAD_CHANNEL: &str = "mnemo2://settings-reload";
+
 /// The shared Mnemo2 app state: one live lead and its event forwarder.
 #[derive(Default)]
 pub struct Mnemo2State {
@@ -68,6 +73,7 @@ pub struct Mnemo2State {
     team_forwarder: Mutex<Option<JoinHandle<()>>>,
     board_forwarder: Mutex<Option<JoinHandle<()>>>,
     indexing_forwarder: Mutex<Option<JoinHandle<()>>>,
+    settings_forwarder: Mutex<Option<JoinHandle<()>>>,
     marker_root: Mutex<Option<PathBuf>>,
     preferences: Mutex<Option<(PathBuf, ProjectPreferences)>>,
     notified: Mutex<HashSet<String>>,
@@ -252,6 +258,9 @@ impl Mnemo2State {
             forwarder.abort();
         }
         if let Some(forwarder) = self.indexing_forwarder.lock().await.take() {
+            forwarder.abort();
+        }
+        if let Some(forwarder) = self.settings_forwarder.lock().await.take() {
             forwarder.abort();
         }
         let marker_root = self.marker_root.lock().await.take();
@@ -578,6 +587,9 @@ pub async fn lead_open(
     if let Some(forwarder) = state.indexing_forwarder.lock().await.take() {
         forwarder.abort();
     }
+    if let Some(forwarder) = state.settings_forwarder.lock().await.take() {
+        forwarder.abort();
+    }
     state.release_external_lead(&app).await;
     if let Some(old) = state.runtime.lock().await.take() {
         let old_root = old.workspace_root().to_path_buf();
@@ -677,6 +689,19 @@ pub async fn lead_open(
             }
         }
     });
+    let mut settings_events = runtime.subscribe_settings_reloads();
+    let settings_app = app.clone();
+    let settings_forwarder = tauri::async_runtime::spawn(async move {
+        loop {
+            match settings_events.recv().await {
+                Ok(notice) => {
+                    let _ = settings_app.emit(SETTINGS_RELOAD_CHANNEL, &notice);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     // The Laya check (plan 8106337a) starts with the project: unforced, it
     // skips silently when routing is off, Laya is down or the record's
     // fingerprint still matches. It must come after the indexing forwarder
@@ -705,6 +730,7 @@ pub async fn lead_open(
     *state.team_forwarder.lock().await = Some(team_forwarder);
     *state.board_forwarder.lock().await = Some(board_forwarder);
     *state.indexing_forwarder.lock().await = Some(indexing_forwarder);
+    *state.settings_forwarder.lock().await = Some(settings_forwarder);
     state.sync_run_file(Some(&root));
     crate::mnemo2::show_open_project(&app, Some(&root));
 

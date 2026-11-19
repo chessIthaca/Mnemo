@@ -13,6 +13,12 @@
 //!
 //! `Config::load()` merges all of them. `keys.toml` is loaded last and never
 //! included in `Debug` output.
+//!
+//! The four live files are also what the live-settings watcher
+//! ([`crate::host::config_watcher`]) fingerprints: a hand edit — or another
+//! instance's save — reloads a running engine through
+//! [`crate::headless::Setup::reload_if_changed`], the same live-apply a
+//! Settings save uses. [`ConfigFingerprint`] is that check's currency.
 
 pub mod endpoints;
 pub mod general;
@@ -33,8 +39,10 @@ pub use keys::KeyStore;
 pub use mcp::McpServerDef;
 pub use projects::{ProjectEntry, ProjectRegistry};
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::Result;
 
@@ -437,8 +445,214 @@ impl Config {
         for path in &paths {
             let _ = fs::remove_file(backup_path(path));
         }
+        // Remember what this process just put on disk, from the bytes it
+        // wrote: the live-settings watcher must not treat an instance's own
+        // save as an outside change (the calling save path already applied
+        // these values live).
+        for (path, text) in paths.iter().zip(texts.iter()) {
+            record_live_file_written(path, text);
+        }
         Ok(())
     }
+}
+
+/// The four live config files the global config merges — the set whose
+/// content a hand edit or another instance's save can change under a running
+/// engine.
+///
+/// `projects.toml` is deliberately absent: the known-projects registry is not
+/// live config, and a hand edit there (a project added or renamed) takes
+/// effect the next time a window reads the list, not through a reload.
+pub const CONFIG_FILE_NAMES: [&str; 4] =
+    ["config.toml", "endpoints.toml", "keys.toml", "mcp.toml"];
+
+/// The content fingerprint of the four live config files
+/// ([`CONFIG_FILE_NAMES`]) — the live-settings watcher compares a fingerprint
+/// of what is on disk with the one this instance last applied, and reloads only
+/// when they differ.
+///
+/// It hashes the raw file bytes, never the parsed config: a file that is
+/// missing, half-written by an editor, or invalid TOML still fingerprints
+/// cleanly, so the comparison never depends on the reload succeeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigFingerprint {
+    /// One hash per [`CONFIG_FILE_NAMES`] entry, in that order.
+    hashes: [u64; CONFIG_FILE_NAMES.len()],
+}
+
+impl ConfigFingerprint {
+    /// Fingerprint the four live config files under `config_dir`.
+    ///
+    /// A missing file hashes differently from an empty one, so deleting a
+    /// config file is a change the watcher sees.
+    pub fn read(config_dir: &Path) -> Self {
+        let mut hashes = [0u64; CONFIG_FILE_NAMES.len()];
+        for (slot, name) in hashes.iter_mut().zip(CONFIG_FILE_NAMES) {
+            *slot = match fs::read(config_dir.join(name)) {
+                Ok(bytes) => fingerprint_bytes(&bytes),
+                Err(_) => ABSENT_FILE_HASH,
+            };
+        }
+        Self { hashes }
+    }
+
+    /// The files whose content differs between this fingerprint and `other`,
+    /// named in [`CONFIG_FILE_NAMES`] order.
+    pub fn changed_files(&self, other: &Self) -> Vec<&'static str> {
+        CONFIG_FILE_NAMES
+            .iter()
+            .zip(self.hashes.iter().zip(other.hashes.iter()))
+            .filter(|(_, (mine, theirs))| mine != theirs)
+            .map(|(name, _)| *name)
+            .collect()
+    }
+}
+
+/// FNV-1a's offset basis — also the hash of a missing file.
+const ABSENT_FILE_HASH: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a's prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// One FNV-1a hash of `bytes`, starting from a present-file basis.
+///
+/// FNV-1a is deliberate: stable across processes and Rust releases (unlike
+/// `DefaultHasher`), tiny, and good enough to tell config files apart.
+fn fingerprint_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = ABSENT_FILE_HASH ^ 0x9e37_79b9_7f4a_7c15;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// What this process last wrote to the live config files under one config
+/// dir — one slot per [`CONFIG_FILE_NAMES`] entry: `Some(hash)` for the exact
+/// bytes of its last write, `None` for a file it never wrote.
+///
+/// `None` is the point of the type (review finding seedAbsorbsEdit): a fresh
+/// entry NEVER reads disk, so an external edit that landed before this
+/// process's first write can never be absorbed as an own save — a slot only
+/// ever holds bytes this process itself wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WrittenFiles {
+    /// One slot per [`CONFIG_FILE_NAMES`] entry, in that order.
+    slots: [Option<u64>; CONFIG_FILE_NAMES.len()],
+}
+
+fn last_written() -> &'static Mutex<HashMap<PathBuf, WrittenFiles>> {
+    static LAST_WRITTEN: OnceLock<Mutex<HashMap<PathBuf, WrittenFiles>>> = OnceLock::new();
+    LAST_WRITTEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The registry key: the canonical dir when it resolves, so a Setup and a
+/// watcher that spell the same directory differently still meet.
+fn fingerprint_key(config_dir: &Path) -> PathBuf {
+    fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf())
+}
+
+/// Record that this process just wrote one live config file, from the exact
+/// text that was written — never a fresh disk read, which a concurrent edit
+/// could have moved past. A slot this process never wrote stays `None`, so it
+/// can never match disk (review finding seedAbsorbsEdit).
+///
+/// Every in-process writer of a live file calls this (`Config::save_all`,
+/// `KeyStore::save`, the tier-ladder, general-config, endpoints and MCP
+/// writers, and through them the MCP token store and the load-time
+/// migrations): a file event for a file this process wrote is its own save,
+/// and the calling save path already applied it — a reload would only
+/// duplicate the work and show a false "changed in another window" toast. A
+/// `path` that names no live config file is ignored, so a writer can call it
+/// unconditionally.
+pub(crate) fn record_live_file_written(path: &Path, text: &str) {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Some(index) = CONFIG_FILE_NAMES.iter().position(|file| *file == name) else {
+        return;
+    };
+    let Some(config_dir) = path.parent() else {
+        return;
+    };
+    let mut map = last_written().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map.entry(fingerprint_key(config_dir)).or_default();
+    entry.slots[index] = Some(fingerprint_bytes(text.as_bytes()));
+}
+
+/// Whether every live config file that differs from `applied` is one this
+/// process itself wrote, with exactly the bytes now on `disk` — the own-save
+/// check [`crate::headless::Setup::reload_if_changed`] runs before reloading.
+///
+/// Per file, not per fingerprint-set: a process that wrote only `keys.toml`
+/// (an API key rotation) still matches when nothing else moved, while an
+/// external edit to ANY other file breaks the match and reloads. A file this
+/// process never wrote (`None`) can never match, so an edit that landed before
+/// or alongside the first write is a reload, never an absorbed own save.
+///
+/// `false` when nothing differs (the caller treats an unchanged set earlier)
+/// or when this process never wrote anything under the dir.
+pub(crate) fn disk_changes_are_own_writes(
+    config_dir: &Path,
+    applied: &ConfigFingerprint,
+    disk: &ConfigFingerprint,
+) -> bool {
+    let guard = last_written().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(written) = guard.get(&fingerprint_key(config_dir)) else {
+        return false;
+    };
+    let mut changed = false;
+    for index in 0..CONFIG_FILE_NAMES.len() {
+        if applied.hashes[index] == disk.hashes[index] {
+            continue; // unchanged — not this check's business
+        }
+        changed = true;
+        if written.slots[index] != Some(disk.hashes[index]) {
+            return false; // a change this process did not write itself
+        }
+    }
+    changed
+}
+
+/// The fingerprint of what this process last saved under `config_dir` — every
+/// slot it wrote from its own record, any file it never wrote from a fresh
+/// read. [`Config::save_all`] writes all four files, so the stamp after a
+/// Settings save is fully the writer's own record and a concurrent external
+/// edit is never stamped applied.
+pub(crate) fn saved_fingerprint(config_dir: &Path) -> ConfigFingerprint {
+    let disk = ConfigFingerprint::read(config_dir);
+    let guard = last_written().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(written) = guard.get(&fingerprint_key(config_dir)) else {
+        return disk;
+    };
+    let mut hashes = disk.hashes;
+    for (slot, written) in hashes.iter_mut().zip(written.slots.iter()) {
+        if let Some(hash) = written {
+            *slot = *hash;
+        }
+    }
+    ConfigFingerprint { hashes }
+}
+
+/// The process-global live-config apply lock, per canonical config dir.
+///
+/// Every path that swaps a live engine's shared config holds it across its
+/// whole read→apply→stamp unit: `Setup::patch_settings`,
+/// `Setup::reload_if_changed`, `Setup::classifier_setup`,
+/// `Setup::refresh_live` and `Setup::save_mcp_servers` (review finding
+/// reloadSaveRace). A per-Setup lock would be useless — every settings IPC
+/// opens a FRESH `Setup` (`settings_setup`, ipc.rs) while the live-settings
+/// watcher holds a long-lived one — so the lock is keyed by the config dir and
+/// shared by every `Setup` this process opens on it. Lock order is always
+/// this lock first, the shared config's own mutex second.
+pub fn live_config_apply_lock(config_dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(fingerprint_key(config_dir))
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 /// Path of the staging file for `path` (`foo.toml` → `foo.toml.tmp`).
@@ -1086,6 +1300,94 @@ api_key = "sk-super-secret"
         );
         // But it is still accessible via the key store.
         assert_eq!(cfg.key_for("openai"), Some("sk-super-secret"));
+    }
+
+    #[test]
+    fn fingerprint_names_the_changed_files() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join("config.toml"), "[general]\n");
+        let first = ConfigFingerprint::read(dir.path());
+        assert!(first.changed_files(&first).is_empty());
+        write(&dir.path().join("endpoints.toml"), "pricing = []\n");
+        let second = ConfigFingerprint::read(dir.path());
+        assert_eq!(second.changed_files(&first), vec!["endpoints.toml"]);
+        // A rewrite with identical content is not a change.
+        write(&dir.path().join("config.toml"), "[general]\n");
+        assert!(ConfigFingerprint::read(dir.path())
+            .changed_files(&second)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_missing_file_fingerprints_differently_from_an_empty_one() {
+        let dir = tempdir().unwrap();
+        let missing = ConfigFingerprint::read(dir.path());
+        write(&dir.path().join("config.toml"), "");
+        assert_eq!(
+            ConfigFingerprint::read(dir.path()).changed_files(&missing),
+            vec!["config.toml"],
+            "deleting a file must be a change; an empty file is not the same as none"
+        );
+    }
+
+    #[test]
+    fn save_all_records_the_fingerprint_it_wrote() {
+        let dir = tempdir().unwrap();
+        let before = ConfigFingerprint::read(dir.path());
+        Config::default().save_all(dir.path()).unwrap();
+        let disk = ConfigFingerprint::read(dir.path());
+        assert_eq!(
+            saved_fingerprint(dir.path()),
+            disk,
+            "a save must record exactly what landed on disk"
+        );
+        assert!(
+            disk_changes_are_own_writes(dir.path(), &before, &disk),
+            "a save_all is this process's own write"
+        );
+    }
+
+    /// Review finding seedAbsorbsEdit, at the registry's own level: the first
+    /// write must never seed the other slots from disk, or an external edit
+    /// that landed before it is absorbed as an own save and never applied.
+    #[test]
+    fn an_external_edit_alongside_an_own_write_is_not_absorbed() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join("config.toml"), "[general]\n");
+        let applied = ConfigFingerprint::read(dir.path());
+        // An external hand edit to config.toml …
+        write(&dir.path().join("config.toml"), "[general]\nsafety = \"plan\"\n");
+        // … then this process writes keys.toml (the writer records what it
+        // wrote).
+        let keys_text = "[test]\napi_key = \"sk\"\n";
+        write(&dir.path().join("keys.toml"), keys_text);
+        record_live_file_written(&dir.path().join("keys.toml"), keys_text);
+        let disk = ConfigFingerprint::read(dir.path());
+        assert!(
+            !disk_changes_are_own_writes(dir.path(), &applied, &disk),
+            "the hand edit before the own write must not be absorbed"
+        );
+        // Revert the hand edit: only the own write differs, and it matches.
+        write(&dir.path().join("config.toml"), "[general]\n");
+        let disk = ConfigFingerprint::read(dir.path());
+        assert!(
+            disk_changes_are_own_writes(dir.path(), &applied, &disk),
+            "a sole own write is this process's own save"
+        );
+    }
+
+    #[test]
+    fn unwatched_files_do_not_change_the_fingerprint() {
+        let dir = tempdir().unwrap();
+        write(&dir.path().join("config.toml"), "[general]\n");
+        let before = ConfigFingerprint::read(dir.path());
+        write(&dir.path().join("projects.toml"), "[[project]]\npath = 'x'\n");
+        assert!(
+            ConfigFingerprint::read(dir.path())
+                .changed_files(&before)
+                .is_empty(),
+            "projects.toml is not live config"
+        );
     }
 
     #[test]

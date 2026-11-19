@@ -55,11 +55,15 @@ pub use crate::host::runtime::{
     cleanup_inactive_subagents, spawn_agent_shared, AgentLoopMap, HostRuntime,
     SessionOptions, SpawnHost, WorktreeBinding,
 };
+/// Plan d3336a8a step 6: the live-settings seam — the OS watcher that reloads a
+/// hand-edited `~/.mnemo/*.toml` through [`Setup::reload_if_changed`], and its
+/// debounce. The app crate drives it; `host` holds the implementation.
+pub use crate::host::config_watcher::{ConfigWatcher, CONFIG_DEBOUNCE};
 pub use setup::{
     EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TierDto, TiersDto,
     EmbedderReadiness, EmbeddingModelDto, EndpointDto, EndpointReadiness, EngineConfig,
-    InitProjectOptions, McpTestResult, ProjectInfo, ProjectReadiness, SafetyRuleDto,
-    SafetyRulesDto, Scope, Setup, SetupEvent, SetupStatus, SetupStep,
+    InitProjectOptions, McpTestResult, ProjectInfo, ProjectReadiness, ReloadNotice, ReloadOutcome,
+    SafetyRuleDto, SafetyRulesDto, Scope, Setup, SetupEvent, SetupStatus, SetupStep,
 };
 pub use stats::{EngineStats, SessionStats, TraceApi, UsageRates};
 pub use types::{

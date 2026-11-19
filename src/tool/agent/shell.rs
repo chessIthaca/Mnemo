@@ -64,6 +64,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::{MachineConfig, OptimizerConfig, ShellFilterConfig};
 use crate::host::machine_slots::{is_heavy, wait_note, HeavySlots, SlotGuard};
+// The shared Rust build cache (plan d3336a8a step 7): every spawned command
+// gets RUSTC_WRAPPER=sccache when the machine has it and the user has not set
+// a wrapper of their own.
+use crate::host::sccache;
 #[cfg(windows)]
 use crate::process_tree::KillOnCloseJob;
 use crate::provider::ToolSchema;
@@ -1094,6 +1098,11 @@ pub(crate) async fn run_command(
     {
         cmd.process_group(0);
     }
+
+    // Plan d3336a8a step 7: hand the command the shared Rust build cache when
+    // the machine has one. Inert for a non-cargo command, and it never
+    // overrides a wrapper the user chose.
+    sccache::apply_env(&mut cmd);
 
     let started = Instant::now();
     let mut child = match cmd.spawn() {

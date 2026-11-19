@@ -3387,6 +3387,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "uuid",
+ "which",
  "windows-sys 0.61.2",
  "zeroize",
  "zip",

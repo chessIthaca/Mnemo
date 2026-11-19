@@ -121,6 +121,7 @@ function previewSettings(): ModelSettings {
         { role: "project", volume: "C:", free_gb: 250 },
         { role: "config", volume: "D:", free_gb: 80 },
       ],
+      sccache: { found: true, path: "C:\\Users\\me\\.cargo\\bin\\sccache.exe" },
     },
   };
 }

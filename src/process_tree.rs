@@ -120,6 +120,35 @@ impl Drop for KillOnCloseJob {
     }
 }
 
+/// A `Command` for a helper process that must OUTLIVE its caller and every
+/// command tree the caller starts (the shared `sccache` server, plan
+/// d3336a8a step 7): no console window on Windows, its own process group on
+/// Unix, and never assigned to a kill-on-close job — surviving the spawn that
+/// started it is the whole point.
+pub fn detached_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    platform_detach(&mut command);
+    command
+}
+
+/// The platform half of [`detached_command`]: Win32 creation flags on Windows,
+/// a fresh process group on Unix.
+#[cfg(windows)]
+fn platform_detach(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+}
+
+/// The platform half of [`detached_command`]: a fresh process group, so no
+/// group signal aimed at a command tree reaches the helper.
+#[cfg(not(windows))]
+fn platform_detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::os::windows::io::AsRawHandle as _;

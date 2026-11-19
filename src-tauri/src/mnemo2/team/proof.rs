@@ -357,7 +357,7 @@ enum ShellRun {
 /// the whole group at once.
 fn shell_command(script: &str) -> tokio::process::Command {
     #[cfg(windows)]
-    let command = {
+    let mut command = {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut command = tokio::process::Command::new("powershell");
         command.args(["-NoProfile", "-Command", script]);
@@ -365,12 +365,16 @@ fn shell_command(script: &str) -> tokio::process::Command {
         command
     };
     #[cfg(not(windows))]
-    let command = {
+    let mut command = {
         let mut command = tokio::process::Command::new("sh");
         command.args(["-c", script]);
         command.process_group(0);
         command
     };
+    // Plan d3336a8a step 7: a proof builds and tests, so it shares the
+    // machine's Rust build cache (inert when the machine has none, and it
+    // never overrides a user's own RUSTC_WRAPPER).
+    mnemo::sccache::apply_env(&mut command);
     command
 }
 

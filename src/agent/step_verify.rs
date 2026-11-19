@@ -46,6 +46,9 @@ use tokio::process::Command;
 
 use crate::config::{MachineConfig, OptimizerConfig, VerifyConfig};
 use crate::host::machine_slots::HeavySlots;
+// The shared Rust build cache (plan d3336a8a step 7): the verification run is
+// a build+test like any other, so it gets RUSTC_WRAPPER=sccache too.
+use crate::host::sccache;
 use crate::tool::agent::output_compactor;
 
 /// The greppable head tag on every evidence note.
@@ -191,6 +194,9 @@ impl StepVerifyHandle {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Plan d3336a8a step 7: the shared Rust build cache, when present and
+        // the user has not named a wrapper of their own.
+        sccache::apply_env(&mut cmd);
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {

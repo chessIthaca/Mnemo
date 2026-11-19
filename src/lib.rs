@@ -91,6 +91,9 @@ pub use crate::host::startup;
 // proofs take a heavy-command slot, both on BARE crate-root paths.
 pub use crate::host::disk;
 pub use crate::host::machine_slots;
+// The shared Rust build cache (plan d3336a8a step 7): the Mnemo2 proofs and
+// the Machine page read it on the same bare crate-root path.
+pub use crate::host::sccache;
 pub use crate::runtime::turn_resolve;
 
 #[cfg(test)]

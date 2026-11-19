@@ -55,6 +55,8 @@ use mnemo::tool::agent::sandbox::Sandbox;
 use mnemo::tool::agent::search::SearchTool;
 use mnemo::tool::agent::search_read::SearchReadTool;
 
+use crate::mnemo2::insights;
+use crate::mnemo2::instances;
 use crate::mnemo2::model_label::short_model_name;
 use crate::mnemo2::project;
 use crate::mnemo2::runtime::LeadRuntime;
@@ -622,6 +624,45 @@ fn waiting_on_user(status: WorkerStatus) -> bool {
     )
 }
 
+/// Today's spend for the open project, priced the way the Cost tab prices it:
+/// the durable ledger at the project's `[[pricing]]`, restricted to the
+/// engine's row for the UTC day of `now`.
+///
+/// Best-effort by design: an instances overview must still answer when no row
+/// is priced, the engine has no row for today, or a read fails, so every miss
+/// is `0` rather than an error.
+async fn cost_today_micros(lead: &Arc<LeadRuntime>) -> u64 {
+    let Ok(team) = lead.team_handle().await else {
+        return 0;
+    };
+    let usage = team.usage().await;
+    let Ok(pricing) = lead.pricing() else {
+        return 0;
+    };
+    let Ok(engine) = lead.engine_handle().await else {
+        return 0;
+    };
+    let Ok(stats) = engine.stats().await else {
+        return 0;
+    };
+    let now_secs = i64::try_from(run_file::now_ms() / 1000).unwrap_or(i64::MAX);
+    cost_today(
+        &insights::cost_report(&usage, &pricing, &stats.project_stats.per_day, now_secs),
+        now_secs,
+    )
+}
+
+/// The micro-USD a Cost-tab report holds for the UTC day of `now_secs` (`0`
+/// when the 14-day series has no row for that day).
+fn cost_today(report: &insights::CostReport, now_secs: i64) -> u64 {
+    let today = now_secs.div_euclid(86_400);
+    report
+        .per_day
+        .iter()
+        .find(|day| day.day.div_euclid(86_400) == today)
+        .map_or(0, |day| day.cost_micros)
+}
+
 impl Shared {
     /// The bearer-token check, run on the request head before the body is
     /// read.
@@ -645,6 +686,11 @@ impl Shared {
         match request.path.as_str() {
             "/health" => self.health(&request.body).await,
             "/app/quit" => self.app_quit(&request.body).await,
+            instances::SUMMARY_PATH => self.instance_summary().await,
+            instances::SHOW_PATH => {
+                self.host.show_window();
+                Response::json(200, &json!({ "shown": true }))
+            }
             "/mcp" => self.mcp(request).await,
             "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
                 self.lead_route(request).await
@@ -679,6 +725,54 @@ impl Shared {
                 "project": project,
                 "open_error": failure.map(|failure| failure.reason),
                 "open_error_age_ms": age_ms,
+            }),
+        )
+    }
+
+    /// This instance's own summary for the Mission Control instances list in
+    /// the other windows: rootless like `/health`, so it answers for whatever
+    /// project is open — and for none, on the start screen.
+    async fn instance_summary(&self) -> Response {
+        let version = env!("CARGO_PKG_VERSION");
+        let Some(lead) = self.host.lead().await else {
+            return Response::json(
+                200,
+                &json!({
+                    "project": Value::Null,
+                    "workers_running": 0,
+                    "workers_waiting": 0,
+                    "cost_today_micros": 0,
+                    "version": version,
+                }),
+            );
+        };
+        let project = lead.workspace_root().to_string_lossy().into_owned();
+        let (workers_running, workers_waiting) = match lead.team_handle().await {
+            Ok(team) => {
+                let snapshot = team.snapshot().await;
+                (
+                    snapshot
+                        .workers
+                        .iter()
+                        .filter(|worker| is_running(worker.status))
+                        .count(),
+                    snapshot
+                        .workers
+                        .iter()
+                        .filter(|worker| waiting_on_user(worker.status))
+                        .count(),
+                )
+            }
+            Err(_) => (0, 0),
+        };
+        Response::json(
+            200,
+            &json!({
+                "project": project,
+                "workers_running": workers_running,
+                "workers_waiting": workers_waiting,
+                "cost_today_micros": cost_today_micros(&lead).await,
+                "version": version,
             }),
         )
     }
@@ -2061,6 +2155,82 @@ mod tests {
         let (status, _) = fixture.post("/nope", Some("tok-123"), &[], "{}").await;
         assert_eq!(status, 404);
         fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn instance_routes_require_the_bearer_token() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        for path in [instances::SUMMARY_PATH, instances::SHOW_PATH] {
+            let (status, _) = fixture.post(path, None, &[], "").await;
+            assert_eq!(status, 401, "{path} without a token");
+            let (status, _) = fixture.post(path, Some("wrong"), &[], "").await;
+            assert_eq!(status, 401, "{path} with a wrong token");
+        }
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn instance_summary_reports_the_open_project_and_show_brings_the_window_forward() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let (status, body) = fixture
+            .post(instances::SUMMARY_PATH, Some("tok-123"), &[], "")
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let summary: instances::InstanceSummary = serde_json::from_str(&body).expect("summary json");
+        assert_eq!(
+            summary.project.as_deref(),
+            Some(fixture.root.to_string_lossy().as_ref())
+        );
+        assert_eq!(summary.workers_running, 0);
+        assert_eq!(summary.workers_waiting, 0);
+        assert_eq!(summary.cost_today_micros, 0);
+        assert_eq!(summary.version, env!("CARGO_PKG_VERSION"));
+
+        let (status, body) = fixture
+            .post(instances::SHOW_PATH, Some("tok-123"), &[], "")
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(fixture.host.shown.load(Ordering::SeqCst), 1);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn instance_summary_answers_on_the_start_screen() {
+        // No lead is open, like the start screen: the summary must still
+        // answer, with no project and zero counters.
+        let fixture = Fixture::new(false, false, ServerOptions::default()).await;
+        let (status, body) = fixture
+            .post(instances::SUMMARY_PATH, Some("tok-123"), &[], "")
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let summary: Value = serde_json::from_str(&body).expect("summary json");
+        assert!(summary["project"].is_null(), "{summary}");
+        assert_eq!(summary["workers_running"], 0);
+        assert_eq!(summary["workers_waiting"], 0);
+        assert_eq!(summary["cost_today_micros"], 0);
+        assert_eq!(summary["version"], env!("CARGO_PKG_VERSION"));
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn today_cost_reads_the_utc_day_row() {
+        let now = 1_700_000_000_i64;
+        let today = now.div_euclid(86_400) * 86_400;
+        let report = insights::CostReport {
+            per_day: vec![
+                insights::CostDay {
+                    day: today - 86_400,
+                    cost_micros: 11,
+                },
+                insights::CostDay {
+                    day: today + 60,
+                    cost_micros: 42,
+                },
+            ],
+            ..insights::CostReport::default()
+        };
+        assert_eq!(cost_today(&report, now), 42);
+        assert_eq!(cost_today(&insights::CostReport::default(), now), 0);
     }
 
     #[tokio::test(start_paused = true)]

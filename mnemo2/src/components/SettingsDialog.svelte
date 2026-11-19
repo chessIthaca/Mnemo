@@ -17,6 +17,7 @@
   import ClaudeCodePage from "./ClaudeCodePage.svelte";
   import EndpointsPage from "./EndpointsPage.svelte";
   import InlineConfirm from "./InlineConfirm.svelte";
+  import MachinePage from "./MachinePage.svelte";
   import McpPage from "./McpPage.svelte";
   import ModelsPage from "./ModelsPage.svelte";
   import ProjectPage from "./ProjectPage.svelte";
@@ -33,6 +34,7 @@
     | "tiers"
     | "models"
     | "savings"
+    | "machine"
     | "safety"
     | "mcp"
     | "claude"
@@ -53,6 +55,7 @@
         { id: "tiers", label: "Tiers" },
         { id: "models", label: "Models" },
         { id: "savings", label: "Savings" },
+        { id: "machine", label: "Machine" },
         { id: "safety", label: "Safety" },
         { id: "mcp", label: "MCP" },
         { id: "claude", label: "Claude Code" },
@@ -272,6 +275,12 @@
             <SavingsPage transport={modelTransport} />
           {:else}
             <p class="settings-empty">Savings settings are available in the desktop app.</p>
+          {/if}
+        {:else if page === "machine"}
+          {#if modelTransport}
+            <MachinePage transport={modelTransport} />
+          {:else}
+            <p class="settings-empty">Machine settings are available in the desktop app.</p>
           {/if}
         {:else}
           <TiersPage {transport} {layaTransport} {endpoints} {tiers} ontiers={(next) => (tiers = next)} evalPass={$app.indexing?.laya ?? null} />

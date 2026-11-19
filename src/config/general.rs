@@ -145,6 +145,16 @@ pub struct GeneralSection {
     /// keep no optimizer trace (mirrors `[general.laya]`).
     #[serde(default, skip_serializing_if = "OptimizerConfig::is_default")]
     pub optimizer: OptimizerConfig,
+    /// **Machine-wide limits (plan d3336a8a).** How many heavy commands
+    /// (`cargo build/test/clippy`, `npm test/build/check`, the session's own
+    /// check commands) may run AT ONCE across every Mnemo2 instance on this
+    /// computer — one OS file lock per slot under `~/.mnemo/run/heavy/`. The
+    /// setting is machine-global, not project-specific, and is read live per
+    /// heavy command, so a Settings save applies to the next command with no
+    /// restart. Omitted from the saved config while it holds its default
+    /// (mirrors `[general.optimizer]`).
+    #[serde(default, skip_serializing_if = "MachineConfig::is_default")]
+    pub machine: MachineConfig,
     /// **CodeGraph (opt-out).** When `true` (the default), the codebase is
     /// parsed into the per-project knowledge graph
     /// (`<root>/.coding/codegraph.db`) in a background task at startup and the
@@ -473,6 +483,83 @@ fn default_routing_threshold() -> f64 {
 /// its minimal shape.
 fn routing_threshold_is_default(threshold: &f64) -> bool {
     (*threshold - default_routing_threshold()).abs() < f64::EPSILON
+}
+
+/// The fewest heavy-command slots a machine offers: a hand-edited `0` still
+/// runs one build, because a limit that refuses every build would wedge the
+/// machine shut.
+pub const MIN_HEAVY_COMMANDS: usize = 1;
+
+/// The most heavy-command slots a machine offers (the setting's upper bound).
+pub const MAX_HEAVY_COMMANDS: usize = 16;
+
+/// The out-of-box heavy-command limit.
+pub const DEFAULT_HEAVY_COMMANDS: usize = 2;
+
+/// The `[general.machine]` section — the limits every Mnemo2 instance on this
+/// computer shares (plan d3336a8a step 3).
+///
+/// [`heavy_commands`](Self::heavy_commands) bounds how many HEAVY commands
+/// (`cargo` build/test/clippy/check/doc/bench, `npm`/`npx`/`pnpm`/`yarn`
+/// test/build/check/vitest/tsc, and the session's own check commands) may run
+/// AT ONCE across all instances: each command takes one OS file lock under
+/// `~/.mnemo/run/heavy/` and polls until a slot is free. Default 2. A
+/// hand-edited value is CLAMPED to 1-16 on load (a `0` still runs one build);
+/// the Settings patch REJECTS an out-of-range number with a clear error
+/// instead, so a typo in the dialog never silently becomes a different limit.
+/// Omitted from the saved config while it holds its default, so untouched
+/// configs keep no machine trace (mirrors `[general.verify]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MachineConfig {
+    /// Heavy commands allowed to run at once on this machine. Clamped to
+    /// [`MIN_HEAVY_COMMANDS`]-[`MAX_HEAVY_COMMANDS`] on load. Omitted while
+    /// default.
+    #[serde(
+        skip_serializing_if = "machine_heavy_commands_is_default",
+        deserialize_with = "clamp_heavy_commands_on_load"
+    )]
+    pub heavy_commands: usize,
+}
+
+impl Default for MachineConfig {
+    fn default() -> Self {
+        Self {
+            heavy_commands: DEFAULT_HEAVY_COMMANDS,
+        }
+    }
+}
+
+impl MachineConfig {
+    /// Clamp a slot count into the supported range.
+    pub fn clamp_heavy_commands(slots: usize) -> usize {
+        slots.clamp(MIN_HEAVY_COMMANDS, MAX_HEAVY_COMMANDS)
+    }
+
+    /// True while every field holds its default — the `[general.machine]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`VerifyConfig::is_default`]).
+    fn is_default(&self) -> bool {
+        self.heavy_commands == DEFAULT_HEAVY_COMMANDS
+    }
+}
+
+/// `skip_serializing_if` guard for [`MachineConfig::heavy_commands`]: the
+/// default stays unwritten, so an untouched config keeps its exact pre-machine
+/// shape.
+fn machine_heavy_commands_is_default(value: &usize) -> bool {
+    *value == DEFAULT_HEAVY_COMMANDS
+}
+
+/// Deserialize `heavy_commands` through
+/// [`MachineConfig::clamp_heavy_commands`], so a hand-edited `0` or `1000` in
+/// `config.toml` can never wedge or flood the machine.
+fn clamp_heavy_commands_on_load<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = usize::deserialize(deserializer)?;
+    Ok(MachineConfig::clamp_heavy_commands(raw))
 }
 
 /// The `[general.verify]` section — harness-run deterministic verification at
@@ -881,6 +968,7 @@ impl Default for GeneralSection {
             verify: VerifyConfig::default(),
             budget: BudgetConfig::default(),
             optimizer: OptimizerConfig::default(),
+            machine: MachineConfig::default(),
             codegraph: default_codegraph_enabled(),
         }
     }
@@ -2093,6 +2181,7 @@ sound_stopped_errors = false
                 verify: VerifyConfig::default(),
                 budget: BudgetConfig::default(),
                 optimizer: OptimizerConfig::default(),
+                machine: MachineConfig::default(),
                 codegraph: true,
             },
             context: ContextConfig {

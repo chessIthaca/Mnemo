@@ -2287,6 +2287,27 @@ export const previewScenes: PreviewScene[] = [
     },
   },
   {
+    name: "settings-machine",
+    title: "Settings: Machine",
+    description:
+      "The settings dialog's Machine page: the machine-wide limit on heavy builds and tests shared by every Mnemo2 window, and the read-only free-disk lines for the volumes that fill up.",
+    // Same mount pattern as settings-models; the rail click opens the Machine
+    // page directly so the scene shows the page it names.
+    build: missionControl,
+    mount: (target) => {
+      const restore = seedPreviewSettings();
+      const dialog = svelteMount(SettingsDialog, { target, props: { open: true, onclose: () => {} } });
+      const machine = [...target.querySelectorAll<HTMLButtonElement>("nav button")].find(
+        (button) => button.textContent === "Machine",
+      );
+      machine?.click();
+      return () => {
+        unmount(dialog);
+        restore();
+      };
+    },
+  },
+  {
     name: "settings-tiers",
     title: "Settings: Tiers",
     description:

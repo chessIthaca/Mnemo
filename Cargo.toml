@@ -155,6 +155,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# Unix-only: `statvfs` for the Machine settings page's free-disk line (plan
+# d3336a8a step 3). Windows uses GetDiskFreeSpaceExW from windows-sys above.
+libc = "0.2"
+
 [dev-dependencies]
 # test-util enables tokio's paused/advanceable test clock (tokio::test
 # start_paused) so tests covering retry-backoff paths run instantly instead of

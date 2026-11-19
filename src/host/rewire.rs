@@ -111,6 +111,10 @@ pub fn rewire_vision_embedder(targets: &RewireTargets, cfg: &Config) -> Option<R
         // The deterministic budget layer ([general.budget]): the cap
         // gate reads the config at every plan-step boundary.
         factory.set_budget_config(cfg.general.general.budget.clone());
+        // Machine-wide heavy-command slots ([general.machine], plan d3336a8a
+        // step 3): every command-running tool reads the limit per command, so
+        // a Settings save lands on the next heavy command.
+        factory.set_machine_config(cfg.general.general.machine.clone());
     }
     if let Some(store) = &targets.memory_store {
         // The bundled model cache lives under the config dir (NOT

@@ -38,7 +38,9 @@ use std::sync::{Arc, RwLock};
 
 use crate::agent::context::ContextManager;
 use crate::agent::{reflex::ReflexHandle, step_verify::StepVerifyHandle, AgentLoop, AgentLoopConfig};
-use crate::config::{BudgetConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig};
+use crate::config::{
+    BudgetConfig, MachineConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig,
+};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::MemoryStoreTrait;
 use crate::project::ConstitutionSource;
@@ -449,6 +451,16 @@ pub struct AgentLoopFactory {
     /// reads it at its plan-step gates, so a Settings save is observed on the
     /// next boundary with no rebuild (mirrors `verify`).
     budget: Arc<RwLock<BudgetConfig>>,
+    /// Live mirror of `[general.machine]` (the machine-wide heavy-command slots,
+    /// plan d3336a8a step 3), shared with every command-running tool this
+    /// factory builds (`ShellTool`, `RunChecksTool`, the job registry and the
+    /// `StepVerifyHandle`). Defaults to the out-of-box limit; the IPC layer
+    /// overrides via [`with_machine_config`](Self::with_machine_config).
+    machine: Arc<RwLock<MachineConfig>>,
+    /// The machine's heavy-slot directory (`<config dir>/run/heavy`). `None`
+    /// until the IPC layer wires it, so headless runs and tests execute heavy
+    /// commands unslotted (the limit is an optimisation, never a failure mode).
+    machine_dir: Option<PathBuf>,
     /// The persistent index-staleness log (backlog fc1d57fe) handed to every
     /// search/graph tool this factory builds: each stale-index repair appends
     /// one record per file, and the freshness note points at it. Defaults to
@@ -619,6 +631,11 @@ impl AgentLoopFactory {
             // fires); the IPC layer overrides via `with_budget_config` from
             // the loaded config at startup (mirrors `verify`).
             budget: Arc::new(RwLock::new(BudgetConfig::default())),
+            // Machine limit at its out-of-box default (2 slots); the IPC layer
+            // overrides via `with_machine_config` from the loaded config at
+            // startup and wires the slot directory (mirrors `budget`).
+            machine: Arc::new(RwLock::new(MachineConfig::default())),
+            machine_dir: None,
             // The global index-staleness log (backlog fc1d57fe) unless a test
             // overrides it.
             staleness_log: crate::index_staleness::StalenessLog::global(),
@@ -865,6 +882,22 @@ impl AgentLoopFactory {
         self
     }
 
+    /// Wire the shared `[general.machine]` config AND the machine's heavy-slot
+    /// directory (`<config dir>/run/heavy`, plan d3336a8a step 3). Called once
+    /// by the IPC layer at startup; every command-running tool built after this
+    /// call shares the same `Arc<RwLock<MachineConfig>>` and the same slot
+    /// directory, so a Settings save applies to the next heavy command with no
+    /// rebuild (mirrors [`with_optimizer_config`](Self::with_optimizer_config)).
+    pub fn with_machine_config(
+        mut self,
+        cfg: Arc<RwLock<MachineConfig>>,
+        slots_dir: PathBuf,
+    ) -> Self {
+        self.machine = cfg;
+        self.machine_dir = Some(slots_dir);
+        self
+    }
+
     /// Wire in the [`AgentSpawner`] that backs the `spawn_agent` tool.
     ///
     /// Called once by the IPC layer after the `AgentManager` + factory exist.
@@ -957,6 +990,17 @@ impl AgentLoopFactory {
     /// registry rebuild and no app restart.
     pub fn set_budget_config(&self, cfg: BudgetConfig) {
         *self.budget.write().expect("budget lock poisoned") = cfg;
+    }
+
+    /// Update the live `[general.machine]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is persisted
+    /// and reloaded). Every command-running tool shares the same
+    /// `Arc<RwLock<MachineConfig>>` (see
+    /// [`with_machine_config`](Self::with_machine_config)) and reads it per
+    /// command, so a Settings save lands on the next heavy command — no rebuild
+    /// and no restart.
+    pub fn set_machine_config(&self, cfg: MachineConfig) {
+        *self.machine.write().expect("machine lock poisoned") = cfg;
     }
 
     /// Swap in a new provider (e.g. when the user switches models from the
@@ -1603,31 +1647,39 @@ impl AgentLoopFactory {
             registry.register(Box::new(ConvertLineEndingsTool::new(sandbox.clone())));
         }
         if want(ToolGroup::Shell, "shell") {
-            registry.register(Box::new(
-                ShellTool::new(sandbox.clone())
-                    .with_check_commands(
-                        root.map(|spec| spec.check_commands.clone())
-                            .unwrap_or_default(),
-                    )
-                    .with_filter_config(Arc::clone(&self.shell_filter))
-                    // Same handle as GitTool: `shell git merge|push` must raise the
-                    // always-on core-operation prompt too (follow-up A, 2027-01-11).
-                    .with_core_operations(Arc::clone(&self.core_operations))
-                    // Token-optimizer lever 2 (backlog e4a50d22): the shared
-                    // `[general.optimizer]` handle, read per call so a config
-                    // save lands on the next command without a rebuild.
-                    .with_optimizer(Arc::clone(&self.optimizer)),
-            ));
+            let mut shell = ShellTool::new(sandbox.clone())
+                .with_check_commands(
+                    root.map(|spec| spec.check_commands.clone())
+                        .unwrap_or_default(),
+                )
+                .with_filter_config(Arc::clone(&self.shell_filter))
+                // Same handle as GitTool: `shell git merge|push` must raise the
+                // always-on core-operation prompt too (follow-up A, 2027-01-11).
+                .with_core_operations(Arc::clone(&self.core_operations))
+                // Token-optimizer lever 2 (backlog e4a50d22): the shared
+                // `[general.optimizer]` handle, read per call so a config
+                // save lands on the next command without a rebuild.
+                .with_optimizer(Arc::clone(&self.optimizer));
+            // Plan d3336a8a step 3: a heavy command takes one of the machine's
+            // slots (unwired → it runs unslotted, today's behaviour).
+            if let Some(dir) = &self.machine_dir {
+                shell = shell.with_machine(Arc::clone(&self.machine), dir.clone());
+            }
+            registry.register(Box::new(shell));
         }
         // Plan 5b85ab61 step 3: ONE call runs every configured check command
         // and reports which passed. Registered only when the session HAS
         // checks, so a project without `.coding/checks.toml` never sees it;
         // `NeedsApproval` and the validated allow-list are shell's own.
         if want(ToolGroup::Shell, "run_checks") {
-            let checks = RunChecksTool::new(sandbox.clone()).with_check_commands(
+            let mut checks = RunChecksTool::new(sandbox.clone()).with_check_commands(
                 root.map(|spec| spec.check_commands.clone())
                     .unwrap_or_default(),
             );
+            // Every check command is heavy (plan d3336a8a step 3).
+            if let Some(dir) = &self.machine_dir {
+                checks = checks.with_machine(Arc::clone(&self.machine), dir.clone());
+            }
             if checks.has_checks() {
                 registry.register(Box::new(
                     checks.with_core_operations(Arc::clone(&self.core_operations)),
@@ -1641,10 +1693,18 @@ impl AgentLoopFactory {
             .iter()
             .any(|name| want(ToolGroup::Shell, name));
         if wants_jobs {
-            let jobs = Arc::new(JobRegistry::new(
-                sandbox.clone(),
-                Arc::clone(&self.shell_filter),
-            ));
+            let mut job_registry = JobRegistry::new(sandbox.clone(), Arc::clone(&self.shell_filter))
+                // The session's own check commands count as heavy in a job too.
+                .with_check_commands(
+                    root.map(|spec| spec.check_commands.clone())
+                        .unwrap_or_default(),
+                );
+            // Plan d3336a8a step 3: a job of a heavy command waits for a slot.
+            if let Some(dir) = &self.machine_dir {
+                job_registry =
+                    job_registry.with_machine(Arc::clone(&self.machine), dir.clone());
+            }
+            let jobs = Arc::new(job_registry);
             if want(ToolGroup::Shell, "job_start") {
                 registry.register(Box::new(
                     JobStartTool::new(Arc::clone(&jobs), Arc::clone(&self.core_operations))
@@ -1746,7 +1806,14 @@ impl AgentLoopFactory {
             Some(spec) => spec.sandbox.root().to_path_buf(),
             None => self.sandbox.root().to_path_buf(),
         };
-        StepVerifyHandle::new(Arc::clone(&self.verify), Arc::clone(&self.optimizer)).with_root(root)
+        let mut handle =
+            StepVerifyHandle::new(Arc::clone(&self.verify), Arc::clone(&self.optimizer))
+                .with_root(root);
+        // The verification command is heavy (plan d3336a8a step 3).
+        if let Some(dir) = &self.machine_dir {
+            handle = handle.with_machine(Arc::clone(&self.machine), dir.clone());
+        }
+        handle
     }
 
 

@@ -30,10 +30,11 @@ pub mod settings_dto;
 
 pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, Tier, TierLadder, kind_wire};
 pub use general::{
-    BudgetConfig, EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig,
+    BudgetConfig, EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig, MachineConfig,
     MarkdownConfig, ModelRef, ModelsConfig, OptimizerConfig, RoutingConfig, SafetyMode,
     ShellFilterConfig, ShellFilterOverride, TraceConfig, VerifyConfig, VisionModel,
-    EMBEDDING_MODEL_SENTINEL_HASH,
+    DEFAULT_HEAVY_COMMANDS, EMBEDDING_MODEL_SENTINEL_HASH, MAX_HEAVY_COMMANDS,
+    MIN_HEAVY_COMMANDS,
 };
 pub use keys::KeyStore;
 pub use mcp::McpServerDef;

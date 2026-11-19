@@ -49,7 +49,7 @@
 //! team_merge). Workers must not run dev servers; the lead renders
 //! previews.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -62,7 +62,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
-use crate::config::{OptimizerConfig, ShellFilterConfig};
+use crate::config::{MachineConfig, OptimizerConfig, ShellFilterConfig};
+use crate::host::machine_slots::{is_heavy, wait_note, HeavySlots, SlotGuard};
 #[cfg(windows)]
 use crate::process_tree::KillOnCloseJob;
 use crate::provider::ToolSchema;
@@ -445,6 +446,14 @@ pub struct ShellTool {
     optimizer: Arc<RwLock<OptimizerConfig>>,
     /// Exact commands whose before/after content trees are measured.
     check_commands: Vec<String>,
+    /// Machine-wide heavy-command limit (the `[general.machine]` section, plan
+    /// d3336a8a). The heavy policy reads the slot count at call time, so a
+    /// Settings save applies to the next command without a registry rebuild.
+    machine: Arc<RwLock<MachineConfig>>,
+    /// The machine's heavy-slot directory (`<config dir>/run/heavy`), shared by
+    /// every instance on the computer. `None` (headless, unit tests) runs heavy
+    /// commands unslotted — the limit is an optimisation, never a failure mode.
+    slots_dir: Option<PathBuf>,
 }
 
 impl ShellTool {
@@ -461,7 +470,35 @@ impl ShellTool {
             core_operations: Arc::new(RwLock::new(vec!["merge".to_string(), "push".to_string()])),
             optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
             check_commands: Vec::new(),
+            machine: Arc::new(RwLock::new(MachineConfig::default())),
+            slots_dir: None,
         }
+    }
+
+    /// Wire the shared `[general.machine]` handle and the machine's slot
+    /// directory (`<config dir>/run/heavy`): a heavy command then waits for one
+    /// of the machine's slots before it spawns (plan d3336a8a step 3). Both are
+    /// read per call, so a Settings save and a changed slot count land on the
+    /// next command.
+    pub fn with_machine(mut self, cfg: Arc<RwLock<MachineConfig>>, slots_dir: PathBuf) -> Self {
+        self.machine = cfg;
+        self.slots_dir = Some(slots_dir);
+        self
+    }
+
+    /// The heavy-slot policy for `command`: `None` when the machine handle is
+    /// not wired or the command is light, so a light command never waits.
+    fn heavy_slots(&self, command: &str) -> Option<HeavySlots> {
+        let dir = self.slots_dir.clone()?;
+        if !is_heavy(command, &self.check_commands) {
+            return None;
+        }
+        let slots = self
+            .machine
+            .read()
+            .expect("machine config lock poisoned")
+            .heavy_commands;
+        Some(HeavySlots::new(dir, slots))
     }
 
     /// Override BOTH limits to the same value (primarily for tests): a command
@@ -677,7 +714,18 @@ impl Tool for ShellTool {
         // `None` for the job-log tap: the shell tool's own result is the whole
         // record of a call that completes here (plan 5b85ab61 step 2 added the
         // tap for the job tools, which outlive their call).
-        let outcome = run_command(&args.command, &cwd, self.limits, Some(sink), None).await;
+        // Plan d3336a8a step 3: a HEAVY command takes one of the machine's
+        // shared slots first — `None` for a light command, which never waits.
+        let slots = self.heavy_slots(&args.command);
+        let (outcome, waited) = run_command(
+            &args.command,
+            &cwd,
+            self.limits,
+            Some(sink),
+            None,
+            slots.as_ref(),
+        )
+        .await;
         let (code, stdout_bytes, stderr_bytes, background_held, translated) = match outcome {
             RunOutcome::SpawnFailed(message) => return ToolResult::error(message),
             RunOutcome::SilenceTimeout {
@@ -695,6 +743,7 @@ impl Tool for ShellTool {
                     "silence",
                     stdout,
                     stderr,
+                    waited,
                 );
             }
             RunOutcome::TotalTimeout {
@@ -708,6 +757,7 @@ impl Tool for ShellTool {
                     "hard_cap",
                     stdout,
                     stderr,
+                    waited,
                 );
             }
             RunOutcome::Exited {
@@ -821,6 +871,11 @@ impl Tool for ShellTool {
         // output may be truncated.
         if background_held {
             combined.insert_str(0, BACKGROUND_HOLD_NOTE);
+        }
+        // Plan d3336a8a step 3: a real wait for a machine build slot is the
+        // user's answer to "why is this call slow?" — say how long it was.
+        if let Some(note) = wait_note(waited) {
+            combined.insert_str(0, &format!("{note}\n"));
         }
         // Plan 0ff83146: say what the tool itself measured, at the moment of
         // the mistake, so no rule has to ask for it. These lead the output —
@@ -955,13 +1010,44 @@ enum DeadlineKind {
 /// first. A long command that keeps printing is never killed by the silence
 /// limit — that is the point: a multi-minute `cargo test` finishes inside one
 /// call instead of being detached and polled.
+///
+/// Machine-wide slots (plan d3336a8a step 3): with `slots` set, the command
+/// waits for one of the machine's heavy slots BEFORE it spawns, and both clocks
+/// start after the wait — a command queued behind another instance's build is
+/// never mistaken for a silent one. The wait is announced once on the live view,
+/// and it is returned alongside the outcome so the caller can say how long it
+/// took.
 pub(crate) async fn run_command(
     command: &str,
     cwd: &Path,
     limits: RunLimits,
     sink: Option<OutputSink>,
     log: Option<JobLogTap>,
-) -> RunOutcome {
+    slots: Option<&HeavySlots>,
+) -> (RunOutcome, Duration) {
+    // Take the machine slot before anything else: the clocks below start after
+    // this returns, and the live view hears about the wait exactly once.
+    let announce_sink = sink.clone();
+    let announce_log = log.clone();
+    let slot = match slots {
+        Some(slots) => {
+            slots
+                .acquire(|in_use| {
+                    let line = format!(
+                        "waiting for a build slot ({in_use} in use on this machine)...\n"
+                    );
+                    if let Some(sink) = &announce_sink {
+                        sink.emit(ToolOutputStream::Stdout, &line);
+                    }
+                    if let Some(log) = &announce_log {
+                        log.push(ToolOutputStream::Stdout, line.as_bytes());
+                    }
+                })
+                .await
+        }
+        None => SlotGuard::none(),
+    };
+    let waited = slot.waited();
     let (program, flag) = if cfg!(target_os = "windows") {
         ("powershell", "-Command")
     } else {
@@ -1008,7 +1094,12 @@ pub(crate) async fn run_command(
     let started = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return RunOutcome::SpawnFailed(format!("failed to execute command: {e}")),
+        Err(e) => {
+            return (
+                RunOutcome::SpawnFailed(format!("failed to execute command: {e}")),
+                waited,
+            )
+        }
     };
 
     // Plan bfe2b09f: own the whole process TREE from here on. The shell is in a
@@ -1127,16 +1218,22 @@ pub(crate) async fn run_command(
         let stdout = join_reader_at(&mut readers.out, grace).await;
         let stderr = join_reader_at(&mut readers.err, grace).await;
         return match kind {
-            DeadlineKind::Silence => RunOutcome::SilenceTimeout {
-                stdout,
-                stderr,
-                elapsed,
-            },
-            DeadlineKind::Total => RunOutcome::TotalTimeout {
-                stdout,
-                stderr,
-                elapsed,
-            },
+            DeadlineKind::Silence => (
+                RunOutcome::SilenceTimeout {
+                    stdout,
+                    stderr,
+                    elapsed,
+                },
+                waited,
+            ),
+            DeadlineKind::Total => (
+                RunOutcome::TotalTimeout {
+                    stdout,
+                    stderr,
+                    elapsed,
+                },
+                waited,
+            ),
         };
     }
     let status = match end {
@@ -1181,7 +1278,7 @@ pub(crate) async fn run_command(
             }
         };
 
-    match status {
+    let outcome = match status {
         Ok(status) => RunOutcome::Exited {
             code: status.code().unwrap_or(-1),
             stdout: stdout_bytes,
@@ -1191,7 +1288,8 @@ pub(crate) async fn run_command(
             elapsed,
         },
         Err(e) => RunOutcome::SpawnFailed(format!("failed to execute command: {e}")),
-    }
+    };
+    (outcome, waited)
 }
 
 /// Await one reader's captured bytes no later than `deadline`. A reader that
@@ -1224,11 +1322,25 @@ const KILLED_OUTPUT_TRUNCATED_NOTE: &str = "[... earlier output omitted ...]\n";
 /// the command printed. `data` mirrors a normal result so the tool card can
 /// render the output, with `exit_code: -1` (no exit status exists) and
 /// `killed: "silence" | "hard_cap"` naming the reason.
-fn killed_result(reason: String, killed: &str, stdout: Vec<u8>, stderr: Vec<u8>) -> ToolResult {
+///
+/// `waited` is the machine-slot wait this call already spent (plan d3336a8a): a
+/// killed run still reports it, or the model reads "printed nothing" on a call
+/// that in fact queued 90 s behind another instance's build (finding
+/// killedWaitNote).
+fn killed_result(
+    reason: String,
+    killed: &str,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    waited: Duration,
+) -> ToolResult {
     let raw_stdout = String::from_utf8_lossy(&stdout).to_string();
     let raw_stderr = String::from_utf8_lossy(&stderr).to_string();
     let combined = combine_streams(&raw_stdout, &raw_stderr);
-    let mut output = reason;
+    let mut output = match wait_note(waited) {
+        Some(note) => format!("{note}\n{reason}"),
+        None => reason,
+    };
     if !combined.is_empty() {
         output.push_str("\n\n");
         if combined.len() > KILLED_OUTPUT_TAIL {
@@ -1659,10 +1771,234 @@ pub(crate) fn test_heartbeat(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::machine_slots::SlotAttempt;
     use tempfile::tempdir;
 
     fn tool_in(dir: &std::path::Path) -> ShellTool {
         ShellTool::new(Sandbox::new(dir).unwrap())
+    }
+
+    /// A three-second script with no output: the fastest HONEST "heavy build"
+    /// stand-in, because it is a session CHECK command — heavy by definition
+    /// (plan d3336a8a). Three seconds because a wait under 2 s is deliberately
+    /// NOT reported in the result.
+    fn slow_heavy_command() -> String {
+        if cfg!(target_os = "windows") {
+            "Start-Sleep -Milliseconds 3000".to_string()
+        } else {
+            "sleep 3".to_string()
+        }
+    }
+
+    /// A tool sharing ONE machine slot (a `run/heavy` dir the test owns), its
+    /// heavy command being [`slow_heavy_command`], with `silence` as the
+    /// silence deadline.
+    fn slotted_tool(dir: &std::path::Path, slots: &std::path::Path, silence: Duration) -> ShellTool {
+        tool_in(dir)
+            .with_check_commands(vec![slow_heavy_command()])
+            .with_machine(
+                Arc::new(RwLock::new(MachineConfig {
+                    heavy_commands: 1,
+                })),
+                slots.to_path_buf(),
+            )
+            .with_limits(Some(silence), Duration::from_secs(60))
+    }
+
+    /// Wait until the ONE-slot machine dir is HELD by another caller: the only
+    /// deterministic way to know the first command really took the slot before
+    /// the second one runs (a fixed sleep loses under a loaded test runtime).
+    async fn wait_until_slot_is_held(slots: &std::path::Path) {
+        let probe = HeavySlots::new(slots.to_path_buf(), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if matches!(probe.try_take(), SlotAttempt::Busy) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no command ever took the only slot"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Two instances' heavy commands, one slot: the second WAITS, reports how
+    /// long, and the live view announces it ONCE (plan d3336a8a step 3).
+    #[tokio::test]
+    async fn second_heavy_command_waits_for_the_slot() {
+        let dir = tempdir().unwrap();
+        let slots = tempdir().unwrap();
+        let command = slow_heavy_command();
+        let first_tool = slotted_tool(dir.path(), slots.path(), Duration::from_secs(30));
+        let second_tool = slotted_tool(dir.path(), slots.path(), Duration::from_secs(30));
+        let first_command = command.clone();
+        let first = tokio::spawn(async move {
+            first_tool
+                .execute(json!({"command": first_command, "purpose": "first heavy"}))
+                .await
+        });
+        // Wait until the first command really holds the only slot.
+        wait_until_slot_is_held(slots.path()).await;
+
+        let live = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&live);
+        let sink = OutputSink::new(move |_stream, text| {
+            seen.lock().expect("live sink").push(text.to_string());
+        });
+        let started = std::time::Instant::now();
+        let second = second_tool
+            .execute_streaming(
+                json!({"command": command, "purpose": "second heavy"}),
+                sink,
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        let first = first.await.expect("first join");
+        assert!(first.success, "{}", first.output);
+        assert!(
+            second.success,
+            "a queued command still runs: {}",
+            second.output
+        );
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "the second heavy command waited for the slot, took {elapsed:?}"
+        );
+        assert!(
+            second.output.contains("NOTE: waited"),
+            "the result says how long it waited: {}",
+            second.output
+        );
+        let live = live.lock().expect("live sink");
+        assert!(
+            live.iter()
+                .any(|chunk| chunk.contains("waiting for a build slot (1 in use on this machine)")),
+            "the live view announces the wait once: {live:?}"
+        );
+        assert_eq!(
+            live.iter()
+                .filter(|chunk| chunk.contains("waiting for a build slot"))
+                .count(),
+            1,
+            "the wait line is announced once, not per poll: {live:?}"
+        );
+    }
+
+    /// A script that prints a line every ~200 ms for ~1.2 s: its own gaps are
+    /// far under the silence window below, so only a deadline that WRONGLY
+    /// counted the slot wait could kill it.
+    fn chatty_command() -> String {
+        if cfg!(target_os = "windows") {
+            "1..6 | ForEach-Object { Write-Output \"tick $_\"; Start-Sleep -Milliseconds 200 }"
+                .to_string()
+        } else {
+            "for i in 1 2 3 4 5 6; do echo tick $i; sleep 0.2; done".to_string()
+        }
+    }
+
+    /// The silence clock starts AFTER the slot is acquired: a command queued for
+    /// longer than its silence window is not killed as "silent" (plan d3336a8a).
+    #[tokio::test]
+    async fn slot_wait_is_not_counted_as_silence() {
+        let dir = tempdir().unwrap();
+        let slots = tempdir().unwrap();
+        let held = HeavySlots::new(slots.path().to_path_buf(), 1)
+            .try_take()
+            .guard()
+            .expect("the only slot is free");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(8000));
+            drop(held);
+        });
+        // A 4 s silence window is generous for PowerShell's own startup on a
+        // loaded machine, and the wait below is longer still: counting the wait
+        // as silence would kill the command before it ever spawned.
+        let limits = RunLimits {
+            silence: Some(Duration::from_millis(4000)),
+            total: Duration::from_secs(60),
+        };
+        let slots_for_call = HeavySlots::new(slots.path().to_path_buf(), 1);
+        let (outcome, waited) = run_command(
+            &chatty_command(),
+            dir.path(),
+            limits,
+            None,
+            None,
+            Some(&slots_for_call),
+        )
+        .await;
+        release.join().expect("release thread");
+        assert!(
+            waited >= Duration::from_millis(2500),
+            "the call waited for the slot: {waited:?}"
+        );
+        match outcome {
+            RunOutcome::Exited { code, .. } => {
+                assert_eq!(code, 0, "the queued command ran to completion")
+            }
+            other => panic!("the wait must not count as silence: {other:?}"),
+        }
+    }
+
+    /// A light command NEVER waits, even while the machine's only slot is held.
+    #[tokio::test]
+    async fn light_command_never_waits() {
+        let dir = tempdir().unwrap();
+        let slots = tempdir().unwrap();
+        // The holder's heavy command runs for 8 s, so a light command that
+        // WRONGLY queued would take at least that long; a plain PowerShell
+        // start under full-suite load stays well under the 5 s bound.
+        let held_command = if cfg!(target_os = "windows") {
+            "Start-Sleep -Milliseconds 8000".to_string()
+        } else {
+            "sleep 8".to_string()
+        };
+        let holder_tool = tool_in(dir.path())
+            .with_check_commands(vec![held_command.clone()])
+            .with_machine(
+                Arc::new(RwLock::new(MachineConfig {
+                    heavy_commands: 1,
+                })),
+                slots.path().to_path_buf(),
+            )
+            .with_limits(Some(Duration::from_secs(60)), Duration::from_secs(120));
+        let holder = tokio::spawn(async move {
+            holder_tool
+                .execute(json!({"command": held_command, "purpose": "holder"}))
+                .await
+        });
+        // Wait until the holder really took the only slot (acquired before its
+        // spawn), instead of guessing with a fixed sleep.
+        wait_until_slot_is_held(slots.path()).await;
+
+        let light = tool_in(dir.path()).with_machine(
+            Arc::new(RwLock::new(MachineConfig {
+                heavy_commands: 1,
+            })),
+            slots.path().to_path_buf(),
+        );
+        let started = std::time::Instant::now();
+        let result = light
+            .execute(json!({"command": "echo hi", "purpose": "light"}))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            elapsed < Duration::from_millis(5000),
+            "a light command never waits for a build slot (the held heavy command \
+             runs for 8 s), took {elapsed:?}"
+        );
+        assert!(
+            !result.output.contains("waited"),
+            "a light command reports no wait: {}",
+            result.output
+        );
+        // The holder outlives the assertion on purpose; drop it instead of
+        // waiting out its 8 s.
+        holder.abort();
+
     }
 
     #[test]
@@ -2435,6 +2771,7 @@ mod tests {
             "hard_cap",
             stdout,
             Vec::new(),
+            Duration::ZERO,
         );
         assert!(!result.success, "a kill is a tool error");
         assert!(
@@ -2461,13 +2798,49 @@ mod tests {
     #[test]
     fn killed_result_without_output_is_just_the_reason() {
         let reason = "command printed nothing for 5m and was killed (silence timeout)";
-        let result = killed_result(reason.to_string(), "silence", Vec::new(), Vec::new());
+        let result = killed_result(
+            reason.to_string(),
+            "silence",
+            Vec::new(),
+            Vec::new(),
+            Duration::ZERO,
+        );
         assert!(!result.success);
         assert_eq!(result.output, reason);
         let data = result.data.expect("data");
         assert_eq!(data["stdout"].as_str(), Some(""));
         assert_eq!(data["stderr"].as_str(), Some(""));
         assert_eq!(data["killed"].as_str(), Some("silence"));
+    }
+
+    /// Plan d3336a8a (finding killedWaitNote): a KILLED run still reports the
+    /// machine-slot wait it already spent — otherwise the model reads "printed
+    /// nothing" on a call that mostly queued behind another instance's build.
+    #[test]
+    fn killed_result_keeps_the_slot_wait_note() {
+        let result = killed_result(
+            "command printed nothing for 5m and was killed (silence timeout)".to_string(),
+            "silence",
+            Vec::new(),
+            Vec::new(),
+            Duration::from_secs(80),
+        );
+        assert!(
+            result
+                .output
+                .starts_with("NOTE: waited 1m20s for a build slot.\ncommand printed nothing"),
+            "the wait note leads the killed result: {}",
+            result.output
+        );
+        // A short wait stays silent, exactly like the exit path.
+        let short = killed_result(
+            "reason".to_string(),
+            "hard_cap",
+            Vec::new(),
+            Vec::new(),
+            Duration::from_millis(300),
+        );
+        assert_eq!(short.output, "reason");
     }
 
     /// Plan 5b85ab61: the hard cap kills a command that never stops printing.

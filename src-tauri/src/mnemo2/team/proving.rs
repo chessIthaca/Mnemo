@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, Mutex};
 
 use mnemo::app::plan_board::PlanBoard;
+use mnemo::machine_slots::HeavySlots;
 use mnemo::memory::plan_format::{PlanFile, PlanKind};
 
 use crate::mnemo2::phase3;
@@ -180,23 +181,52 @@ pub(crate) trait ProofRunner: Send + Sync {
     async fn mutate(&self, request: MutateRequest) -> Result<Vec<Mutant>, String>;
 }
 
-/// The real runner: [`super::proof`]'s two entry points, unchanged.
-pub(super) struct RealProofs;
+/// The real runner: [`super::proof`]'s two entry points, carrying the runtime's
+/// RESOLVED config dir so a proof's machine slot lives in the same pool as the
+/// instance's own heavy commands (finding proofConfigDir). Re-resolving
+/// `~/.mnemo` here built a SECOND pool in production and wrote to the real home
+/// directory in tests, which must only ever touch a temp dir.
+pub(super) struct RealProofs {
+    config_dir: PathBuf,
+}
+
+impl RealProofs {
+    /// The runner over the runtime's config dir (the dir `Setup` opened:
+    /// `$MNEMO_HOME` or `~/.mnemo` in production, a temp dir in tests).
+    pub(super) fn new(config_dir: PathBuf) -> Self {
+        Self { config_dir }
+    }
+
+    /// The machine's heavy slots as THIS instance sees them: the slot files
+    /// under `<config_dir>/run/heavy` and the saved `[general.machine]` limit.
+    /// `None` when the config cannot be read — the proof then runs unslotted,
+    /// because the limit is an optimisation, never a failure mode.
+    fn heavy_slots(&self) -> Option<HeavySlots> {
+        let config = mnemo::config::Config::load(&self.config_dir).ok()?;
+        Some(HeavySlots::new(
+            mnemo::machine_slots::default_dir(&self.config_dir),
+            config.general.general.machine.heavy_commands,
+        ))
+    }
+}
 
 #[async_trait]
 impl ProofRunner for RealProofs {
     async fn prove(&self, request: ProveRequest) -> Result<RedOutcome, String> {
+        let slots = self.heavy_slots();
         proof::prove_regression(
             request.checkout,
             request.base,
             request.tip,
             request.cfg,
             request.test,
+            slots.as_ref(),
         )
         .await
     }
 
     async fn mutate(&self, request: MutateRequest) -> Result<Vec<Mutant>, String> {
+        let slots = self.heavy_slots();
         proof::run_mutation(
             request.main_root,
             request.checkout,
@@ -204,6 +234,7 @@ impl ProofRunner for RealProofs {
             request.tip,
             request.cfg,
             request.worker_id,
+            slots.as_ref(),
         )
         .await
     }
@@ -1431,4 +1462,52 @@ fn missing_tool(error: &str) -> Option<&str> {
         let lower = line.to_lowercase();
         MARKERS.iter().any(|marker| lower.contains(marker))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan d3336a8a (finding proofSlotsUntested): the real runner's machine
+    /// slots come from the config dir it was BUILT with. Re-pointing
+    /// [`RealProofs::heavy_slots`] at a re-resolved `~/.mnemo` would (a) give
+    /// proofs a second slot pool and (b) write into the real home directory in
+    /// this very test — so the exact-dir equality below is the red line, and the
+    /// Busy check proves the pool object really points at the temp dir's slot.
+    #[test]
+    fn real_proofs_takes_its_slots_from_its_config_dir() {
+        let dir = tempfile::tempdir().expect("temp config dir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[general.machine]\nheavy_commands = 1\n",
+        )
+        .expect("temp config.toml");
+        let proofs = RealProofs::new(dir.path().to_path_buf());
+        let slots = proofs.heavy_slots().expect("the temp config loads");
+        assert_eq!(
+            slots.dir(),
+            mnemo::machine_slots::default_dir(dir.path()),
+            "the proof's slot pool must be the RUNTIME config dir, not a re-resolved \
+             ~/.mnemo (finding proofConfigDir)"
+        );
+        assert_eq!(
+            slots.slots(),
+            1,
+            "the limit comes from THAT dir's config.toml"
+        );
+        // Hold the temp dir's only slot: the runner's own HeavySlots must see it
+        // as taken. A re-resolved home pool would report a free slot here.
+        let held = slots
+            .try_take()
+            .guard()
+            .expect("the temp dir's only slot is free");
+        assert!(
+            matches!(
+                proofs.heavy_slots().expect("slots").try_take(),
+                mnemo::machine_slots::SlotAttempt::Busy
+            ),
+            "the runner's slots are the temp dir's slots"
+        );
+        drop(held);
+    }
 }

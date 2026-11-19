@@ -494,6 +494,7 @@ async fn bug_fixing_plan_end_to_end_with_finish_capture() {
         store.as_ref(),
         &plans_dir,
         &backlog_path,
+        None,
         &(|_: usize, _: usize| {}),
     )
     .await
@@ -709,6 +710,7 @@ async fn bug_fixing_plan_end_to_end_with_finish_capture() {
         store.as_ref(),
         &plans_dir,
         &backlog_path,
+        None,
         &(|_: usize, _: usize| {}),
     )
     .await

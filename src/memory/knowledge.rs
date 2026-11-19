@@ -55,12 +55,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::memory::types::MemoryRecordType;
 
 /// The knowledge root under `.coding/` (`.coding/knowledge/`).
 pub const KNOWLEDGE_DIR_NAME: &str = "knowledge";
+
+/// The machine-tier knowledge root: `<config dir>/knowledge` (`~/.mnemo/
+/// knowledge/` in a default install). Its `how/` and `decision/` records hold
+/// for EVERY project on the machine, so each project indexes them read-only
+/// into its own memory store (plan d3336a8a step 8).
+pub fn machine_knowledge_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join(KNOWLEDGE_DIR_NAME)
+}
 
 /// Maximum chars of the title part of a generated slug (the date prefix and
 /// joining hyphen are extra). Keeps filenames a label, not a paragraph.
@@ -516,33 +525,56 @@ fn render_front_matter(
 /// afterwards (see
 /// [`reindex_knowledge_files`](crate::memory::indexer::reindex_knowledge_files)).
 pub struct KnowledgeStore {
-    /// `.coding/knowledge/` — resolved from the project root.
+    /// `.coding/knowledge/` — resolved from the project root — or
+    /// `<config dir>/knowledge/` for the machine tier.
     knowledge_dir: PathBuf,
     /// Clock for the `YYYY-MM-DD` created prefix (tests pin it).
     now: Box<dyn Fn() -> i64 + Send + Sync>,
     /// Serializes the read-modify-write of a supersede (two files change in
     /// one operation).
     lock: Mutex<()>,
+    /// The MACHINE knowledge tier (plan d3336a8a step 8): every instance on
+    /// the machine shares this corpus, so a new file carries a random
+    /// `-<4 hex>` suffix (never the numeric dedup that two processes can
+    /// race) and every file write is atomic (temp file + rename), so a
+    /// reader in another instance never sees a half-written record.
+    machine: bool,
 }
 
 impl KnowledgeStore {
     /// Create a store rooted at the knowledge dir, with the wall clock.
     pub fn new(knowledge_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            knowledge_dir: knowledge_dir.into(),
-            now: Box::new(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
-            }),
-            lock: Mutex::new(()),
-        }
+        Self::with_clock(knowledge_dir, || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        })
     }
 
-    /// The knowledge root directory (`.coding/knowledge/`).
+    /// Create the MACHINE-tier store rooted at `<config dir>/knowledge/`
+    /// (see [`machine_knowledge_dir`]): its files are shared by every Mnemo2
+    /// instance on the machine, so new names carry a random suffix and every
+    /// write is atomic.
+    pub fn new_machine(knowledge_dir: impl Into<PathBuf>) -> Self {
+        Self::with_clock_machine(knowledge_dir, || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        })
+    }
+
+    /// The knowledge root directory (`.coding/knowledge/` or the machine
+    /// tier's `<config dir>/knowledge/`).
     pub fn dir(&self) -> &Path {
         &self.knowledge_dir
+    }
+
+    /// Whether this store backs the machine-wide tier rather than a single
+    /// project's corpus.
+    pub fn is_machine(&self) -> bool {
+        self.machine
     }
 
     /// Create a store with a fixed clock (deterministic tests).
@@ -554,7 +586,90 @@ impl KnowledgeStore {
             knowledge_dir: knowledge_dir.into(),
             now: Box::new(now),
             lock: Mutex::new(()),
+            machine: false,
         }
+    }
+
+    /// [`Self::with_clock`] for the machine tier (fixed clock, shared
+    /// corpus — see [`Self::new_machine`]).
+    pub fn with_clock_machine(
+        knowledge_dir: impl Into<PathBuf>,
+        now: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            knowledge_dir: knowledge_dir.into(),
+            now: Box::new(now),
+            lock: Mutex::new(()),
+            machine: true,
+        }
+    }
+
+    /// Write one knowledge file. The machine tier writes ATOMICALLY — a temp
+    /// file in the same directory, then a rename — because every instance on
+    /// the machine reads that corpus and a reader must never observe a
+    /// half-written record; a project store keeps its historical direct
+    /// write (unchanged behaviour).
+    fn write_file(&self, path: &Path, contents: String) -> Result<()> {
+        if !self.machine {
+            std::fs::write(path, contents)?;
+            return Ok(());
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("record");
+        let tmp = path.with_file_name(format!(
+            ".{name}.tmp-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        if let Err(e) = std::fs::write(&tmp, contents) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// The suffix a machine-tier NEW file carries: four random hex chars.
+    /// The numeric `-2`/`-3` dedup of the project tier is a check-then-write
+    /// race two PROCESSES can lose (both pick `-1`, one silently clobbers the
+    /// other); a machine corpus is written by several instances at once, so
+    /// its new names are random instead (plan d3336a8a step 8).
+    fn machine_suffix() -> String {
+        Uuid::new_v4().simple().to_string()[..4].to_string()
+    }
+
+    /// The rel path for a NEW file in `dir` with slug `base`: the machine
+    /// tier appends a random [`Self::machine_suffix`], the project tier keeps
+    /// the numeric `-2`/`-3` dedup suffix (unchanged behaviour).
+    fn new_file_rel(&self, dir: &str, base: &str) -> String {
+        if self.machine {
+            loop {
+                let rel = format!("{dir}/{base}-{}.md", Self::machine_suffix());
+                if !self.knowledge_dir.join(&rel).exists() {
+                    return rel;
+                }
+            }
+        }
+        for n in 1u32.. {
+            let slug = if n == 1 {
+                base.to_string()
+            } else {
+                format!("{base}-{n}")
+            };
+            let rel = format!("{dir}/{slug}.md");
+            if !self.knowledge_dir.join(&rel).exists() {
+                return rel;
+            }
+        }
+        unreachable!("the loop always returns or the filesystem is exhausted")
     }
 
     /// The front-matter title for a record: the record type's typed prefix
@@ -594,7 +709,9 @@ impl KnowledgeStore {
     /// (with `.md`), e.g. `decision/2026-08-23-typed-records.md`. The body
     /// is stored verbatim; the front matter carries the title, `created`,
     /// and `live` status. A slug collision (same date + title already on
-    /// disk) suffixes `-2`, `-3`, … so a rewrite never clobbers history.
+    /// disk) suffixes `-2`, `-3`, … so a rewrite never clobbers history;
+    /// the MACHINE tier appends a random `-<4 hex>` instead, because several
+    /// instances write that corpus at once (see [`Self::new_machine`]).
     pub fn write(&self, record_type: MemoryRecordType, title: &str, body: &str) -> Result<String> {
         self.write_with_evidence(record_type, title, body, None)
     }
@@ -625,26 +742,16 @@ impl KnowledgeStore {
             .map_err(|_| Error::Memory("knowledge lock poisoned".into()))?;
         let date = self.stamped_date();
         let base = slug_for(&title, &date);
-        for n in 1u32.. {
-            let slug = if n == 1 {
-                base.clone()
-            } else {
-                format!("{base}-{n}")
-            };
-            let rel = format!("{dir}/{slug}.md");
-            if !self.knowledge_dir.join(&rel).exists() {
-                let path = self.knowledge_dir.join(&rel);
-                std::fs::create_dir_all(path.parent().unwrap())?;
-                let file = format!(
-                    "{}\n{}\n",
-                    render_front_matter(&title, KnowledgeStatus::Live, None, Some(&date), evidence),
-                    body
-                );
-                std::fs::write(path, file)?;
-                return Ok(rel);
-            }
-        }
-        unreachable!("the loop always returns or the filesystem is exhausted")
+        let rel = self.new_file_rel(dir, &base);
+        let path = self.knowledge_dir.join(&rel);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let file = format!(
+            "{}\n{}\n",
+            render_front_matter(&title, KnowledgeStatus::Live, None, Some(&date), evidence),
+            body
+        );
+        self.write_file(&path, file)?;
+        Ok(rel)
     }
 
     /// Idempotent write keyed by an explicit slug: create (or overwrite)
@@ -693,7 +800,7 @@ impl KnowledgeStore {
             ),
             body
         );
-        std::fs::write(path, file)?;
+        self.write_file(&path, file)?;
         Ok(rel)
     }
 
@@ -767,7 +874,7 @@ impl KnowledgeStore {
             ),
             body
         );
-        std::fs::write(path, file)?;
+        self.write_file(&path, file)?;
         Ok(rel_path.to_string())
     }
 
@@ -820,7 +927,7 @@ impl KnowledgeStore {
             ),
             body.trim_end()
         );
-        std::fs::write(&path, file)
+        self.write_file(&path, file)
             .map_err(|e| Error::Memory(format!("knowledge replace: {}: {e}", rel_path)))?;
         Ok(1)
     }
@@ -988,7 +1095,7 @@ impl KnowledgeStore {
             ),
             body
         );
-        std::fs::write(path, file)?;
+        self.write_file(&path, file)?;
         Ok(rel_path.to_string())
     }
 
@@ -1055,22 +1162,7 @@ impl KnowledgeStore {
         let new_title = Self::bare_title(new_title, old.record_type);
         let date = self.stamped_date();
         let base = slug_for(&new_title, &date);
-        let new_rel = {
-            let mut new_rel = String::new();
-            for n in 1u32.. {
-                let slug = if n == 1 {
-                    base.clone()
-                } else {
-                    format!("{base}-{n}")
-                };
-                let candidate = format!("{dir}/{slug}.md");
-                if !self.knowledge_dir.join(&candidate).exists() {
-                    new_rel = candidate;
-                    break;
-                }
-            }
-            new_rel
-        };
+        let new_rel = self.new_file_rel(dir, &base);
         // Successor file.
         let successor_path = self.knowledge_dir.join(&new_rel);
         std::fs::create_dir_all(successor_path.parent().unwrap())?;
@@ -1085,7 +1177,7 @@ impl KnowledgeStore {
             ),
             new_body
         );
-        std::fs::write(successor_path, file)?;
+        self.write_file(&successor_path, file)?;
         // Flip the old file (preserve its title/created; mark superseded).
         let flipped = format!(
             "{}\n{}\n",
@@ -1098,7 +1190,7 @@ impl KnowledgeStore {
             ),
             old.body
         );
-        std::fs::write(&old_path, flipped)?;
+        self.write_file(&old_path, flipped)?;
         Ok(new_rel)
     }
 

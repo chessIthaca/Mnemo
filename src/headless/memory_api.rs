@@ -362,12 +362,14 @@ impl MemoryApi {
     }
 
     /// §5.6's `rebuild_index()` — wipe + rescan the derived index
-    /// (budgeted digests of `.coding/plans`, `.coding/reviews`, and the
-    /// pending backlog); authored memories are never touched.
+    /// (budgeted digests of `.coding/plans`, `.coding/reviews`, the pending
+    /// backlog, and the machine knowledge corpus); authored memories are never
+    /// touched.
     pub async fn rebuild_index(
         &self,
         plans_dir: &std::path::Path,
         backlog_path: &std::path::Path,
+        machine_knowledge: Option<&std::path::Path>,
         progress: &(dyn Fn(usize, usize) + Send + Sync),
     ) -> Result<crate::memory::indexer::IndexReport, crate::error::Error> {
         let store = self
@@ -378,6 +380,7 @@ impl MemoryApi {
             store.as_ref() as &dyn MemoryStoreTrait,
             plans_dir,
             backlog_path,
+            machine_knowledge,
             progress,
         )
         .await

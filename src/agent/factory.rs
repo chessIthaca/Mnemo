@@ -311,6 +311,12 @@ pub struct AgentLoopFactory {
     /// once at construction and shared by the memory tools + the finish
     /// capture. `None` when the plans dir implies no project root.
     knowledge: Option<Arc<KnowledgeStore>>,
+    /// The MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8): the HOW/DECISION records shared by every project on
+    /// the machine, indexed read-only into this project's store and written
+    /// by `memory_write scope=machine`. `None` until the host wires it (tests,
+    /// a build without a config dir) — a machine write is then refused.
+    machine_knowledge: Option<Arc<KnowledgeStore>>,
     sandbox: Arc<Sandbox>,
     project_root: PathBuf,
     safety_rules: Option<Arc<SafetyRules>>,
@@ -469,6 +475,22 @@ pub struct FactoryDeps {
 }
 
 impl AgentLoopFactory {
+    /// Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8) — builder-style, once, from the host that knows the
+    /// config dir. Every memory tool built afterwards routes `[machine]`
+    /// records to this store and accepts `memory_write scope=machine`; the
+    /// project store indexes its records read-only.
+    pub fn with_machine_knowledge(mut self, machine: Option<Arc<KnowledgeStore>>) -> Self {
+        self.machine_knowledge = machine;
+        self
+    }
+
+    /// The machine knowledge corpus this factory was wired with, if any (the
+    /// host hands the same dir to the derived-index runs).
+    pub fn machine_knowledge(&self) -> Option<&Arc<KnowledgeStore>> {
+        self.machine_knowledge.as_ref()
+    }
+
     /// The factory's steering counters (2c.4/G4) — the instance-scoped
     /// replacement for the deleted process-wide singleton. The IPC
     /// `get_steering_stats` command reads this; every loop this factory
@@ -540,6 +562,11 @@ impl AgentLoopFactory {
                 .map(|p| p.join(knowledge::KNOWLEDGE_DIR_NAME))
                 .map(KnowledgeStore::new)
                 .map(Arc::new),
+            // No machine corpus at construction — the host wires it via
+            // `with_machine_knowledge` once the config dir is known (plan
+            // d3336a8a step 8). Until then `memory_write scope=machine` is
+            // refused and no machine record is indexed.
+            machine_knowledge: None,
             sandbox,
             project_root,
             safety_rules,
@@ -1862,6 +1889,10 @@ impl AgentLoopFactory {
             // reindexing. `None` (a plans dir that implies no root) keeps
             // the historical DB-only behavior.
             let knowledge = self.knowledge.clone();
+            // The machine tier (plan d3336a8a step 8): every memory tool routes
+            // a `[machine]` record's edit to the shared corpus and accepts
+            // `memory_write scope=machine`. `None` until the host wires it.
+            let machine = self.machine_knowledge.clone();
             let typing = self.typing.clone();
             let mk_write = |store: Arc<dyn MemoryStoreTrait>| {
                 let tool = match &knowledge {
@@ -1872,7 +1903,8 @@ impl AgentLoopFactory {
                     )
                     // A worktree lane agent shares the factory-wide knowledge
                     // store (main tree) — the tool's result says so explicitly.
-                    .with_agent_root(root.map(|r| r.project_root.clone())),
+                    .with_agent_root(root.map(|r| r.project_root.clone()))
+                    .with_machine_knowledge(machine.clone()),
                     None => MemoryWriteTool::new(store.clone()),
                 };
                 // The Laya auto-typing gate rides every memory_write —
@@ -1907,28 +1939,36 @@ impl AgentLoopFactory {
             // junk delete, and query-less browsing.
             match &knowledge {
                 Some(k) => {
-                    registry.register(Box::new(MemoryUpdateTool::with_knowledge(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
-                    registry.register(Box::new(MemorySupersedeTool::with_knowledge(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
-                    registry.register(Box::new(MemoryDeleteTool::with_knowledge(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
+                    registry.register(Box::new(
+                        MemoryUpdateTool::with_knowledge(
+                            store.clone(),
+                            k.clone(),
+                            self.plans_dir.clone(),
+                        )
+                        .with_machine_knowledge(machine.clone()),
+                    ));
+                    registry.register(Box::new(
+                        MemorySupersedeTool::with_knowledge(
+                            store.clone(),
+                            k.clone(),
+                            self.plans_dir.clone(),
+                        )
+                        .with_machine_knowledge(machine.clone()),
+                    ));
+                    registry.register(Box::new(
+                        MemoryDeleteTool::with_knowledge(
+                            store.clone(),
+                            k.clone(),
+                            self.plans_dir.clone(),
+                        )
+                        .with_machine_knowledge(machine.clone()),
+                    ));
                     // memory_amend is file-only (it appends to the knowledge
                     // FILE) — registered only when the backing is wired.
-                    registry.register(Box::new(MemoryAmendTool::new(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
+                    registry.register(Box::new(
+                        MemoryAmendTool::new(store.clone(), k.clone(), self.plans_dir.clone())
+                            .with_machine_knowledge(machine.clone()),
+                    ));
                 }
                 None => {
                     registry.register(Box::new(MemoryUpdateTool::new(store.clone())));

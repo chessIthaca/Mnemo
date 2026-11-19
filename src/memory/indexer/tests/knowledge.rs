@@ -1200,3 +1200,157 @@ async fn reindex_recreates_a_row_that_vanished_while_its_state_remained() {
     assert_eq!(recreated.title, "DECISION: Typed records as files");
     assert_eq!(recreated.record_class, MemoryClass::Derived);
 }
+
+// ── Machine knowledge tier (plan d3336a8a step 8) ────────────────────────
+
+/// Write a file under a machine corpus root (`<config dir>/knowledge/`).
+fn write_machine_knowledge(root: &Path, rel: &str, text: &str) {
+    let path = root.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+const MACHINE_HOW: &str = "+++\ntitle = \"Cargo workspace builds compile src-tauri\"\ncreated = \"2026-11-19\"\n+++\n\nA root-only cargo test never compiles the app crate, so the machine-wide rule is to run cargo test --workspace.\n";
+
+const MACHINE_DECISION: &str = "+++\ntitle = \"One shared embedding host\"\ncreated = \"2026-11-19\"\n+++\n\nEvery instance on this machine attaches to the same mnemo-models process.\n";
+
+/// The acceptance scenario: a HOW record filed in the machine corpus is found
+/// from BOTH projects' stores — read-only, labelled machine, keyed in the
+/// `machine:` family (plan d3336a8a step 8).
+#[tokio::test]
+async fn machine_record_found_from_two_projects() {
+    let home = tempdir().unwrap();
+    let machine_dir = home.path().join("knowledge");
+    write_machine_knowledge(&machine_dir, "how/2026-11-19-workspace-builds.md", MACHINE_HOW);
+    let project_a = tempdir().unwrap();
+    let project_b = tempdir().unwrap();
+    let store_a = make_store();
+    let store_b = make_store();
+    for (dir, store) in [(&project_a, &store_a), (&project_b, &store_b)] {
+        crate::memory::indexer::index_derived(
+            store.as_ref(),
+            &plans_dir(dir.path()),
+            &backlog_path(dir.path()),
+            Some(&machine_dir),
+            &noop_progress,
+        )
+        .await
+        .unwrap();
+    }
+
+    let id = crate::memory::indexer::machine_knowledge_id("how/2026-11-19-workspace-builds.md");
+    for store in [&store_a, &store_b] {
+        let row = store
+            .get_memory(&id)
+            .await
+            .unwrap()
+            .expect("the machine record is indexed in this project's store");
+        assert_eq!(row.title, "HOW: Cargo workspace builds compile src-tauri");
+        assert_eq!(row.data["source"], "machine", "{:?}", row.data);
+        assert_eq!(row.data["rel_path"], "how/2026-11-19-workspace-builds.md");
+        assert!(
+            row.content.contains("2026-11-19-workspace-builds.md"),
+            "the digest points at the shared file: {}",
+            row.content
+        );
+        // Meaning search finds it (no word in common with the file name).
+        let hits = store
+            .recall(
+                "which cargo command compiles the app crate",
+                &MemoryFilter::new().limit(5),
+            )
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().any(|hit| hit.memory.id == id),
+            "machine record missing from {:?}",
+            hits.iter()
+                .map(|hit| hit.memory.title.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // The project corpus itself stays clean: no machine record is COPIED into
+    // `.coding/knowledge/` (only the generated INDEX.md map may appear there),
+    // and nothing was written into the machine root.
+    assert!(
+        !project_a.path().join(".coding/knowledge/how").exists(),
+        "machine records are never copied into the project corpus"
+    );
+    let entries: Vec<_> = std::fs::read_dir(machine_dir.join("how")).unwrap().collect();
+    assert_eq!(entries.len(), 1, "indexing is read-only for the shared corpus");
+}
+
+/// A machine root configured but unreadable (never created, or a transient
+/// failure) must keep its rows — a scan that cannot see the shared corpus is
+/// not evidence that its records vanished (plan d3336a8a step 8).
+#[tokio::test]
+async fn machine_corpus_absent_keeps_its_rows() {
+    let home = tempdir().unwrap();
+    let machine_dir = home.path().join("knowledge");
+    write_machine_knowledge(
+        &machine_dir,
+        "decision/2026-11-19-shared-host.md",
+        MACHINE_DECISION,
+    );
+    let dir = tempdir().unwrap();
+    let store = make_store();
+    crate::memory::indexer::index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        Some(&machine_dir),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    let id = crate::memory::indexer::machine_knowledge_id("decision/2026-11-19-shared-host.md");
+    assert!(store.get_memory(&id).await.unwrap().is_some());
+
+    // The root disappears: the shared row survives (no mass delete).
+    std::fs::remove_dir_all(&machine_dir).unwrap();
+    let report = crate::memory::indexer::index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        Some(&machine_dir),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.removed, 0,
+        "an unlistable machine corpus removes nothing: {report:?}"
+    );
+    assert!(
+        store.get_memory(&id).await.unwrap().is_some(),
+        "machine rows survive an absent root"
+    );
+    // Nor does the staleness pre-check report a phantom removal.
+    assert!(
+        !crate::memory::indexer::corpus_is_stale(
+            store.as_ref(),
+            &plans_dir(dir.path()),
+            &backlog_path(dir.path()),
+            Some(&machine_dir),
+        )
+        .await
+        .unwrap(),
+        "an absent machine root is not a corpus change"
+    );
+
+    // Readable again with the file gone: the row IS removed (the corpus is
+    // authoritative when it can be read).
+    std::fs::create_dir_all(&machine_dir).unwrap();
+    let report = crate::memory::indexer::index_derived(
+        store.as_ref(),
+        &plans_dir(dir.path()),
+        &backlog_path(dir.path()),
+        Some(&machine_dir),
+        &noop_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.removed, 1, "{report:?}");
+    assert!(store.get_memory(&id).await.unwrap().is_none());
+}

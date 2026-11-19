@@ -26,6 +26,51 @@ use super::{
     write_derived, IndexReport, SourceRecord,
 };
 
+/// The `derived_index_state` key prefix that marks a MACHINE knowledge
+/// record: a record under `<config dir>/knowledge/` whose claim holds for
+/// every project on the machine (plan d3336a8a step 8). Project records keep
+/// the `knowledge:` family, so a project row and a machine row never collide
+/// on a key even when both corpora hold the same type and slug.
+pub const MACHINE_KEY_PREFIX: &str = "machine:";
+
+/// The `data.source` value a machine-tier knowledge row carries. Absent
+/// means the record comes from this project's own corpus.
+pub const MACHINE_SOURCE: &str = "machine";
+
+/// The derived-memory source key of a knowledge record in its corpus's
+/// family: `knowledge:<type>/<slug>` for a project record,
+/// `machine:<type>/<slug>` for a machine-tier one.
+pub fn knowledge_key(record: &KnowledgeRecord, machine: bool) -> String {
+    if machine {
+        format!(
+            "{MACHINE_KEY_PREFIX}{}/{}",
+            record.record_type.as_str(),
+            record.slug
+        )
+    } else {
+        record.source_key()
+    }
+}
+
+/// The key a knowledge rel path maps to in its corpus's family — the twin of
+/// [`knowledge_key`] for a path whose file may already be gone (removal
+/// detection).
+fn key_for_rel(rel_path: &str, machine: bool) -> String {
+    let stem = rel_path.strip_suffix(".md").unwrap_or(rel_path);
+    if machine {
+        format!("{MACHINE_KEY_PREFIX}{stem}")
+    } else {
+        format!("{}:{stem}", knowledge::KNOWLEDGE_DIR_NAME)
+    }
+}
+
+/// The deterministic derived-memory id for a MACHINE knowledge file's rel
+/// path — the UUIDv5 of its `machine:` source key (no `.md` extension),
+/// mirroring [`knowledge_id`] for the project tier.
+pub fn machine_knowledge_id(rel_path: &str) -> String {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, key_for_rel(rel_path, true).as_bytes()).to_string()
+}
+
 /// Re-index a small set of knowledge files that changed on disk (a write
 /// just landed via the file-backed `KnowledgeStore`): parses them into
 /// records and runs the full knowledge scan + metadata resolution + write
@@ -39,6 +84,7 @@ pub async fn reindex_knowledge_files(
     store: &dyn MemoryStoreTrait,
     knowledge_dir: &Path,
     rels: &[String],
+    machine: bool,
 ) -> Result<IndexReport> {
     // Scan phase on the blocking pool: the files may not be UTF-8 or may
     // vanish mid-write — a failed read is a report error, never a panic.
@@ -69,7 +115,7 @@ pub async fn reindex_knowledge_files(
                     };
                     match knowledge::parse_file(rel, &text) {
                         Some(record) => {
-                            sources.push(knowledge_source(&record, &config));
+                            sources.push(knowledge_source(&record, &config, machine, &dir));
                             records.push(record);
                         }
                         None => errors.push(format!("knowledge {rel}: unparseable record shape")),
@@ -107,7 +153,7 @@ pub async fn reindex_knowledge_files(
                         Some(rel) => match std::fs::read_to_string(dir.join(&rel)) {
                             Ok(text) => match knowledge::parse_file(&rel, &text) {
                                 Some(record) => {
-                                    sources.push(knowledge_source(&record, &config));
+                                    sources.push(knowledge_source(&record, &config, machine, &dir));
                                     records.push(record);
                                     context_files += 1;
                                 }
@@ -138,7 +184,7 @@ pub async fn reindex_knowledge_files(
         errors: scan_errors,
         ..IndexReport::default()
     };
-    let metas = build_knowledge_metas(&records, &mut report.errors);
+    let metas = build_knowledge_metas(&records, machine, &mut report.errors);
     // The set of rel paths that were DELETED (present in the request, absent
     // on disk) — removal detection for the targeted path.
     let mut seen_keys = HashSet::new();
@@ -146,8 +192,7 @@ pub async fn reindex_knowledge_files(
         seen_keys.insert(source.key.clone());
     }
     for rel in &rels {
-        let stem = rel.strip_suffix(".md").unwrap_or(rel);
-        let key = format!("{}:{stem}", knowledge::KNOWLEDGE_DIR_NAME);
+        let key = key_for_rel(rel, machine);
         if !seen_keys.contains(&key) {
             if let Some((_, memory_id)) = store.index_state_get(&key).await? {
                 store.delete_memory(&memory_id).await?;
@@ -238,8 +283,12 @@ pub async fn reindex_knowledge_files(
             .await?;
     }
     // Every knowledge write keeps the generated map current (plan 373dec00
-    // step 6). Best effort, blocking pool, no-op when the bytes match.
-    crate::memory::knowledge_index::regenerate_blocking(knowledge_dir.to_path_buf()).await;
+    // step 6). Best effort, blocking pool, no-op when the bytes match. The
+    // machine tier has no project map to regenerate — its corpus is shared,
+    // not part of any project's `.coding/` corpus.
+    if !machine {
+        crate::memory::knowledge_index::regenerate_blocking(knowledge_dir.to_path_buf()).await;
+    }
     Ok(report)
 }
 
@@ -280,13 +329,16 @@ pub(super) struct KnowledgeMeta {
     pub(super) data: serde_json::Value,
 }
 
-/// Scan `.coding/knowledge/<type>/*.md` (the four knowledge type dirs, flat)
-/// into both a digest source AND the parsed record — the record feeds the
-/// metadata resolution (a successor file changes its predecessor's row), the
-/// source feeds the hash-driven write loop. A missing type dir is not an
-/// error (fresh projects have no knowledge yet).
+/// Scan `<root>/<type>/*.md` (the four knowledge type dirs, flat) into both a
+/// digest source AND the parsed record — the record feeds the metadata
+/// resolution (a successor file changes its predecessor's row), the source
+/// feeds the hash-driven write loop. A missing type dir is not an error (fresh
+/// projects have no knowledge yet). `machine` selects the corpus family: a
+/// machine record (`<config dir>/knowledge/`) is keyed in the `machine:`
+/// family and its row carries `data.source = "machine"`.
 pub(super) fn scan_knowledge(
     knowledge_dir: &Path,
+    machine: bool,
     out: &mut Vec<SourceRecord>,
     records: &mut Vec<KnowledgeRecord>,
     errors: &mut Vec<String>,
@@ -318,7 +370,7 @@ pub(super) fn scan_knowledge(
             match std::fs::read_to_string(&path) {
                 Ok(text) => match knowledge::parse_file(&rel, &text) {
                     Some(record) => {
-                        out.push(knowledge_source(&record, config));
+                        out.push(knowledge_source(&record, config, machine, knowledge_dir));
                         records.push(record);
                     }
                     None => errors.push(format!("knowledge {rel}: unparseable record shape")),
@@ -332,16 +384,29 @@ pub(super) fn scan_knowledge(
 /// Build the digest `SourceRecord` for one knowledge record: a budgeted gist
 /// (the file body is unbounded — the digest is the pointer) plus the
 /// mandatory pointer line to the file, which is the truth. `HOW:` has no
-/// typed budget; its digest uses the SPEC/REVIEW default of 500.
-fn knowledge_source(record: &KnowledgeRecord, config: &MemorySearchConfig) -> SourceRecord {
+/// typed budget; its digest uses the SPEC/REVIEW default of 500. A machine
+/// record's pointer names its shared corpus root (`<config dir>/knowledge/`)
+/// — the project-shaped `.coding/knowledge/` path it does not live at would
+/// dangle.
+fn knowledge_source(
+    record: &KnowledgeRecord,
+    config: &MemorySearchConfig,
+    machine: bool,
+    root: &Path,
+) -> SourceRecord {
     let gist = first_content_line(&record.body)
         .unwrap_or(record.title.as_str())
         .to_string();
     let budget = config.digest_budget(record.record_type).unwrap_or(500);
+    let pointer = if machine {
+        format!("path {}/{}", root.display(), record.rel_path)
+    } else {
+        record.pointer_line()
+    };
     SourceRecord {
-        key: record.source_key(),
+        key: knowledge_key(record, machine),
         title: truncate_title(&record.typed_title()),
-        content: budgeted_digest(&gist, &record.pointer_line(), budget),
+        content: budgeted_digest(&gist, &pointer, budget),
     }
 }
 
@@ -353,8 +418,13 @@ fn knowledge_source(record: &KnowledgeRecord, config: &MemorySearchConfig) -> So
 /// Deterministic — records are sorted by rel path first because `read_dir`
 /// order varies by OS; the first successor to claim a predecessor wins and
 /// later claimants surface as report errors, never silent drops.
+///
+/// Supersede resolution is PER CORPUS: `machine` selects the key family, so a
+/// machine successor resolves its machine predecessor and a project successor
+/// its project one — a machine record never claims a project row.
 pub(super) fn build_knowledge_metas(
     records: &[KnowledgeRecord],
+    machine: bool,
     errors: &mut Vec<String>,
 ) -> HashMap<String, KnowledgeMeta> {
     let mut sorted: Vec<&KnowledgeRecord> = records.iter().collect();
@@ -377,12 +447,14 @@ pub(super) fn build_knowledge_metas(
             .iter()
             .find(|r| r.slug == slug && r.record_type == successor.record_type)
             .or_else(|| sorted.iter().find(|r| r.slug == slug))
-            .map(|r| r.source_key());
+            .map(|r| knowledge_key(r, machine));
         match pred_key {
             Some(key) => {
-                let successor_id =
-                    Uuid::new_v5(&Uuid::NAMESPACE_URL, successor.source_key().as_bytes())
-                        .to_string();
+                let successor_id = Uuid::new_v5(
+                    &Uuid::NAMESPACE_URL,
+                    knowledge_key(successor, machine).as_bytes(),
+                )
+                .to_string();
                 match claimed.entry(key) {
                     Entry::Occupied(_) => errors.push(format!(
                         "knowledge {}: predecessor '{slug}' claimed by multiple successors",
@@ -403,7 +475,7 @@ pub(super) fn build_knowledge_metas(
     sorted
         .iter()
         .map(|record| {
-            let superseded_by = match claimed.get(&record.source_key()) {
+            let superseded_by = match claimed.get(&knowledge_key(record, machine)) {
                 Some(successor_id) => Some(successor_id.clone()),
                 // Self-declared dead with no successor file — the sentinel
                 // keeps the row out of recall without inventing an id.
@@ -417,6 +489,12 @@ pub(super) fn build_knowledge_metas(
                 "rel_path": record.rel_path,
                 "links": record.links,
             });
+            // A machine record is labelled as such in every result and routed
+            // back to the shared corpus by the memory tools (plan d3336a8a
+            // step 8); a project row carries no `source` at all.
+            if machine {
+                data["source"] = serde_json::Value::String(MACHINE_SOURCE.to_string());
+            }
             // How the record is known (plan 373dec00 step 4): the file's
             // front-matter evidence rides the row digest, and a BUG whose
             // body names a regression test counts as confirmed even without
@@ -431,7 +509,7 @@ pub(super) fn build_knowledge_metas(
                 data["regression_test"] = serde_json::Value::Bool(true);
             }
             (
-                record.source_key(),
+                knowledge_key(record, machine),
                 KnowledgeMeta {
                     superseded_by,
                     data,

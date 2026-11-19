@@ -27,7 +27,7 @@ use crate::memory::auto_typing::{self, TypingDecision};
 use crate::memory::plan_scope;
 use crate::memory::classifier::Classifier;
 use crate::memory::consolidation::consolidate_session;
-use crate::memory::indexer::{index_derived, reindex_knowledge_files};
+use crate::memory::indexer::{index_derived, reindex_knowledge_files, MACHINE_SOURCE};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::{
     Memory, MemoryClass, MemoryFilter, MemoryRecordType, MemoryStoreTrait, MemoryTier,
@@ -45,6 +45,10 @@ struct MemoryWriteArgs {
     /// What shows this is true — optional; nothing is refused without it.
     #[serde(default)]
     evidence: Option<String>,
+    /// Where the record lives: `project` (default) or `machine` (the corpus
+    /// shared by every project on this machine — HOW/DECISION only).
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// Arguments for `memory_recall`.
@@ -112,6 +116,7 @@ impl MemoryWriteTool {
                 knowledge,
                 store: store.clone(),
                 plans_dir: plans_dir.into(),
+                machine: None,
             }),
             store,
             now: Box::new(utc_now_secs),
@@ -126,6 +131,18 @@ impl MemoryWriteTool {
     /// own file tools cannot read the reported path.
     pub fn with_agent_root(mut self, root: Option<PathBuf>) -> Self {
         self.agent_root = root;
+        self
+    }
+
+    /// Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8) — the HOW/DECISION records shared by every project
+    /// and instance on the machine. Builder-style: `with_knowledge` leaves it
+    /// unwired, and a machine write then fails with a clear message rather
+    /// than landing in the project's corpus.
+    pub fn with_machine_knowledge(mut self, machine: Option<Arc<KnowledgeStore>>) -> Self {
+        if let Some(support) = self.knowledge.as_mut() {
+            support.machine = machine;
+        }
         self
     }
 
@@ -176,11 +193,10 @@ impl Tool for MemoryWriteTool {
             format!(
                 "{} MANDATORY the moment you learn a durable fact, decision, \
                  convention or bug root cause: write it immediately or it is \
-                 lost. Not for this task's results or what the code already \
-                 shows. Memories are auto-recalled into future prompts. Typed \
+                 lost. Not for this task's results or what the code shows. Typed \
                  title prefixes (SPEC:/DECISION:/BUG:/PLAN:/HOW:/REVIEW:) \
-                 classify the record; keep it compact (gist + path/commit \
-                 pointer), the file carries the detail.",
+                 classify the record; keep it compact (gist + pointer), the file \
+                 carries the detail.",
                 tool_contract::contract(
                     "`tier`, `title`, `content`",
                     "{\"tier\":\"semantic\",\"title\":\"DECISION: …\",\"content\":\"…\"}"
@@ -192,7 +208,8 @@ impl Tool for MemoryWriteTool {
                     "tier": {"type": "string", "enum": ["working", "episodic", "semantic", "procedural"], "description": "Memory tier: working (raw events), episodic (session summaries), semantic (facts), procedural (workflows)."},
                     "title": {"type": "string", "description": "Short label, used in recall listings; carries the typed prefix."},
                     "content": {"type": "string", "description": "The memory body."},
-                    "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."}
+                    "evidence": {"type": "string", "description": "What shows this is true: a test name, a file and line, a run, the user said so."},
+                    "scope": {"type": "string", "enum": ["project", "machine"], "description": "'machine' = ~/.mnemo/knowledge, shared by all projects."}
                 },
                 "required": ["tier", "title", "content"]
             }),
@@ -268,10 +285,49 @@ impl Tool for MemoryWriteTool {
             None => None,
         };
         let record_type = MemoryRecordType::from_title(&title);
+        // `scope: "machine"` targets the machine-wide corpus (plan d3336a8a
+        // step 8): the HOW/DECISION records that hold for every project on
+        // this machine. Only those two types qualify — a spec, bug, plan or
+        // review is about THIS project, so the write is refused rather than
+        // silently landing in one project's corpus.
+        let machine_scope = match args.scope.as_deref() {
+            None | Some("") | Some("project") => false,
+            Some("machine") => true,
+            Some(other) => {
+                return ToolResult::error(format!(
+                    "unknown scope '{other}' — use \"project\" (default) or \"machine\""
+                ))
+            }
+        };
+        if machine_scope
+            && !matches!(
+                record_type,
+                MemoryRecordType::How | MemoryRecordType::Decision
+            )
+        {
+            return ToolResult::error(format!(
+                "scope \"machine\" is for HOW: and DECISION: records only — \"{title}\" is a {} \
+                 record about this project (omit scope, or use \"project\")",
+                record_type.as_str()
+            ));
+        }
+        if machine_scope && self.knowledge.is_none() {
+            return ToolResult::error(NO_MACHINE_CORPUS);
+        }
         // Plan-scoped notes (plan id / branch references) are only true while
         // the plan lives: file them episodic + tagged, and keep them out of
-        // the durable knowledge store, so closing the plan can retire them.
-        let scope = plan_scope::scoped_tier(tier, &title, &args.content);
+        // the durable knowledge store, so closing the plan can retire them. A
+        // machine record outlives every plan, so a plan reference never
+        // reroutes it.
+        let scope = if machine_scope {
+            plan_scope::PlanScope {
+                tier,
+                plan_ids: Vec::new(),
+                branch: false,
+            }
+        } else {
+            plan_scope::scoped_tier(tier, &title, &args.content)
+        };
         let rerouted = scope.tier != tier;
         let tier = scope.tier;
         // Knowledge-backed typed write: the record's FILE is the truth — the
@@ -286,16 +342,28 @@ impl Tool for MemoryWriteTool {
         // to the historical DB-only row.
         if let Some(support) = self.knowledge.as_ref().filter(|_| is_knowledge_type) {
             let body = args.content.clone();
-            match support
-                .knowledge
-                .write_with_evidence(record_type, &title, &body, args.evidence.as_deref())
-            {
-                Ok(rel) => match support.reindex(std::slice::from_ref(&rel)).await {
+            // The corpus the write lands in: the machine tier for
+            // `scope: machine`, this project's otherwise.
+            let Some(corpus) = support.corpus(machine_scope) else {
+                return ToolResult::error(NO_MACHINE_CORPUS);
+            };
+            let corpus = corpus.clone();
+            match corpus.write_with_evidence(record_type, &title, &body, args.evidence.as_deref()) {
+                Ok(rel) => match support.reindex(std::slice::from_ref(&rel), machine_scope).await {
                     Ok(()) => {
                         // Count the knowledge-file write (the run-all
                         // completion note diffs this across the run window).
                         KNOWLEDGE_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let row_id = crate::memory::indexer::knowledge_id(&rel);
+                        let row_id = if machine_scope {
+                            crate::memory::indexer::machine_knowledge_id(&rel)
+                        } else {
+                            crate::memory::indexer::knowledge_id(&rel)
+                        };
+                        let file_path = if machine_scope {
+                            format!("{}/{rel}", corpus.dir().display())
+                        } else {
+                            format!(".coding/knowledge/{rel}")
+                        };
                         let (phrase, suffix) = tier_summary(tier);
                         let mut msg =
                             format!("Saved {phrase} \"{}\" ({} memory)", title, tier.as_str());
@@ -303,10 +371,18 @@ impl Tool for MemoryWriteTool {
                             msg.push_str(" — ");
                             msg.push_str(suffix);
                         }
-                        msg.push_str(&format!(
-                            " — knowledge record at .coding/knowledge/{rel} (files are the truth; \
-                             the memory row is a budgeted digest)"
-                        ));
+                        if machine_scope {
+                            msg.push_str(&format!(
+                                " — MACHINE knowledge record at {file_path} (shared by every \
+                                 project on this machine; the file is the truth, the memory row is a \
+                                 budgeted digest, labelled [machine] in search)"
+                            ));
+                        } else {
+                            msg.push_str(&format!(
+                                " — knowledge record at {file_path} (files are the truth; the \
+                                 memory row is a budgeted digest)"
+                            ));
+                        }
                         // A run-all lane agent is rooted in its worktree, but the
                         // knowledge store is factory-wide (the shared main-tree
                         // corpus by design) — the path above is main-tree-relative,
@@ -316,15 +392,19 @@ impl Tool for MemoryWriteTool {
                         // the same source spelling (both derive from the same
                         // project-root source; verbatim-prefixed or 8.3 short-name
                         // spellings would compare unequal — unreachable here).
-                        let store_root =
-                            support.knowledge.dir().parent().and_then(Path::parent);
-                        if let Some(agent_root) = self.agent_root.as_deref() {
-                            if Some(agent_root) != store_root {
-                                msg.push_str(
-                                    " — landed in the MAIN project tree, not this worktree \
-                                     (this lane's file tools are worktree-rooted and cannot \
-                                     read that path)",
-                                );
+                        // A machine record lives outside any project tree, so the
+                        // note never applies to it.
+                        if !machine_scope {
+                            let store_root =
+                                support.knowledge.dir().parent().and_then(Path::parent);
+                            if let Some(agent_root) = self.agent_root.as_deref() {
+                                if Some(agent_root) != store_root {
+                                    msg.push_str(
+                                        " — landed in the MAIN project tree, not this worktree \
+                                         (this lane's file tools are worktree-rooted and cannot \
+                                         read that path)",
+                                    );
+                                }
                             }
                         }
                         if let Some(note) = &typing_note {
@@ -336,7 +416,8 @@ impl Tool for MemoryWriteTool {
                             "tier": tier.as_str(),
                             "title": title,
                             "record_type": record_type.as_str(),
-                            "knowledge": format!(".coding/knowledge/{rel}"),
+                            "scope": if machine_scope { "machine" } else { "project" },
+                            "knowledge": file_path,
                             "auto_typed": typing_note,
                         }))
                     }
@@ -486,22 +567,63 @@ struct KnowledgeSupport {
     /// `.coding/plans` — locates the corpus for the full post-supersede
     /// reindex (the indexer's other source families).
     plans_dir: PathBuf,
+    /// The MACHINE corpus (`<config dir>/knowledge/`, plan d3336a8a step 8):
+    /// the how/decision records shared by every project and instance on the
+    /// machine. `None` (tests, a build without a config dir) makes a machine
+    /// write and every machine-record edit fail with [`NO_MACHINE_CORPUS`]
+    /// rather than silently landing in the project's own corpus.
+    machine: Option<Arc<KnowledgeStore>>,
 }
+
+/// The refusal a machine-tier write or edit produces when this build has no
+/// machine corpus wired.
+const NO_MACHINE_CORPUS: &str = "no machine knowledge folder is configured";
 
 /// The knowledge-file metadata for a derived memory id — what
 /// [`KnowledgeSupport::knowledge_for_id`] resolves: the rel path plus the
-/// record's title/tier, so tool results can name the amended record
+/// record's title/tier/corpus, so tool results can name the amended record
 /// instead of a bare id (backlog d779060a: "Amended [semantic] 'SPEC:
 /// storage' (id …)").
 struct KnowledgeRef {
     rel: String,
     title: String,
     tier: MemoryTier,
+    /// The record lives in the machine corpus, not this project's — the edit
+    /// must land in the shared file, and the label says so.
+    machine: bool,
 }
 
 impl KnowledgeSupport {
-    fn knowledge_dir(&self) -> &Path {
-        self.knowledge.dir()
+    /// The store backing one corpus (this project's unless `machine`).
+    fn corpus(&self, machine: bool) -> Option<&Arc<KnowledgeStore>> {
+        if machine {
+            self.machine.as_ref()
+        } else {
+            Some(&self.knowledge)
+        }
+    }
+
+    /// The machine corpus root, if wired — the full index run indexes both
+    /// corpora in one pass.
+    fn machine_dir(&self) -> Option<&Path> {
+        self.machine.as_ref().map(|m| m.dir())
+    }
+
+    /// The pointer prefix a knowledge file's `File:` line carries: the
+    /// project-relative `.coding/knowledge/` for this project's corpus, the
+    /// absolute `<config dir>/knowledge/` for the shared machine corpus
+    /// (which lives outside every project tree).
+    fn pointer_prefix(&self, machine: bool) -> String {
+        match self.corpus(machine) {
+            Some(corpus) if machine => format!("{}/", corpus.dir().display()),
+            _ => format!(".coding/{}/", knowledge::KNOWLEDGE_DIR_NAME),
+        }
+    }
+
+    /// The user-facing path of one knowledge file (see
+    /// [`Self::pointer_prefix`]).
+    fn shown_path(&self, machine: bool, rel: &str) -> String {
+        format!("{}{rel}", self.pointer_prefix(machine))
     }
 
     /// The knowledge-file metadata for a derived memory id — the rel path
@@ -517,7 +639,11 @@ impl KnowledgeSupport {
         }
         let rel = m.data.get("rel_path")?.as_str()?.to_string();
         // Only knowledge rows carry rel_path (plans/reviews/backlog rows
-        // don't have the field at all, so this is belt-and-braces).
+        // don't have the field at all, so this is belt-and-braces). A machine
+        // record additionally carries `data.source = "machine"` — one indexed
+        // from the shared `<config dir>/knowledge/` corpus — so the edit is
+        // routed back to that file.
+        let machine = m.data.get("source").and_then(|v| v.as_str()) == Some(MACHINE_SOURCE);
         if rel.starts_with("spec/")
             || rel.starts_with("decision/")
             || rel.starts_with("bug/")
@@ -527,15 +653,19 @@ impl KnowledgeSupport {
                 rel,
                 title: m.title,
                 tier: m.tier,
+                machine,
             })
         } else {
             None
         }
     }
 
-    /// A targeted reindex of the given knowledge files.
-    async fn reindex(&self, rels: &[String]) -> Result<(), String> {
-        let report = reindex_knowledge_files(self.store.as_ref(), self.knowledge_dir(), rels)
+    /// A targeted reindex of the given knowledge files in one corpus.
+    async fn reindex(&self, rels: &[String], machine: bool) -> Result<(), String> {
+        let Some(corpus) = self.corpus(machine) else {
+            return Err(NO_MACHINE_CORPUS.to_string());
+        };
+        let report = reindex_knowledge_files(self.store.as_ref(), corpus.dir(), rels, machine)
             .await
             .map_err(|e| e.to_string())?;
         if !report.errors.is_empty() {
@@ -550,17 +680,21 @@ impl KnowledgeSupport {
 
     /// A full derived-index run — used after supersede (the successor file
     /// changes an unchanged predecessor's row, which only the full scan
-    /// reconciles). Best-effort: a failure surfaces as a warning, never
-    /// fails the tool (the FILE is the truth; the row catches up next run).
+    /// reconciles). Covers the project corpus AND the machine corpus in one
+    /// pass, so a machine record's predecessor reconciles too. Best-effort: a
+    /// failure surfaces as a warning, never fails the tool (the FILE is the
+    /// truth; the row catches up next run).
     async fn full_index(&self) {
+        let backlog = self
+            .plans_dir
+            .parent()
+            .map(|p| p.join("backlog.jsonl"))
+            .unwrap_or_else(|| PathBuf::from(".coding/backlog.jsonl"));
         if let Err(e) = index_derived(
             self.store.as_ref(),
             &self.plans_dir,
-            &self
-                .plans_dir
-                .parent()
-                .map(|p| p.join("backlog.jsonl"))
-                .unwrap_or_else(|| PathBuf::from(".coding/backlog.jsonl")),
+            &backlog,
+            self.machine_dir(),
             &(|_: usize, _: usize| {}),
         )
         .await
@@ -913,25 +1047,37 @@ impl MemoryUpdateTool {
     /// refusing `.coding/knowledge/**`; a DB-only id repairs the stored
     /// content directly.
     async fn repair_by_id(&self, id: &str, find: &str, replace_with: &str) -> ToolResult {
-        let rel = match &self.knowledge {
-            Some(support) => support.knowledge_for_id(id).await.map(|kr| kr.rel),
+        let kref = match &self.knowledge {
+            Some(support) => support.knowledge_for_id(id).await,
             None => None,
         };
-        if let Some(rel) = rel {
+        if let Some(kref) = kref {
             let Some(support) = &self.knowledge else {
                 return ToolResult::error(format!(
                     "knowledge record {id} exists but the file backing is not wired"
                 ));
             };
-            if let Err(e) = support.knowledge.replace_in_body(&rel, find, replace_with) {
+            let Some(corpus) = support.corpus(kref.machine).cloned() else {
+                return ToolResult::error(NO_MACHINE_CORPUS);
+            };
+            let rel = kref.rel;
+            if let Err(e) = corpus.replace_in_body(&rel, find, replace_with) {
                 return ToolResult::error(format!("failed to repair knowledge record: {e}"));
             }
-            return match support.reindex(std::slice::from_ref(&rel)).await {
+            let path = support.shown_path(kref.machine, &rel);
+            return match support
+                .reindex(std::slice::from_ref(&rel), kref.machine)
+                .await
+            {
                 Ok(()) => ToolResult::success(format!(
-                    "Repaired knowledge record {id} — replaced 1 occurrence in \
-                     .coding/knowledge/{rel}; the memory row re-indexed"
+                    "Repaired knowledge record {id} — replaced 1 occurrence in {path}; \
+                     the memory row re-indexed"
                 ))
-                .with_data(json!({ "id": id, "knowledge": format!(".coding/knowledge/{rel}") })),
+                .with_data(json!({
+                    "id": id,
+                    "knowledge": path,
+                    "scope": if kref.machine { "machine" } else { "project" },
+                })),
                 Err(e) => ToolResult::error(format!("failed to index knowledge record: {e}")),
             };
         }
@@ -987,9 +1133,19 @@ impl MemoryUpdateTool {
                 knowledge,
                 store: store.clone(),
                 plans_dir: plans_dir.into(),
+                machine: None,
             }),
             store,
         }
+    }
+    /// Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8) — a `[machine]` row's edit lands in the shared file.
+    /// Builder-style: `with_knowledge` leaves it unwired.
+    pub fn with_machine_knowledge(mut self, machine: Option<Arc<KnowledgeStore>>) -> Self {
+        if let Some(support) = self.knowledge.as_mut() {
+            support.machine = machine;
+        }
+        self
     }
 }
 
@@ -1087,35 +1243,50 @@ impl Tool for MemoryUpdateTool {
             return self.repair_by_id(&id, find, replace_with).await;
         }
         // Knowledge-backed update: the id is the deterministic row id of a
-        // knowledge record — edit the FILE (the truth) + targeted reindex.
-        let rel = match &self.knowledge {
-            Some(support) => support.knowledge_for_id(&id).await.map(|kr| kr.rel),
+        // knowledge record — edit the FILE (the truth) + targeted reindex,
+        // routed to the machine corpus for a `[machine]` row.
+        let kref = match &self.knowledge {
+            Some(support) => support.knowledge_for_id(&id).await,
             None => None,
         };
-        if let Some(rel) = rel {
+        if let Some(kref) = kref {
             let Some(support) = &self.knowledge else {
                 return ToolResult::error(format!(
                     "knowledge record {id} exists but the file backing is not wired"
                 ));
             };
-            match support.knowledge.update(
+            let Some(corpus) = support.corpus(kref.machine).cloned() else {
+                return ToolResult::error(NO_MACHINE_CORPUS);
+            };
+            let rel = kref.rel;
+            match corpus.update(
                 &rel,
                 args.title.as_deref(),
                 args.content.as_deref(),
                 args.evidence.as_deref(),
             ) {
-                Ok(_) => match support.reindex(std::slice::from_ref(&rel)).await {
-                    Ok(()) => ToolResult::success(format!(
-                        "Updated knowledge record {} ({} changed) — file .coding/knowledge/{rel} \
-                         rewritten; the memory row re-indexed",
-                        id,
-                        changed.join(" + ")
-                    ))
-                    .with_data(
-                        json!({ "id": id, "knowledge": format!(".coding/knowledge/{rel}") }),
-                    ),
-                    Err(e) => ToolResult::error(format!("failed to index knowledge record: {e}")),
-                },
+                Ok(_) => {
+                    let path = support.shown_path(kref.machine, &rel);
+                    match support
+                        .reindex(std::slice::from_ref(&rel), kref.machine)
+                        .await
+                    {
+                        Ok(()) => ToolResult::success(format!(
+                            "Updated knowledge record {} ({} changed) — file {path} rewritten; \
+                             the memory row re-indexed",
+                            id,
+                            changed.join(" + ")
+                        ))
+                        .with_data(json!({
+                            "id": id,
+                            "knowledge": path,
+                            "scope": if kref.machine { "machine" } else { "project" },
+                        })),
+                        Err(e) => {
+                            ToolResult::error(format!("failed to index knowledge record: {e}"))
+                        }
+                    }
+                }
                 Err(e) => ToolResult::error(format!("failed to update knowledge record: {e}")),
             }
         } else {
@@ -1199,8 +1370,16 @@ impl MemoryAmendTool {
                 knowledge,
                 store,
                 plans_dir: plans_dir.into(),
+                machine: None,
             },
         }
+    }
+    /// Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8) — a `[machine]` row's successor lands in the shared
+    /// corpus. Builder-style: `with_knowledge` leaves it unwired.
+    pub fn with_machine_knowledge(mut self, machine: Option<Arc<KnowledgeStore>>) -> Self {
+        self.support.machine = machine;
+        self
     }
 }
 
@@ -1270,18 +1449,27 @@ impl Tool for MemoryAmendTool {
         } else {
             String::new()
         };
-        match self.support.knowledge.amend(&record.rel, &args.paragraph) {
-            Ok(_) => match self.support.reindex(std::slice::from_ref(&record.rel)).await {
+        let Some(corpus) = self.support.corpus(record.machine).cloned() else {
+            return ToolResult::error(NO_MACHINE_CORPUS);
+        };
+        let path = self.support.shown_path(record.machine, &record.rel);
+        match corpus.amend(&record.rel, &args.paragraph) {
+            Ok(_) => match self
+                .support
+                .reindex(std::slice::from_ref(&record.rel), record.machine)
+                .await
+            {
                 Ok(()) => ToolResult::success(format!(
-                    "Amended [{}] '{}' (id {id}) — dated paragraph appended to \
-                     .coding/knowledge/{}; the memory row re-indexed{note}",
+                    "Amended [{}] '{}' (id {id}) — dated paragraph appended to {path}; \
+                     the memory row re-indexed{note}",
                     record.tier.as_str(),
                     record.title,
-                    record.rel
                 ))
-                .with_data(
-                    json!({ "id": id, "knowledge": format!(".coding/knowledge/{}", record.rel) }),
-                ),
+                .with_data(json!({
+                    "id": id,
+                    "knowledge": path,
+                    "scope": if record.machine { "machine" } else { "project" },
+                })),
                 Err(e) => ToolResult::error(format!("failed to index knowledge record: {e}")),
             },
             Err(e) => ToolResult::error(format!("failed to amend knowledge record: {e}")),
@@ -1335,10 +1523,21 @@ impl MemorySupersedeTool {
                 knowledge,
                 store: store.clone(),
                 plans_dir: plans_dir.into(),
+                machine: None,
             }),
             store,
             now: Box::new(utc_now_secs),
         }
+    }
+
+    /// Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8) — a `[machine]` row's successor lands in the shared
+    /// corpus. Builder-style: `with_knowledge` leaves it unwired.
+    pub fn with_machine_knowledge(mut self, machine: Option<Arc<KnowledgeStore>>) -> Self {
+        if let Some(support) = self.knowledge.as_mut() {
+            support.machine = machine;
+        }
+        self
     }
 }
 
@@ -1350,12 +1549,12 @@ impl MemorySupersedeTool {
 /// pointer lines are touched; the pointer token runs to the first
 /// whitespace or parenthetical. Returns the corrected body plus the stale
 /// paths that were rewritten.
-fn reconcile_file_pointers(body: &str, canonical_rel: &str) -> (String, Vec<String>) {
+fn reconcile_file_pointers(body: &str, prefix: &str, canonical_rel: &str) -> (String, Vec<String>) {
     let mut stale: Vec<String> = Vec::new();
     let mut out: Vec<String> = Vec::new();
     for line in body.lines() {
         let trimmed = line.trim_start();
-        let Some(rest) = trimmed.strip_prefix("File: .coding/knowledge/") else {
+        let Some(rest) = trimmed.strip_prefix(&format!("File: {prefix}")) else {
             out.push(line.to_string());
             continue;
         };
@@ -1367,10 +1566,10 @@ fn reconcile_file_pointers(body: &str, canonical_rel: &str) -> (String, Vec<Stri
             out.push(line.to_string());
             continue;
         }
-        stale.push(format!(".coding/knowledge/{path}"));
+        stale.push(format!("{prefix}{path}"));
         out.push(line.replacen(
-            &format!(".coding/knowledge/{path}"),
-            &format!(".coding/knowledge/{canonical_rel}"),
+            &format!("{prefix}{path}"),
+            &format!("{prefix}{canonical_rel}"),
             1,
         ));
     }
@@ -1442,11 +1641,11 @@ impl Tool for MemorySupersedeTool {
         // (2026-11-01 lead friction: `memory_supersede` with tier
         // "procedural" on a file-backed record errored instead of doing the
         // obvious thing, and the agent had to retry); the result says so.
-        let knowledge_rel = match &self.knowledge {
-            Some(support) => support.knowledge_for_id(&old_id).await.map(|kr| kr.rel),
+        let knowledge_ref = match &self.knowledge {
+            Some(support) => support.knowledge_for_id(&old_id).await,
             None => None,
         };
-        let tier_note = if knowledge_rel.is_some() && tier != MemoryTier::Semantic {
+        let tier_note = if knowledge_ref.is_some() && tier != MemoryTier::Semantic {
             tier = MemoryTier::Semantic;
             format!(
                 ". The successor is stored as semantic (file-backed records are always \
@@ -1456,13 +1655,19 @@ impl Tool for MemorySupersedeTool {
         } else {
             String::new()
         };
-        if let Some(old_rel) = knowledge_rel {
+        if let Some(kref) = knowledge_ref {
             let Some(support) = &self.knowledge else {
                 return ToolResult::error(format!(
                     "knowledge record {old_id} exists but the file backing is not wired"
                 ));
             };
-            match support.knowledge.supersede_with_evidence(
+            let Some(corpus) = support.corpus(kref.machine).cloned() else {
+                return ToolResult::error(NO_MACHINE_CORPUS);
+            };
+            let old_rel = kref.rel;
+            let old_path = support.shown_path(kref.machine, &old_rel);
+            let prefix = support.pointer_prefix(kref.machine);
+            match corpus.supersede_with_evidence(
                 &old_rel,
                 &title,
                 &args.content,
@@ -1473,17 +1678,15 @@ impl Tool for MemorySupersedeTool {
                     // assumed a different successor filename than the tool
                     // chose (slug truncation, dedup suffixes) so the body's
                     // self-reference never dangles.
-                    let (body, stale_pointers) = reconcile_file_pointers(&args.content, &new_rel);
+                    let (body, stale_pointers) =
+                        reconcile_file_pointers(&args.content, &prefix, &new_rel);
                     if !stale_pointers.is_empty() {
-                        if let Err(e) =
-                            support
-                                .knowledge
-                                .update(&new_rel, None, Some(&body), None)
-                        {
+                        if let Err(e) = corpus.update(&new_rel, None, Some(&body), None) {
+                            let new_path = support.shown_path(kref.machine, &new_rel);
                             return ToolResult::error(format!(
                                 "superseded knowledge record {old_id}, but rewriting its \
                                  {} stale File: pointer line(s) failed: {e} — the canonical \
-                                 successor path is .coding/knowledge/{new_rel}",
+                                 successor path is {new_path}",
                                 stale_pointers.len()
                             ));
                         }
@@ -1491,7 +1694,12 @@ impl Tool for MemorySupersedeTool {
                     // The successor FILE flips the unchanged predecessor's
                     // row — only the full scan reconciles that, so run it.
                     support.full_index().await;
-                    let new_id = crate::memory::indexer::knowledge_id(&new_rel);
+                    let new_id = if kref.machine {
+                        crate::memory::indexer::machine_knowledge_id(&new_rel)
+                    } else {
+                        crate::memory::indexer::knowledge_id(&new_rel)
+                    };
+                    let new_path = support.shown_path(kref.machine, &new_rel);
                     let pointer_note = if stale_pointers.is_empty() {
                         String::new()
                     } else {
@@ -1502,8 +1710,8 @@ impl Tool for MemorySupersedeTool {
                     };
                     let msg = format!(
                         "Superseded knowledge record {old_id} with \"{title}\" — old file \
-                         .coding/knowledge/{old_rel} marked superseded (history), successor \
-                         at .coding/knowledge/{new_rel}{pointer_note}; memory rows re-indexed\
+                         {old_path} marked superseded (history), successor \
+                         at {new_path}{pointer_note}; memory rows re-indexed\
                          {tier_note}"
                     );
                     ToolResult::success(msg).with_data(json!({
@@ -1511,7 +1719,8 @@ impl Tool for MemorySupersedeTool {
                         "supersedes": old_id,
                         "tier": tier.as_str(),
                         "title": title,
-                        "knowledge": format!(".coding/knowledge/{new_rel}"),
+                        "scope": if kref.machine { "machine" } else { "project" },
+                        "knowledge": new_path,
                     }))
                 }
                 Err(e) => ToolResult::error(format!("failed to supersede knowledge record: {e}")),
@@ -1582,9 +1791,19 @@ impl MemoryDeleteTool {
                 knowledge,
                 store: store.clone(),
                 plans_dir: plans_dir.into(),
+                machine: None,
             }),
             store,
         }
+    }
+    /// Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8) — only used to REFUSE deleting a shared record.
+    /// Builder-style: `with_knowledge` leaves it unwired.
+    pub fn with_machine_knowledge(mut self, machine: Option<Arc<KnowledgeStore>>) -> Self {
+        if let Some(support) = self.knowledge.as_mut() {
+            support.machine = machine;
+        }
+        self
     }
 }
 
@@ -1627,20 +1846,33 @@ impl Tool for MemoryDeleteTool {
         };
         // Knowledge-backed delete: the id is the deterministic row id of a
         // knowledge record — remove the FILE (the truth dies) + targeted
-        // reindex (the derived row is dropped by removal detection).
-        let rel = match &self.knowledge {
-            Some(support) => support.knowledge_for_id(&args.id).await.map(|kr| kr.rel),
+        // reindex (the derived row is dropped by removal detection). A
+        // MACHINE record belongs to every project on the machine, so it is
+        // never deleted from here: one project hard-deleting the shared file
+        // would remove it from all of them.
+        let kref = match &self.knowledge {
+            Some(support) => support.knowledge_for_id(&args.id).await,
             None => None,
         };
-        if let Some(rel) = rel {
+        if let Some(kref) = kref {
             let Some(support) = &self.knowledge else {
                 return ToolResult::error(format!(
                     "knowledge record {} exists but the file backing is not wired",
                     args.id
                 ));
             };
+            if kref.machine {
+                return ToolResult::error(format!(
+                    "knowledge record {} is a MACHINE record at {} — shared by every project on \
+                     this machine, so memory_delete refuses it; rewrite it with memory_update or \
+                     retire it with memory_supersede",
+                    args.id,
+                    support.shown_path(true, &kref.rel),
+                ));
+            }
+            let rel = kref.rel;
             match support.knowledge.delete(&rel) {
-                Ok(_) => match support.reindex(std::slice::from_ref(&rel)).await {
+                Ok(_) => match support.reindex(std::slice::from_ref(&rel), false).await {
                     Ok(()) => ToolResult::success(format!(
                         "Deleted knowledge record {} — file .coding/knowledge/{rel} removed \
                          (the truth is gone); the memory row dropped by reindex",
@@ -2347,7 +2579,7 @@ mod tests {
         // rewritten in place (parenthetical preserved); a lowercase `file:`
         // line is not the digest pointer shape and passes through.
         let body = "Intro line.\nFile: .coding/knowledge/decision/old-name.md (supersedes x).\nFile: .coding/knowledge/decision/canonical.md\nfile: .coding/knowledge/decision/case.md\n";
-        let (out, stale) = reconcile_file_pointers(body, "decision/canonical.md");
+        let (out, stale) = reconcile_file_pointers(body, ".coding/knowledge/", "decision/canonical.md");
         assert_eq!(
             stale,
             vec![".coding/knowledge/decision/old-name.md".to_string()]
@@ -2369,7 +2601,7 @@ mod tests {
         // rewrite must not normalize the whole file's line endings.
         let crlf_body =
             "Intro line.\r\nFile: .coding/knowledge/decision/old-name.md (history).\r\nTail.\r\n";
-        let (out, stale) = reconcile_file_pointers(crlf_body, "decision/canonical.md");
+        let (out, stale) = reconcile_file_pointers(crlf_body, ".coding/knowledge/", "decision/canonical.md");
         assert_eq!(
             stale,
             vec![".coding/knowledge/decision/old-name.md".to_string()]
@@ -2763,7 +2995,7 @@ mod tests {
                 "the store is sqlite",
             )
             .unwrap();
-        reindex_knowledge_files(store.as_ref(), ks.dir(), std::slice::from_ref(&rel))
+        reindex_knowledge_files(store.as_ref(), ks.dir(), std::slice::from_ref(&rel), false)
             .await
             .unwrap();
         let id = crate::memory::indexer::knowledge_id(&rel);
@@ -3850,6 +4082,204 @@ mod tests {
             result.output.contains("unknown record_type 'bogus'"),
             "{}",
             result.output
+        );
+    }
+
+    // ── Machine knowledge tier (plan d3336a8a step 8) ────────────────────
+
+    /// Build the writing tools over a temp project wired to a MACHINE corpus
+    /// (`<config dir>/knowledge/`): the shared store plus the tools that route
+    /// a `[machine]` record's edit back to it.
+    fn make_machine_tools(
+        dir: &tempfile::TempDir,
+        store: Arc<dyn MemoryStoreTrait>,
+    ) -> (
+        Arc<KnowledgeStore>,
+        MemoryWriteTool,
+        MemorySupersedeTool,
+        MemoryDeleteTool,
+    ) {
+        let knowledge = Arc::new(KnowledgeStore::new(dir.path().join(".coding/knowledge")));
+        let machine = Arc::new(KnowledgeStore::new_machine(
+            dir.path().join("machine/knowledge"),
+        ));
+        let plans_dir = dir.path().join(".coding/plans");
+        let write = MemoryWriteTool::with_knowledge(store.clone(), knowledge.clone(), &plans_dir)
+            .with_machine_knowledge(Some(machine.clone()));
+        let supersede =
+            MemorySupersedeTool::with_knowledge(store.clone(), knowledge.clone(), &plans_dir)
+                .with_machine_knowledge(Some(machine.clone()));
+        let delete = MemoryDeleteTool::with_knowledge(store.clone(), knowledge, &plans_dir)
+            .with_machine_knowledge(Some(machine.clone()));
+        (machine, write, supersede, delete)
+    }
+
+    /// The `how/` file names in a machine corpus, sorted.
+    fn machine_how_files(machine: &KnowledgeStore) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(machine.dir().join("how"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// `scope: "machine"` is HOW/DECISION only: a SPEC or BUG record is about
+    /// one project, so it is refused instead of landing in the shared corpus
+    /// every project reads (plan d3336a8a step 8).
+    #[tokio::test]
+    async fn machine_scope_rejected_for_spec_and_bug() {
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (machine, write, _, _) = make_machine_tools(&dir, store);
+
+        for title in ["SPEC: branch strategy", "BUG: the watcher races"] {
+            let result = write
+                .execute(json!({
+                    "tier": "semantic",
+                    "title": title,
+                    "content": "this is about one project, not the machine",
+                    "scope": "machine",
+                }))
+                .await;
+            assert!(!result.success, "{title} must be refused: {}", result.output);
+            assert!(
+                result.output.contains("HOW: and DECISION: records only"),
+                "{}",
+                result.output
+            );
+        }
+        assert!(
+            !machine.dir().exists(),
+            "a refused write creates no machine corpus"
+        );
+
+        // HOW passes, and two identical titles NEVER collide: the machine tier
+        // names new files with a random 4-hex suffix (several instances write
+        // this corpus at once).
+        for _ in 0..2 {
+            let result = write
+                .execute(json!({
+                    "tier": "semantic",
+                    "title": "HOW: cargo test needs --workspace",
+                    "content": "run cargo test --workspace",
+                    "scope": "machine",
+                    "evidence": "the CI workflow",
+                }))
+                .await;
+            assert!(result.success, "{}", result.output);
+            assert!(
+                result.output.contains("MACHINE knowledge record"),
+                "{}",
+                result.output
+            );
+        }
+        let files = machine_how_files(&machine);
+        assert_eq!(files.len(), 2, "two writes never collide: {files:?}");
+        for name in &files {
+            let stem = name.strip_suffix(".md").expect("markdown file");
+            let suffix = stem.rsplit('-').next().expect("suffixed name");
+            assert_eq!(suffix.len(), 4, "{name}");
+            assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+            let text = std::fs::read_to_string(machine.dir().join("how").join(name)).unwrap();
+            assert!(text.contains("evidence = \"the CI workflow\""), "{text}");
+        }
+        // Nothing landed in the project corpus.
+        assert!(!dir.path().join(".coding/knowledge").exists());
+
+        // An unknown scope is a clear error, not a silent project write.
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "HOW: x",
+                "content": "y",
+                "scope": "global",
+            }))
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("unknown scope 'global'"), "{}", result.output);
+    }
+
+    /// A `[machine]` record's supersede edits the SHARED files (successor
+    /// there, predecessor flipped there), its rows stay machine-labelled, and
+    /// `memory_delete` refuses to remove a record every project depends on
+    /// (plan d3336a8a step 8).
+    #[tokio::test]
+    async fn machine_record_supersede_updates_the_file() {
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (machine, write, supersede, delete) = make_machine_tools(&dir, store.clone());
+
+        let written = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "HOW: builds are slow",
+                "content": "every instance rebuilds from scratch",
+                "scope": "machine",
+                "evidence": "a timed run",
+            }))
+            .await;
+        assert!(written.success, "{}", written.output);
+        let written_data = written.data.expect("structured data");
+        assert_eq!(written_data["scope"], "machine");
+        let old_id = written_data["id"].as_str().unwrap().to_string();
+        let old_path = written_data["knowledge"].as_str().unwrap().to_string();
+        let prefix = format!("{}/", machine.dir().display());
+        let old_rel = old_path
+            .strip_prefix(&prefix)
+            .expect("the shared corpus path")
+            .to_string();
+        let old_text = std::fs::read_to_string(&old_path).unwrap();
+        assert!(!old_text.contains("superseded"), "{old_text}");
+
+        let result = supersede
+            .execute(json!({
+                "id": old_id,
+                "tier": "semantic",
+                "title": "HOW: builds are shared",
+                "content": "sccache serves every instance",
+                "evidence": "a timed run",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.expect("structured data");
+        assert_eq!(data["scope"], "machine");
+        let new_id = data["id"].as_str().unwrap().to_string();
+        let new_path = data["knowledge"].as_str().unwrap().to_string();
+        assert!(
+            new_path.starts_with(&prefix),
+            "the successor lands in the shared corpus: {new_path}"
+        );
+
+        // On disk: the predecessor is history in the SHARED corpus, the
+        // successor is live there, and the project corpus stayed empty.
+        let flipped = std::fs::read_to_string(machine.dir().join(&old_rel)).unwrap();
+        assert!(flipped.contains("status = \"superseded\""), "{flipped}");
+        let successor = std::fs::read_to_string(&new_path).unwrap();
+        assert!(successor.contains("supersedes = \""), "{successor}");
+        assert!(
+            !dir.path().join(".coding/knowledge/how").exists(),
+            "the project corpus never receives a copy of a machine record"
+        );
+
+        // The rows: the old one is excluded history, the successor carries the
+        // machine source label (what search/browse/recal render as [machine]).
+        let old_row = store.get_memory(&old_id).await.unwrap().expect("old row");
+        assert!(old_row.superseded_by.is_some(), "{old_row:?}");
+        let new_row = store.get_memory(&new_id).await.unwrap().expect("successor");
+        assert_eq!(new_row.data["source"], "machine");
+
+        // Deleting a shared record is refused — supersede/update instead.
+        let refused = delete.execute(json!({"id": new_id})).await;
+        assert!(!refused.success, "{}", refused.output);
+        assert!(refused.output.contains("MACHINE record"), "{}", refused.output);
+        assert!(
+            std::fs::read_to_string(&new_path).is_ok(),
+            "the shared file survives the refusal"
         );
     }
 }

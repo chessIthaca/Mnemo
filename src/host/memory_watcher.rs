@@ -185,6 +185,7 @@ impl MemoryWatcher {
     pub fn spawn(
         store: Arc<dyn MemoryStoreTrait>,
         state_dir: PathBuf,
+        machine_dir: Option<PathBuf>,
         debounce: Duration,
     ) -> Result<Self, notify::Error> {
         // Bridge notify's synchronous callback into async via an unbounded
@@ -196,8 +197,25 @@ impl MemoryWatcher {
             let _ = tx.send(res);
         })?;
         watcher.watch(&state_dir, RecursiveMode::Recursive)?;
+        // The MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+        // d3336a8a step 8) is a second watched root: a how/decision record
+        // written by ANOTHER instance or by hand must reach this project's
+        // store without a restart. The root is created when absent so the
+        // watch can be established (the memory tools create the type dirs on
+        // demand); a watch failure is a warning, never fatal — the project
+        // watch above keeps working.
+        if let Some(dir) = machine_dir.as_ref() {
+            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
+                eprintln!(
+                    "warning: memory watcher cannot watch the machine corpus {}: {e}",
+                    dir.display()
+                );
+            }
+        }
 
         let task_state_dir = state_dir.clone();
+        let task_machine_dir = machine_dir.clone();
         // Run the debounce loop on a Tokio runtime. Most callers are already
         // inside one, but a host may build its brain from a context with NO
         // reactor (e.g. an app's setup hook on the main thread) — a bare
@@ -208,7 +226,7 @@ impl MemoryWatcher {
         // needs a handle.
         let task = match tokio::runtime::Handle::try_current() {
             Ok(handle) => Some(handle.spawn(async move {
-                Self::debounce_loop(store, task_state_dir, rx, debounce).await;
+                Self::debounce_loop(store, task_state_dir, task_machine_dir, rx, debounce).await;
             })),
             Err(_) => {
                 let thread = std::thread::Builder::new()
@@ -224,7 +242,13 @@ impl MemoryWatcher {
                                 return;
                             }
                         };
-                        rt.block_on(Self::debounce_loop(store, task_state_dir, rx, debounce));
+                        rt.block_on(Self::debounce_loop(
+                            store,
+                            task_state_dir,
+                            task_machine_dir,
+                            rx,
+                            debounce,
+                        ));
                     });
                 match thread {
                     Ok(_) => None,
@@ -249,6 +273,7 @@ impl MemoryWatcher {
     async fn debounce_loop(
         store: Arc<dyn MemoryStoreTrait>,
         state_dir: PathBuf,
+        machine_dir: Option<PathBuf>,
         mut rx: tokio_mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
         debounce: Duration,
     ) {
@@ -262,7 +287,7 @@ impl MemoryWatcher {
             let Some(first) = rx.recv().await else {
                 return;
             };
-            let mut dirty = Self::event_is_memory_source(&first, &state_dir);
+            let mut dirty = Self::event_is_memory_source(&first, &state_dir, machine_dir.as_deref());
 
             // Coalesce the burst: keep draining until `debounce` passes with
             // no new events. Any event resets the timer so a long edit storm
@@ -272,7 +297,7 @@ impl MemoryWatcher {
                 let mut saw_more = false;
                 while let Ok(ev) = rx.try_recv() {
                     saw_more = true;
-                    if Self::event_is_memory_source(&ev, &state_dir) {
+                    if Self::event_is_memory_source(&ev, &state_dir, machine_dir.as_deref()) {
                         dirty = true;
                     }
                 }
@@ -312,6 +337,7 @@ impl MemoryWatcher {
                 store.as_ref(),
                 &plans_dir,
                 &backlog_path,
+                machine_dir.as_deref(),
             )
             .await
             {
@@ -330,6 +356,7 @@ impl MemoryWatcher {
                     store.as_ref(),
                     &plans_dir,
                     &backlog_path,
+                    machine_dir.as_deref(),
                     &|_, _| {},
                 )
                 .await
@@ -366,18 +393,56 @@ impl MemoryWatcher {
     /// Whether a raw watcher event carries a memory-source change. Error
     /// events (watch overflow / errors) are treated as changes — better to
     /// re-scan than to miss one.
-    fn event_is_memory_source(ev: &notify::Result<notify::Event>, state_dir: &Path) -> bool {
+    fn event_is_memory_source(
+        ev: &notify::Result<notify::Event>,
+        state_dir: &Path,
+        machine_dir: Option<&Path>,
+    ) -> bool {
         match ev {
             Ok(event) => {
                 is_change_kind(&event.kind)
-                    && event
-                        .paths
-                        .iter()
-                        .any(|path| is_memory_source_path(path, state_dir))
+                    && event.paths.iter().any(|path| {
+                        is_memory_source_path(path, state_dir)
+                            || machine_dir.is_some_and(|dir| is_machine_source_path(path, dir))
+                    })
             }
             Err(_) => true,
         }
     }
+}
+
+/// Whether `path` is a MACHINE knowledge record — `<config dir>/knowledge/
+/// <type>/<file>.md` (plan d3336a8a step 8). Every project indexes that shared
+/// corpus, so a hand edit or another instance's write must trigger a live
+/// reconcile here too. The root itself, a bare type dir and a dotfile (an
+/// in-flight atomic-write temp) never count.
+fn is_machine_source_path(path: &Path, machine_dir: &Path) -> bool {
+    let relative = match path.strip_prefix(machine_dir) {
+        Ok(rel) => rel.to_path_buf(),
+        Err(_) => {
+            // FSEvents (macOS) delivers every symlink resolved — retry against
+            // the canonical root, exactly as `is_memory_source_path` does.
+            let Ok(canonical) = std::fs::canonicalize(machine_dir) else {
+                return false;
+            };
+            match path.strip_prefix(&canonical) {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => return false,
+            }
+        }
+    };
+    let parts: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let name = parts.last().map(String::as_str).unwrap_or_default();
+    !name.starts_with('.') && path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
 #[cfg(test)]
@@ -455,7 +520,7 @@ mod tests {
         let store = Arc::new(MemoryStore::open_in_memory(hash_embedder()).unwrap());
         let trait_store: Arc<dyn MemoryStoreTrait> = store.clone();
         let _watcher =
-            MemoryWatcher::spawn(trait_store, state_dir.clone(), Duration::from_millis(100))
+            MemoryWatcher::spawn(trait_store, state_dir.clone(), None, Duration::from_millis(100))
                 .expect("spawn memory watcher");
 
         let spec_dir = state_dir.join("openspec/specs/power-grid");
@@ -532,7 +597,7 @@ mod tests {
         let store = Arc::new(MemoryStore::open_in_memory(hash_embedder()).unwrap());
         let trait_store: Arc<dyn MemoryStoreTrait> = store.clone();
         let _watcher =
-            MemoryWatcher::spawn(trait_store, state_dir.clone(), Duration::from_millis(100))
+            MemoryWatcher::spawn(trait_store, state_dir.clone(), None, Duration::from_millis(100))
                 .expect("spawn memory watcher");
 
         std::fs::write(

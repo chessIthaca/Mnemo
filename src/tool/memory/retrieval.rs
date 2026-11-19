@@ -101,20 +101,37 @@ fn format_hit(sm: &crate::memory::ScoredMemory) -> String {
     // A knowledge record whose cited source paths the repo has moved past:
     // say so before the agent trusts the claim (the memory check pass stamps
     // `data.moved_paths`; plan 373dec00 step 5).
+    // A record indexed from the MACHINE knowledge corpus (`<config dir>/
+    // knowledge/`, plan d3336a8a step 8) holds for every project on the
+    // machine — label it so a project-specific claim is never confused with a
+    // shared one. Like the tags below it sits AFTER the pinned
+    // "(id/score/strength)" group, so the frontend parser still matches.
+    let machine = if is_machine_record(&sm.memory) {
+        " [machine]"
+    } else {
+        ""
+    };
     let moved = moved_paths_note(&sm.memory.data);
     format!(
-        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}{}{}{}\n  {}\n\n",
+        "[{}] {} (id: {}, score: {:.2}, strength: {:.2}){}{}{}{}{}\n  {}\n\n",
         sm.memory.tier,
         sm.memory.title,
         sm.memory.id,
         sm.score,
         sm.memory.strength,
+        machine,
         superseded,
         quarantined,
         unconfirmed,
         moved,
         sm.memory.content.chars().take(200).collect::<String>(),
     )
+}
+
+/// Whether a memory row came from the MACHINE knowledge corpus rather than
+/// this project's own (its derived-metadata `data.source` is `"machine"`).
+fn is_machine_record(m: &crate::memory::Memory) -> bool {
+    m.data.get("source").and_then(|v| v.as_str()) == Some(crate::memory::indexer::MACHINE_SOURCE)
 }
 
 /// Arguments for `memory_search` — the union of the six read tools it
@@ -275,13 +292,22 @@ impl Tool for MemorySearchTool {
                                 ""
                             };
                             let moved = moved_paths_note(&m.data);
+                            // A machine-corpus record (plan d3336a8a step 8)
+                            // leads the tags in browse too — same tag, same
+                            // place, whether searched or listed.
+                            let machine = if is_machine_record(m) {
+                                " [machine]"
+                            } else {
+                                ""
+                            };
                             out.push_str(&format!(
-                                "{}  {}  {}  {}  {}{}{}{}{}\n",
+                                "{}  {}  {}  {}  {}{}{}{}{}{}\n",
                                 m.id,
                                 m.tier,
                                 m.record_type,
                                 crate::tool::memory::format_epoch_date(m.created_at),
                                 m.title,
+                                machine,
                                 superseded,
                                 quarantined,
                                 unconfirmed,
@@ -678,5 +704,71 @@ mod tests {
             .await;
         assert!(hist.success, "{}", hist.output);
         assert!(hist.output.contains("[superseded]"), "{}", hist.output);
+    }
+
+    /// A record indexed from the MACHINE corpus (`data.source = "machine"`)
+    /// carries the `[machine]` label in search results, in browse, and in the
+    /// prompt's recalled block — so a claim that holds for every project on
+    /// the machine is never mistaken for this project's own (plan d3336a8a
+    /// step 8).
+    #[tokio::test]
+    async fn machine_record_carries_the_machine_label() {
+        let store = make_store();
+        let mut shared = Memory::new(
+            MemoryTier::Semantic,
+            "HOW: one embedding host per machine",
+            "every instance attaches to the same mnemo-models process",
+            1000,
+        );
+        shared.id = "machine-row".to_string();
+        shared.record_class = MemoryClass::Derived;
+        shared.data = json!({
+            "kind": "knowledge",
+            "rel_path": "how/2026-11-19-embedding-host.md",
+            "source": "machine",
+        });
+        store.write(shared).await.unwrap();
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                "HOW: this project builds",
+                "this project builds with cargo here",
+                1000,
+            ))
+            .await
+            .unwrap();
+
+        let labelled = "HOW: one embedding host per machine [machine]";
+        // Search output places the tag right after the pinned
+        // "(id/score/strength)" group, so the frontend parser still matches.
+        let searched = MemorySearchTool::new(store.clone())
+            .execute(json!({"query": "shared mnemo-models embedding host"}))
+            .await;
+        assert!(searched.success, "{}", searched.output);
+        assert!(searched.output.contains(") [machine]"), "{}", searched.output);
+
+        // Browse: the same tag right after the title.
+        let browsed = MemorySearchTool::new(store.clone())
+            .execute(json!({}))
+            .await;
+        assert!(browsed.success, "{}", browsed.output);
+        assert!(browsed.output.contains(labelled), "{}", browsed.output);
+        assert!(
+            !browsed.output.contains("HOW: this project builds [machine]"),
+            "a project row carries no machine label: {}",
+            browsed.output
+        );
+
+        // The prompt's recalled block renders the same tag.
+        let memory = store
+            .get_memory("machine-row")
+            .await
+            .unwrap()
+            .expect("machine row");
+        let block = crate::agent::prompt::format_recall_context(&[crate::memory::ScoredMemory {
+            memory,
+            score: 0.9,
+        }]);
+        assert!(block.contains(labelled), "{block}");
     }
 }

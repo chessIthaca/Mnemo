@@ -66,17 +66,28 @@ const PROBE_POLL: Duration = Duration::from_millis(10);
 static RESOLVED: LazyLock<RwLock<Option<Option<PathBuf>>>> =
     LazyLock::new(|| RwLock::new(None));
 
-/// The last build-cache server confirmation and when it was obtained.
-static SERVER: LazyLock<RwLock<Option<ServerCheck>>> =
-    LazyLock::new(|| RwLock::new(None));
-
-/// The outcome of the last build-cache server check and when it ran.
-struct ServerCheck {
-    /// Whether a server was confirmed up (and the wrapper may be handed out).
-    ok: bool,
-    /// When the check ran; an answer older than [`RECHECK_AFTER`] is stale.
-    at: Instant,
+/// The state of the shared build-cache server, as last confirmed.
+///
+/// `None` in the cell means "no answer yet"; the variants below are sticky in
+/// the direction that keeps the wrapper from flapping: [`ServerState::Up`]
+/// keeps answering "ok" while it re-validates, and [`ServerState::Down`] keeps
+/// answering "not ok" until a Settings read re-checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerState {
+    /// A check confirmed a server and when it last did.
+    Up {
+        /// When the confirming check ran; older than [`RECHECK_AFTER`] is
+        /// stale, but a stale "up" still answers "up" while it re-validates.
+        at: Instant,
+    },
+    /// A check reported no working server: the wrapper stays off until a
+    /// Settings read finds one.
+    Down,
 }
+
+/// The last build-cache server confirmation: `None` before the first check has
+/// landed, then the state it reported.
+static SERVER: LazyLock<RwLock<Option<ServerState>>> = LazyLock::new(|| RwLock::new(None));
 
 /// The cached `sccache` path, resolving it on first use.
 ///
@@ -86,13 +97,36 @@ pub fn current() -> Option<PathBuf> {
     cached(&RESOLVED, lookup, false)
 }
 
-/// Look `sccache` up on `PATH` right now and cache the answer.
+/// Look `sccache` up on `PATH` right now and cache the answer, and give a
+/// build cache that was switched off another chance.
 ///
 /// Called on every Settings read (`model_settings_get`), so a binary installed
-/// after startup shows up in the Machine page without an app restart.
+/// after startup shows up in the Machine page without an app restart. It is
+/// also the ONLY way back from [`ServerState::Down`]: a failed check turns the
+/// wrapper off for the rest of the process rather than flapping, and opening
+/// Settings re-probes the server (off the command path, in the background).
 pub fn refresh() -> Option<PathBuf> {
-    cached(&RESOLVED, lookup, true)
+    let found = cached(&RESOLVED, lookup, true);
+    if let Some(binary) = found.as_deref() {
+        if should_revalidate(&SERVER) {
+            start_refresh(binary);
+        }
+    }
+    found
 }
+
+/// Whether a Settings read should re-probe the server: only a sticky
+/// [`ServerState::Down`] needs it — `Up` re-validates itself in the background
+/// and `None` has not been checked yet.
+fn should_revalidate(state: &RwLock<Option<ServerState>>) -> bool {
+    matches!(
+        *state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        Some(ServerState::Down)
+    )
+}
+
 
 /// Look `sccache` up on `PATH` without touching the cache.
 ///
@@ -165,46 +199,58 @@ fn has_wrapper(inherited: Option<&OsStr>) -> bool {
     inherited.is_some_and(|value| !value.to_string_lossy().trim().is_empty())
 }
 
-/// The confirmed state of the shared build-cache server, refreshing it in the
+/// The confirmed state of the shared build-cache server, re-validated in the
 /// background when the cached answer has aged out.
 ///
-/// Never blocks the command path: an unknown or stale answer is `false` (this
-/// one command runs `rustc` directly) and a detached check runs off-thread, so
-/// the next command gets the wrapper. A running server therefore costs one
-/// helper per [`RECHECK_AFTER`] window per process and nothing on the commands
-/// themselves.
+/// Never blocks the command path and never flaps: once a check has confirmed a
+/// server, a stale "up" keeps answering "up" while the re-check runs, because
+/// `cargo` folds the wrapper into its fingerprints — a command that dropped the
+/// wrapper for one spawn would rebuild the whole target dir. Only a check that
+/// actually FAILS turns the wrapper off (and nothing but a Settings read turns
+/// it back on). The first command before any check runs unwrapped.
 pub fn ensure_server(binary: &Path) -> bool {
     server_ok(&SERVER, Instant::now(), || start_refresh(binary))
 }
 
-/// The cache core behind [`ensure_server`]: a fresh answer is served from the
-/// cache, otherwise `refresh` is asked to look again and this command is told
-/// "not confirmed" until that look lands.
+/// The cache core behind [`ensure_server`], with the clock and the refresh
+/// trigger injected so both edges are testable.
+///
+/// - no answer yet → ask for a check, answer "not confirmed" (that first
+///   command runs unwrapped);
+/// - a fresh or STALE "up" → answer "up"; a stale one also asks for a
+///   re-check, so the wrapper never disappears mid-session;
+/// - "down" → answer "not confirmed" without asking again: one real failure
+///   switches the cache off until a Settings read re-probes.
 fn server_ok(
-    state: &RwLock<Option<ServerCheck>>,
+    state: &RwLock<Option<ServerState>>,
     now: Instant,
     refresh: impl FnOnce(),
 ) -> bool {
-    if let Some((ok, at)) = state
+    let current = *state
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .map(|check| (check.ok, check.at))
-    {
-        if now.saturating_duration_since(at) < RECHECK_AFTER {
-            return ok;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match current {
+        Some(ServerState::Up { at }) => {
+            if now.saturating_duration_since(at) >= RECHECK_AFTER {
+                refresh();
+            }
+            true
+        }
+        Some(ServerState::Down) => false,
+        None => {
+            refresh();
+            false
         }
     }
-    refresh();
-    false
 }
 
 /// Refresh the confirmed server state on a background thread, one check at a
 /// time.
 ///
 /// The check starts the server from Mnemo — never from a command tree — and
-/// stores the answer, a failure included, so a broken cache is retried after
-/// the same window instead of on every command.
+/// stores the answer: [`ServerState::Up`] while it works, [`ServerState::Down`]
+/// once a check genuinely fails, so the wrapper is dropped exactly once and the
+/// cache then stays off instead of flapping.
 fn start_refresh(binary: &Path) {
     /// True while a background check runs, so a burst of commands runs one.
     static BUSY: AtomicBool = AtomicBool::new(false);
@@ -213,19 +259,20 @@ fn start_refresh(binary: &Path) {
     }
     let binary = binary.to_path_buf();
     std::thread::spawn(move || {
-        let ok = start_server(&binary);
-        if !ok {
+        let state = if start_server(&binary) {
+            ServerState::Up {
+                at: Instant::now(),
+            }
+        } else {
             eprintln!(
                 "warning: sccache is installed but no build server is running; \
                  RUSTC_WRAPPER left unset"
             );
-        }
+            ServerState::Down
+        };
         *SERVER
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ServerCheck {
-            ok,
-            at: Instant::now(),
-        });
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(state);
         BUSY.store(false, Ordering::Release);
     });
 }
@@ -417,29 +464,56 @@ mod server_tests {
         assert_eq!(chosen, None);
     }
 
-    /// A fresh answer is served from the cache; an unknown or stale one asks
-    /// for a background refresh, so that command is told "not confirmed".
+    /// An unknown state is "not confirmed", a fresh "up" is served from the
+    /// cache, and a STALE "up" keeps answering "up" while it re-validates.
     #[test]
-    fn a_fresh_answer_is_reused_and_a_stale_one_refreshes() {
+    fn a_stale_positive_answer_keeps_the_wrapper_while_it_revalidates() {
         let state = RwLock::new(None);
         let refreshes = Cell::new(0);
         let look = || refreshes.set(refreshes.get() + 1);
         let t0 = Instant::now();
         assert!(
             !server_ok(&state, t0, look),
-            "nothing is confirmed before the first check lands"
+            "no answer yet means the first command runs unwrapped"
         );
         assert_eq!(refreshes.get(), 1, "the first command starts a check");
-        *state.write().expect("state") = Some(ServerCheck { ok: true, at: t0 });
+        *state.write().expect("state") = Some(ServerState::Up { at: t0 });
         assert!(
             server_ok(&state, t0 + Duration::from_secs(30), look),
             "a fresh positive answer is served from the cache"
         );
         assert_eq!(refreshes.get(), 1, "a fresh answer does not re-check");
+        // Stale: still "up", so the wrapper never flaps; each stale call asks
+        // for a re-validation (the BUSY guard collapses them into one thread in
+        // production).
+        let mut calls = 0;
+        for step in 1..=5 {
+            let now = t0 + Duration::from_secs(60 * step + 1);
+            assert!(server_ok(&state, now, look), "a stale 'up' never flaps");
+            calls += 1;
+            assert_eq!(refreshes.get(), 1 + calls, "each stale call re-validates");
+        }
+    }
+
+    /// A check that actually fails drops the wrapper once and keeps it off — no
+    /// retry loop, no flapping — until a Settings read re-probes.
+    #[test]
+    fn a_failed_refresh_switches_the_wrapper_off_for_good() {
+        let state = RwLock::new(Some(ServerState::Down));
+        let refreshes = Cell::new(0);
+        let look = || refreshes.set(refreshes.get() + 1);
+        let t0 = Instant::now();
+        for step in 0..5 {
+            let now = t0 + Duration::from_secs(61 * step);
+            assert!(!server_ok(&state, now, look), "down stays down");
+        }
+        assert_eq!(refreshes.get(), 0, "a down cache is not re-probed per command");
+        assert!(should_revalidate(&state), "a Settings read is the way back");
+        *state.write().expect("state") = Some(ServerState::Up { at: t0 });
+        assert!(!should_revalidate(&state), "an up cache needs no Settings retry");
         assert!(
-            !server_ok(&state, t0 + Duration::from_secs(61), look),
-            "a stale answer is never trusted"
+            server_ok(&state, t0 + Duration::from_secs(1), look),
+            "a re-confirmed server hands the wrapper out again"
         );
-        assert_eq!(refreshes.get(), 2, "a stale answer is re-checked");
     }
 }

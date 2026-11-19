@@ -2997,6 +2997,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Changes a shell default only; no requirement of any OpenSpec capability is affected."
+    },
+    {
+      "id": "8283acc5",
+      "status": "open",
+      "created_at_ms": 1795131418064,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Version strings, lockfile versions and the CHANGELOG only; no behaviour changes."
     }
   ]
 }

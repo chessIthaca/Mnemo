@@ -459,6 +459,24 @@ impl McpManager {
         self.status.lock().await.clear();
     }
 
+    /// Test seam (review finding mcpSwapUnderLock): acquire the connections
+    /// mutex and park on `release` — exactly the shape of a first-use tool
+    /// call that holds it across initialize + list_tools for up to 300 s, the
+    /// stall the finding describes. Announces on `held` once the mutex is
+    /// held, so a test can prove a Settings save (or any other live-config
+    /// writer) never holds its locks across
+    /// [`Self::replace_servers`]'s wait on it.
+    #[cfg(test)]
+    pub(crate) async fn test_hold_connections(
+        &self,
+        held: &tokio::sync::Semaphore,
+        release: &tokio::sync::Semaphore,
+    ) {
+        let _guard = self.connections.lock().await;
+        held.add_permits(1);
+        let _ = release.acquire().await;
+    }
+
     /// The server definition for `name`, when configured AND enabled.
     fn def(&self, name: &str) -> Result<McpServerDef> {
         let guard = self.servers.read().expect("mcp server list lock poisoned");

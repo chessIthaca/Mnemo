@@ -1543,20 +1543,36 @@ impl Setup {
         // One live-config change at a time (see [`Setup::apply_lock`]): the
         // file write and the live config swap are one unit, so a concurrent
         // reload cannot interleave and leave an older set live.
-        let _apply = self.apply_lock.lock().await;
-        let global_path = self.config_dir.join("mcp.toml");
-        let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
-        let outcome =
-            crate::config::mcp::save_split(&global_path, project_path.as_deref(), servers)
-                .map_err(|e| {
-                    EngineError::start_failed(format!("saving the MCP servers failed: {e}"))
-                })?;
-        if let Some(live) = &self.live {
-            let mut config = live.config.lock().await;
-            config.mcp = outcome.global;
-            if let Some(manager) = live.factory.mcp_manager() {
-                manager.replace_servers(outcome.merged.clone()).await;
+        let (merged, manager) = {
+            let _apply = self.apply_lock.lock().await;
+            let global_path = self.config_dir.join("mcp.toml");
+            let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
+            let outcome =
+                crate::config::mcp::save_split(&global_path, project_path.as_deref(), servers)
+                    .map_err(|e| {
+                        EngineError::start_failed(format!(
+                            "saving the MCP servers failed: {e}"
+                        ))
+                    })?;
+            // The manager swap is deliberately OUTSIDE the apply lock and the
+            // shared-config guard (review finding mcpSwapUnderLock):
+            // replace_servers awaits the connections mutex, which a first-use
+            // tool call can hold across initialize + list_tools for up to
+            // 300 s — holding either guard across that would stall every
+            // Settings save, the watcher reload and every brain-config
+            // reader.
+            let mut manager = None;
+            if let Some(live) = &self.live {
+                let mut config = live.config.lock().await;
+                config.mcp = outcome.global;
+                manager = live.factory.mcp_manager();
             }
+            (outcome.merged, manager)
+            // Both guards drop here, at the end of the block — before the
+            // swap's await.
+        };
+        if let Some(manager) = manager {
+            manager.replace_servers(merged).await;
         }
         Ok(
             "saved — servers apply to agents built after this save (a restart always picks them \
@@ -2337,6 +2353,101 @@ mod tests {
         engine.shutdown().await.expect("shutdown");
     }
 
+    /// Review finding mcpSwapUnderLock: the manager swap can wait on the
+    /// connections mutex for a first-use tool call (up to 300 s across
+    /// initialize + list_tools), so the MCP save must not hold the
+    /// process-global apply lock — or the shared-config guard — across it:
+    /// a Settings save on another Setup completes while the swap is still
+    /// blocked.
+    #[tokio::test]
+    async fn an_mcp_save_does_not_stall_other_settings_saves() {
+        let (_root, cfg, engine) = ready_engine_with_mcp().await;
+        let saving = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let patching = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        // Hold the manager's connections mutex the way a first-use tool call
+        // does, on a gate — the exact wait replace_servers blocks on.
+        let manager = saving
+            .live
+            .as_ref()
+            .and_then(|live| live.factory.mcp_manager())
+            .expect("the fixture engine has an MCP manager");
+        let held = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let holder = {
+            let manager = Arc::clone(&manager);
+            let held = Arc::clone(&held);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                manager.test_hold_connections(&held, &release).await;
+            })
+        };
+        let _ = held.acquire().await; // the connections mutex is held
+
+        // The MCP save: its file write + live config swap complete, but the
+        // manager swap blocks on the connections mutex.
+        let save = {
+            let saving = saving.clone();
+            tokio::spawn(async move { saving.save_mcp_servers(None, vec![]).await })
+        };
+        // replace_servers swaps the server list BEFORE it awaits the
+        // connections mutex — the emptied list proves the save is parked
+        // inside the swap, not before it.
+        for _ in 0..50 {
+            if manager.servers().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            manager.servers().is_empty(),
+            "the save is parked inside the blocked manager swap"
+        );
+        assert!(!save.is_finished());
+
+        // A Settings save on another Setup completes WHILE the swap is
+        // blocked — the apply lock was released before the swap's await.
+        let patch = {
+            let patching = patching.clone();
+            tokio::spawn(async move {
+                patching
+                    .patch_settings(SettingsSaveDto {
+                        safety: Some("autonomous".to_string()),
+                        ..Default::default()
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), patch)
+            .await
+            .expect("a Settings save completes while the MCP swap is blocked")
+            .expect("patch task")
+            .expect("the patch applies");
+        // And a brain-config reader is not stalled either — the
+        // shared-config guard was released before the swap too.
+        let _guard = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.brain().config.lock(),
+        )
+        .await
+        .expect("the shared-config guard is free while the swap is blocked");
+        drop(_guard);
+
+        // Release the gate: the save completes with its message.
+        release.add_permits(1);
+        holder.await.expect("the holder task ends");
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), save)
+            .await
+            .expect("the MCP save completes once the gate opens")
+            .expect("save task")
+            .expect("the MCP save applies");
+        assert!(!message.is_empty());
+        engine.shutdown().await.expect("shutdown");
+    }
+
     /// Review finding seedAbsorbsEdit: an external edit that landed BEFORE
     /// this process's first own write must not be absorbed as an own save —
     /// the registry's never-written slots can never match disk, so the edit
@@ -2451,6 +2562,33 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cfg = tempfile::tempdir().unwrap();
         write_ready_config(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        (root, cfg, engine)
+    }
+
+    /// A ready engine over fresh temp dirs WITH one configured MCP server —
+    /// the brain wires a live `McpManager` (brain.rs:1138) so the save path
+    /// has a manager to swap. The server is never connected: the manager is
+    /// inert until a tool call first uses it, so the fixture is offline.
+    async fn ready_engine_with_mcp() -> (tempfile::TempDir, tempfile::TempDir, Engine) {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        std::fs::write(
+            cfg.path().join("mcp.toml"),
+            "[[server]]\nname = \"filesystem\"\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n",
+        )
+        .unwrap();
         let engine = Engine::start(EngineOptions {
             workspace: Workspace::new(root.path()),
             config_dir: Some(cfg.path().to_path_buf()),

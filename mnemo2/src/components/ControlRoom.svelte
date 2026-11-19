@@ -12,6 +12,7 @@
     selectedWorker,
   } from "../lib/store";
   import type { Worker, WorkerStatus } from "../lib/types";
+  import InstancesPanel from "./InstancesPanel.svelte";
   import WorkerDetail from "./WorkerDetail.svelte";
   import WorkerRow from "./WorkerRow.svelte";
 
@@ -126,6 +127,8 @@
       <button class="button button-quiet" title="Delete merged, cancelled, stopped, interrupted, and failed workers, plus finished audits, with their history" disabled={oldCount === 0 || $app.workerDeletion !== null} onclick={() => actions.requestDeleteOldWorkers()}><Trash2 size={11} /> Delete old ({oldCount})</button>
     </div>
   </header>
+
+  <InstancesPanel />
 
   <div class="control-layout" style={`--board-columns: ${boardColumns}`}>
     <aside class="worker-board" bind:this={boardEl} aria-label="Worker board">

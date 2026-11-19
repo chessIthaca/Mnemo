@@ -798,6 +798,27 @@ impl TeamRuntime {
         self.snapshot_known(&HashMap::new()).await
     }
 
+    /// How many workers are running and how many are blocked on the person,
+    /// counted from the records alone.
+    ///
+    /// [`TeamRuntime::snapshot`] clones every worker's transcript (and the
+    /// usage accumulator) for the same two numbers; the machine-wide
+    /// instances summary, which every viewing window polls every 10 s, must
+    /// not.
+    pub async fn activity_counts(&self) -> (usize, usize) {
+        let records = self.records.lock().await;
+        (
+            records
+                .iter()
+                .filter(|worker| worker.status.is_running())
+                .count(),
+            records
+                .iter()
+                .filter(|worker| worker.status.waiting_on_user())
+                .count(),
+        )
+    }
+
     /// The current team state, without the transcripts the caller holds.
     ///
     /// `known` maps a worker id to the transcript revision the caller already

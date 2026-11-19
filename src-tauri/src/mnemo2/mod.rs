@@ -104,6 +104,10 @@ pub mod git_view;
 /// The per-instance run file the `mnemo2-mcp` helper finds a live Mnemo2 by.
 pub mod run_file;
 
+/// The machine-wide instances overview: every running Mnemo2, its open
+/// project, its workers and today's cost, probed over the run files.
+pub mod instances;
+
 /// The Laya decision-model settings commands (status, setup, disable,
 /// save) — the backend of the Settings dialog's Laya page (plan
 /// e02de747).
@@ -812,6 +816,8 @@ pub fn run() {
             ipc::team_delete_preview,
             ipc::team_delete,
             ipc::team_messages,
+            ipc::instances_list,
+            ipc::instance_show,
             ipc::project_list,
             ipc::project_add,
             ipc::project_create,

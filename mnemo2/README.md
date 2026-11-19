@@ -227,6 +227,15 @@ only the app.
   instead of removing its folder. A branch that another worker record still
   uses (legacy ids sharing an 8-character prefix) is kept until its last record
   is deleted. The lead has no delete tool.
+- **Instances overview.** Mission Control lists every Mnemo2 window running on
+  this machine, this one included (marked "this window"): its open project, its
+  running and waiting workers, today's cost (the Cost tab's per-day figure) and
+  its version, refreshed every 10 seconds while the page is open. The rows come
+  from the run files under `~/.mnemo/run` (stale ones are pruned) plus each
+  instance's authenticated `POST /instance/summary`, asked in parallel with a
+  1.5-second timeout; a window that does not answer keeps its row and shows
+  "not answering". Clicking another window asks it to come forward through its
+  `POST /instance/show`. The bearer tokens never leave the app process.
 
 ## Native workbench and project lifecycle
 

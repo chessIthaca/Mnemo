@@ -14025,3 +14025,56 @@ async fn automatic_mutation_skips_a_test_only_change() {
     eventually(|| async { (mutate_calls.load(Ordering::SeqCst) == 1).then_some(()) }).await;
     team.shutdown().await;
 }
+
+/// The instances summary's counts-only accessor agrees with the snapshot
+/// counts it replaced, and it counts without cloning transcripts.
+#[tokio::test]
+async fn activity_counts_match_the_snapshot_counts() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    {
+        let mut records = team.records.lock().await;
+        for (index, status) in [
+            WorkerStatus::Working,
+            WorkerStatus::Dispatching,
+            WorkerStatus::Fixing,
+            WorkerStatus::Merging,
+            WorkerStatus::NeedsYou,
+            WorkerStatus::Conflict,
+            WorkerStatus::Idle,
+            WorkerStatus::Completed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = worker(root.path(), &format!("actcount{index:04}"));
+            record.status = status;
+            records.push(record);
+        }
+    }
+
+    let counts = team.activity_counts().await;
+    let snapshot = team.snapshot().await;
+    let from_snapshot = (
+        snapshot
+            .workers
+            .iter()
+            .filter(|worker| worker.status.is_running())
+            .count(),
+        snapshot
+            .workers
+            .iter()
+            .filter(|worker| worker.status.waiting_on_user())
+            .count(),
+    );
+    assert_eq!(counts, from_snapshot, "the accessor and the snapshot agree");
+    assert_eq!(
+        counts,
+        (4, 3),
+        "working, dispatching, fixing and merging run; needs-you, conflict and completed wait"
+    );
+    team.shutdown().await;
+}

@@ -42,6 +42,7 @@ use crate::mnemo2::mcp_server::{McpServer, OpenFailure};
 use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
 use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
+use crate::mnemo2::instances::{self, InstanceRow};
 use crate::mnemo2::laya_learnings::{self, LearningsOffer, LearningsSource};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
@@ -1536,6 +1537,29 @@ pub async fn settings_save_tiers(
         .map_err(|err| err.to_string())?;
     settings_refresh(runtime).await?;
     Ok(saved)
+}
+
+/// Every Mnemo2 instance running on this machine, this window included.
+///
+/// No project is needed: this is the machine-wide Mission Control instances
+/// overview, so it also answers on the start screen.
+#[tauri::command]
+pub async fn instances_list() -> Result<Vec<InstanceRow>, String> {
+    Ok(instances::list(&machine_config_dir(), std::process::id()).await)
+}
+
+/// Ask another running instance to bring its window to the front.
+///
+/// The run file's bearer token stays in this process; the window only names
+/// the pid.
+#[tauri::command]
+pub async fn instance_show(pid: u32) -> Result<(), String> {
+    instances::show(&machine_config_dir(), pid).await
+}
+
+/// The machine-wide config directory, which holds the `run` folder.
+fn machine_config_dir() -> PathBuf {
+    mnemo::config::resolve_config_dir(None)
 }
 
 #[cfg(test)]

@@ -38,14 +38,14 @@ pub mod watcher;
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::codegraph::extract::{extract_file, extract_file_with, ParserCache, RefKind};
+use crate::codegraph::extract::{extract_file, extract_file_with, ParserCache, RefKind, Symbol, SymbolKind};
 use crate::codegraph::query::GraphView;
 use crate::codegraph::store::{
     ContentHit, FileData, FileMeta, GraphStats, Store, UpsertEntry,
@@ -97,6 +97,10 @@ pub struct CodeGraph {
     indexing: AtomicBool,
     /// State for the background symbol-embed pass (plan d3336a8a step 9).
     symbol_embed: SymbolEmbedState,
+    /// The semantic code search snapshot (plan d3336a8a step 11): the
+    /// generation counter the vector/symbol writers bump, plus the loaded
+    /// in-memory index [`Self::symbol_search`] ranks against.
+    symbol_search: SymbolSearchState,
 }
 
 /// The embedder source a pass builds from (plan d3336a8a step 9).
@@ -170,6 +174,285 @@ impl Drop for CodeGraph {
     /// queue against a database whose engine is gone.
     fn drop(&mut self) {
         self.symbol_embed.stop.store(true, Ordering::Release);
+    }
+}
+
+// ====== Semantic code search snapshot (plan d3336a8a step 11) ======
+// `find_code` ranks symbols by meaning blended with text and name matches.
+// The vectors live in `cg_symbol_vec`; re-reading ~16k × 768 f32 rows per
+// query would cost more than the ranking itself, so one snapshot per
+// generation is held in memory and reloaded only when a writer says it moved.
+
+/// The semantic-search snapshot state (plan d3336a8a step 11): the
+/// generation counter the writers bump plus the loaded snapshot.
+pub(crate) struct SymbolSearchState {
+    /// Bumped whenever stored vectors or symbols change — the symbol-embed
+    /// pass storing a batch, an index pass re-parsing or pruning files. The
+    /// snapshot records the generation it was loaded at; a query that finds
+    /// a newer generation reloads it.
+    generation: Arc<AtomicU64>,
+    /// The loaded snapshot with the generation and model it was built for.
+    cached: Mutex<Option<(u64, String, Arc<SymbolSearchIndex>)>>,
+}
+
+impl Default for SymbolSearchState {
+    fn default() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+/// The in-memory snapshot `find_code` ranks against (plan d3336a8a step
+/// 11): every stored vector for one embedding model plus the symbol
+/// metadata and text rows the ranking and the output need. Loaded once per
+/// generation by [`CodeGraph::symbol_search`], on the blocking pool.
+pub(crate) struct SymbolSearchIndex {
+    /// Unit-normalised vectors keyed by symbol id, so cosine is a plain dot
+    /// product. Zero vectors are dropped — they carry no direction.
+    vectors: HashMap<String, Vec<f32>>,
+    /// Every stored symbol, in stable (id) order.
+    symbols: Vec<Symbol>,
+    /// Symbol id → index into `symbols`.
+    by_id: HashMap<String, usize>,
+    /// File → symbol indices ordered by `(start_line asc, end_line desc)`,
+    /// so an FTS hit's enclosing-symbol lookup is a short scan.
+    by_file: HashMap<String, Vec<usize>>,
+    /// Symbol id → `(signature, doc block)` from the stored text rows.
+    text: HashMap<String, (String, String)>,
+    /// Stored vector rows for the model (the progress note's N).
+    vector_rows: usize,
+    /// Stored symbol text rows (the progress note's M).
+    text_rows: usize,
+}
+
+impl SymbolSearchIndex {
+    /// Load the snapshot for `model`: one read per table, never on the
+    /// request path ([`CodeGraph::symbol_search`] runs it on the blocking
+    /// pool).
+    fn load(store: &Store, model: &str) -> Result<Self> {
+        let symbols = store.all_symbols()?;
+        let mut by_id = HashMap::with_capacity(symbols.len());
+        let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, sym) in symbols.iter().enumerate() {
+            by_id.insert(sym.id.clone(), i);
+            by_file.entry(sym.file.clone()).or_default().push(i);
+        }
+        for list in by_file.values_mut() {
+            list.sort_by(|a, b| {
+                let (x, y) = (&symbols[*a], &symbols[*b]);
+                x.start_line
+                    .cmp(&y.start_line)
+                    .then(y.end_line.cmp(&x.end_line))
+            });
+        }
+        let text: HashMap<String, (String, String)> = store
+            .all_symbol_texts()?
+            .into_iter()
+            .map(|t| (t.symbol_id, (t.signature, t.doc)))
+            .collect();
+        let text_rows = store.symbol_text_count()?;
+        let rows = store.all_symbol_vecs(model)?;
+        let vector_rows = rows.len();
+        let mut vectors = HashMap::with_capacity(rows.len());
+        for row in rows {
+            // A vector whose symbol vanished awaits a prune — it can never
+            // be rendered, so it never ranks.
+            if !by_id.contains_key(&row.symbol_id) {
+                continue;
+            }
+            let norm = row.vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm <= 1e-6 {
+                // A zero vector carries no direction — it cannot rank.
+                continue;
+            }
+            vectors.insert(
+                row.symbol_id,
+                row.vec.iter().map(|v| v / norm).collect::<Vec<f32>>(),
+            );
+        }
+        Ok(Self {
+            vectors,
+            symbols,
+            by_id,
+            by_file,
+            text,
+            vector_rows,
+            text_rows,
+        })
+    }
+
+    /// Stored vector rows for the model — the progress note's N.
+    pub(crate) fn vector_count(&self) -> usize {
+        self.vector_rows
+    }
+
+    /// Stored symbol text rows — the progress note's M.
+    pub(crate) fn symbol_count(&self) -> usize {
+        self.text_rows
+    }
+
+    /// Whether any vector can carry the cosine term.
+    pub(crate) fn has_vectors(&self) -> bool {
+        !self.vectors.is_empty()
+    }
+
+    /// The cached vectors as `(symbol id, unit-norm vector)` pairs.
+    pub(crate) fn vectors(&self) -> impl Iterator<Item = (&str, &[f32])> {
+        self.vectors
+            .iter()
+            .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+    }
+
+    /// One symbol by id, when it still exists.
+    pub(crate) fn symbol(&self, id: &str) -> Option<&Symbol> {
+        self.by_id.get(id).map(|i| &self.symbols[*i])
+    }
+
+    /// Every stored symbol, in stable (id) order — the name-match scan.
+    pub(crate) fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// The `(signature, doc block)` stored for a symbol, when it has a text
+    /// row.
+    pub(crate) fn text(&self, id: &str) -> Option<&(String, String)> {
+        self.text.get(id)
+    }
+
+    /// The innermost REAL symbol whose line range contains `line` in `file`
+    /// — how a content-index hit becomes a symbol (plan d3336a8a step 11).
+    /// Synthetic module symbols are skipped: a hit outside any real
+    /// definition has no useful symbol to name.
+    pub(crate) fn enclosing(&self, file: &str, line: usize) -> Option<&Symbol> {
+        let indices = self.by_file.get(file)?;
+        let span = |s: &Symbol| s.end_line.saturating_sub(s.start_line);
+        let mut best: Option<&Symbol> = None;
+        for &i in indices {
+            let sym = &self.symbols[i];
+            if sym.start_line > line || sym.end_line < line {
+                continue;
+            }
+            if matches!(sym.kind, SymbolKind::Module) {
+                continue;
+            }
+            best = match best {
+                Some(current)
+                    if span(sym) > span(current)
+                        || (span(sym) == span(current)
+                            && sym.start_line <= current.start_line) =>
+                {
+                    Some(current)
+                }
+                _ => Some(sym),
+            };
+        }
+        best
+    }
+}
+
+impl CodeGraph {
+    /// Invalidate the semantic-search snapshot (plan d3336a8a step 11):
+    /// called wherever stored vectors or symbols change. The next query
+    /// reloads; the stale snapshot still serves until then.
+    fn bump_symbol_search(&self) {
+        self.symbol_search.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The semantic-search snapshot for `model` (plan d3336a8a step 11):
+    /// the cached one while its generation and model still match, else a
+    /// fresh load. Blocking (a full read of the vector and symbol tables) —
+    /// call it from the blocking pool, never a tokio worker.
+    pub(crate) fn symbol_search(&self, model: &str) -> Result<Arc<SymbolSearchIndex>> {
+        let generation = self.symbol_search.generation.load(Ordering::Acquire);
+        let mut cached = self
+            .symbol_search
+            .cached
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some((loaded_at, loaded_model, index)) = cached.as_ref() {
+            if *loaded_at == generation && loaded_model == model {
+                return Ok(Arc::clone(index));
+            }
+        }
+        let index = Arc::new(SymbolSearchIndex::load(&self.store(), model)?);
+        *cached = Some((generation, model.to_string(), Arc::clone(&index)));
+        Ok(index)
+    }
+
+    /// The stored vector and text-row counts without loading the snapshot —
+    /// the `find_code` fallback note and the eval's progress probe.
+    pub(crate) fn symbol_search_counts(&self) -> Result<(usize, usize)> {
+        let store = self.store();
+        Ok((store.symbol_vec_count()?, store.symbol_text_count()?))
+    }
+
+    /// How many symbols still await a vector for `model` (plan d3336a8a
+    /// step 11) — the eval waits for the pass to drain on this.
+    #[cfg(test)]
+    pub(crate) fn symbol_embed_pending(&self, model: &str) -> Result<usize> {
+        Ok(self.store().pending_symbols(model, 1)?.len())
+    }
+
+    /// Content-index hits for a token set, best bm25 first (plan d3336a8a
+    /// step 11): the semantic code search's lexical term. One FTS query.
+    pub(crate) fn content_hits_any(
+        &self,
+        tokens: &[String],
+        limit: usize,
+    ) -> Result<Vec<ContentHit>> {
+        self.store().search_content_any(tokens, limit)
+    }
+
+    /// Test seam (plan d3336a8a step 11): store one symbol's vector row, so
+    /// a ranking test needs no embed pass.
+    #[cfg(test)]
+    pub(crate) fn store_symbol_vector_for_test(
+        &self,
+        model: &str,
+        symbol_id: &str,
+        vec: &[f32],
+    ) -> Result<()> {
+        let mut store = self.store();
+        let batch: Vec<_> = store
+            .pending_symbols(model, 4096)?
+            .into_iter()
+            .filter(|p| p.symbol_id == symbol_id)
+            .collect();
+        store.store_symbol_vecs(model, vec.len(), &batch, &[vec.to_vec()])?;
+        Ok(())
+    }
+}
+
+impl CodeGraph {
+    /// The code embedder a `find_code` query may use (plan d3336a8a step
+    /// 11): the process-global slot's cached good build — never a build,
+    /// never a wait. A miss starts the shared build in the background and
+    /// answers `None`, so the query falls back to text search instead of
+    /// blocking. `None` also when the graph was never armed (no code
+    /// embedding for this project).
+    #[cfg(feature = "embeddings")]
+    pub(crate) fn query_embedder(&self) -> Option<Arc<dyn crate::memory::embedder::Embedder>> {
+        match &self.symbol_embed.armed {
+            Some(ArmedEmbedder::Real {
+                cache_dir,
+                memory_model,
+            }) => code_embedder_slot::cached().or_else(|| {
+                code_embedder_slot::ensure_build(cache_dir, memory_model.as_deref());
+                None
+            }),
+            #[cfg(test)]
+            Some(ArmedEmbedder::Stub(embedder)) => Some(Arc::clone(embedder)),
+            None => None,
+        }
+    }
+
+    /// Light build (no `embeddings` feature): no code embedder exists, so
+    /// every `find_code` query answers from the text fallback.
+    #[cfg(not(feature = "embeddings"))]
+    pub(crate) fn query_embedder(&self) -> Option<Arc<dyn crate::memory::embedder::Embedder>> {
+        None
     }
 }
 
@@ -398,6 +681,7 @@ impl CodeGraph {
             store: Arc::new(Mutex::new(Store::open(db_path)?)),
             indexing: AtomicBool::new(false),
             symbol_embed: SymbolEmbedState::default(),
+            symbol_search: SymbolSearchState::default(),
         })
     }
 
@@ -408,6 +692,7 @@ impl CodeGraph {
             store: Arc::new(Mutex::new(Store::open_in_memory()?)),
             indexing: AtomicBool::new(false),
             symbol_embed: SymbolEmbedState::default(),
+            symbol_search: SymbolSearchState::default(),
         })
     }
 
@@ -716,6 +1001,11 @@ impl CodeGraph {
             stats.edges = s.edges;
         }
         stats.elapsed_ms = started.elapsed().as_millis() as u64;
+        if reindexed > 0 || stats.files_pruned > 0 {
+            // Semantic code search (step 11): the symbol and text rows
+            // moved — the in-memory query snapshot is stale.
+            self.bump_symbol_search();
+        }
         // The background symbol-embed pass (plan d3336a8a step 9): armed
         // graphs schedule it after every index pass — it embeds (or
         // lazily re-embeds) whatever is pending and exits when the queue
@@ -859,6 +1149,11 @@ impl CodeGraph {
         if touched_source || pruned {
             self.store().rebuild_edges()?;
         }
+        if touched_source || pruned {
+            // Semantic code search (step 11): re-parsed or pruned rows make
+            // the in-memory query snapshot stale.
+            self.bump_symbol_search();
+        }
         // Same step-9 scheduling as the index pass above: the inline
         // refresh changed text rows, so pending symbols are embedded.
         self.schedule_symbol_embed_pass();
@@ -894,12 +1189,24 @@ impl CodeGraph {
     /// The test seam (plan d3336a8a step 9): arm with a stub embedder —
     /// fixed dim, deterministic vectors — so pass tests never download a
     /// model or touch any host (the no-download rule). Generic over the
-    /// embedder so call sites pass their concrete stub Arcs.
+    /// embedder so call sites pass their concrete stub Arcs. `pub(crate)`
+    /// since step 11: the `find_code` ranking tests arm it too.
     #[cfg(all(test, feature = "embeddings"))]
-    fn arm_symbol_embedder_stub<E>(&mut self, embedder: Arc<E>)
+    pub(crate) fn arm_symbol_embedder_stub<E>(&mut self, embedder: Arc<E>)
     where
         E: crate::memory::embedder::Embedder + 'static,
     {
+        self.symbol_embed.armed = Some(ArmedEmbedder::Stub(embedder));
+    }
+
+    /// The test seam for an ALREADY-BUILT embedder (plan d3336a8a step 11):
+    /// the eval arms the real code model through it (the generic stub arm
+    /// needs a concrete type, the factory answers a trait object).
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn arm_symbol_embedder_dyn(
+        &mut self,
+        embedder: Arc<dyn crate::memory::embedder::Embedder>,
+    ) {
         self.symbol_embed.armed = Some(ArmedEmbedder::Stub(embedder));
     }
 
@@ -927,6 +1234,9 @@ impl CodeGraph {
         let stop = Arc::clone(&self.symbol_embed.stop);
         let running = Arc::clone(&self.symbol_embed.running);
         let store = Arc::clone(&self.store);
+        // Semantic code search (step 11): the pass announces stored vectors
+        // so an in-memory query snapshot reloads instead of ranking stale.
+        let generation = Arc::clone(&self.symbol_search.generation);
         let spawned = std::thread::Builder::new()
             .name("codegraph-symbol-embed".to_string())
             .spawn(move || {
@@ -935,7 +1245,7 @@ impl CodeGraph {
                 // single-flight flag stuck for the rest of the process —
                 // the guard clears it on scope exit, unwind or return.
                 let _running = RunningFlagGuard(Arc::clone(&running));
-                run_symbol_embed_pass(armed, store, Arc::clone(&stop));
+                run_symbol_embed_pass(armed, store, Arc::clone(&stop), generation);
             });
         if spawned.is_err() {
             // Resource exhaustion — best-effort pass, never fatal. Free
@@ -1441,6 +1751,7 @@ fn run_symbol_embed_pass(
     armed: ArmedEmbedder,
     store: Arc<Mutex<Store>>,
     stop: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
 ) {
     let embedder = match &armed {
         #[cfg(test)]
@@ -1541,7 +1852,12 @@ fn run_symbol_embed_pass(
                     code_embedder_slot::log_skip_once("a non-empty batch stored nothing");
                     break;
                 }
-                Ok(n) => stored += n,
+                Ok(n) => {
+                    stored += n;
+                    // Semantic code search (step 11): the new vectors are
+                    // rankable now — the query snapshot reloads.
+                    generation.fetch_add(1, Ordering::AcqRel);
+                }
                 Err(e) => {
                     eprintln!("codegraph: symbol-embed store failed: {e}");
                     break;
@@ -1588,6 +1904,10 @@ mod code_embedder_slot {
     static BUILDER: Mutex<Option<Build>> = Mutex::new(None);
     static SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
     static RETRY_WINDOW_SECS: AtomicU64 = AtomicU64::new(DEFAULT_RETRY_WINDOW_SECS);
+    /// True while a query started the shared build (plan d3336a8a step 11)
+    /// — dedupes those background builds, which the pass's own acquire
+    /// would otherwise run again.
+    static BUILDING: AtomicBool = AtomicBool::new(false);
 
     /// The retry window (10 minutes); tests shrink it via the injected
     /// interval.
@@ -1627,6 +1947,44 @@ mod code_embedder_slot {
         Some(embedder)
     }
 
+    /// The cached good build, WITHOUT building one (plan d3336a8a step 11)
+    /// — the instant path a `find_code` query uses. `None` when the slot is
+    /// empty or parked behind a retry gate.
+    pub(super) fn cached() -> Option<Arc<dyn Embedder>> {
+        let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        slot.embedder.as_ref().map(Arc::clone)
+    }
+
+    /// Start the shared build on its own thread and return at once (plan
+    /// d3336a8a step 11): a query that finds no cached embedder must never
+    /// wait for the tens-of-seconds build. One build at a time; a parked
+    /// retry gate is left alone (the pass retries it once the window
+    /// expires, a query does not).
+    pub(super) fn ensure_build(cache_dir: &Path, memory_model: Option<&str>) {
+        {
+            let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.embedder.is_some() || slot.retry_at.is_some() {
+                return;
+            }
+        }
+        if BUILDING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let cache_dir = cache_dir.to_path_buf();
+        let memory_model = memory_model.map(str::to_string);
+        let spawned = std::thread::Builder::new()
+            .name("codegraph-code-embedder".to_string())
+            .spawn(move || {
+                let _ = acquire(&cache_dir, memory_model.as_deref());
+                BUILDING.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            // Resource exhaustion — best-effort, never fatal; the pass
+            // builds on its own thread at the next index.
+            BUILDING.store(false, Ordering::Release);
+        }
+    }
+
     /// Log one skip reason per process (the step's "skip silently, one
     /// info line per process").
     pub(super) fn log_skip_once(reason: &str) {
@@ -1658,6 +2016,7 @@ mod code_embedder_slot {
             };
             *BUILDER.lock().unwrap_or_else(|p| p.into_inner()) = None;
             SKIP_LOGGED.store(false, Ordering::Relaxed);
+            BUILDING.store(false, Ordering::Relaxed);
             RETRY_WINDOW_SECS.store(DEFAULT_RETRY_WINDOW_SECS, Ordering::Relaxed);
         }
 
@@ -2679,6 +3038,7 @@ mod tests {
             armed,
             Arc::clone(&graph.store),
             Arc::clone(&graph.symbol_embed.stop),
+            Arc::clone(&graph.symbol_search.generation),
         );
     }
 

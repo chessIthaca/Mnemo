@@ -550,6 +550,7 @@ describe("SettingsDialog", () => {
       save: vi.fn(async () => undefined),
       install: vi.fn(async () => undefined),
       onEmbedderEvent: vi.fn(async () => () => {}),
+      hostStatus: vi.fn(async () => ({ running: false, port: null, models: [], windows: 0 })),
     };
     await openDialog();
     await fireEvent.click(screen.getByRole("button", { name: "Models" }));
@@ -685,6 +686,7 @@ describe("unsaved edits", () => {
       save: vi.fn(async () => undefined),
       install: vi.fn(async () => undefined),
       onEmbedderEvent: vi.fn(async () => () => {}),
+      hostStatus: vi.fn(async () => ({ running: false, port: null, models: [], windows: 0 })),
     };
   }
 

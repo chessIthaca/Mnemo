@@ -49,6 +49,12 @@ function makeTransport(settings: ModelSettings) {
     save: vi.fn(async (_section: ModelSettingsSection, _value: unknown) => undefined),
     install: vi.fn(async () => undefined),
     onEmbedderEvent: vi.fn(async () => () => {}),
+    hostStatus: vi.fn(async () => ({
+      running: true,
+      port: 8080,
+      models: ["all-MiniLM-L6-v2", "jina-embeddings-v2-base-code"],
+      windows: 1,
+    })),
   };
   return transport;
 }
@@ -113,6 +119,15 @@ describe("MachinePage", () => {
     page();
     expect(
       await screen.findByText("Shared Rust build cache: off; install it with cargo install sccache"),
+    ).toBeTruthy();
+  });
+
+  it("shows the shared model host's status", async () => {
+    page();
+    expect(
+      await screen.findByText(
+        "Shared model host: running on port 8080, serving all-MiniLM-L6-v2, jina-embeddings-v2-base-code, used by 1 window",
+      ),
     ).toBeTruthy();
   });
 });

@@ -2082,6 +2082,12 @@ impl AgentLoopFactory {
             registry.register(Box::new(GraphContextTool::new(graph.clone())));
             registry.register(Box::new(GraphImpactTool::new(graph.clone())));
             registry.register(Box::new(GraphPathTool::new(graph.clone())));
+            // Semantic code search (plan d3336a8a step 11): the
+            // meaning-first tool sits next to the name-first graph tools —
+            // it is registered only with a graph, like they are.
+            registry.register(Box::new(
+                crate::tool::agent::find_code::FindCodeTool::new(Some(graph.clone())),
+            ));
         }
     }
 

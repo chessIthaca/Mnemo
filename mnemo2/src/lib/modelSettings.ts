@@ -365,6 +365,29 @@ export interface ModelSettingsTransportBindings {
   listen: typeof listen;
 }
 
+/** The shared model host's status (plan d3336a8a step 11) — the Models and
+ * Machine pages both render its line. Never carries the bearer token. */
+export interface ModelsHostStatus {
+  /** Whether a live host holds the service record. */
+  running: boolean;
+  /** The port it serves on. */
+  port: number | null;
+  /** The models it serves. */
+  models: string[];
+  /** How many windows hold a live lease. */
+  windows: number;
+}
+
+/** The one line both settings pages show for the shared model host (plan
+ * d3336a8a step 11): where it runs and what it serves, or that every window
+ * loads its own copy. */
+export function modelsHostLine(status: ModelsHostStatus): string {
+  if (!status.running) return "Shared model host: not running; each window loads its own copy";
+  const models = status.models.length > 0 ? status.models.join(", ") : "no models yet";
+  const windows = status.windows === 1 ? "1 window" : `${status.windows} windows`;
+  return `Shared model host: running on port ${status.port ?? "?"}, serving ${models}, used by ${windows}`;
+}
+
 /** The IPC surface the Models and Savings pages need. */
 export interface ModelSettingsTransport {
   /** The full snapshot; sections the page does not save stay untouched. */
@@ -375,6 +398,8 @@ export interface ModelSettingsTransport {
   install(modelId: string): Promise<void>;
   /** Subscribe to install progress; resolves to the unsubscribe function. */
   onEmbedderEvent(handler: (event: EmbedderEvent) => void): Promise<UnlistenFn>;
+  /** The shared model host's status (run files; no token). */
+  hostStatus(): Promise<ModelsHostStatus>;
 }
 
 export function createTauriModelSettingsTransport(bindings: ModelSettingsTransportBindings): ModelSettingsTransport {
@@ -384,6 +409,7 @@ export function createTauriModelSettingsTransport(bindings: ModelSettingsTranspo
     install: (modelId) => bindings.invoke<void>("embedding_install", { modelId }),
     onEmbedderEvent: (handler) =>
       bindings.listen<EmbedderEvent>(EMBEDDER_EVENT_CHANNEL, (event) => handler(event.payload)),
+    hostStatus: () => bindings.invoke<ModelsHostStatus>("models_host_status"),
   };
 }
 

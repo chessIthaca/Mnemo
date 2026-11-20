@@ -48,6 +48,12 @@ function makeTransport(overrides: Partial<ModelSettingsTransport> = {}) {
     save: vi.fn(async (section: ModelSettingsSection, value: unknown) => undefined),
     install: vi.fn(async () => undefined),
     onEmbedderEvent: vi.fn(async () => () => {}),
+    hostStatus: vi.fn(async () => ({
+      running: false,
+      port: null,
+      models: [] as string[],
+      windows: 0,
+    })),
   };
   return { settings, transport: { ...base, ...overrides } as typeof base };
 }

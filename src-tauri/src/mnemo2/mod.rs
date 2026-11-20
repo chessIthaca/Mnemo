@@ -795,6 +795,7 @@ pub fn run() {
             model_settings::model_settings_get,
             model_settings::model_settings_save,
             model_settings::embedding_install,
+            model_settings::models_host_status,
             ipc::team_dispatch,
             ipc::team_audit_dispatch,
             ipc::team_message,

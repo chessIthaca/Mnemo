@@ -275,6 +275,8 @@ search for those.
 - search / search_read: FIRST choice for non-symbol text (literals, config \
 keys, comments) and FALLBACK when the graph comes up empty; when a hit \
 surfaces a symbol, switch to graph_context.
+- When you don't know a name yet, describe what you're looking for in words \
+with find_code; use search or graph_search once you have the name.
 - spawn_agent: parallel review/investigation; role:\"reviewer\" is read-only.
 - ask_user: a concrete choice between ≥2 options — never open-ended.
 - image_* tools: task-specific image analysis; image_analysis is the generic \
@@ -1135,8 +1137,10 @@ mod tests {
         // Bumped 2026-11-19 (plan 5b85ab61 step 3): the run_checks bullet —
         // run every project check in one call, and only the exact command from
         // the checkout root counts in `shell`.
+        // Bumped 2026-11-20 (plan d3336a8a step 11): the find_code bullet —
+        // describe what you look for in words before you know a name.
         const GOLDEN_HEAD: &str =
-            "len=13730|sha256=5e6084c3b152dccda5c3a40d04925119a16cba94799d08f6e4b06017ef4b6794";
+            "len=13873|sha256=3e37a6943fd9a1894f7260c634898d417298180803727b5f595ea5c507b8b477";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",

@@ -38,6 +38,8 @@ pub mod expand_result;
 pub mod file_append;
 pub mod file_edit;
 pub mod file_write;
+/// `find_code` — semantic code search (plan d3336a8a step 11).
+pub mod find_code;
 pub mod git;
 pub mod git_diff;
 pub mod git_read;

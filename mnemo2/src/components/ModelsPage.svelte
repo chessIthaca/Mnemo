@@ -8,7 +8,8 @@
   /**
    * The Models settings page: the model each kind of work uses beyond the
    * tiers (planning, executing, bug fixing, reviewing, summarize), the
-   * vision model, the code-indexing model with its download status, and
+   * vision model, the Embeddings section (the memory embedding model with its
+   * download status, the code-search model and the shared model host), and
    * the budget caps. Every section saves on its own button and only writes
    * its own config section; the engine reads the config on start, so a
    * change applies after reopening the project.

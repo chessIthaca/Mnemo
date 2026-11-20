@@ -695,7 +695,10 @@ fn spawn_embedder_forwarder(app: AppHandle, mut events: EventReceiver<SetupEvent
             }
         }
     });
-}/// The shared model host's status for the Settings pages (plan d3336a8a
+}
+
+/// The shared model host's status for the Settings pages (plan d3336a8a
+/// step 11). Both the Models page and the Machine page show the same line;
 /// step 11). Both the Models page and the Machine page show the same line;
 /// it comes from the run files, so it is a cheap read. The bearer token is
 /// never part of this shape.

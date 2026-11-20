@@ -30,6 +30,9 @@
 //!   `model` parameter)
 //! - `graph_search` / `graph_context` / `graph_impact` / `graph_path`
 //!   (read-only queries over the CodeGraph knowledge graph, when enabled)
+//! - `find_code` (finds code by what it does: embeds the words with the code
+//!   model and ranks symbols by meaning blended with text and name matches —
+//!   the meaning-first counterpart of `search`/`graph_search`)
 
 pub mod codegraph;
 pub mod convert_line_endings;

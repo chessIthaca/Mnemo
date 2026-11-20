@@ -1061,10 +1061,13 @@ impl Store {
     /// code search's lexical term needs the OR widening. Quoting each
     /// token keeps FTS5 syntax characters harmless.
     pub fn search_content_any(&self, tokens: &[String], limit: usize) -> Result<Vec<ContentHit>> {
+        // The length rule applies to the TOKEN, before quote-wrapping: a
+        // one-character token matches almost every line and only widens the
+        // OR into noise (review finding deadShortTokenFilter).
         let quoted: Vec<String> = tokens
             .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-            .filter(|t| t.len() > 2)
+            .filter(|token| token.chars().count() >= 2)
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect();
         if quoted.is_empty() {
             return Ok(Vec::new());

@@ -46,6 +46,7 @@ use serde_json::json;
 use crate::codegraph::store::ContentHit;
 use crate::codegraph::{CodeGraph, SymbolSearchIndex};
 use crate::error::Result;
+use crate::memory::embedder::EmbedderStatus;
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
@@ -409,14 +410,13 @@ impl Tool for FindCodeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "find_code",
-            "Finds code by MEANING: describe what it does in words (not its \
-             name) and get the symbols whose embeddings are closest, blended \
-             with text matches and name matches. Returns one line per symbol, \
-             `<file>:<start>-<end> <kind> <name> — <signature>`, plus the doc \
-             comment's first line. Use it BEFORE you know a name; once you \
-             have one, use search or graph_search (they are indexed lookups, \
-             this tool ranks every stored vector). While the code embeddings \
-             are still being built it says so and answers with text matches.",
+            "Find code by what it does. Describe the behaviour in words, not its \
+             name, and get the closest functions and types, one per line: \
+             `<file>:<start>-<end> <kind> <name> — <signature>`, with the first \
+             line of the doc comment below. Use it when you don't know a name \
+             yet; once you have one, search or graph_search are faster and \
+             exact. While code embeddings are still being built, it says so and \
+             returns text matches instead.",
             json!({
                 "type": "object",
                 "properties": {
@@ -459,15 +459,23 @@ impl Tool for FindCodeTool {
         // Never wait for the embedder: the shared build runs tens of seconds
         // and a query must not hold a worker for it (plan d3336a8a step 11).
         let Some(embedder) = graph.query_embedder() else {
-            let counts = graph.symbol_search_counts().unwrap_or((0, 0));
-            return find_code_fallback(&graph, &query, limit, counts);
+            return find_code_fallback(&graph, &query, limit, None).await;
         };
+        // The embed pass refuses a degraded embedder's vectors; a query must
+        // do the same — a Failed embedder answers hash-fallback vectors, and
+        // ranking the query against those would be junk cosines.
+        if matches!(embedder.status(), Some(EmbedderStatus::Failed)) {
+            return find_code_fallback(&graph, &query, limit, None).await;
+        }
         let vector = embedder.embed(&query).await;
-        if vector.is_empty() || vector.iter().all(|value| *value == 0.0) {
-            // The embedder trait's failure contract: a zero vector carries no
-            // direction, so ranking it would be noise. Answer from text.
-            let counts = graph.symbol_search_counts().unwrap_or((0, 0));
-            return find_code_fallback(&graph, &query, limit, counts);
+        // Checked AGAIN after the call: the remote embedder flips to Failed
+        // when its request fails, and the hash fallback it returns then is not
+        // the model's vector. A zero vector carries no direction either.
+        if matches!(embedder.status(), Some(EmbedderStatus::Failed))
+            || vector.is_empty()
+            || vector.iter().all(|value| *value == 0.0)
+        {
+            return find_code_fallback(&graph, &query, limit, None).await;
         }
 
         let model = embedder.model_id().to_string();
@@ -501,7 +509,7 @@ impl Tool for FindCodeTool {
                 }
             }
             Ok(Ok(Prepared::NoVectors(counts))) => {
-                find_code_fallback(&graph, &query, limit, counts)
+                find_code_fallback(&graph, &query, limit, Some(counts)).await
             }
             Ok(Err(e)) => ToolResult::error(format!("find_code could not read the code index: {e}")),
             Err(e) => ToolResult::error(format!("find_code's ranking task failed: {e}")),
@@ -514,16 +522,34 @@ impl Tool for FindCodeTool {
 ///
 /// The note is the step's `code embeddings are still being built (N of M
 /// symbols)` while N < M; with every symbol embedded the embedder itself is
-/// the missing piece (the shared host is starting, or a failed build sits in
-/// its retry window) and the note says so; an index with no embeddable
-/// symbol yet says that instead.
-fn find_code_fallback(
-    graph: &CodeGraph,
+/// the missing piece (the shared host is starting, degraded, or a failed
+/// build sits in its retry window) and the note says so; an index with no
+/// embeddable symbol yet says that instead. `counts` carries numbers the
+/// ranked path already read; `None` reads them here.
+///
+/// Both reads are SQLite and run on the blocking pool like the ranked path —
+/// a tokio worker never touches the store here.
+async fn find_code_fallback(
+    graph: &Arc<CodeGraph>,
     query: &str,
     limit: usize,
-    counts: (usize, usize),
+    counts: Option<(usize, usize)>,
 ) -> ToolResult {
-    let (embedded, total) = counts;
+    let tokens = query_tokens(query);
+    let graph_for_task = Arc::clone(graph);
+    let read = tokio::task::spawn_blocking(move || -> ((usize, usize), Vec<ContentHit>) {
+        let counts =
+            counts.unwrap_or_else(|| graph_for_task.symbol_search_counts().unwrap_or((0, 0)));
+        let hits = graph_for_task
+            .content_hits_any(&tokens, limit)
+            .unwrap_or_default();
+        (counts, hits)
+    })
+    .await;
+    let ((embedded, total), hits) = match read {
+        Ok(read) => read,
+        Err(e) => return ToolResult::error(format!("find_code's text search task failed: {e}")),
+    };
     let mut out = if total == 0 {
         "the code index has no embeddable symbols yet".to_string()
     } else if embedded < total {
@@ -531,8 +557,6 @@ fn find_code_fallback(
     } else {
         "the code embedder is not ready; showing text matches instead".to_string()
     };
-    let tokens = query_tokens(query);
-    let hits = graph.content_hits_any(&tokens, limit).unwrap_or_default();
     if hits.is_empty() {
         out.push_str("\nno text matches either — try different words, or `search` for a literal");
     } else {
@@ -734,11 +758,107 @@ pub fn stale_edit_gate(read_hash: &str) -> bool { !read_hash.is_empty() }
 
     #[tokio::test]
     async fn limit_defaults_to_eight_and_caps_at_twenty() {
+        let mut body = String::new();
+        for i in 0..30 {
+            body.push_str(&format!("pub fn handler_{i:02}() -> u32 {{ {i} }}\n"));
+        }
+        let (_dir, mut graph) = graph_with(&[("src/many.rs", &body)]);
+        graph.arm_symbol_embedder_stub(FixedEmbedder::new(vec![1.0, 0.0, 0.0, 0.0]));
+        let first = symbol_id(&graph, "handler_00");
+        graph
+            .store_symbol_vector_for_test(CODE_EMBEDDING_MODEL, &first, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let tool = FindCodeTool::new(Some(Arc::new(graph)));
+        let count = |out: &str| out.lines().filter(|l| !l.starts_with(' ')).count();
+        let default = tool.execute(json!({"query": "handler"})).await;
+        assert_eq!(count(&default.output), 8, "{}", default.output);
+        let capped = tool.execute(json!({"query": "handler", "limit": 50})).await;
+        assert_eq!(count(&capped.output), 20, "{}", capped.output);
+        let one = tool.execute(json!({"query": "handler", "limit": 1})).await;
+        assert_eq!(count(&one.output), 1, "{}", one.output);
+    }
+
+    #[tokio::test]
+    async fn a_missing_graph_explains_itself() {
         let tool = FindCodeTool::new(None);
         let result = tool.execute(json!({"query": "anything", "limit": 99})).await;
         // No graph: the tool explains itself instead of panicking.
         assert!(!result.success);
         assert!(result.output.contains("code graph"), "{}", result.output);
+    }
+
+    /// A generation bump must make the NEXT query reload the snapshot: each
+    /// writer path renames or adds symbols and the tool must then read the new
+    /// state, so deleting `bump_symbol_search` (or a call site) turns this red.
+    #[tokio::test]
+    async fn every_symbol_writer_makes_the_next_query_reload() {
+        let (dir, mut graph) = graph_with(&[("src/lib.rs", "pub fn alpha_one() -> u32 { 1 }\n")]);
+        graph.arm_symbol_embedder_stub(FixedEmbedder::new(vec![1.0, 0.0, 0.0, 0.0]));
+        let alpha = symbol_id(&graph, "alpha_one");
+        graph
+            .store_symbol_vector_for_test(CODE_EMBEDDING_MODEL, &alpha, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let graph = Arc::new(graph);
+        let tool = FindCodeTool::new(Some(Arc::clone(&graph)));
+        let store_vector = |name: &str| {
+            let id = symbol_id(&graph, name);
+            graph
+                .store_symbol_vector_for_test(CODE_EMBEDDING_MODEL, &id, &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+        };
+        let first = tool.execute(json!({"query": "alpha_one"})).await;
+        assert!(first.output.contains("alpha_one"), "{}", first.output);
+
+        // reindex_stale_files: the function is renamed on disk.
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn beta_two() -> u32 { 2 }\n").unwrap();
+        graph
+            .reindex_stale_files(
+                &["src/lib.rs".to_string()],
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        store_vector("beta_two");
+        let second = tool.execute(json!({"query": "beta_two"})).await;
+        assert!(
+            second.output.contains("beta_two"),
+            "a re-parsed file must invalidate the snapshot: {}",
+            second.output
+        );
+        assert!(
+            !second.output.contains("alpha_one"),
+            "the vanished symbol must not be served: {}",
+            second.output
+        );
+
+        // reindex_files_containing: a new file the containment pass adopts.
+        std::fs::write(
+            dir.path().join("src/gamma.rs"),
+            "pub fn gamma_three() -> u32 { 3 }\n",
+        )
+        .unwrap();
+        graph.reindex_files_containing("gamma_three").unwrap();
+        store_vector("gamma_three");
+        let third = tool.execute(json!({"query": "gamma_three"})).await;
+        assert!(
+            third.output.contains("gamma_three"),
+            "the containment pass must invalidate the snapshot: {}",
+            third.output
+        );
+
+        // index: the full walk adopts another new file.
+        std::fs::write(
+            dir.path().join("src/delta.rs"),
+            "pub fn delta_four() -> u32 { 4 }\n",
+        )
+        .unwrap();
+        graph.index(None).unwrap();
+        store_vector("delta_four");
+        let fourth = tool.execute(json!({"query": "delta_four"})).await;
+        assert!(
+            fourth.output.contains("delta_four"),
+            "an index pass must invalidate the snapshot: {}",
+            fourth.output
+        );
     }
 }
 
@@ -974,6 +1094,85 @@ mod eval {
         println!(
             "cosine scan over {COUNT} x {DIMS}: {:?} (best {best:.4})",
             started.elapsed()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+mod degraded_embedder_tests {
+    use super::*;
+    use crate::memory::embedder::{Embedder, EmbedderStatus, CODE_EMBEDDING_MODEL};
+
+    /// A degraded stub: `Failed` status with the remote embedder's
+    /// hash-fallback shape (non-zero vectors that are NOT the model's).
+    struct FailingEmbedder {
+        model: String,
+    }
+
+    #[async_trait]
+    impl Embedder for FailingEmbedder {
+        async fn embed(&self, _text: &str) -> Vec<f32> {
+            vec![0.5, 0.5, 0.5, 0.5]
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model
+        }
+
+        fn dim(&self) -> usize {
+            4
+        }
+
+        fn status(&self) -> Option<EmbedderStatus> {
+            Some(EmbedderStatus::Failed)
+        }
+    }
+
+    /// A one-file graph with the degraded embedder armed and one real vector
+    /// stored — the ranked path WOULD apply if the status check let it.
+    fn degraded_graph() -> Arc<CodeGraph> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "/// Adds one to the counter.\npub fn bump_counter(v: u32) -> u32 { v + 1 }\n",
+        )
+        .unwrap();
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embedder_stub(Arc::new(FailingEmbedder {
+            model: CODE_EMBEDDING_MODEL.to_string(),
+        }));
+        let bump = graph
+            .view()
+            .unwrap()
+            .resolve("bump_counter")
+            .first()
+            .map(|symbol| symbol.id.clone())
+            .expect("fixture symbol");
+        graph
+            .store_symbol_vector_for_test(CODE_EMBEDDING_MODEL, &bump, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        Arc::new(graph)
+    }
+
+    #[tokio::test]
+    async fn a_degraded_embedder_falls_back_instead_of_ranking_junk() {
+        let tool = FindCodeTool::new(Some(degraded_graph()));
+        let result = tool
+            .execute(json!({"query": "adds one to the counter"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains("function bump_counter"),
+            "a Failed embedder must not rank: {}",
+            result.output
+        );
+        assert!(
+            result.output.starts_with("code embeddings are still being built")
+                || result.output.starts_with("the code embedder is not ready"),
+            "the fallback note leads: {}",
+            result.output
         );
     }
 }

@@ -1387,6 +1387,17 @@ impl CodeGraph {
         if touched_source {
             self.store().rebuild_edges()?;
         }
+        if touched_source {
+            // Semantic code search (step 11): re-parsed rows make the
+            // in-memory query snapshot stale — it would serve vanished ids
+            // and old line ranges, and the new text rows need vectors. Same
+            // two calls as `index` / `reindex_stale_files`, made after the
+            // store lock is released.
+            self.bump_symbol_search();
+        }
+        // Same step-9 scheduling as the index pass: the refresh changed text
+        // rows, so pending symbols are embedded.
+        self.schedule_symbol_embed_pass();
         Ok(ReindexOutcome {
             matched,
             matched_unparsed,

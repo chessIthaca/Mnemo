@@ -32,7 +32,7 @@ export interface TaskModels {
   summarize: string | null;
 }
 
-/** One selectable code-indexing model. */
+/** One selectable memory-embedding model (the Embeddings section). */
 export interface EmbeddingOption {
   id: string;
   label: string;

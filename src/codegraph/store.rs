@@ -169,6 +169,20 @@ pub struct SymbolVec {
     pub text_hash: String,
 }
 
+/// One symbol's embeddable text row — the `cg_symbol_text` row (plan
+/// d3336a8a step 9), as the semantic code search reads it for display and
+/// ranking (plan d3336a8a step 11).
+#[derive(Debug, Clone)]
+pub struct SymbolText {
+    /// The symbol id (the row key).
+    pub symbol_id: String,
+    /// The stored signature line.
+    pub signature: String,
+    /// The stored doc-comment block (may span lines; callers take the
+    /// first line).
+    pub doc: String,
+}
+
 /// The graph store. Not `Sync` — wrap in a `Mutex` for shared access (the
 /// `CodeGraph` facade in `mod.rs` does exactly that, mirroring `MemoryStore`).
 pub struct Store {
@@ -973,6 +987,115 @@ impl Store {
             out.push(row?);
         }
         Ok(out.into_iter().next())
+    }
+
+    /// Every stored symbol vector for `model` (plan d3336a8a step 11) —
+    /// the semantic code search's cosine term, loaded in ONE query and
+    /// kept in memory by [`crate::codegraph::SymbolSearchIndex`]. Rows
+    /// of another model are skipped: they are pending a re-embed, and
+    /// ranking against them would mix vector spaces.
+    pub fn all_symbol_vecs(&self, model: &str) -> Result<Vec<SymbolVec>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol_id, model, dim, vec, text_hash
+             FROM cg_symbol_vec WHERE model = ?1 ORDER BY symbol_id",
+        )?;
+        let rows = stmt.query_map(params![model], |r| {
+            let dim: i64 = r.get(2)?;
+            let blob: Vec<u8> = r.get(3)?;
+            let vec: Vec<f32> = blob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            Ok(SymbolVec {
+                symbol_id: r.get(0)?,
+                model: r.get(1)?,
+                dim: dim as usize,
+                vec,
+                text_hash: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// How many symbol TEXT rows are stored — the "N of M symbols"
+    /// denominator of the semantic search's progress note (plan
+    /// d3336a8a step 11): the symbols the code model can embed.
+    pub fn symbol_text_count(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM cg_symbol_text", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Every stored symbol text row, in stable (id) order — the display
+    /// text (signature, doc comment) the semantic code search renders,
+    /// loaded once with the vector cache (plan d3336a8a step 11).
+    pub fn all_symbol_texts(&self) -> Result<Vec<SymbolText>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT symbol_id, signature, doc FROM cg_symbol_text ORDER BY symbol_id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SymbolText {
+                symbol_id: r.get(0)?,
+                signature: r.get(1)?,
+                doc: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// FTS content hits for a TOKEN SET (plan d3336a8a step 11): every
+    /// line matching ANY token, best bm25 first. The plain
+    /// [`Self::search_content`] quotes the whole input as one phrase,
+    /// which a natural-language question never matches; the semantic
+    /// code search's lexical term needs the OR widening. Quoting each
+    /// token keeps FTS5 syntax characters harmless.
+    pub fn search_content_any(&self, tokens: &[String], limit: usize) -> Result<Vec<ContentHit>> {
+        // The length rule applies to the TOKEN, before quote-wrapping: a
+        // one-character token matches almost every line and only widens the
+        // OR into noise (review finding deadShortTokenFilter).
+        let quoted: Vec<String> = tokens
+            .iter()
+            .filter(|token| token.chars().count() >= 2)
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect();
+        if quoted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = quoted.join(" OR ");
+        let mut stmt = self.conn.prepare(
+            "SELECT path, line, text, rank FROM cg_content
+             WHERE cg_content MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, line, text, rank) = row?;
+            out.push(ContentHit {
+                path,
+                line: line as usize,
+                text,
+                rank,
+            });
+        }
+        Ok(out)
     }
 
     /// Test seam (plan d3336a8a step 9): stamp every stored vector row

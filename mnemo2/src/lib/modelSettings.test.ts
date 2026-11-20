@@ -8,6 +8,7 @@ import {
   createTauriModelSettingsTransport,
   isValidModelRef,
   modelRefOptions,
+  modelsHostLine,
   optimizerDraft,
   optimizerWire,
   parseWholeNumber,
@@ -92,11 +93,33 @@ describe("modelSettings", () => {
     await transport.install("all-MiniLM-L6-v2");
     expect(invoke).toHaveBeenLastCalledWith("embedding_install", { modelId: "all-MiniLM-L6-v2" });
 
+    await transport.hostStatus();
+    expect(invoke).toHaveBeenLastCalledWith("models_host_status");
+
     const seen: EmbedderEvent[] = [];
     await transport.onEmbedderEvent((event) => seen.push(event));
     expect(listen.mock.calls[0][0]).toBe(EMBEDDER_EVENT_CHANNEL);
     channelHandler!({ payload: { type: "progress", step: "embedder_model", label: "Fetching", fraction: 0.5 } });
     expect(seen).toEqual([{ type: "progress", step: "embedder_model", label: "Fetching", fraction: 0.5 }]);
+  });
+
+  it("word the shared model host line for running and absent hosts", () => {
+    expect(
+      modelsHostLine({
+        running: true,
+        port: 8123,
+        models: ["all-MiniLM-L6-v2", "jina-embeddings-v2-base-code"],
+        windows: 2,
+      }),
+    ).toBe(
+      "Shared model host: running on port 8123, serving all-MiniLM-L6-v2, jina-embeddings-v2-base-code, used by 2 windows",
+    );
+    expect(modelsHostLine({ running: true, port: 8123, models: [], windows: 1 })).toBe(
+      "Shared model host: running on port 8123, serving no models yet, used by 1 window",
+    );
+    expect(modelsHostLine({ running: false, port: null, models: [], windows: 0 })).toBe(
+      "Shared model host: not running; each window loads its own copy",
+    );
   });
 
   it("validates model references", () => {

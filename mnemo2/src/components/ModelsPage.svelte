@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Download } from "@lucide/svelte";
-  import { EMBEDDING_KEYWORD_ID, EMBEDDING_STATUS_META, budgetDraft, budgetWire, isValidModelRef, modelRefOptions, type BudgetDraft, type EmbeddingSection, type ModelSettingsTransport, type TaskModels } from "../lib/modelSettings";
+  import { EMBEDDING_KEYWORD_ID, EMBEDDING_STATUS_META, budgetDraft, budgetWire, isValidModelRef, modelRefOptions, modelsHostLine, type BudgetDraft, type EmbeddingSection, type ModelSettingsTransport, type ModelsHostStatus, type TaskModels } from "../lib/modelSettings";
   import type { EndpointDetailDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import { trackUnsaved } from "../lib/unsavedEdits";
@@ -8,7 +8,8 @@
   /**
    * The Models settings page: the model each kind of work uses beyond the
    * tiers (planning, executing, bug fixing, reviewing, summarize), the
-   * vision model, the code-indexing model with its download status, and
+   * vision model, the Embeddings section (the memory embedding model with its
+   * download status, the code-search model and the shared model host), and
    * the budget caps. Every section saves on its own button and only writes
    * its own config section; the engine reads the config on start, so a
    * change applies after reopening the project.
@@ -23,6 +24,9 @@
 
   /** The embedder section of the snapshot: live status plus the catalog. */
   let embedder = $state<EmbeddingSection | null>(null);
+  /** The shared model host's status (plan d3336a8a step 11) — one line for
+   * both embedding models; `null` until the first read returns. */
+  let host = $state<ModelsHostStatus | null>(null);
   let loadError = $state("");
 
   let compaction = $state({ draft: emptyCompaction(), original: emptyCompaction(), saving: false, error: "", saved: false });
@@ -80,6 +84,21 @@
       .catch((failure) => {
         if (!cancelled) loadError = errorText(failure);
       });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** The shared host line (plan d3336a8a step 11): a separate, cheap read —
+   * a failure just leaves the line out. */
+  $effect(() => {
+    let cancelled = false;
+    transport
+      .hostStatus()
+      .then((status) => {
+        if (!cancelled) host = status;
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
@@ -322,14 +341,20 @@
         </div>
       </section>
 
-      <section class="group" aria-label="Code indexing">
+      <section class="group" aria-label="Embeddings">
         <header>
-          <h3>Code indexing</h3>
+          <h3>Embeddings</h3>
           <p class="micro">
-            The model that embeds your code for recall. "Keyword only" skips the model and matches on keywords instead.
+            Memory model: finds related memory by meaning — specs, decisions, bugs and HOW records, plan, review and backlog summaries; also matches routing and failure-triage examples.
           </p>
+          <p class="micro">
+            Code-search model: jina-embeddings-v2-base-code — finds code by meaning for find_code.
+          </p>
+          {#if host}
+            <p class="micro host-line">{modelsHostLine(host)}</p>
+          {/if}
         </header>
-        <div class="embed-list" role="radiogroup" aria-label="Code indexing model">
+        <div class="embed-list" role="radiogroup" aria-label="Memory embedding model">
           {#each embedder.options as option (option.id)}
             <label class="embed-option">
               <input type="radio" name="code-indexing-model" value={option.id} bind:group={index.draft} />
@@ -370,7 +395,7 @@
           <div class="section-buttons">
             <button class="button button-quiet" disabled={index.saving || !indexDirty} onclick={discardIndex}>Discard</button>
             <button class="button button-primary" disabled={index.saving || !indexDirty} onclick={saveIndex}>
-              {index.saving ? "Saving…" : "Save indexing"}
+              {index.saving ? "Saving…" : "Save embeddings"}
             </button>
           </div>
         </div>

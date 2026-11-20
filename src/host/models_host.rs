@@ -87,6 +87,43 @@ pub const HOST_BINARY_ENV: &str = "MNEMO_MODELS_EXE";
 /// Poll between health probes inside one probe budget.
 const PROBE_POLL: Duration = Duration::from_millis(250);
 
+/// The shared host's status as the Settings pages show it (plan d3336a8a
+/// step 11) — read from the run files, never from the host itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostStatus {
+    /// Whether a live host holds the service record.
+    pub running: bool,
+    /// The port it serves on.
+    pub port: Option<u16>,
+    /// The models it serves.
+    pub models: Vec<String>,
+    /// How many windows hold a live lease.
+    pub windows: usize,
+}
+
+/// Read the shared host's status from `~/.mnemo/run/models/` (plan d3336a8a
+/// step 11): the service record and the live leases, pruning dead leases on
+/// the way. A record whose process is gone reads as NOT running — a crash
+/// leaves the file behind. The bearer token never leaves this function.
+pub fn status(config_dir: &Path) -> HostStatus {
+    let dir = shared_service::service_dir(config_dir, SERVICE_NAME);
+    let windows = shared_service::live_leases(&dir).len();
+    match shared_service::read_service(&dir) {
+        Some(info) if crate::process_tree::pid_alive(info.pid) => HostStatus {
+            running: true,
+            port: Some(info.port),
+            models: info.models,
+            windows,
+        },
+        _ => HostStatus {
+            running: false,
+            port: None,
+            models: Vec::new(),
+            windows,
+        },
+    }
+}
+
 /// Connect/read timeout of one health probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1053,6 +1090,64 @@ pub fn spawn_test_host(config_dir: &Path, models: &[&str], idle: Duration) -> (u
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// `status` reads the service record plus the live leases, and reports a
+    /// record whose process is gone as not running (plan d3336a8a step 11).
+    #[test]
+    fn status_reports_the_record_and_its_live_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle = status(dir.path());
+        assert!(!idle.running, "no record means no host");
+        assert_eq!(idle.port, None);
+        assert!(idle.models.is_empty());
+        assert_eq!(idle.windows, 0);
+
+        let service = crate::host::shared_service::service_dir(dir.path(), SERVICE_NAME);
+        let record = crate::host::shared_service::ServiceInfo {
+            pid: std::process::id(),
+            port: 8137,
+            token: "never-shown-on-any-page".to_string(),
+            version: "test".to_string(),
+            started_ms: 0,
+            created: String::new(),
+            models: vec![
+                "bge-base-en-v1.5".to_string(),
+                "jina-embeddings-v2-base-code".to_string(),
+            ],
+        };
+        crate::host::shared_service::write_service(&service, &record).unwrap();
+        let lease = crate::host::shared_service::take_lease(&service, std::process::id()).unwrap();
+
+        let running = status(dir.path());
+        assert!(running.running, "a live record reports running");
+        assert_eq!(running.port, Some(8137));
+        assert_eq!(running.models, record.models);
+        assert_eq!(running.windows, 1, "this process holds one lease");
+        drop(lease);
+
+        // A record left behind by a dead process reads as not running.
+        let mut dead = record.clone();
+        dead.pid = dead_pid();
+        crate::host::shared_service::write_service(&service, &dead).unwrap();
+        assert!(!status(dir.path()).running, "a stale record is not a host");
+    }
+
+    /// A pid that is certainly not running: spawned and reaped immediately.
+    fn dead_pid() -> u32 {
+        let child = if std::env::consts::OS == "windows" {
+            Command::new(std::env::var_os("COMSPEC").expect("COMSPEC"))
+                .args(["/C", "exit 0"])
+                .spawn()
+        } else {
+            Command::new("/bin/sh").args(["-c", "exit 0"]).spawn()
+        }
+        .expect("spawn a short-lived process");
+        let pid = child.id();
+        let mut child = child;
+        let _ = child.wait();
+        pid
+    }
+
 
     /// A live process that plays another instance (its pid gets a lease).
     struct StubProcess(std::process::Child);

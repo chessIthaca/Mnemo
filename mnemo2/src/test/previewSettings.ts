@@ -219,6 +219,14 @@ export function createPreviewModelSettingsTransport(): ModelSettingsTransport {
         handlers = handlers.filter((entry) => entry !== handler);
       };
     },
+    // The preview shows a running host so the shared-model-host line renders
+    // with real content (plan d3336a8a step 11).
+    hostStatus: async () => ({
+      running: true,
+      port: 8080,
+      models: ["all-MiniLM-L6-v2", "jina-embeddings-v2-base-code"],
+      windows: 1,
+    }),
   };
 }
 

@@ -2,10 +2,12 @@
   import {
     machineDraft,
     machineWire,
+    modelsHostLine,
     type MachineDraft,
     type MachineSection,
     type ModelSettings,
     type ModelSettingsTransport,
+    type ModelsHostStatus,
   } from "../lib/modelSettings";
   import { errorText } from "../lib/settingsState";
   import { trackUnsaved } from "../lib/unsavedEdits";
@@ -23,6 +25,9 @@
 
   let loaded = $state(false);
   let loadError = $state("");
+  /** The shared model host's status (plan d3336a8a step 11) — the same
+   * line the Models page shows; `null` until the read returns. */
+  let host = $state<ModelsHostStatus | null>(null);
 
   let machine = $state({
     draft: emptyDraft(),
@@ -59,6 +64,21 @@
       .catch((failure) => {
         if (!cancelled) loadError = errorText(failure);
       });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  /** The shared model host line (plan d3336a8a step 11): a separate, cheap
+   * read; a failure leaves the "could not read" note. */
+  $effect(() => {
+    let cancelled = false;
+    transport
+      .hostStatus()
+      .then((status) => {
+        if (!cancelled) host = status;
+      })
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
@@ -152,6 +172,20 @@
           </p>
         </header>
         <p class="cache-line">{sccacheLine(machine.sccache)}</p>
+      </section>
+
+      <section class="group" aria-label="Shared model host">
+        <header>
+          <h3>Shared model host</h3>
+          <p class="micro">
+            One embedding server per computer, serving the memory and code-search models to every window that needs them.
+          </p>
+        </header>
+        {#if host}
+          <p class="cache-line">{modelsHostLine(host)}</p>
+        {:else}
+          <p class="micro">Could not read the shared model host's status.</p>
+        {/if}
       </section>
 
       <section class="group" aria-label="Disk space">

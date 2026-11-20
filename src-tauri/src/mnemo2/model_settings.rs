@@ -695,7 +695,42 @@ fn spawn_embedder_forwarder(app: AppHandle, mut events: EventReceiver<SetupEvent
             }
         }
     });
-}// ── Tests ──────────────────────────────────────────────────────────────────
+}
+
+/// The shared model host's status for the Settings pages (plan d3336a8a
+/// step 11). Both the Models page and the Machine page show the same line;
+/// step 11). Both the Models page and the Machine page show the same line;
+/// it comes from the run files, so it is a cheap read. The bearer token is
+/// never part of this shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelsHostStatusWire {
+    /// Whether a live host holds the service record.
+    pub running: bool,
+    /// The port it serves on.
+    pub port: Option<u16>,
+    /// The models it serves.
+    pub models: Vec<String>,
+    /// How many windows hold a live lease.
+    pub windows: usize,
+}
+
+/// Read the shared model host's status (plan d3336a8a step 11) — running,
+/// port, served models, attached windows — from `~/.mnemo/run/models/`.
+#[tauri::command]
+pub async fn models_host_status(
+    state: State<'_, Mnemo2State>,
+) -> Result<ModelsHostStatusWire, String> {
+    let (setup, _) = settings_setup(&state).await?;
+    let status = mnemo::models_host::status(setup.config_dir());
+    Ok(ModelsHostStatusWire {
+        running: status.running,
+        port: status.port,
+        models: status.models,
+        windows: status.windows,
+    })
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
 //
 // The round-trip tests run against a fixture config with sections the
 // pages do NOT own (safety, [context], [ui], [markdown], the foreign

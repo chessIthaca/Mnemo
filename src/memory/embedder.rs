@@ -83,8 +83,10 @@ pub trait Embedder: Send + Sync {
     /// report). `None` means "no tracked status" — callers treat it as
     /// healthy and rely on [`Embedder::model_id`]. The code-graph
     /// symbol-embed pass (plan d3336a8a step 9) uses it to refuse
-    /// storing vectors from a degraded embedder: a `Failed` status
-    /// answers zero vectors, which would be junk in the vec table.
+    /// storing vectors from a degraded embedder: a `Failed` embedder's
+    /// vectors are NOT the model's — the remote embedder's degraded
+    /// shape is `Failed` plus non-zero hash-fallback vectors, not
+    /// zeros — so they must never be stored in the vec table.
     fn status(&self) -> Option<EmbedderStatus> {
         None
     }

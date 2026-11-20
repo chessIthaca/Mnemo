@@ -439,7 +439,7 @@ impl CodeGraph {
     /// every stored text row so every symbol turns pending and the pass
     /// re-embeds the shape's chunks (replacing the previous shape's
     /// vectors). Returns the number of re-hashed rows.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "embeddings"))]
     pub(crate) fn retarget_symbol_chunks_for_test(
         &self,
         shape: crate::codegraph::store::ChunkShape,
@@ -1232,9 +1232,10 @@ impl CodeGraph {
     }
 
     /// Arm the background symbol-embed pass (plan d3336a8a step 9):
-    /// after this, every [`Self::index`] / [`Self::reindex_stale_files`]
-    /// schedules a pass over symbols whose text hash has no vector for
-    /// the current model — batches of [`SYMBOL_EMBED_BATCH`] through
+    /// after this, every [`Self::index`], [`Self::reindex_stale_files`] and
+    /// [`Self::reindex_files_containing`] schedules a pass over symbols whose
+    /// text hash has no vector for the current model — batches of
+    /// [`SYMBOL_EMBED_BATCH`] through
     /// [`Embedder::embed_batch`](crate::memory::embedder::Embedder::embed_batch).
     /// Called once by the brain right after open, BEFORE the graph is
     /// shared (`&mut self`); seed graphs are never armed, so worktree

@@ -2935,10 +2935,10 @@
     },
     {
       "id": "d3336a8a",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795096814665,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795208525254,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-d3336a8a-20261120-210205.md",
       "abandon_reason": null,
       "spec_deltas": [
         {

@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::host::shared_service::{self, LeaseGuard, ServiceInfo};
 use crate::memory::embedder::{dim_for_model, model_for_id};
@@ -181,17 +181,17 @@ pub fn shared_config_dir(cache_dir: &Path) -> Option<PathBuf> {
     (!config_dir.as_os_str().is_empty()).then(|| config_dir.to_path_buf())
 }
 
-/// A fresh bearer token for a spawning instance (std-only entropy, the same
-/// discipline as the shared-service lease tokens: nanoseconds, the pid and
-/// a process-local sequence).
+/// A fresh bearer token for a spawning instance: two UUID v4 values in
+/// their 32-character simple form, concatenated — 64 hex characters, 244
+/// random bits, drawn from the OS CSPRNG. A local peer must not be able to
+/// guess it from the process's start time or pid (security review finding:
+/// the old token was a timestamp, the pid and a process-local counter).
 fn service_token() -> String {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{nanos:x}-{}-{sequence:x}", std::process::id())
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 /// A free loopback port (bind `:0`, read it, drop the socket). The standard
@@ -836,10 +836,10 @@ fn handle_connection(mut stream: TcpStream, token: &str, state: Arc<HostState>) 
     // Bearer check before the body is read: an unauthenticated request
     // is never buffered past the head (review finding authAfterBody).
     let expected = format!("Bearer {token}");
-    let authorized = head
-        .headers
-        .iter()
-        .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == &expected);
+    let authorized = head.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("authorization")
+            && constant_time_eq(value.as_bytes(), expected.as_bytes())
+    });
     if !authorized {
         let _ = respond(&mut stream, 401, "Unauthorized", &error_body("missing or invalid bearer token"));
         return;
@@ -877,6 +877,22 @@ fn handle_connection(mut stream: TcpStream, token: &str, state: Arc<HostState>) 
     }
     let code = if head.method == "GET" || head.method == "POST" { 404 } else { 405 };
     let _ = respond(&mut stream, code, "Not Found", &error_body("unknown method or path"));
+}
+
+/// Compare two byte strings in constant time: a length mismatch is false,
+/// otherwise every byte is XOR-folded into one accumulator with no early
+/// return, so the running time does not depend on where the first differing
+/// byte sits. Used for the bearer token — a peer must not be able to
+/// recover it byte by byte from response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 /// The JSON error body of `message`.
@@ -1184,6 +1200,37 @@ mod tests {
             let _ = tx.send(serve(&config_dir, port, &serve_token, models, idle));
         });
         (port, token, exited)
+    }
+
+    /// Regression (unguessableToken): the bearer token used to be the spawn
+    /// time, the pid and a process-local counter — guessable by a local peer
+    /// that can see the process. It is now two UUID v4 values from the OS
+    /// CSPRNG, so it is 64 lower-case hex characters and differs per call.
+    #[test]
+    fn service_token_is_64_hex_and_unique() {
+        let first = service_token();
+        let second = service_token();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(first.bytes().all(|byte| !byte.is_ascii_uppercase()));
+        assert_ne!(first, second, "two service_token calls collide");
+        assert_eq!(second.len(), 64);
+    }
+
+    /// The comparison behind the bearer check: equal bytes match, a
+    /// same-length difference does not, and a length mismatch is false. The
+    /// first-byte and last-byte cases are both here because a compare that
+    /// returned early would still answer them correctly — the point of the
+    /// table is the contract, and the constant-time body is the property.
+    #[test]
+    fn constant_time_eq_table() {
+        assert!(constant_time_eq(b"Bearer abc123", b"Bearer abc123"));
+        assert!(!constant_time_eq(b"Bearer abc123", b"Bearer abc124"));
+        assert!(!constant_time_eq(b"Xearer abc123", b"Bearer abc123"));
+        assert!(!constant_time_eq(b"Bearer abc123", b"Bearer abc12"));
+        assert!(!constant_time_eq(b"Bearer abc123", b"Bearer abc1234"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"x"));
     }
 
     #[test]

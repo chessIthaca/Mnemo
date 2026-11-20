@@ -432,11 +432,14 @@ impl Ctx<'_> {
     }
 
     /// The definition's signature: source text from the node's start up
-    /// to the first `{` or `;` (whichever comes first) — or, when the
-    /// definition has neither (Python and Ruby delimit bodies by
-    /// indentation, not braces), up to the end of its first line —
-    /// newlines collapsed to single spaces, capped at
-    /// [`SIGNATURE_MAX_CHARS`] characters.
+    /// to the first `{` or `;` (whichever comes first), or up to the end
+    /// of its first line — newlines collapsed to single spaces, capped
+    /// at [`SIGNATURE_MAX_CHARS`] characters. The brace-less languages
+    /// (Python and Ruby delimit bodies by indentation, not braces) cut
+    /// at the end of the definition's FIRST line unconditionally: their
+    /// bodies routinely CONTAIN braces or semicolons (`config = {}`
+    /// inside a Python function), so searching the whole node for `{`
+    /// or `;` would swallow body text into the signature.
     fn signature_of(&self, node: tree_sitter::Node) -> String {
         let start = node.start_byte();
         // The node came from this Ctx's source (the HTML script
@@ -444,10 +447,13 @@ impl Ctx<'_> {
         let Some(text) = self.src.get(start..node.end_byte()) else {
             return String::new();
         };
-        let cut = text
-            .find(['{', ';'])
-            .or_else(|| text.find('\n'))
-            .unwrap_or(text.len());
+        let cut = match doc_style(self.lang) {
+            DocStyle::BodyString => text.find('\n').unwrap_or(text.len()),
+            _ => text
+                .find(['{', ';'])
+                .or_else(|| text.find('\n'))
+                .unwrap_or(text.len()),
+        };
         let collapsed: String = text[..cut].split_whitespace().collect::<Vec<_>>().join(" ");
         collapsed.chars().take(SIGNATURE_MAX_CHARS).collect()
     }
@@ -458,6 +464,7 @@ impl Ctx<'_> {
         match doc_style(self.lang) {
             DocStyle::AboveRust => self.doc_above(node, is_rust_doc_line, strip_rust_doc_line),
             DocStyle::AboveC => self.doc_above(node, is_c_doc_line, strip_c_doc_line),
+            DocStyle::AboveGo => self.doc_above(node, is_go_doc_line, strip_go_doc_line),
             DocStyle::BodyString => self.body_docstring(node),
         }
     }
@@ -560,9 +567,14 @@ enum DocStyle {
     /// `///` and `//!` lines above the definition (Rust).
     AboveRust,
     /// `/** … */` blocks with `*`-continuation lines, and `///` lines
-    /// (TS/JS — including the HTML script sub-parses — Go, Java, C/C++,
+    /// (TS/JS — including the HTML script sub-parses — Java, C/C++,
     /// C#, PHP).
     AboveC,
+    /// The C-family forms, PLUS Go's plain `//` lines: Go's documented
+    /// convention is that the contiguous `//` block immediately above
+    /// a declaration IS its doc (review finding goDocComments — Go
+    /// only; everywhere else plain `//` and `#` are not docs).
+    AboveGo,
     /// The docstring is the body's leading string statement (Python,
     /// Ruby).
     BodyString,
@@ -573,12 +585,8 @@ fn doc_style(lang: Lang) -> DocStyle {
     match lang {
         Lang::Rust => DocStyle::AboveRust,
         Lang::Python | Lang::Ruby => DocStyle::BodyString,
-        // Go writes docs as plain `//` lines, which deliberately do not
-        // qualify here (the approved step-9 semantics: plain `//` and
-        // `#` never count as doc comments), so Go joins the C family:
-        // its symbols answer empty docs unless they carry a `/** */`
-        // block.
-        Lang::Ts | Lang::Tsx | Lang::Js | Lang::Go | Lang::Java | Lang::C
+        Lang::Go => DocStyle::AboveGo,
+        Lang::Ts | Lang::Tsx | Lang::Js | Lang::Java | Lang::C
         | Lang::Cpp | Lang::CSharp | Lang::Php | Lang::Html => DocStyle::AboveC,
     }
 }
@@ -626,6 +634,24 @@ fn strip_c_doc_line(trimmed: &str) -> String {
                 .trim()
         });
     body.to_string()
+}
+
+/// Whether a trimmed line is a Go doc line: the C-family forms, or a
+/// plain `//` line — Go's documented convention is that the contiguous
+/// `//` block immediately above a declaration IS its doc (review
+/// finding goDocComments; Go only — other languages keep excluding
+/// plain `//`).
+fn is_go_doc_line(trimmed: &str) -> bool {
+    is_c_doc_line(trimmed) || trimmed.starts_with("//")
+}
+
+/// Strip one Go doc line's markup: the `//` prefix for plain lines,
+/// the C-family strip otherwise.
+fn strip_go_doc_line(trimmed: &str) -> String {
+    if let Some(body) = trimmed.strip_prefix("//") {
+        return body.trim().to_string();
+    }
+    strip_c_doc_line(trimmed)
 }
 
 /// A single-line attribute (Rust `#[..]`) or decorator line
@@ -2792,6 +2818,47 @@ def run():
         let run = sym(&f, "run");
         assert_eq!(run.signature, "def run():");
         assert_eq!(run.doc, "Runs the pipeline.\n\n    With detail.");
+    }
+
+    /// Review finding goDocComments: Go's plain `//` block directly above
+    /// a declaration IS its doc — extracted for Go only.
+    #[test]
+    fn extracts_go_plain_slash_doc_block() {
+        let src = r#"
+package main
+
+// Add returns a + b.
+// Second line.
+func Add(a int, b int) int {
+    return a + b
+}
+"#;
+        let f = extract_file("m.go", src, Lang::Go);
+        let add = sym(&f, "Add");
+        assert_eq!(add.signature, "func Add(a int, b int) int");
+        assert_eq!(add.doc, "Add returns a + b.\nSecond line.");
+    }
+
+    /// Review finding pyRubySigBody: brace-less languages cut the
+    /// signature at the definition's first line — body text containing
+    /// `{` or `;` never leaks into the signature.
+    #[test]
+    fn brace_less_signatures_stop_at_the_first_line() {
+        let python = "def run():\n    config = {}\n    return config\n";
+        let f = extract_file("m.py", python, Lang::Python);
+        assert_eq!(
+            sym(&f, "run").signature,
+            "def run():",
+            "a brace in the Python body must not leak into the signature"
+        );
+
+        let ruby = "def run\n  x = a; b\n  1\nend\n";
+        let f = extract_file("m.rb", ruby, Lang::Ruby);
+        assert_eq!(
+            sym(&f, "run").signature,
+            "def run",
+            "a semicolon in the Ruby body must not leak into the signature"
+        );
     }
 
     #[test]

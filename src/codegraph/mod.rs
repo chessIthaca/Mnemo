@@ -930,8 +930,12 @@ impl CodeGraph {
         let spawned = std::thread::Builder::new()
             .name("codegraph-symbol-embed".to_string())
             .spawn(move || {
+                // Review finding panicStuckRunning: a panic inside the
+                // pass (a misbehaving embedder) must not leave the
+                // single-flight flag stuck for the rest of the process —
+                // the guard clears it on scope exit, unwind or return.
+                let _running = RunningFlagGuard(Arc::clone(&running));
                 run_symbol_embed_pass(armed, store, Arc::clone(&stop));
-                running.store(false, Ordering::Release);
             });
         if spawned.is_err() {
             // Resource exhaustion — best-effort pass, never fatal. Free
@@ -1404,6 +1408,20 @@ pub fn content_hash(bytes: &[u8]) -> String {
 #[cfg(feature = "embeddings")]
 const SYMBOL_EMBED_BATCH: usize = 64;
 
+/// Clears the pass's single-flight flag when the pass thread ends —
+/// normal return or panic (review finding panicStuckRunning: Drop runs
+/// on unwind too, so a panicking embedder must not disable the graph's
+/// pass for the rest of the process).
+#[cfg(feature = "embeddings")]
+struct RunningFlagGuard(Arc<AtomicBool>);
+
+#[cfg(feature = "embeddings")]
+impl Drop for RunningFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The background pass body (plan d3336a8a step 9): builds the embedder
 /// per the armed source — the real path builds it ONCE per process ON
 /// THIS THREAD (attach-or-spawn of the shared host, or an in-process
@@ -1489,14 +1507,40 @@ fn run_symbol_embed_pass(
             }
             let texts: Vec<String> = batch.iter().map(|s| s.text.clone()).collect();
             let vectors = embedder.embed_batch(&texts).await;
+            // Review finding midPassHashJunk: re-check the status EVERY
+            // batch, after the embed call. A mid-pass degradation — the
+            // shared host died and the in-process load failed — keeps
+            // ANSWERING, as the hash fallback's deterministic, NON-ZERO,
+            // right-dim vectors under the code model's id, so neither
+            // the model check, the dim guard nor the zero guard catches
+            // it; only the status flip to Failed does. Drop the batch,
+            // stop the pass — the next pass retries after the host or
+            // model recovers.
+            if matches!(
+                embedder.status(),
+                Some(crate::memory::embedder::EmbedderStatus::Failed)
+            ) {
+                code_embedder_slot::log_skip_once("embedder degraded mid-pass (status Failed)");
+                break;
+            }
             if vectors.iter().all(|v| v.iter().all(|f| *f == 0.0)) {
-                // A dead host with an unloadable fallback answers
-                // zeros: persisting them would be junk. Stop — the next
-                // pass retries after the host/model recovers.
+                // The bundled embedder's own failure contract answers
+                // zeros: persisting them would be junk, and a zero
+                // vector is indistinguishable from no signal in cosine.
+                // Stop — the next pass retries after recovery.
                 code_embedder_slot::log_skip_once("embedder answered zero vectors");
                 break;
             }
             match lock_store(&store).store_symbol_vecs(&model, dim, &batch, &vectors) {
+                Ok(0) => {
+                    // Review finding zeroProgressLoop: nothing stored for
+                    // a NON-empty batch (wrong-length vectors, or every
+                    // symbol vanished mid-batch) — re-reading the queue
+                    // would return the very same batch in a hot loop.
+                    // Stop; the next pass retries from a fresh queue.
+                    code_embedder_slot::log_skip_once("a non-empty batch stored nothing");
+                    break;
+                }
                 Ok(n) => stored += n,
                 Err(e) => {
                     eprintln!("codegraph: symbol-embed store failed: {e}");
@@ -2526,13 +2570,19 @@ mod tests {
 
     /// The deterministic stub embedder (the lead's no-download seam):
     /// fixed dim, vectors derived from the text's bytes, a configurable
-    /// model id and status, and an embed-call counter.
+    /// model id and status, an embed-call counter — and a degrade knob:
+    /// after `fail_after_batches` served batches, `status()` reports
+    /// Failed (the mid-pass fallback shape, review finding
+    /// midPassHashJunk: the hash fallback keeps answering, non-zero and
+    /// right-dim, under the code model's id).
     #[cfg(feature = "embeddings")]
     struct StubEmbedder {
         model: String,
         dim: usize,
         status: Option<crate::memory::embedder::EmbedderStatus>,
         calls: AtomicUsize,
+        batches: AtomicUsize,
+        fail_after_batches: usize,
     }
 
     #[cfg(feature = "embeddings")]
@@ -2547,6 +2597,21 @@ mod tests {
                 dim,
                 status,
                 calls: AtomicUsize::new(0),
+                batches: AtomicUsize::new(0),
+                fail_after_batches: 0,
+            })
+        }
+
+        /// Degrade after `after` served batches: `status()` flips to
+        /// Failed from the batch after them on (zero = never degrade).
+        fn new_degrading(model: &str, dim: usize, after: usize) -> Arc<Self> {
+            Arc::new(Self {
+                model: model.to_string(),
+                dim,
+                status: None,
+                calls: AtomicUsize::new(0),
+                batches: AtomicUsize::new(0),
+                fail_after_batches: after,
             })
         }
 
@@ -2578,6 +2643,7 @@ mod tests {
 
         async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
             self.calls.fetch_add(texts.len(), Ordering::Relaxed);
+            self.batches.fetch_add(1, Ordering::Relaxed);
             texts.iter().map(|t| self.embed_one(t)).collect()
         }
 
@@ -2590,6 +2656,11 @@ mod tests {
         }
 
         fn status(&self) -> Option<crate::memory::embedder::EmbedderStatus> {
+            if self.fail_after_batches > 0
+                && self.batches.load(Ordering::Relaxed) > self.fail_after_batches
+            {
+                return Some(crate::memory::embedder::EmbedderStatus::Failed);
+            }
             self.status.clone()
         }
     }
@@ -2831,6 +2902,179 @@ mod tests {
             graph.store().symbol_vec_count().unwrap(),
             embedder.calls(),
             "the background pass embedded every pending symbol"
+        );
+    }
+
+    /// A stub that panics inside its embed calls — a misbehaving embedder
+    /// (review finding panicStuckRunning).
+    #[cfg(feature = "embeddings")]
+    struct PanickingStubEmbedder {
+        entries: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for PanickingStubEmbedder {
+        async fn embed(&self, _text: &str) -> Vec<f32> {
+            self.entries.fetch_add(1, Ordering::Relaxed);
+            panic!("a misbehaving embedder");
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> Vec<Vec<f32>> {
+            self.entries.fetch_add(1, Ordering::Relaxed);
+            panic!("a misbehaving embedder");
+        }
+
+        fn dim(&self) -> usize {
+            8
+        }
+
+        fn model_id(&self) -> &str {
+            crate::memory::embedder::CODE_EMBEDDING_MODEL
+        }
+    }
+
+    /// Review finding panicStuckRunning: the pass thread's Drop guard
+    /// clears the single-flight flag even when the pass panics, so a
+    /// later trigger schedules the pass again — a panicking embedder
+    /// cannot disable the graph's pass for the rest of the process.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn panicking_embedder_does_not_stick_the_single_flight_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let entries = Arc::new(AtomicUsize::new(0));
+        graph.arm_symbol_embedder_stub(Arc::new(PanickingStubEmbedder {
+            entries: Arc::clone(&entries),
+        }));
+        graph.schedule_symbol_embed_pass();
+        // Wait out the panicking pass: the guard clears the flag on
+        // unwind.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while graph.symbol_embed.running.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !graph.symbol_embed.running.load(Ordering::Acquire),
+            "the guard cleared the flag despite the panic"
+        );
+        assert_eq!(entries.load(Ordering::Relaxed), 1);
+        // The second schedule really runs — the flag was not stuck.
+        graph.schedule_symbol_embed_pass();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while graph.symbol_embed.running.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            entries.load(Ordering::Relaxed),
+            2,
+            "the pass runs again after the panicking embedder"
+        );
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+    }
+
+    /// A stub answering non-zero vectors of the WRONG length — the
+    /// store's dim-mismatch guard skips every row, so a non-empty batch
+    /// stores nothing (review finding zeroProgressLoop).
+    #[cfg(feature = "embeddings")]
+    struct WrongLengthStubEmbedder {
+        batches: AtomicUsize,
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for WrongLengthStubEmbedder {
+        async fn embed(&self, _text: &str) -> Vec<f32> {
+            vec![1.0, 2.0]
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            texts.iter().map(|_| vec![1.0, 2.0]).collect()
+        }
+
+        fn dim(&self) -> usize {
+            // The vectors above are 2-long: the mismatch trips the store
+            // guard, and the batch stores nothing.
+            8
+        }
+
+        fn model_id(&self) -> &str {
+            crate::memory::embedder::CODE_EMBEDDING_MODEL
+        }
+    }
+
+    /// Review finding zeroProgressLoop: a non-empty batch that stores
+    /// nothing stops the pass after ONE embed — re-reading the queue
+    /// would return the very same batch forever.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_stops_when_a_non_empty_batch_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let stub = Arc::new(WrongLengthStubEmbedder {
+            batches: AtomicUsize::new(0),
+        });
+        graph.arm_symbol_embedder_stub(Arc::clone(&stub));
+        run_armed_pass(&graph);
+        assert_eq!(
+            stub.batches.load(Ordering::Relaxed),
+            1,
+            "exactly one batch embed — no hot loop"
+        );
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+        assert_eq!(
+            graph
+                .store()
+                .pending_symbols(crate::memory::embedder::CODE_EMBEDDING_MODEL, 100)
+                .unwrap()
+                .len(),
+            3,
+            "the symbols stay pending for the next pass"
+        );
+    }
+
+    /// Review finding midPassHashJunk: a mid-pass degradation keeps
+    /// answering — the hash fallback's deterministic, non-zero,
+    /// right-dim vectors under the code model's id — so only the
+    /// per-batch status re-check catches it. The batch embedded before
+    /// the flip is stored; the batch embedded after it is dropped, and
+    /// the pass stops.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_stops_and_drops_the_batch_when_the_embedder_degrades_mid_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 embeddable fns: two batches at SYMBOL_EMBED_BATCH = 64.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let mut src = String::new();
+        for i in 0..100 {
+            src.push_str(&format!("pub fn f{i}() -> u32 {{ {i} }}\n"));
+        }
+        std::fs::write(src_dir.join("big.rs"), src).unwrap();
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let model = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        assert_eq!(
+            graph.store().pending_symbols(model, 1000).unwrap().len(),
+            100
+        );
+        let stub = StubEmbedder::new_degrading(model, 8, 1);
+        graph.arm_symbol_embedder_stub(Arc::clone(&stub));
+        run_armed_pass(&graph);
+        // Batch 1 (64 symbols) stored; batch 2 embedded, then dropped on
+        // its status check; nothing after.
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 64);
+        assert_eq!(stub.calls(), 100);
+        // The pass stopped: the degraded batch's symbols stay pending
+        // for the next pass.
+        assert_eq!(
+            graph.store().pending_symbols(model, 1000).unwrap().len(),
+            36
         );
     }
 

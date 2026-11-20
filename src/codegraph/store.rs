@@ -889,12 +889,17 @@ impl Store {
     }
 
     /// Store computed symbol vectors (plan d3336a8a step 9): one short
-    /// transaction, one `INSERT OR REPLACE` per row. `model` is whatever
-    /// produced the vectors — the pass validated it names the real code
-    /// model, so the vec table's `model` column always does. An
-    /// all-zero vector (a degraded embedder's zero-vector contract) is
-    /// skipped rather than stored, and so is a vector whose length
-    /// disagrees with `dim`. Returns the number of rows written.
+    /// transaction, one insert per row. `model` is whatever produced the
+    /// vectors — the pass validated it names the real code model, so the
+    /// vec table's `model` column always does. An all-zero vector (a
+    /// degraded embedder's zero-vector contract) is skipped rather than
+    /// stored, and so is a vector whose length disagrees with `dim`.
+    /// Review finding orphanVecRows: a row lands only while its symbol
+    /// AND its text row still exist with the SAME text hash the vector
+    /// was built from — a reindex deleting the symbol or swapping its
+    /// text between the batch read and this write must not (re-)create a
+    /// vector row for a vanished symbol. Returns the number of rows
+    /// actually written.
     pub fn store_symbol_vecs(
         &mut self,
         model: &str,
@@ -905,7 +910,12 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut ins = tx.prepare_cached(
             "INSERT OR REPLACE INTO cg_symbol_vec (symbol_id, model, dim, vec, text_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE EXISTS (
+                 SELECT 1 FROM cg_symbols s
+                 JOIN cg_symbol_text t ON t.symbol_id = s.id
+                 WHERE s.id = ?1 AND t.text_hash = ?5
+             )",
         )?;
         let mut stored = 0usize;
         for (sym, vec) in batch.iter().zip(vectors) {
@@ -913,8 +923,13 @@ impl Store {
                 continue;
             }
             let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
-            ins.execute(params![sym.symbol_id, model, dim as i64, blob, sym.text_hash])?;
-            stored += 1;
+            stored += ins.execute(params![
+                sym.symbol_id,
+                model,
+                dim as i64,
+                blob,
+                sym.text_hash
+            ])?;
         }
         drop(ins);
         tx.commit()?;
@@ -1642,6 +1657,117 @@ mod tests {
         );
         let good = vec![vec![0.25, 0.5, 1.0], vec![0.25, 0.5, 1.0]];
         assert_eq!(s.store_symbol_vecs("m", 3, &pending, &good).unwrap(), 2);
+    }
+
+    /// Review finding orphanVecRows: a symbol deleted between the batch
+    /// read and the write gets no vector row — the insert is guarded by
+    /// the symbol and its text row still existing with the same text
+    /// hash the vector was built from.
+    #[test]
+    fn store_symbol_vecs_skips_symbols_deleted_mid_batch() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.upsert_file("a.rs", "h1", 100, &file_a(), "fn caller() {}").unwrap();
+        let pending = s.pending_symbols("m", 100).unwrap();
+        assert_eq!(pending.len(), 2);
+        // The reindex that deleted the helper lands between the read
+        // and the write: re-upsert the file without it, then store the
+        // STALE batch.
+        let mut sans_helper = file_a();
+        sans_helper.symbols.retain(|sym| sym.name != "helper");
+        s.upsert_file("a.rs", "h2", 101, &sans_helper, "fn caller() {}").unwrap();
+        let vectors: Vec<Vec<f32>> = pending.iter().map(|_| vec![0.25, 0.5]).collect();
+        assert_eq!(
+            s.store_symbol_vecs("m", 2, &pending, &vectors).unwrap(),
+            1,
+            "only the surviving symbol's vector is stored"
+        );
+        let helper_id = pending
+            .iter()
+            .find(|p| p.symbol_id.contains("helper"))
+            .unwrap()
+            .symbol_id
+            .clone();
+        assert!(
+            s.symbol_vec(&helper_id).unwrap().is_none(),
+            "the vanished symbol gets no vector row"
+        );
+        let caller_id = pending
+            .iter()
+            .find(|p| p.symbol_id.contains("caller"))
+            .unwrap()
+            .symbol_id
+            .clone();
+        assert!(s.symbol_vec(&caller_id).unwrap().is_some());
+        // The survivor's row is valid (its text hash is unchanged), so
+        // the queue drains.
+        assert!(s.pending_symbols("m", 100).unwrap().is_empty());
+    }
+
+    /// Two real symbols carrying signature + doc (plus the module row), so
+    /// an edit to ONE symbol's text is observable next to an unchanged
+    /// sibling (review finding textDriftUntested).
+    fn file_two_texts(helper_doc: &str) -> FileData {
+        let mut helper = sym("t.rs", "helper", SymbolKind::Function, 3, 6);
+        helper.signature = "pub fn helper() -> u32".to_string();
+        helper.doc = helper_doc.to_string();
+        let mut other = sym("t.rs", "other", SymbolKind::Function, 9, 11);
+        other.signature = "pub fn other()".to_string();
+        other.doc = "Unchanged doc.".to_string();
+        FileData {
+            symbols: vec![
+                Symbol {
+                    id: "t.rs::module".to_string(),
+                    name: "t.rs".to_string(),
+                    kind: SymbolKind::Module,
+                    file: "t.rs".to_string(),
+                    start_line: 1,
+                    end_line: 11,
+                    signature: String::new(),
+                    doc: String::new(),
+                },
+                helper,
+                other,
+            ],
+            refs: vec![],
+            contains: vec![],
+        }
+    }
+
+    /// Review finding textDriftUntested: editing one symbol's doc drifts
+    /// its text hash — the pass re-embeds exactly that symbol while the
+    /// unchanged sibling keeps its vector untouched.
+    #[test]
+    fn changed_symbol_is_reembedded() {
+        let mut s = Store::open_in_memory().unwrap();
+        let model = "jina-embeddings-v2-base-code";
+        s.upsert_file("t.rs", "h1", 100, &file_two_texts("Adds one."), "src").unwrap();
+        // First pass: both symbols pending, both stored.
+        let first = s.pending_symbols(model, 100).unwrap();
+        assert_eq!(first.len(), 2);
+        let vectors: Vec<Vec<f32>> = first.iter().map(|_| vec![0.25, 0.5, 0.75]).collect();
+        assert_eq!(s.store_symbol_vecs(model, 3, &first, &vectors).unwrap(), 2);
+        let helper_before = s.symbol_vec("t.rs::helper::3").unwrap().unwrap();
+        let other_before = s.symbol_vec("t.rs::other::9").unwrap().unwrap();
+        // Edit helper's doc: same id (the lines did not move), new text
+        // hash.
+        s.upsert_file("t.rs", "h2", 100, &file_two_texts("Adds TWO."), "src").unwrap();
+        let pending = s.pending_symbols(model, 100).unwrap();
+        assert_eq!(pending.len(), 1, "only the edited symbol is pending");
+        assert_eq!(pending[0].symbol_id, "t.rs::helper::3");
+        assert!(pending[0].text.contains("Adds TWO."));
+        // Re-embed: helper's row is replaced (new vector + new hash),
+        // other's is untouched.
+        let vectors: Vec<Vec<f32>> = pending.iter().map(|_| vec![0.9, 0.5, 0.25]).collect();
+        assert_eq!(s.store_symbol_vecs(model, 3, &pending, &vectors).unwrap(), 1);
+        assert_eq!(s.symbol_vec_count().unwrap(), 2);
+        let helper_after = s.symbol_vec("t.rs::helper::3").unwrap().unwrap();
+        assert_ne!(helper_after.text_hash, helper_before.text_hash);
+        assert_eq!(helper_after.vec, vec![0.9, 0.5, 0.25]);
+        let other_after = s.symbol_vec("t.rs::other::9").unwrap().unwrap();
+        assert_eq!(other_after.text_hash, other_before.text_hash);
+        assert_eq!(other_after.vec, other_before.vec);
+        // And the queue is drained.
+        assert!(s.pending_symbols(model, 100).unwrap().is_empty());
     }
 
     /// remove_file drops the file's symbol text and vector rows along with

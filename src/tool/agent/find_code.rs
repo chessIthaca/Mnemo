@@ -29,12 +29,15 @@
 //! <signature>`, plus the doc comment's first line on an indented second
 //! line when the symbol has one.
 //!
-//! When no query embedder is available yet (the shared host is still
-//! starting, the model is not installed, or a failed build sits in its
-//! retry window) the tool NEVER waits for the tens-of-seconds build: it
-//! starts that build in the background and answers with the
-//! `code embeddings are still being built (N of M symbols)` note plus the
-//! content index's hits, in the `search` tool's `path:line: text` shape.
+//! When no query embedder is available yet the tool NEVER waits for the
+//! tens-of-seconds build: it starts that build in the background and
+//! answers with the content index's hits, in the `search` tool's
+//! `path:line: text` shape, headed by a note that says which of the two
+//! states it is (plan d3336a8a step 17, finding notReadyNoteMisleads):
+//! the `code embeddings are still being built (N of M symbols)` note
+//! while vectors are actually appearing, and a `the code search model
+//! is not available right now` note when a failed build sits in its
+//! retry window — nothing is being built then.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -517,15 +520,63 @@ impl Tool for FindCodeTool {
     }
 }
 
+/// The fallback's progress note (plan d3336a8a step 11 + step 17's
+/// finding notReadyNoteMisleads): the parked-gate wording is checked
+/// first — with the `embeddings` feature a failed build that parked the
+/// slot's retry gate means NOTHING is being built, and the old "still
+/// being built (0 of M)" line would mislead. Without the feature no
+/// code embedder exists at all and the note is the step-11 progress
+/// line alone.
+fn fallback_note(graph: &CodeGraph, embedded: usize, total: usize) -> String {
+    #[cfg(feature = "embeddings")]
+    if let Some(note) = parked_note(graph) {
+        return note;
+    }
+    // Without the embeddings feature no code embedder exists, so `graph`
+    // carries no state for the note.
+    #[cfg(not(feature = "embeddings"))]
+    let _ = graph;
+    if total == 0 {
+        "the code index has no embeddable symbols yet".to_string()
+    } else if embedded < total {
+        format!("code embeddings are still being built ({embedded} of {total} symbols)")
+    } else {
+        "the code embedder is not ready; showing text matches instead".to_string()
+    }
+}
+
+/// The parked-retry-gate wording of the fallback note (plan d3336a8a
+/// step 17, finding notReadyNoteMisleads): the model is unavailable, not
+/// being built, and the note says when the next round retries. `None`
+/// for every other state (the progress line answers those).
+#[cfg(feature = "embeddings")]
+fn parked_note(graph: &CodeGraph) -> Option<String> {
+    match graph.code_embedder_state() {
+        crate::codegraph::CodeEmbedderState::Parked { retry_in } => {
+            let minutes = retry_in.as_secs().div_ceil(60).max(1);
+            Some(format!(
+                "the code search model is not available right now (the shared \
+                 model host is not answering); showing text matches; it retries \
+                 in about {minutes} minutes"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// The text-only answer (plan d3336a8a step 11): a progress note, then the
 /// content index's hits in the `search` tool's `path:line: text` shape.
 ///
-/// The note is the step's `code embeddings are still being built (N of M
-/// symbols)` while N < M; with every symbol embedded the embedder itself is
-/// the missing piece (the shared host is starting, degraded, or a failed
-/// build sits in its retry window) and the note says so; an index with no
-/// embeddable symbol yet says that instead. `counts` carries numbers the
-/// ranked path already read; `None` reads them here.
+/// The note says WHICH state the slot is in (plan d3336a8a step 17,
+/// finding notReadyNoteMisleads): a parked retry gate after a failed
+/// build reads as `the code search model is not available right now ...
+/// it retries in about N minutes` — nothing is being built, so the old
+/// `still being built (0 of M)` line would mislead. Everything else
+/// keeps the step-11 wording: `code embeddings are still being built
+/// (N of M)` while N < M; with every symbol embedded the embedder
+/// itself is the missing piece and the note says so; an index with no
+/// embeddable symbol yet says that instead. `counts` carries numbers
+/// the ranked path already read; `None` reads them here.
 ///
 /// Both reads are SQLite and run on the blocking pool like the ranked path —
 /// a tokio worker never touches the store here.
@@ -550,13 +601,7 @@ async fn find_code_fallback(
         Ok(read) => read,
         Err(e) => return ToolResult::error(format!("find_code's text search task failed: {e}")),
     };
-    let mut out = if total == 0 {
-        "the code index has no embeddable symbols yet".to_string()
-    } else if embedded < total {
-        format!("code embeddings are still being built ({embedded} of {total} symbols)")
-    } else {
-        "the code embedder is not ready; showing text matches instead".to_string()
-    };
+    let mut out = fallback_note(graph, embedded, total);
     if hits.is_empty() {
         out.push_str("\nno text matches either — try different words, or `search` for a literal");
     } else {

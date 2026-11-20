@@ -495,16 +495,24 @@ fn load_bundled_or_fallback(
 /// d3336a8a step 2) is preferred over loading the model into this process.
 /// No host, or an unusable one, falls back to today's synchronous
 /// in-process load (never a worse state than before).
+///
+/// The acquire retries with the step-17 backoff while a host is serveable
+/// (finding rewireNoRetryAndDoc): every caller of this branch runs on a
+/// background or blocking thread — the settings rewire's off-path build
+/// (rewire.rs), the headless reembed's `spawn_blocking`, never an apply
+/// critical path — and a single attempt could pin an in-process model
+/// after a save during a cold start. Not serveable → the single fast
+/// attempt of today.
 #[cfg(feature = "embeddings")]
 fn configured_model_embedder(
     model_id: &str,
     cache_dir: &Path,
     status: &Arc<RwLock<EmbedderStatus>>,
 ) -> Arc<dyn Embedder> {
-    // Remote-first: acquire_remote_embedder itself derives the config dir
+    // Remote-first: the retrying acquire itself derives the config dir
     // from cache_dir (no share when the last component is not "models")
     // and falls back to None on any failure.
-    if let Some(remote) = acquire_remote_embedder(model_id, cache_dir, status.clone()) {
+    if let Some(remote) = acquire_remote_embedder_with_retry(model_id, cache_dir, status.clone()) {
         return remote;
     }
     load_bundled_or_fallback(model_id, cache_dir, status)
@@ -614,9 +622,18 @@ pub fn build_code_embedder(cache_dir: &Path, memory_model: Option<&str>) -> Arc<
         // falls back to text search. A window that fell back in-process
         // mid-pass held ~3.5 GB of weights and ONNX arena the host
         // already serves machine-wide.
-        if retry_while_serveable(cache_dir, || {
-            client
-                .acquire(crate::memory::embedder::CODE_EMBEDDING_MODEL, &serve)
+        if retry_while_serveable(cache_dir, |fresh| {
+            if fresh {
+                client
+                    .acquire(crate::memory::embedder::CODE_EMBEDDING_MODEL, &serve)
+            } else {
+                // One spawn per round (finding spawnChurnPerRound): the
+                // retries attach only, to what the fresh leg published.
+                client.attach(
+                    crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                    crate::host::models_host::ATTACH_PROBE,
+                )
+            }
         })
         .is_some()
         {
@@ -685,14 +702,21 @@ static CODE_INPROCESS_LOADS: std::sync::atomic::AtomicU64 =
 
 /// The shared acquire retry loop (step 17 A): attempt now, then up to
 /// [`ACQUIRE_RETRY_STEPS`] more attempts with the doubling backoff — but
-/// only while the host stays serveable, re-checked before every sleep. Not
-/// serveable → the single first attempt returns immediately.
+/// only while the host stays serveable, re-checked before every sleep.
+/// Not serveable → the single first attempt returns immediately.
+///
+/// `attempt(fresh)` receives `true` for the FIRST attempt and `false`
+/// for every retry: a round allows exactly ONE spawn (finding
+/// spawnChurnPerRound, plan d3336a8a step 17) — the `fresh` leg is
+/// attach-or-spawn, the retries attach ONLY to whatever the first leg
+/// left published, so a host that can never become healthy is not
+/// re-spawned by every retry.
 #[cfg(feature = "embeddings")]
 fn retry_while_serveable<T>(
     cache_dir: &Path,
-    mut attempt: impl FnMut() -> Option<T>,
+    mut attempt: impl FnMut(bool) -> Option<T>,
 ) -> Option<T> {
-    if let Some(found) = attempt() {
+    if let Some(found) = attempt(true) {
         return Some(found);
     }
     for step in 0..ACQUIRE_RETRY_STEPS {
@@ -702,7 +726,7 @@ fn retry_while_serveable<T>(
         std::thread::sleep(std::time::Duration::from_millis(
             ACQUIRE_RETRY_BASE_MS.load(std::sync::atomic::Ordering::Relaxed) * (1_u64 << step),
         ));
-        if let Some(found) = attempt() {
+        if let Some(found) = attempt(false) {
             return Some(found);
         }
     }
@@ -723,8 +747,14 @@ pub fn acquire_remote_embedder_with_retry(
     cache_dir: &Path,
     status: Arc<RwLock<EmbedderStatus>>,
 ) -> Option<Arc<dyn Embedder>> {
-    retry_while_serveable(cache_dir, || {
-        acquire_remote_embedder(model_id, cache_dir, status.clone())
+    retry_while_serveable(cache_dir, |fresh| {
+        if fresh {
+            acquire_remote_embedder(model_id, cache_dir, status.clone())
+        } else {
+            // One spawn per round (finding spawnChurnPerRound): the retry
+            // legs attach only, to whatever the fresh leg left published.
+            build_remote_embedder(model_id, cache_dir, status.clone())
+        }
     })
 }
 
@@ -1667,8 +1697,10 @@ mod tests {
 
     /// The retry cadence itself (step 17 A): a serveable host keeps the
     /// acquire retrying — the first attempt plus [`ACQUIRE_RETRY_STEPS`]
-    /// more with the backoff shrunk to zero; a non-serveable setup stops
-    /// after the first attempt.
+    /// more with the backoff shrunk to zero, and the FRESH leg runs
+    /// exactly once (finding spawnChurnPerRound: one spawn-allowed
+    /// attempt per round, the retries are attach-only); a non-serveable
+    /// setup stops after the first attempt.
     #[cfg(feature = "embeddings")]
     #[test]
     fn acquire_retries_only_while_a_host_is_serveable() {
@@ -1676,21 +1708,25 @@ mod tests {
         let cache = crate::config::embedder_cache_dir(home.path());
         ACQUIRE_RETRY_BASE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         publish_live_descriptor(home.path(), 64000, "stub-token");
-        let mut attempts = 0;
-        let found: Option<()> = retry_while_serveable(&cache, || {
-            attempts += 1;
+        let mut fresh_flags: Vec<bool> = Vec::new();
+        let found: Option<()> = retry_while_serveable(&cache, |fresh| {
+            fresh_flags.push(fresh);
             None
         });
         assert!(found.is_none());
-        assert_eq!(attempts, 1 + ACQUIRE_RETRY_STEPS);
+        assert_eq!(
+            fresh_flags,
+            vec![true, false, false, false, false],
+            "the spawn-allowed leg runs exactly once per round"
+        );
         let bare = tempfile::tempdir().unwrap();
         let bare_cache = crate::config::embedder_cache_dir(bare.path());
-        let mut bare_attempts = 0;
-        let found: Option<()> = retry_while_serveable(&bare_cache, || {
-            bare_attempts += 1;
+        let mut bare_flags: Vec<bool> = Vec::new();
+        let found: Option<()> = retry_while_serveable(&bare_cache, |fresh| {
+            bare_flags.push(fresh);
             None
         });
         assert!(found.is_none());
-        assert_eq!(bare_attempts, 1);
+        assert_eq!(bare_flags, vec![true]);
     }
 }

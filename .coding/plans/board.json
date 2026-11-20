@@ -3011,10 +3011,10 @@
     },
     {
       "id": "c7ad776e",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795132770235,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795133206511,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c7ad776e-20261120-000646.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},

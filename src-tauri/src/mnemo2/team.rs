@@ -814,7 +814,7 @@ impl TeamRuntime {
                 .count(),
             records
                 .iter()
-                .filter(|worker| worker.status.waiting_on_user())
+                .filter(|worker| worker.waiting_on_user())
                 .count(),
         )
     }

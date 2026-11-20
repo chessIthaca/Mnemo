@@ -14333,6 +14333,19 @@ async fn activity_counts_match_the_snapshot_counts() {
             record.status = status;
             records.push(record);
         }
+        // Two finished audits (their reports delivered) never wait; one audit
+        // that failed before reporting still needs its resume.
+        for (index, status, delivered) in [
+            (0, WorkerStatus::Completed, true),
+            (1, WorkerStatus::Completed, true),
+            (2, WorkerStatus::Failed, false),
+        ] {
+            let mut record = worker(root.path(), &format!("actaudit{index:04}"));
+            record.kind = "audit".to_string();
+            record.status = status;
+            record.report_delivered = delivered;
+            records.push(record);
+        }
     }
 
     let counts = team.activity_counts().await;
@@ -14346,14 +14359,72 @@ async fn activity_counts_match_the_snapshot_counts() {
         snapshot
             .workers
             .iter()
-            .filter(|worker| worker.status.waiting_on_user())
+            .filter(|worker| worker.waiting_on_user())
             .count(),
     );
     assert_eq!(counts, from_snapshot, "the accessor and the snapshot agree");
     assert_eq!(
         counts,
-        (4, 3),
-        "working, dispatching, fixing and merging run; needs-you, conflict and completed wait"
+        (4, 4),
+        "working, dispatching, fixing and merging run; needs-you, conflict, completed and the \
+         unreported audit wait, while the two delivered audits do not"
+    );
+    team.shutdown().await;
+}
+
+/// A finished audit is never reviewed or merged, so it stays `Completed`
+/// forever: it must not count as waiting on the person (the Mission Control
+/// instances list reported eight waiting workers with nothing waiting on the
+/// user — all of them completed audits).
+#[tokio::test]
+async fn completed_audits_do_not_count_as_waiting() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    {
+        let mut records = team.records.lock().await;
+        let mut implementation = worker(root.path(), "waitimpl01");
+        implementation.status = WorkerStatus::Completed;
+        records.push(implementation);
+        for index in 0..2 {
+            let mut audit = worker(root.path(), &format!("waitaudit{index:02}"));
+            audit.kind = "audit".to_string();
+            audit.status = WorkerStatus::Completed;
+            audit.report_delivered = true;
+            records.push(audit);
+        }
+    }
+
+    let (running, waiting) = team.activity_counts().await;
+    assert_eq!(running, 0, "nothing is running");
+    assert_eq!(
+        waiting, 1,
+        "only the implementation awaiting review waits; the two finished audits do not"
+    );
+    let snapshot = team.snapshot().await;
+    assert_eq!(
+        snapshot
+            .workers
+            .iter()
+            .filter(|worker| worker.waiting_on_user())
+            .count(),
+        waiting,
+        "the snapshot counts the same"
+    );
+    // An audit that failed before delivering its report still needs a resume.
+    {
+        let mut records = team.records.lock().await;
+        let mut failed = worker(root.path(), "waitfaile01");
+        failed.kind = "audit".to_string();
+        failed.status = WorkerStatus::Failed;
+        records.push(failed);
+    }
+    assert_eq!(
+        team.activity_counts().await.1,
+        2,
+        "an unreported failed audit waits for its resume"
     );
     team.shutdown().await;
 }

@@ -445,6 +445,21 @@ pub(super) fn audit_finished(record: &WorkerRecord) -> bool {
         && (record.report_delivered || record.status == WorkerStatus::Completed)
 }
 
+impl WorkerRecord {
+    /// Whether this worker is blocked on the person's review or intervention.
+    ///
+    /// The status decides, with one audit exception: an audit worker's job is
+    /// over once its report is delivered — it is never reviewed, merged or
+    /// resumed, so a finished audit would otherwise stay `Completed` and
+    /// "waiting" forever, inflating every Mission Control waiting count. An
+    /// audit whose report has not been delivered still waits: it is running,
+    /// or it failed and needs a resume. Implementation workers keep the plain
+    /// status rule.
+    pub(crate) fn waiting_on_user(&self) -> bool {
+        self.status.waiting_on_user() && !audit_finished(self)
+    }
+}
+
 /// The refusal every finished-audit gate carries.
 pub(super) fn audit_finished_error(worker_id: &str) -> String {
     format!(

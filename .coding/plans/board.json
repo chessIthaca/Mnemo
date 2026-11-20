@@ -3030,6 +3030,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Unix process liveness and a test fix; no spec requirement changes."
+    },
+    {
+      "id": "f296f8f9",
+      "status": "open",
+      "created_at_ms": 1795176941396,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "It tightens the existing executor git gate (an internal guardrail) with an extra refusal; no specified behaviour in external-lead, worker-brief, tier-ladder or other governed capabilities changes."
     }
   ]
 }

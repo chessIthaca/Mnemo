@@ -143,6 +143,13 @@ const BODY_CAP: usize = 16 * 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The most texts one ONNX inference call embeds (plan d3336a8a step 15):
+/// a request of any size is split into sub-batches of at most this many
+/// texts, bounding the padded attention working set — one 64-text request
+/// with long chunks spiked the host's RAM into gigabytes. The answers
+/// concatenate back in input order.
+const EMBED_SUB_BATCH: usize = 16;
+
 /// The `POST /v1/embed` body: the model id plus the texts to embed.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct EmbedRequest {
@@ -679,6 +686,17 @@ enum Session {
     /// model for it.
     #[cfg(test)]
     Stub(usize),
+    /// Tests: constant vectors of this dim that also record every
+    /// embed call's batch size, and answer each text with a vector
+    /// whose every element encodes the marker number after the text's
+    /// last `-` (`symbol-42` → `42.5`) — so a test can assert BOTH the
+    /// sub-batch sizes and that the answers keep the input order (plan
+    /// d3336a8a step 15).
+    #[cfg(test)]
+    RecordingStub {
+        dim: usize,
+        sizes: Arc<Mutex<Vec<usize>>>,
+    },
 }
 
 impl Session {
@@ -691,17 +709,37 @@ impl Session {
             }
             #[cfg(test)]
             Session::Stub(dim) => Ok(texts.iter().map(|_| vec![0.5_f32; *dim]).collect()),
+            #[cfg(test)]
+            Session::RecordingStub { dim, sizes } => {
+                if let Ok(mut sizes) = sizes.lock() {
+                    sizes.push(texts.len());
+                }
+                Ok(texts
+                    .iter()
+                    .map(|text| {
+                        let marker = text
+                            .rsplit('-')
+                            .next()
+                            .and_then(|tail| tail.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        vec![marker as f32 + 0.5; *dim]
+                    })
+                    .collect())
+            }
         }
     }
 }
 
 /// The production load: the catalog lookup, the dim, and the fastembed
-/// ONNX init with the machine-global cache (a first use may download
-/// into it — the request blocks for that, by design).
+/// ONNX init through the ONE shared load path of the host and the
+/// in-process fallback (`embedder::text_init_options` — the code-search
+/// model's token cap rides along; plan d3336a8a step 15), with the
+/// machine-global cache (a first use may download into it — the request
+/// blocks for that, by design).
 fn load_bundled_model(cache_dir: &Path, model_id: &str) -> Result<LoadedModel, String> {
     let model = model_for_id(model_id)?;
     let dim = dim_for_model(&model);
-    let init = fastembed::TextInitOptions::new(model).with_cache_dir(cache_dir.to_path_buf());
+    let init = crate::memory::embedder::text_init_options(model, model_id, cache_dir);
     let session = fastembed::TextEmbedding::try_new(init)
         .map_err(|err| format!("failed to load embedding model '{model_id}': {err}"))?;
     Ok(LoadedModel {
@@ -713,7 +751,11 @@ fn load_bundled_model(cache_dir: &Path, model_id: &str) -> Result<LoadedModel, S
 impl HostState {
     /// Embed `texts` with `model_id`, loading the model lazily on its first
     /// request (a first use may download into the shared cache — the request
-    /// blocks for it, by design). Errors carry the one-line reason the HTTP
+    /// blocks for it, by design). Requests larger than
+    /// [`EMBED_SUB_BATCH`] texts run as consecutive sub-batches — the
+    /// padded ONNX attention of one giant call is what unbounded the
+    /// host's RAM (plan d3336a8a step 15) — and the answers concatenate
+    /// back in input order. Errors carry the one-line reason the HTTP
     /// answer shows.
     fn embed(&self, model_id: &str, texts: &[String]) -> Result<(Vec<Vec<f32>>, usize), String> {
         if !self.serving.iter().any(|served| served == model_id) {
@@ -724,9 +766,20 @@ impl HostState {
             .session
             .lock()
             .map_err(|_| String::from("the model session is poisoned"))?;
-        let vectors = session
-            .embed(texts)
-            .map_err(|err| format!("inference for '{model_id}' failed: {err}"))?;
+        let mut vectors = Vec::with_capacity(texts.len());
+        for sub_batch in texts.chunks(EMBED_SUB_BATCH) {
+            let part = session
+                .embed(sub_batch)
+                .map_err(|err| format!("inference for '{model_id}' failed: {err}"))?;
+            if part.len() != sub_batch.len() {
+                return Err(format!(
+                    "inference for '{model_id}' returned {} vectors for {} texts",
+                    part.len(),
+                    sub_batch.len()
+                ));
+            }
+            vectors.extend(part);
+        }
         Ok((vectors, loaded_model.dim))
     }
 
@@ -1384,6 +1437,55 @@ mod tests {
         assert!(
             response.contains("not served"),
             "the answer says why: {response}"
+        );
+    }
+
+    /// Plan d3336a8a step 15: one embed request is split into
+    /// sub-batches of at most [`EMBED_SUB_BATCH`] texts — the padded
+    /// attention of one giant ONNX call is what unbounded the host's
+    /// RAM — and the answers keep the input order. The recording stub
+    /// (a load-seam stand-in) records each inference call's size and
+    /// answers each text with a vector encoding the text's marker.
+    #[test]
+    fn host_splits_large_embed_requests() {
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let sizes_for_load = Arc::clone(&sizes);
+        let state = HostState::for_tests(
+            Box::new(move |_model_id| {
+                Ok(LoadedModel {
+                    session: Arc::new(Mutex::new(Session::RecordingStub {
+                        dim: 4,
+                        sizes: Arc::clone(&sizes_for_load),
+                    })),
+                    dim: 4,
+                })
+            }),
+            &["jina-embeddings-v2-base-code"],
+        );
+        let texts: Vec<String> = (0..64)
+            .map(|i| format!("symbol-{i}"))
+            .collect();
+        let (vectors, dim) = state
+            .embed("jina-embeddings-v2-base-code", &texts)
+            .expect("the embed succeeds");
+        assert_eq!(dim, 4);
+        assert_eq!(vectors.len(), 64, "one vector per input text");
+        for (i, vector) in vectors.iter().enumerate() {
+            assert_eq!(vector[0], i as f32 + 0.5, "vector {i} answers text {i}");
+        }
+        let sizes = sizes.lock().expect("the size-recorder lock");
+        assert!(
+            !sizes.is_empty(),
+            "the stub load seam saw the inference calls"
+        );
+        assert!(
+            sizes.iter().all(|size| *size <= EMBED_SUB_BATCH),
+            "every sub-batch stays within EMBED_SUB_BATCH: {sizes:?}"
+        );
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            64,
+            "the sub-batches cover every text exactly once: {sizes:?}"
         );
     }
 

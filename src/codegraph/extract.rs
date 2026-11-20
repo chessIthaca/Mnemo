@@ -1887,6 +1887,84 @@ pub(crate) fn lang_family(file: &str) -> Option<Lang> {
     Lang::from_extension(&ext).map(Lang::family)
 }
 
+/// The most body lines one symbol's excerpt keeps (plan d3336a8a step 15):
+/// enough context for the embedding to carry what the code does, little
+/// enough that a batch of chunks stays cheap to embed.
+pub const EXCERPT_MAX_LINES: usize = 12;
+
+/// The excerpt's character cap (plan d3336a8a step 15) — cut on a char
+/// boundary, never mid-char.
+pub const EXCERPT_MAX_CHARS: usize = 600;
+
+/// The body excerpt of one symbol (plan d3336a8a step 15): the first lines
+/// of its body after the signature — blank and comment-only lines skipped,
+/// at most [`EXCERPT_MAX_LINES`] of them and [`EXCERPT_MAX_CHARS`] chars,
+/// cut on a char boundary. A plain-language question has almost no
+/// signature to match; the body lines carry what the code actually does.
+///
+/// Deterministic over data the store already keeps, so the chunk text
+/// rebuilds identically at upsert time (from the indexed content) and at
+/// embed time (from the `cg_content` rows): `lines` are the file's
+/// `(1-based line number, text)` pairs — blank lines are absent from
+/// `cg_content` and the excerpt skips them anyway, so the two inputs agree
+/// — plus the symbol's line range and the file's language (from the same
+/// path at both call sites). A declaration without a body opener
+/// (`pub struct Foo;`, a type alias) and a one-line body (`fn foo() {}`,
+/// which ends before the body begins) produce an empty excerpt.
+pub fn body_excerpt(
+    lines: &[(usize, &str)],
+    start_line: usize,
+    end_line: usize,
+    lang: Lang,
+) -> String {
+    let body_first = if matches!(doc_style(lang), DocStyle::BodyString) {
+        // The body sits below the `def`/`def`-style declaration line.
+        start_line + 1
+    } else {
+        // The first body opener inside the symbol's own line range; a
+        // declaration without one has no body to excerpt.
+        let Some((open_line, _)) = lines.iter().find(|(line, text)| {
+            *line >= start_line && *line <= end_line && text.contains('{')
+        }) else {
+            return String::new();
+        };
+        open_line + 1
+    };
+    let mut excerpt = String::new();
+    let mut kept = 0usize;
+    for (line, text) in lines {
+        if kept == EXCERPT_MAX_LINES || *line < body_first || *line > end_line {
+            continue;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() || is_comment_only(trimmed) {
+            continue;
+        }
+        if !excerpt.is_empty() {
+            excerpt.push('\n');
+        }
+        let room = EXCERPT_MAX_CHARS.saturating_sub(excerpt.chars().count());
+        let take: String = trimmed.chars().take(room).collect();
+        excerpt.push_str(&take);
+        kept += 1;
+        if excerpt.chars().count() >= EXCERPT_MAX_CHARS {
+            break;
+        }
+    }
+    excerpt
+}
+
+/// A line that carries only a comment (plan d3336a8a step 15): the body
+/// excerpt skips these along with blank lines. Covers the line-comment
+/// families of every parsed language (`//`, `#`) and the block-comment
+/// continuation/close shapes (`*`, `/*`).
+fn is_comment_only(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("/*")
+}
+
 /// [`RefKind`] for a call whose callee node is `callee`: receiver syntax
 /// (`x.m(...)`, `x->m(...)`) is a [`RefKind::MethodCall`]; every other
 /// shape keeps [`RefKind::Call`] — a `new Greeter()` or path call may
@@ -3080,5 +3158,44 @@ func Add(a int, b int) int {
             }),
             "a method call resolves to the same-language method it targets"
         );
+    }
+
+    #[test]
+    fn body_excerpt_for_python_and_ts() {
+        // Python (a body-string doc style): the excerpt begins BELOW the
+        // def line — the docstring and the body lines follow, the
+        // interior `#` comment never appears.
+        let py = "def parse_retry_after(header):\n\
+                  \x20   \"\"\"Parse a Retry-After value.\"\"\"\n\
+                  \x20   value = header.strip()\n\
+                  \x20   return None if not value else float(value)\n\
+                  \x20   # trailing comment\n";
+        let lines: Vec<(usize, &str)> =
+            py.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+        let excerpt = body_excerpt(&lines, 1, 5, Lang::Python);
+        assert_eq!(
+            excerpt,
+            "\"\"\"Parse a Retry-After value.\"\"\"\n\
+             value = header.strip()\n\
+             return None if not value else float(value)"
+        );
+        // TS (a brace body): the excerpt begins after the line that opens
+        // the body brace; the interior `//` comment is skipped and the
+        // comment ABOVE the function is out of the symbol's range anyway.
+        let ts = "// a comment above\nexport function render(items: Item[]): string {\n  // an interior comment\n  const out = items.map(toLabel);\n  return out.join(\"\");\n}";
+        let lines: Vec<(usize, &str)> =
+            ts.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+        let excerpt = body_excerpt(&lines, 2, 6, Lang::Ts);
+        assert_eq!(excerpt, "const out = items.map(toLabel);
+return out.join(\"\");
+}");
+        // A one-line body (the body begins beyond the symbol's own end)
+        // and a declaration without a body opener (a unit struct) both
+        // carry an empty excerpt — never the NEXT symbol's lines.
+        let rust = "fn one() -> u32 { 0 }\nstruct Unit;\nfn next() -> u32 { 1 }\n";
+        let lines: Vec<(usize, &str)> =
+            rust.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+        assert_eq!(body_excerpt(&lines, 1, 1, Lang::Rust), "");
+        assert_eq!(body_excerpt(&lines, 2, 2, Lang::Rust), "");
     }
 }

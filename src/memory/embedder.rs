@@ -30,6 +30,14 @@ pub const EMBEDDING_DIM: usize = 768;
 #[cfg(feature = "embeddings")]
 pub const CODE_EMBEDDING_MODEL: &str = "jina-embeddings-v2-base-code";
 
+/// The tokenizer's token cap for the code-search model (plan d3336a8a step
+/// 15): the model's own config allows 8192-token inputs, and one long
+/// batch spikes the ONNX attention working set into gigabytes of host RAM.
+/// 512 bounds it (a full embedding chunk is ~150-250 tokens, so no real
+/// chunk truncates) and matches the memory model's window.
+#[cfg(feature = "embeddings")]
+pub const CODE_EMBEDDING_MAX_TOKENS: usize = 512;
+
 /// An embedder produces a fixed-dimension vector for a piece of text.
 #[async_trait]
 pub trait Embedder: Send + Sync {
@@ -197,7 +205,7 @@ impl BundledEmbedder {
     ) -> Result<Self, String> {
         let model = model_for_id(model_id)?;
         let dim = dim_for_model(&model);
-        let init = fastembed::TextInitOptions::new(model).with_cache_dir(cache_dir.to_path_buf());
+        let init = text_init_options(model, model_id, cache_dir);
         let model = fastembed::TextEmbedding::try_new(init)
             .map_err(|e| format!("failed to load embedding model '{model_id}': {e}"))?;
         *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
@@ -663,6 +671,37 @@ pub fn model_for_id(id: &str) -> Result<fastembed::EmbeddingModel, String> {
         "jina-embeddings-v2-base-code" => Ok(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode),
         other => Err(format!("unknown embedding model '{other}'")),
     }
+}
+
+/// The fastembed load options of a bundled model — the ONE shared load
+/// path of the models host and the in-process fallback (plan d3336a8a
+/// step 15, so the two can never drift): the cache dir, plus the
+/// code-search model's explicit token cap
+/// ([`CODE_EMBEDDING_MAX_TOKENS`]). Every other model — the memory
+/// models — keeps its own defaults.
+///
+/// The ORT CPU memory arena cannot be disabled from here: fastembed
+/// exposes only `session_config` entries, and the arena is not one
+/// (it is the `DisableCpuMemArena` C API, which fastembed never calls;
+/// the session-options config-keys header has no arena key — an
+/// unknown entry is stored and never consumed). The arena's growth is
+/// bounded instead by the token cap plus the host's sub-batching:
+/// fastembed pads every batch to its longest text
+/// (`PaddingStrategy::BatchLongest`, hardcoded in fastembed — no
+/// fixed-length padding either), so without the cap one long batch
+/// spikes the padded attention (5.2 GB at step 17; the cap plus
+/// 16-text sub-batches bounds a full 17.5k-symbol pass at ~1.4 GB).
+#[cfg(feature = "embeddings")]
+pub fn text_init_options(
+    model: fastembed::EmbeddingModel,
+    model_id: &str,
+    cache_dir: &std::path::Path,
+) -> fastembed::TextInitOptions {
+    let mut init = fastembed::TextInitOptions::new(model).with_cache_dir(cache_dir.to_path_buf());
+    if model_id == CODE_EMBEDDING_MODEL {
+        init = init.with_max_length(CODE_EMBEDDING_MAX_TOKENS);
+    }
+    init
 }
 
 /// The vector dimension a fastembed model produces (used before the first

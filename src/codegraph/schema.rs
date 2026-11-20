@@ -30,7 +30,9 @@
 //!   older (or missing) version predate a change in what the extractor
 //!   persists (v1: refs carry the method-call shape, plan 0d53d659;
 //!   v2: each symbol persists its signature + doc comment for semantic
-//!   code search, plan d3336a8a step 9) and need one re-parse — their
+//!   code search, plan d3336a8a step 9; v3: the embedding chunk carries
+//!   the name's split words, the enclosing type and the body excerpt,
+//!   plan d3336a8a step 15) and need one re-parse — their
 //!   rows cannot be re-derived in place.
 //!
 //! The DB is a derivable cache (gitignored, rebuilt from source on startup),
@@ -48,10 +50,12 @@ use crate::error::Result;
 /// record receiver syntax so the resolver can refuse cross-language and
 /// method-call-to-free-fn targets, plan 0d53d659; v2: every real symbol
 /// persists its signature + doc comment for the semantic code search's
-/// embedding chunk, plan d3336a8a step 9). A plain index pass re-parses
-/// stamped-older files exactly once — same backfill shape as
-/// `cg_content_meta`, never perpetual.
-pub const EXTRACTOR_VERSION: i64 = 2;
+/// embedding chunk, plan d3336a8a step 9; v3: the chunk text gains the
+/// name's split words, the enclosing type and the body excerpt, so every
+/// text hash changes and every symbol re-embeds lazily, plan d3336a8a
+/// step 15). A plain index pass re-parses stamped-older files exactly
+/// once — same backfill shape as `cg_content_meta`, never perpetual.
+pub const EXTRACTOR_VERSION: i64 = 3;
 
 /// Enable the same pragmas the memory store relies on: WAL (concurrent readers
 /// never block the background index writer), a busy timeout so a reader waits

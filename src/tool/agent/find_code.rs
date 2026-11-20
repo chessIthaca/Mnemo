@@ -43,7 +43,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::codegraph::store::ContentHit;
+use crate::codegraph::store::{name_words, ContentHit};
 use crate::codegraph::{CodeGraph, SymbolSearchIndex};
 use crate::error::Result;
 use crate::memory::embedder::EmbedderStatus;
@@ -138,35 +138,6 @@ fn query_tokens(query: &str) -> Vec<String> {
 /// flatten to `stale edit gate`.
 fn flatten_ident(text: &str) -> String {
     name_words(text).join(" ")
-}
-
-/// A name split into its words: snake_case separators, camelCase humps and
-/// acronym boundaries (`HTTPServer` → `http`, `server`), all lowercased.
-fn name_words(name: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut previous: Option<char> = None;
-    for c in name.chars() {
-        if !c.is_alphanumeric() {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            previous = None;
-            continue;
-        }
-        if c.is_uppercase() {
-            let hump = previous.is_some_and(|p| p.is_lowercase() || p.is_numeric());
-            if hump && !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-        }
-        current.extend(c.to_lowercase());
-        previous = Some(c);
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
 }
 
 /// The name-match score of one symbol name for a query (plan d3336a8a step
@@ -860,12 +831,61 @@ pub fn stale_edit_gate(read_hash: &str) -> bool { !read_hash.is_empty() }
             fourth.output
         );
     }
+
+    /// The eval's isolation contract (plan d3336a8a step 15): it embeds
+    /// IN-PROCESS ONLY and reads nothing from the real config dir
+    /// besides the read-only model cache — so the shared host's client
+    /// paths are unreachable from the eval module, and the graph lives
+    /// under a fresh temp root, never under the real config dir. The
+    /// source-shape half lives OUTSIDE the eval module on purpose:
+    /// inside it, the forbidden names would match their own checker.
+    #[test]
+    fn eval_never_touches_the_real_config_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph_db = temp.path().join("codegraph.db");
+        let real_config = crate::config::resolve_config_dir(None);
+        assert!(
+            !graph_db.starts_with(&real_config),
+            "the eval graph stays out of the real config dir: {}",
+            graph_db.display()
+        );
+        let source = include_str!("find_code.rs");
+        // Concatenated so the markers cannot match their own literals in
+        // this test — the test body sits before the eval module in the
+        // file, and `find` returns the FIRST occurrence.
+        let eval_marker = ["mod", " eval", " {"].concat();
+        let degraded_marker = ["mod degraded", "_embedder_tests"].concat();
+        let start = source.find(&eval_marker).expect("the eval module marker");
+        let end = source
+            .find(&degraded_marker)
+            .expect("the following module marker");
+        let module = &source[start..end];
+        assert!(
+            module.contains("BundledEmbedder::new"),
+            "the eval builds its embedder in-process only"
+        );
+        let forbidden_paths = [
+            "build_code_embedder",
+            "acquire_remote_embedder",
+            "crate::host::models_host",
+        ];
+        for forbidden in forbidden_paths {
+            assert!(
+                !module.contains(forbidden),
+                "the eval module must not reach the shared host: {forbidden}"
+            );
+        }
+    }
+
 }
 
 #[cfg(all(test, feature = "embeddings"))]
 mod eval {
     use super::*;
-    use crate::memory::embedder::{is_model_installed, EmbedderStatus, CODE_EMBEDDING_MODEL};
+    use crate::codegraph::store::ChunkShape;
+    use crate::memory::embedder::{
+        is_model_installed, BundledEmbedder, Embedder, EmbedderStatus, CODE_EMBEDDING_MODEL,
+    };
 
     /// One eval question — `tests/eval/find_code_questions.json`.
     #[derive(serde::Deserialize)]
@@ -894,14 +914,20 @@ mod eval {
         Some((file.to_string(), name.to_string()))
     }
 
-    /// The manual eval (plan d3336a8a step 11): symbol and file recall@5 for
-    /// `find_code` and for the `search` tool on the same 25 questions, plus
-    /// the query latency. `#[ignore]`d — it indexes this repository and
-    /// embeds every symbol through the real code model, which takes minutes.
+    /// The manual eval (plan d3336a8a steps 11 and 15): symbol and file
+    /// recall@5 for `find_code` over three chunk variants — a) today's
+    /// (step-9) chunk, b) plus the name's split words, c) plus the
+    /// enclosing type and the body excerpt — each re-embedded through the
+    /// real code model and ranked by the REAL `find_code` tool, plus the
+    /// fair `search` baseline (the same token-OR query `find_code`'s own
+    /// FTS term uses, mapped to enclosing symbols). `#[ignore]`d — it
+    /// indexes this repository and embeds every symbol once per variant,
+    /// which takes tens of minutes.
     ///
     /// Run it with
     /// `cargo test --lib --features embeddings -- --ignored --nocapture find_code_eval`.
-    /// The graph lives in a temp dir; the model cache is READ only, and a
+    /// The graph lives in a temp dir; the eval embeds IN-PROCESS ONLY (never
+    /// the shared host, never its lease); the model cache is READ only, and a
     /// missing model SKIPS the run instead of downloading.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "eval: indexes this repo and embeds every symbol with the code model; run manually"]
@@ -922,6 +948,16 @@ mod eval {
             );
             return;
         }
+        // Isolation assertions (plan d3336a8a step 15): the only real path
+        // this run touches is the read-only model cache — no lease, no
+        // service dir, no spawn — and the graph never lands under the
+        // real config dir.
+        let real_config = crate::config::resolve_config_dir(None);
+        assert_eq!(
+            cache_dir,
+            real_config.join("models"),
+            "the eval reads only the real model cache"
+        );
 
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let temp = tempfile::tempdir().unwrap();
@@ -934,34 +970,24 @@ mod eval {
             env!("CARGO_MANIFEST_DIR")
         );
 
-        let embedder = crate::provider::client_factory::build_code_embedder(&cache_dir, None);
-        if embedder.model_id() != CODE_EMBEDDING_MODEL
-            || matches!(embedder.status(), Some(EmbedderStatus::Failed))
-        {
-            println!(
-                "find_code eval SKIPPED: no usable {CODE_EMBEDDING_MODEL} embedder ({:?})",
-                embedder.status()
-            );
-            return;
-        }
-        // The same model, through the pass's direct seam — the eval measures
-        // the ranking, not the shared slot's attach dance.
-        graph.arm_symbol_embedder_dyn(Arc::clone(&embedder));
-        graph.index(None).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25 * 60);
-        loop {
-            let pending = graph.symbol_embed_pending(CODE_EMBEDDING_MODEL).unwrap();
-            if pending == 0 {
-                break;
-            }
-            if std::time::Instant::now() > deadline {
-                println!("find_code eval SKIPPED: the embed pass did not drain ({pending} pending)");
+        // Isolation (plan d3336a8a step 15): the eval embeds IN-PROCESS
+        // ONLY — the concrete `BundledEmbedder`, never the shared host's
+        // remote client (no `~/.mnemo/run/models` lease, no spawn, no
+        // attach). The only real path the run touches is the model
+        // cache — a READ-ONLY reuse of the already-downloaded files.
+        let status = Arc::new(std::sync::RwLock::new(EmbedderStatus::Checking));
+        let embedder: Arc<dyn Embedder> = match BundledEmbedder::new(
+            CODE_EMBEDDING_MODEL,
+            &cache_dir,
+            status,
+        ) {
+            Ok(embedder) => Arc::new(embedder),
+            Err(reason) => {
+                println!("find_code eval SKIPPED: {reason}");
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-        let (vectors, texts) = graph.symbol_search_counts().unwrap();
-        println!("embedded {vectors} of {texts} symbols");
+        };
+        graph.arm_symbol_embedder_dyn(Arc::clone(&embedder));
 
         let graph = Arc::new(graph);
         let tool = FindCodeTool::new(Some(Arc::clone(&graph)));
@@ -979,84 +1005,152 @@ mod eval {
             );
         }
 
-        let (mut code_symbol, mut code_file) = (0usize, 0usize);
-        let (mut text_symbol, mut text_file) = (0usize, 0usize);
-        let mut cold_ms = 0.0f64;
-        let mut warm_ms = 0.0f64;
-        for (i, question) in questions.iter().enumerate() {
-            let started = std::time::Instant::now();
-            let result = tool
-                .execute(json!({"query": question.question, "limit": 5}))
-                .await;
-            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-            if i == 0 {
-                cold_ms = elapsed_ms;
-            } else {
-                warm_ms += elapsed_ms;
-            }
-            let found: Vec<(String, String)> = result
-                .output
-                .lines()
-                .filter_map(parse_output_line)
-                .collect();
-            let symbol_ok = found
-                .iter()
-                .any(|(file, name)| file == &question.file && name == &question.symbol);
-            let file_ok = found
-                .iter()
-                .take(5)
-                .any(|(file, _)| file == &question.file);
-            code_symbol += symbol_ok as usize;
-            code_file += file_ok as usize;
-
-            // The baseline the step compares against: the `search` tool's
-            // literal phrase query, each hit mapped to its innermost
-            // enclosing symbol, deduped in order.
-            let hits = graph.search_content(&question.question, 25).unwrap();
-            let mut seen: Vec<String> = Vec::new();
-            let mut text_found: Vec<(String, String)> = Vec::new();
-            for hit in &hits {
-                let Some(symbol) = index.enclosing(&hit.path, hit.line) else {
-                    continue;
-                };
-                if seen.contains(&symbol.id) {
-                    continue;
+        // The fair search baseline (plan d3336a8a step 15): the SAME
+        // token query `find_code`'s own FTS term uses — the question's
+        // tokens, OR-combined over the content index — each hit mapped
+        // to its innermost enclosing symbol, deduped in order. The old
+        // baseline sent the whole question as one phrase and scored 0.
+        let search_baseline: Vec<Vec<(String, String)>> = questions
+            .iter()
+            .map(|question| {
+                let tokens = query_tokens(&question.question);
+                let hits = graph.content_hits_any(&tokens, FTS_POOL).unwrap();
+                let mut seen: Vec<String> = Vec::new();
+                let mut found: Vec<(String, String)> = Vec::new();
+                for hit in &hits {
+                    let Some(symbol) = index.enclosing(&hit.path, hit.line) else {
+                        continue;
+                    };
+                    if seen.contains(&symbol.id) {
+                        continue;
+                    }
+                    seen.push(symbol.id.clone());
+                    found.push((symbol.file.clone(), symbol.name.clone()));
+                    if found.len() == 5 {
+                        break;
+                    }
                 }
-                seen.push(symbol.id.clone());
-                text_found.push((symbol.file.clone(), symbol.name.clone()));
-                if text_found.len() == 5 {
+                found
+            })
+            .collect();
+        let search_symbol = search_baseline
+            .iter()
+            .zip(&questions)
+            .filter(|(found, question)| {
+                found
+                    .iter()
+                    .any(|(file, name)| file == &question.file && name == &question.symbol)
+            })
+            .count();
+        let search_file = search_baseline
+            .iter()
+            .zip(&questions)
+            .filter(|(found, question)| {
+                found
+                    .iter()
+                    .take(5)
+                    .any(|(file, _)| file == &question.file)
+            })
+            .count();
+
+        // The baseline prints BEFORE the variant loop: a variant that
+        // times out must not take the numbers with it.
+        let n = questions.len();
+        println!();
+        println!(
+            "fair search baseline (the same token-OR query find_code's own FTS term uses, mapped to enclosing symbols):"
+        );
+        println!("   search symbol recall@5 {search_symbol}/{n}, file recall@5 {search_file}/{n}");
+
+        // One eval run measures every chunk variant (plan d3336a8a step
+        // 15): each variant re-hashes the stored text rows with its
+        // shape, the pass re-embeds every symbol, and the REAL
+        // `find_code` tool ranks over the result — the ranking is the
+        // shipped code path, not a re-implementation. The shipped chunk
+        // (c) measures FIRST — the machine's freshest run covers the
+        // number that decides the ship — and an early exit still leaves
+        // it measured; the final table prints in the narrative order
+        // a → b → c regardless.
+        let variants = [
+            (
+                ChunkShape::Full,
+                "c) + enclosing type + body excerpt",
+            ),
+            (ChunkShape::SplitNames, "b) + split name words"),
+            (ChunkShape::Today, "a) today's chunk"),
+        ];
+        let mut summary: Vec<(String, usize, usize, f64)> = Vec::new();
+        for (shape, label) in variants {
+            let rehashed = graph.retarget_symbol_chunks_for_test(shape).unwrap();
+            println!("== {label}: re-hashed {rehashed} text rows");
+            graph.index(None).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60 * 60);
+            loop {
+                let pending = graph.symbol_embed_pending(CODE_EMBEDDING_MODEL).unwrap();
+                if pending == 0 {
                     break;
                 }
+                if std::time::Instant::now() > deadline {
+                    println!("find_code eval SKIPPED: the embed pass did not drain ({pending} pending)");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
-            let text_symbol_ok = text_found
-                .iter()
-                .any(|(file, name)| file == &question.file && name == &question.symbol);
-            let text_file_ok = text_found
-                .iter()
-                .take(5)
-                .any(|(file, _)| file == &question.file);
-            text_symbol += text_symbol_ok as usize;
-            text_file += text_file_ok as usize;
+            let (vectors, texts) = graph.symbol_search_counts().unwrap();
+            println!("   embedded {vectors} of {texts} symbols");
+
+            let (mut code_symbol, mut code_file) = (0usize, 0usize);
+            let mut warm_ms = 0.0f64;
+            for (i, question) in questions.iter().enumerate() {
+                let started = std::time::Instant::now();
+                let result = tool
+                    .execute(json!({"query": question.question, "limit": 5}))
+                    .await;
+                warm_ms += started.elapsed().as_secs_f64() * 1000.0;
+                let found: Vec<(String, String)> = result
+                    .output
+                    .lines()
+                    .filter_map(parse_output_line)
+                    .collect();
+                let symbol_ok = found
+                    .iter()
+                    .any(|(file, name)| file == &question.file && name == &question.symbol);
+                let file_ok = found
+                    .iter()
+                    .take(5)
+                    .any(|(file, _)| file == &question.file);
+                code_symbol += symbol_ok as usize;
+                code_file += file_ok as usize;
+                println!(
+                    "   {:2}. {label} {} — {}",
+                    i + 1,
+                    if symbol_ok { "HIT " } else { "miss" },
+                    question.question
+                );
+            }
             println!(
-                "{:2}. find_code {} / search {} — {}",
-                i + 1,
-                if symbol_ok { "HIT " } else { "miss" },
-                if text_symbol_ok { "HIT " } else { "miss" },
-                question.question
+                "   {label}: find_code symbol recall@5 {code_symbol}/{n}, file recall@5 {code_file}/{n} (warm {warm_ms:.0} ms total)"
+            );
+            summary.push((label.to_string(), code_symbol, code_file, warm_ms));
+        }
+
+        println!();
+        println!("variant                          find_code sym@5  file@5   search sym@5  file@5");
+        // Narrative order a → b → c, whatever the measurement order was.
+        for label in [
+            "a) today's chunk",
+            "b) + split name words",
+            "c) + enclosing type + body excerpt",
+        ] {
+            let Some((_, code_symbol, code_file, _)) =
+                summary.iter().find(|(measured, ..)| measured == label)
+            else {
+                continue;
+            };
+            println!(
+                "{label:32} {code_symbol:8}/{n:<7} {code_file:5}/{n:<5} {search_symbol:7}/{n:<7} {search_file:5}/{n}"
             );
         }
-        let n = questions.len();
-        println!(
-            "find_code symbol recall@5: {code_symbol}/{n} ({:.0}%)",
-            100.0 * code_symbol as f64 / n as f64
-        );
-        println!("find_code file   recall@5: {code_file}/{n}");
-        println!("search    symbol recall@5: {text_symbol}/{n}");
-        println!("search    file   recall@5: {text_file}/{n}");
-        println!(
-            "query latency: cold {cold_ms:.1} ms, warm {:.1} ms average",
-            warm_ms / (n.saturating_sub(1)).max(1) as f64
-        );
     }
 
     /// The cosine scan's cost at this repo's scale (plan d3336a8a step 11):

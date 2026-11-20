@@ -1960,13 +1960,14 @@ mod tests {
     async fn light_command_never_waits() {
         let dir = tempdir().unwrap();
         let slots = tempdir().unwrap();
-        // The holder's heavy command runs for 8 s, so a light command that
-        // WRONGLY queued would take at least that long; a plain PowerShell
-        // start under full-suite load stays well under the 5 s bound.
+        // The holder keeps the only slot for 60 s, so a light command that
+        // WRONGLY queued would take at least that long. The 20 s bound only
+        // has to clear spawn latency: a bare PowerShell start under full-suite
+        // load has measured up to ~7 s on a busy machine.
         let held_command = if cfg!(target_os = "windows") {
-            "Start-Sleep -Milliseconds 8000".to_string()
+            "Start-Sleep -Milliseconds 60000".to_string()
         } else {
-            "sleep 8".to_string()
+            "sleep 60".to_string()
         };
         let holder_tool = tool_in(dir.path())
             .with_check_commands(vec![held_command.clone()])
@@ -1999,18 +2000,20 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(result.success, "{}", result.output);
         assert!(
-            elapsed < Duration::from_millis(5000),
+            elapsed < Duration::from_millis(20000),
             "a light command never waits for a build slot (the held heavy command \
-             runs for 8 s), took {elapsed:?}"
+             runs for 60 s), took {elapsed:?}"
         );
         assert!(
             !result.output.contains("waited"),
             "a light command reports no wait: {}",
             result.output
         );
-        // The holder outlives the assertion on purpose; drop it instead of
-        // waiting out its 8 s.
+        // The holder outlives the assertion on purpose; abort it and wait for
+        // the future to be dropped (closing its job object kills the child)
+        // instead of waiting out its 60 s, and leave no process behind.
         holder.abort();
+        let _ = holder.await;
 
     }
 

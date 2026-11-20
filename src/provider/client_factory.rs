@@ -419,6 +419,14 @@ pub fn build_vision_client(config: &Config) -> Option<Arc<dyn ImageDescriber>> {
 /// deterministic, in-process [`HashEmbedder`] — offline, dependency-free,
 /// keyword-overlap only — so memory always works (with the shared status set
 /// to `Failed` so the user sees the config issue).
+///
+/// `cache_dir` is the model cache directory under the config dir
+/// (`<config>/models` — every caller passes `embedder_cache_dir`). With
+/// the `embeddings` feature a machine-wide shared models host (plan
+/// d3336a8a step 2) is preferred over loading the model into this process:
+/// the share is derived from `cache_dir` ONLY while its last component is
+/// `models` — any other cache directory has no share and keeps today's
+/// in-process behaviour.
 pub fn build_embedder(
     config: &Config,
     cache_dir: &Path,
@@ -431,7 +439,7 @@ pub fn build_embedder(
             *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
             return Arc::new(HashEmbedder::new());
         }
-        return load_bundled_or_fallback(model_id, cache_dir, &status);
+        return configured_model_embedder(model_id, cache_dir, &status);
     }
     // Hash mode — always ready (no external service).
     *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
@@ -480,6 +488,125 @@ fn load_bundled_or_fallback(
     );
     *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Failed;
     Arc::new(HashEmbedder::new())
+}
+
+/// The configured-model branch of [`build_embedder`] with the `embeddings`
+/// feature on: remote-first — a machine-wide shared models host (plan
+/// d3336a8a step 2) is preferred over loading the model into this process.
+/// No host, or an unusable one, falls back to today's synchronous
+/// in-process load (never a worse state than before).
+#[cfg(feature = "embeddings")]
+fn configured_model_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: &Arc<RwLock<EmbedderStatus>>,
+) -> Arc<dyn Embedder> {
+    // Remote-first: acquire_remote_embedder itself derives the config dir
+    // from cache_dir (no share when the last component is not "models")
+    // and falls back to None on any failure.
+    if let Some(remote) = acquire_remote_embedder(model_id, cache_dir, status.clone()) {
+        return remote;
+    }
+    load_bundled_or_fallback(model_id, cache_dir, status)
+}
+
+/// The configured-model branch of [`build_embedder`] on a light build:
+/// nothing can be shared (no bundled-model machinery compiled in), so
+/// today's in-process shape stands.
+#[cfg(not(feature = "embeddings"))]
+fn configured_model_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: &Arc<RwLock<EmbedderStatus>>,
+) -> Arc<dyn Embedder> {
+    load_bundled_or_fallback(model_id, cache_dir, status)
+}
+
+/// Attach-ONLY to a healthy, published, machine-wide models host serving
+/// `model_id` — the startup leg (brain's installed-model arm). Never spawns
+/// and never waits for a spawn: the health probe is bounded by
+/// [`crate::host::models_host::STARTUP_PROBE`] (at most 1 s), so the startup
+/// path stays as cheap as today's. `Some` is a `RemoteEmbedder` with the
+/// shared status flipped to `Ready`; `None` leaves the caller's status
+/// untouched (the caller falls back to today's hash + deferred-load shape).
+///
+/// `cache_dir` must be the models cache under the config dir (last
+/// component `models`) — any other cache directory has no share and returns
+/// `None` (see [`crate::host::models_host::shared_config_dir`]).
+#[cfg(feature = "embeddings")]
+pub fn build_remote_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: Arc<RwLock<EmbedderStatus>>,
+) -> Option<Arc<dyn Embedder>> {
+    let config_dir = crate::host::models_host::shared_config_dir(cache_dir)?;
+    let client = crate::host::models_host::shared_client(&config_dir);
+    client.attach(model_id, crate::host::models_host::STARTUP_PROBE)?;
+    *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
+    Some(Arc::new(crate::memory::embedder::RemoteEmbedder::new(
+        client, model_id, status,
+    )))
+}
+
+/// Attach-or-spawn a machine-wide models host and return a `RemoteEmbedder`
+/// for `model_id` — the background paths only (the deferred startup load,
+/// the settings rewire's off-path embedder leg, reembed, the code
+/// embedder): spawn budgets are fine there, never on the startup path.
+/// The post-download swap is NOT one of them — embed_download.rs builds
+/// its `BundledEmbedder` in-process once a download finishes (review
+/// finding postDownloadDoc). A host THIS instance
+/// spawns serves `model_id` plus the code-search model (the exact-set
+/// rule: an instance attaches only when its requested model is in the
+/// descriptor's list). `None` on any failure (the caller falls back
+/// in-process).
+#[cfg(feature = "embeddings")]
+pub fn acquire_remote_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: Arc<RwLock<EmbedderStatus>>,
+) -> Option<Arc<dyn Embedder>> {
+    let config_dir = crate::host::models_host::shared_config_dir(cache_dir)?;
+    let client = crate::host::models_host::shared_client(&config_dir);
+    let mut serve = vec![model_id.to_string()];
+    if model_id != crate::memory::embedder::CODE_EMBEDDING_MODEL {
+        serve.push(crate::memory::embedder::CODE_EMBEDDING_MODEL.to_string());
+    }
+    let serve: Vec<&str> = serve.iter().map(String::as_str).collect();
+    client.acquire(model_id, &serve)?;
+    *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
+    Some(Arc::new(crate::memory::embedder::RemoteEmbedder::new(
+        client, model_id, status,
+    )))
+}
+
+/// The code-search embedder (plan d3336a8a step 9's half here):
+/// [`crate::memory::embedder::CODE_EMBEDDING_MODEL`] remote-first — the
+/// shared host serves it alongside the memory model — with today's
+/// in-process load as the fallback. Not wired into memory: the code-graph
+/// vectors and the `find_code` ranking (step 9) own its use.
+///
+/// The in-process fallback drives its OWN fresh status `Arc` — the memory
+/// embedder's shared status is untouched.
+#[cfg(feature = "embeddings")]
+pub fn build_code_embedder(cache_dir: &Path) -> Arc<dyn Embedder> {
+    let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+    if let Some(config_dir) = crate::host::models_host::shared_config_dir(cache_dir) {
+        let client = crate::host::models_host::shared_client(&config_dir);
+        if client
+            .acquire(
+                crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                &[crate::memory::embedder::CODE_EMBEDDING_MODEL],
+            )
+            .is_some()
+        {
+            return Arc::new(crate::memory::embedder::RemoteEmbedder::new(
+                client,
+                crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                status,
+            ));
+        }
+    }
+    load_bundled_or_fallback(crate::memory::embedder::CODE_EMBEDDING_MODEL, cache_dir, &status)
 }
 
 /// How startup should build the memory embedder for the configured bundled
@@ -1208,5 +1335,85 @@ mod tests {
             embedder_startup_plan(Some("all-MiniLM-L6-v2"), dir.path()),
             EmbedderStartupPlan::HashDefault
         );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_remote_embedder_is_none_and_leaves_status_without_a_host() {
+        // The startup attach-only leg: no descriptor, no spawn, no wait —
+        // the caller's status is untouched and today's shape is kept.
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        let status = Arc::new(RwLock::new(EmbedderStatus::Checking));
+        assert!(build_remote_embedder("all-MiniLM-L6-v2", &cache, status.clone()).is_none());
+        assert_eq!(*status.read().unwrap(), EmbedderStatus::Checking);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_remote_embedder_attaches_to_a_healthy_host() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        crate::host::models_host::spawn_test_host(
+            home.path(),
+            &["all-MiniLM-L6-v2"],
+            crate::host::models_host::HOST_IDLE,
+        );
+        let status = Arc::new(RwLock::new(EmbedderStatus::Checking));
+        let embedder = build_remote_embedder("all-MiniLM-L6-v2", &cache, status.clone())
+            .expect("attach to the healthy host");
+        assert_eq!(embedder.model_id(), "all-MiniLM-L6-v2");
+        assert_eq!(embedder.dim(), 384);
+        assert_eq!(*status.read().unwrap(), EmbedderStatus::Ready);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_embedder_prefers_a_healthy_host_over_in_process() {
+        // build_embedder's remote-first leg: with a healthy host published
+        // under the config dir, the embedder is the remote one (status
+        // Ready) and nothing is loaded or downloaded into this process.
+        use crate::config::{GeneralConfig, GeneralSection};
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        crate::host::models_host::spawn_test_host(
+            home.path(),
+            &["all-MiniLM-L6-v2"],
+            crate::host::models_host::HOST_IDLE,
+        );
+        let config = Config {
+            general: GeneralConfig {
+                general: GeneralSection {
+                    bundled_embedding_model: Some("all-MiniLM-L6-v2".into()),
+                    ..GeneralSection::default()
+                },
+                ..GeneralConfig::default()
+            },
+            ..Config::default()
+        };
+        let status = Arc::new(RwLock::new(EmbedderStatus::Checking));
+        let embedder = build_embedder(&config, &cache, status.clone());
+        assert_eq!(embedder.model_id(), "all-MiniLM-L6-v2");
+        assert_eq!(*status.read().unwrap(), EmbedderStatus::Ready);
+        // The no-host leg keeps today's shape — that is
+        // build_embedder_falls_back_to_hash_for_unknown_bundled_model's
+        // ground (an unknown model can never load, so no download).
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_code_embedder_prefers_a_healthy_host() {
+        // The code embedder is remote-first too: a host serving the code
+        // model is used, nothing is downloaded into this process.
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        crate::host::models_host::spawn_test_host(
+            home.path(),
+            &[crate::memory::embedder::CODE_EMBEDDING_MODEL],
+            crate::host::models_host::HOST_IDLE,
+        );
+        let embedder = build_code_embedder(&cache);
+        assert_eq!(embedder.model_id(), crate::memory::embedder::CODE_EMBEDDING_MODEL);
+        assert_eq!(embedder.dim(), 768);
     }
 }

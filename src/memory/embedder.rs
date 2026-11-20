@@ -23,6 +23,13 @@ use serde::{Deserialize, Serialize};
 /// re-embedding everything. `nomic-embed-text` is 768-dim.
 pub const EMBEDDING_DIM: usize = 768;
 
+/// The code-search embedding model the shared models host serves alongside
+/// the configured memory model (plan d3336a8a step 2; fastembed's
+/// `JinaEmbeddingsV2BaseCode`, dim 768, ~611 MB). Not wired into memory:
+/// step 9's code-graph vectors and the `find_code` ranking use it.
+#[cfg(feature = "embeddings")]
+pub const CODE_EMBEDDING_MODEL: &str = "jina-embeddings-v2-base-code";
+
 /// An embedder produces a fixed-dimension vector for a piece of text.
 #[async_trait]
 pub trait Embedder: Send + Sync {
@@ -35,6 +42,22 @@ pub trait Embedder: Send + Sync {
     /// keyword + tier + strength (the existing fallback path), and a zero
     /// stored vector contributes nothing to cosine (well-defined: 0).
     async fn embed(&self, text: &str) -> Vec<f32>;
+
+    /// Embed a batch of texts in one call.
+    ///
+    /// The default loops [`Embedder::embed`] once per text — correct for
+    /// every embedder, and the only cost a trivial one pays. Real embedders
+    /// override it natively: `BundledEmbedder` runs one ONNX pass and
+    /// `RemoteEmbedder` sends one HTTP request, so a batch never costs N
+    /// round trips (the fully-semantic recall pool and the code-graph bulk
+    /// embed depend on this).
+    async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        let mut vectors = Vec::with_capacity(texts.len());
+        for text in texts {
+            vectors.push(self.embed(text).await);
+        }
+        vectors
+    }
 
     /// The dimension of the vectors this embedder produces.
     fn dim(&self) -> usize {
@@ -201,6 +224,12 @@ impl BundledEmbedder {
                 dim: 768,
                 size_mb: 280,
             },
+            BundledModelInfo {
+                id: "jina-embeddings-v2-base-code".into(),
+                name: "Jina Embeddings v2 Base Code (code search)".into(),
+                dim: 768,
+                size_mb: 611,
+            },
         ]
     }
 }
@@ -243,6 +272,338 @@ impl Embedder for BundledEmbedder {
         }
     }
 
+    async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        let count = texts.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        let model = Arc::clone(&self.model);
+        let texts = texts.to_vec();
+        let dim = self.dim;
+        let status = Arc::clone(&self.status);
+        // One ONNX pass for the whole batch: N texts cost one inference
+        // run, not N (the single-text embed does the same with one slice).
+        let embed = tokio::task::spawn_blocking(move || {
+            // fastembed 7's `embed` takes `&mut self`; the guard is scoped
+            // to this sync closure, so it never crosses an `.await`.
+            let mut model = model.lock().expect("embedder model lock poisoned");
+            model.embed(texts, None)
+        });
+        match embed.await {
+            Ok(Ok(batches))
+                if batches.len() == count && batches.iter().all(|batch| batch.len() == dim) =>
+            {
+                *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
+                batches
+            }
+            _ => {
+                *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Fallback;
+                vec![vec![0.0_f32; dim]; count]
+            }
+        }
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+}
+
+/// The machine-wide shared models host as an [`Embedder`] (plan d3336a8a
+/// step 2): the vectors come over loopback HTTP from the one host process
+/// per machine, so instances never load the model into their own address
+/// space while a host serves.
+///
+/// Failure-protected like the bundled embedder: on ANY remote error (dead
+/// port, wrong token, unreadable answer, wrong shape) this embedder lazily
+/// creates the in-process [`BundledEmbedder`] — today's path — and embeds
+/// through it, logging at most once per minute. A fallback whose model
+/// cannot load (an unknown id) becomes the permanent [`HashEmbedder`] with
+/// status `Failed`, matching `build_embedder`'s failure shape. The remote
+/// is retried once per cooldown window, and every retry re-reads the
+/// descriptor first (the re-point rule: a host another instance replaced is
+/// reached at its new port — never a cached port or token).
+///
+/// `dim` and `model_id` match the in-process embedder exactly, so stored
+/// vectors and the store's fingerprint stay compatible across a swap
+/// between remote and in-process.
+#[cfg(feature = "embeddings")]
+pub struct RemoteEmbedder {
+    /// The per-config-dir client holding the lease and the endpoint cache.
+    client: Arc<crate::host::models_host::ModelsHostClient>,
+    model_id: String,
+    dim: usize,
+    status: Arc<RwLock<EmbedderStatus>>,
+    /// The loopback HTTP client (None — always embed in-process — when it
+    /// could not be built).
+    http: Option<reqwest::Client>,
+    /// The lazily created in-process fallback (created at most once).
+    fallback: tokio::sync::Mutex<Option<Arc<dyn Embedder>>>,
+    /// The cooldown window: no remote attempt until this instant passes.
+    host_down_until: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Set by every remote failure: the next attempt re-reads the
+    /// descriptor (the re-point rule) instead of trusting the cache.
+    endpoint_failed: std::sync::atomic::AtomicBool,
+    /// The at-most-once-a-minute error-log gate.
+    last_error_log: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The cooldown length (tests shrink it).
+    cooldown: std::time::Duration,
+}
+
+#[cfg(feature = "embeddings")]
+impl RemoteEmbedder {
+    /// Build the remote embedder for `model_id` through `client`. The
+    /// caller has attached to (or spawned) a healthy host and owns the
+    /// status transition to `Ready`; this wires the pieces — no I/O happens
+    /// here.
+    pub fn new(
+        client: Arc<crate::host::models_host::ModelsHostClient>,
+        model_id: &str,
+        status: Arc<RwLock<EmbedderStatus>>,
+    ) -> Self {
+        let dim = model_for_id(model_id)
+            .map(|model| dim_for_model(&model))
+            .unwrap_or(EMBEDDING_DIM);
+        let http = reqwest::Client::builder()
+            .timeout(crate::host::models_host::REQUEST_TIMEOUT)
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .map_err(|err| {
+                eprintln!(
+                    "warning: could not build the models-host HTTP client ({err}); \
+                     embedding in-process"
+                );
+                err
+            })
+            .ok();
+        Self {
+            client,
+            model_id: model_id.to_string(),
+            dim,
+            status,
+            http,
+            fallback: tokio::sync::Mutex::new(None),
+            host_down_until: std::sync::Mutex::new(None),
+            endpoint_failed: std::sync::atomic::AtomicBool::new(false),
+            last_error_log: std::sync::Mutex::new(None),
+            cooldown: crate::host::models_host::HOST_DOWN_COOLDOWN,
+        }
+    }
+
+    /// Tests only: shrink the host-down cooldown (the re-point window).
+    #[cfg(test)]
+    pub(crate) fn override_cooldown(&mut self, cooldown: std::time::Duration) {
+        self.cooldown = cooldown;
+    }
+
+    /// The shared embed path: remote first (outside the cooldown), the
+    /// in-process fallback on any error — a shared service is an
+    /// optimisation, never a new single point of failure.
+    async fn embed_texts(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        if self.host_down() {
+            return self.embed_fallback(texts).await;
+        }
+        match self.embed_remote(texts).await {
+            Some(vectors) => vectors,
+            None => self.embed_fallback(texts).await,
+        }
+    }
+
+    /// The one remote attempt: resolve the endpoint (re-reading the
+    /// descriptor after any failure — the re-point rule), POST the batch,
+    /// and validate the answer's shape. Errors mark the host down and
+    /// return `None` (the caller embeds through the fallback).
+    async fn embed_remote(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
+        let Some(http) = &self.http else {
+            self.mark_host_down("no HTTP client could be built");
+            return None;
+        };
+        let Some(endpoint) = self.usable_endpoint() else {
+            self.mark_host_down("no healthy host is published");
+            return None;
+        };
+        let request = crate::host::models_host::EmbedRequest {
+            model: self.model_id.clone(),
+            texts: texts.to_vec(),
+        };
+        let answer = http
+            .post(format!("http://127.0.0.1:{}/v1/embed", endpoint.port))
+            .bearer_auth(&endpoint.token)
+            .json(&request)
+            .send()
+            .await;
+        let answer = match answer {
+            Ok(answer) if answer.status().as_u16() == 200 => answer,
+            Ok(answer) => {
+                self.mark_host_down(&format!(
+                    "the host answered HTTP {}",
+                    answer.status().as_u16()
+                ));
+                return None;
+            }
+            Err(err) => {
+                self.mark_host_down(&format!("the request failed: {err}"));
+                return None;
+            }
+        };
+        let decoded = match answer
+            .json::<crate::host::models_host::EmbedResponse>()
+            .await
+        {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                self.mark_host_down(&format!("the host answer was unreadable: {err}"));
+                return None;
+            }
+        };
+        if decoded.dim != self.dim
+            || decoded.vectors.len() != texts.len()
+            || decoded.vectors.iter().any(|vector| vector.len() != self.dim)
+        {
+            self.mark_host_down("the host answered vectors of the wrong shape");
+            return None;
+        }
+        *self
+            .host_down_until
+            .lock()
+            .expect("models-host cooldown lock poisoned") = None;
+        *self
+            .status
+            .write()
+            .expect("embedder status lock poisoned") = EmbedderStatus::Ready;
+        Some(decoded.vectors)
+    }
+
+    /// The cached endpoint while it is fresh, or a re-read descriptor. The
+    /// re-point rule: after any failure never trust the cached port or
+    /// token — a host another instance replaced is reached at its new port.
+    fn usable_endpoint(&self) -> Option<crate::host::models_host::HostEndpoint> {
+        if !self
+            .endpoint_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(endpoint) = self.client.endpoint() {
+                if endpoint.models.iter().any(|served| served == &self.model_id) {
+                    return Some(endpoint);
+                }
+            }
+        }
+        let endpoint = self.client.refresh_endpoint(&self.model_id)?;
+        self.endpoint_failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        Some(endpoint)
+    }
+
+    /// Whether the cooldown window blocks remote attempts.
+    fn host_down(&self) -> bool {
+        matches!(
+            *self
+                .host_down_until
+                .lock()
+                .expect("models-host cooldown lock poisoned"),
+            Some(until) if std::time::Instant::now() < until
+        )
+    }
+
+    /// Record a remote failure: arm the cooldown, mark the endpoint stale
+    /// (the next attempt re-reads the descriptor) and log at most once per
+    /// minute.
+    fn mark_host_down(&self, reason: &str) {
+        *self
+            .host_down_until
+            .lock()
+            .expect("models-host cooldown lock poisoned") =
+            Some(std::time::Instant::now() + self.cooldown);
+        self.endpoint_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.log_throttled(reason);
+    }
+
+    /// Log the fallback reason at most once per minute (every embed would
+    /// otherwise repeat it).
+    fn log_throttled(&self, reason: &str) {
+        let mut last = self
+            .last_error_log
+            .lock()
+            .expect("models-host log lock poisoned");
+        if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60)) {
+            return;
+        }
+        eprintln!(
+            "warning: the shared models host is unreachable ({reason}); embedding \
+             in-process and retrying the host once a minute"
+        );
+        *last = Some(std::time::Instant::now());
+    }
+
+    /// Embed through the lazily created in-process fallback — today's path.
+    /// The fallback is created at most once: a model that cannot load
+    /// becomes the permanent hash embedder with status `Failed` (the
+    /// `build_embedder` failure shape).
+    async fn embed_fallback(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        let embedder = {
+            let mut slot = self.fallback.lock().await;
+            if slot.is_none() {
+                let model = self.model_id.clone();
+                let cache_dir =
+                    crate::config::embedder_cache_dir(self.client.config_dir());
+                let status = Arc::clone(&self.status);
+                let built = tokio::task::spawn_blocking(move || {
+                    BundledEmbedder::new(&model, &cache_dir, status)
+                })
+                .await;
+                let fallback: Arc<dyn Embedder> = match built {
+                    Ok(Ok(bundled)) => Arc::new(bundled),
+                    Ok(Err(err)) => {
+                        eprintln!(
+                            "warning: the models host is unreachable and the in-process \
+                             model failed to load: {err}; embedding with the built-in \
+                             hash embedder"
+                        );
+                        *self
+                            .status
+                            .write()
+                            .expect("embedder status lock poisoned") = EmbedderStatus::Failed;
+                        Arc::new(HashEmbedder::new())
+                    }
+                    Err(join) => {
+                        eprintln!(
+                            "error: the in-process fallback load task panicked: {join}"
+                        );
+                        *self
+                            .status
+                            .write()
+                            .expect("embedder status lock poisoned") = EmbedderStatus::Failed;
+                        Arc::new(HashEmbedder::new())
+                    }
+                };
+                *slot = Some(fallback);
+            }
+            Arc::clone(slot.as_ref().expect("the fallback is set"))
+        };
+        embedder.embed_batch(texts).await
+    }
+}
+
+#[cfg(feature = "embeddings")]
+#[async_trait]
+impl Embedder for RemoteEmbedder {
+    async fn embed(&self, text: &str) -> Vec<f32> {
+        let texts = [text.to_string()];
+        let mut vectors = self.embed_texts(&texts).await;
+        vectors.pop().unwrap_or_else(|| vec![0.0_f32; self.dim])
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        self.embed_texts(texts).await
+    }
+
     fn dim(&self) -> usize {
         self.dim
     }
@@ -253,14 +614,16 @@ impl Embedder for BundledEmbedder {
 }
 
 /// Map a model-id string to the fastembed enum. Returns an error for an
-/// unknown id (the caller surfaces it to the user).
+/// unknown id (the caller surfaces it to the user; the shared models host
+/// also uses this to refuse spawning for a bogus config).
 #[cfg(feature = "embeddings")]
-fn model_for_id(id: &str) -> Result<fastembed::EmbeddingModel, String> {
+pub fn model_for_id(id: &str) -> Result<fastembed::EmbeddingModel, String> {
     match id {
         "all-MiniLM-L6-v2" => Ok(fastembed::EmbeddingModel::AllMiniLML6V2),
         "bge-small-en-v1.5" => Ok(fastembed::EmbeddingModel::BGESmallENV15),
         "bge-base-en-v1.5" => Ok(fastembed::EmbeddingModel::BGEBaseENV15),
         "nomic-embed-text-v1.5" => Ok(fastembed::EmbeddingModel::NomicEmbedTextV15),
+        "jina-embeddings-v2-base-code" => Ok(fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode),
         other => Err(format!("unknown embedding model '{other}'")),
     }
 }
@@ -268,12 +631,13 @@ fn model_for_id(id: &str) -> Result<fastembed::EmbeddingModel, String> {
 /// The vector dimension a fastembed model produces (used before the first
 /// successful embed, for the zero-vector fallback).
 #[cfg(feature = "embeddings")]
-fn dim_for_model(model: &fastembed::EmbeddingModel) -> usize {
+pub fn dim_for_model(model: &fastembed::EmbeddingModel) -> usize {
     match model {
         fastembed::EmbeddingModel::AllMiniLML6V2 => 384,
         fastembed::EmbeddingModel::BGESmallENV15 => 384,
         fastembed::EmbeddingModel::BGEBaseENV15 => 768,
         fastembed::EmbeddingModel::NomicEmbedTextV15 => 768,
+        fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode => 768,
         _ => EMBEDDING_DIM, // safe fallback for unlisted models
     }
 }
@@ -290,6 +654,7 @@ pub fn hf_cache_subdir(model_id: &str) -> Option<String> {
         "bge-small-en-v1.5" => "Xenova/bge-small-en-v1.5",
         "bge-base-en-v1.5" => "Xenova/bge-base-en-v1.5",
         "nomic-embed-text-v1.5" => "nomic-ai/nomic-embed-text-v1.5",
+        "jina-embeddings-v2-base-code" => "jinaai/jina-embeddings-v2-base-code",
         _ => return None,
     };
     // HF cache layout: models--<org>--<name> (slashes → double dashes).
@@ -324,7 +689,6 @@ pub fn is_model_installed(cache_dir: &std::path::Path, model_id: &str) -> bool {
     false
 }
 
-/// Produce a deterministic EMBEDDING_DIM-dim vector from text using a hash-based
 /// Produce a deterministic EMBEDDING_DIM-dim vector from text using a hash-based
 /// projection. Tokenizes on whitespace and hashes each token into the vector.
 pub fn hash_embedding(text: &str) -> Vec<f32> {
@@ -466,6 +830,349 @@ mod tests {
             0.0
         } else {
             dot / (na * nb)
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_batch_default_loops() {
+        struct CountingEmbedder {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl Embedder for CountingEmbedder {
+            async fn embed(&self, _text: &str) -> Vec<f32> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vec![1.0_f32]
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let embedder = CountingEmbedder {
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let vectors = embedder.embed_batch(&texts).await;
+        assert_eq!(vectors.len(), 3);
+        assert!(vectors.iter().all(|vector| vector == &vec![1.0_f32]));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the default embed_batch loops embed once per text"
+        );
+        assert!(embedder.embed_batch(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hash_embedder_embed_batch_matches_single_embeds() {
+        let embedder = HashEmbedder::new();
+        let texts = vec!["alpha beta".to_string(), "gamma".to_string()];
+        let batched = embedder.embed_batch(&texts).await;
+        for (batched, text) in batched.iter().zip(&texts) {
+            assert_eq!(batched, &hash_embedding(text));
+        }
+    }
+
+    /// The RemoteEmbedder against a stub host: the always-run stand-ins for
+    /// the real host (which needs a downloaded model — see
+    /// `remote_embedder_matches_in_process_vectors`).
+    #[cfg(feature = "embeddings")]
+    mod remote {
+        use super::*;
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        /// A minimal loopback HTTP stub answering `GET /health` and
+        /// `POST /v1/embed` with marker vectors. Serves at most `budget`
+        /// requests, then stops: exhausting the budget drops the listener,
+        /// which is how a test kills a stub host (its port goes dead).
+        fn stub_host(marker: f32, models: &[&str], budget: usize) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stub");
+            let port = listener.local_addr().expect("a stub port").port();
+            let models: Vec<String> = models.iter().map(|model| model.to_string()).collect();
+            thread::spawn(move || {
+                let mut served = 0;
+                while served < budget {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    served += 1;
+                    let Some((method, path, body)) = read_stub_request(&mut stream) else {
+                        continue;
+                    };
+                    if method == "GET" && path == "/health" {
+                        let answer =
+                            serde_json::json!({ "models": models, "version": "stub" }).to_string();
+                        write_stub_response(&mut stream, 200, &answer);
+                    } else if method == "POST" && path == "/v1/embed" {
+                        let Ok(request) =
+                            serde_json::from_slice::<crate::host::models_host::EmbedRequest>(
+                                &body,
+                            )
+                        else {
+                            write_stub_response(
+                                &mut stream,
+                                400,
+                                &serde_json::json!({ "error": "bad body" }).to_string(),
+                            );
+                            continue;
+                        };
+                        // The dim must match the embedder's derived dim: an
+                        // unknown model id keeps EMBEDDING_DIM.
+                        let dim = EMBEDDING_DIM;
+                        let vectors: Vec<Vec<f32>> = request
+                            .texts
+                            .iter()
+                            .map(|_| {
+                                let mut vector = vec![0.0_f32; dim];
+                                vector[0] = marker;
+                                vector
+                            })
+                            .collect();
+                        let answer =
+                            serde_json::json!({ "vectors": vectors, "dim": dim }).to_string();
+                        write_stub_response(&mut stream, 200, &answer);
+                    } else {
+                        write_stub_response(
+                            &mut stream,
+                            404,
+                            &serde_json::json!({ "error": "unknown path" }).to_string(),
+                        );
+                    }
+                }
+            });
+            port
+        }
+
+        /// Read one stub request: request line, headers, content-length body.
+        fn read_stub_request(stream: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).ok()?;
+                if read == 0 {
+                    return None;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(at) = buffer
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                {
+                    break at;
+                }
+                if buffer.len() > 64 * 1024 {
+                    return None;
+                }
+            };
+            let head = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+            let mut lines = head.split("\r\n");
+            let request_line = lines.next()?;
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next()?.to_string();
+            let path = parts.next()?.to_string();
+            let content_length: usize = lines
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = buffer[header_end + 4..].to_vec();
+            while body.len() < content_length {
+                let read = stream.read(&mut chunk).ok()?;
+                if read == 0 {
+                    return None;
+                }
+                body.extend_from_slice(&chunk[..read]);
+            }
+            body.truncate(content_length);
+            Some((method, path, body))
+        }
+
+        fn write_stub_response(stream: &mut TcpStream, code: u16, body: &str) {
+            let head = format!(
+                "HTTP/1.1 {code} \r\nContent-Type: application/json\r\nContent-Length: \
+                 {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+
+        /// Publish a descriptor for the TEST process (alive, real creation
+        /// identity) — the stand-in for a host another instance spawned.
+        fn publish_descriptor(config_dir: &std::path::Path, port: u16, token: &str) {
+            crate::host::shared_service::write_service(
+                &crate::host::shared_service::service_dir(config_dir, "models"),
+                &crate::host::shared_service::ServiceInfo {
+                    pid: std::process::id(),
+                    port,
+                    token: token.to_string(),
+                    version: "test".into(),
+                    started_ms: crate::host::shared_service::now_ms(),
+                    created: crate::process_tree::process_creation_id(std::process::id())
+                        .unwrap_or_default(),
+                    models: vec!["not-a-real-model".into()],
+                },
+            )
+            .expect("publish the test descriptor");
+        }
+
+        #[tokio::test]
+        async fn remote_embedder_serves_from_a_healthy_stub_host() {
+            let home = tempfile::tempdir().unwrap();
+            let port = stub_host(7.5, &["not-a-real-model"], 64);
+            publish_descriptor(home.path(), port, "stub-token");
+            let client = crate::host::models_host::shared_client(home.path());
+            let endpoint = client
+                .attach("not-a-real-model", crate::host::models_host::STARTUP_PROBE)
+                .expect("attach to the stub host");
+            assert_eq!(endpoint.port, port);
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let remote = RemoteEmbedder::new(client, "not-a-real-model", Arc::clone(&status));
+            let vector = remote.embed("hello").await;
+            assert_eq!(vector.len(), EMBEDDING_DIM);
+            assert!(
+                (vector[0] - 7.5).abs() < 1e-6,
+                "the vector came from the stub host"
+            );
+            // The batch is one wire call: one marker vector per text.
+            let texts = vec!["a".to_string(), "b".to_string()];
+            let batched = remote.embed_batch(&texts).await;
+            assert_eq!(batched.len(), 2);
+            assert_eq!(batched[0].len(), EMBEDDING_DIM);
+            for vector in &batched {
+                assert!((vector[0] - 7.5).abs() < 1e-6);
+            }
+            assert_eq!(
+                *status.read().expect("embedder status lock poisoned"),
+                EmbedderStatus::Ready
+            );
+        }
+
+        #[tokio::test]
+        async fn remote_embedder_falls_back_when_host_is_down() {
+            let home = tempfile::tempdir().unwrap();
+            // A port nothing listens on (bind :0, drop the socket).
+            let dead_port = {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                drop(listener);
+                port
+            };
+            let client = crate::host::models_host::shared_client(home.path());
+            client.override_endpoint(dead_port, "stub-token", &["not-a-real-model"]);
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let remote = RemoteEmbedder::new(client, "not-a-real-model", Arc::clone(&status));
+            let vector = remote.embed("hello world").await;
+            // The remote POST failed; the fallback's in-process load of an
+            // unknown model fails fast (no download) → hash + Failed —
+            // today's shape for a model that cannot load.
+            assert_eq!(
+                vector,
+                hash_embedding("hello world"),
+                "the fallback embeds with the hash embedder"
+            );
+            assert_eq!(
+                *status.read().expect("embedder status lock poisoned"),
+                EmbedderStatus::Failed
+            );
+        }
+
+        #[tokio::test]
+        async fn remote_embedder_repoints_to_a_replaced_host_after_the_cooldown() {
+            let home = tempfile::tempdir().unwrap();
+            // Host A: healthy, but its budget covers only the attach probe
+            // and one embed — then its port goes dead.
+            let port_a = stub_host(7.5, &["not-a-real-model"], 2);
+            publish_descriptor(home.path(), port_a, "token-a");
+            let client = crate::host::models_host::shared_client(home.path());
+            let endpoint = client
+                .attach("not-a-real-model", crate::host::models_host::STARTUP_PROBE)
+                .expect("attach to host A");
+            assert_eq!(endpoint.port, port_a);
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let mut remote = RemoteEmbedder::new(client, "not-a-real-model", Arc::clone(&status));
+            remote.override_cooldown(std::time::Duration::from_millis(50));
+            let vector = remote.embed("one").await;
+            assert!((vector[0] - 7.5).abs() < 1e-6, "host A served this one");
+
+            // Host A is gone; another instance starts host B on a new port
+            // with a new token and publishes over A's descriptor.
+            let port_b = stub_host(8.5, &["not-a-real-model"], 64);
+            assert_ne!(port_b, port_a);
+            publish_descriptor(home.path(), port_b, "token-b");
+
+            // The remote fails against dead A → the fallback answers (hash:
+            // the unknown model cannot load) and the cooldown is armed.
+            let vector = remote.embed("two").await;
+            assert_eq!(
+                vector,
+                hash_embedding("two"),
+                "the fallback answers while A is dead"
+            );
+            assert_eq!(
+                *status.read().expect("embedder status lock poisoned"),
+                EmbedderStatus::Failed
+            );
+            // After the (short) cooldown the retry re-reads the descriptor
+            // — never the cached port or token — and reaches host B.
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let vector = remote.embed("three").await;
+            assert!(
+                (vector[0] - 8.5).abs() < 1e-6,
+                "the re-read descriptor reached replacement host B"
+            );
+            assert_eq!(
+                *status.read().expect("embedder status lock poisoned"),
+                EmbedderStatus::Ready,
+                "a working remote flips the status back to Ready"
+            );
+        }
+
+        /// The real host's vectors must equal the in-process embedder's for
+        /// the same model — the compatibility contract that lets a store
+        /// swap between remote and in-process without re-embedding.
+        #[ignore = "downloads the embedding model on first run (~90-410 MB)"]
+        #[tokio::test]
+        async fn remote_embedder_matches_in_process_vectors() {
+            let home = tempfile::tempdir().unwrap();
+            // A REAL host (the serve loop the mnemo-models binary runs),
+            // in-process, serving the smallest catalog model.
+            let (_port, _token) = crate::host::models_host::spawn_test_host(
+                home.path(),
+                &["all-MiniLM-L6-v2"],
+                crate::host::models_host::HOST_IDLE,
+            );
+            let client = crate::host::models_host::shared_client(home.path());
+            client
+                .attach("all-MiniLM-L6-v2", crate::host::models_host::STARTUP_PROBE)
+                .expect("attach to the real host");
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let remote = RemoteEmbedder::new(client, "all-MiniLM-L6-v2", Arc::clone(&status));
+            let texts = vec![
+                "the quick brown fox jumps over the lazy dog".to_string(),
+                "semantic memory recall over shared vectors".to_string(),
+                "a plain unrelated third sentence".to_string(),
+            ];
+            // The first embed makes the host lazily load (or download) the
+            // model — that is the point of the laziness.
+            let remote_vectors = remote.embed_batch(&texts).await;
+            let local = BundledEmbedder::new(
+                "all-MiniLM-L6-v2",
+                &crate::config::embedder_cache_dir(home.path()),
+                Arc::new(RwLock::new(EmbedderStatus::Checking)),
+            )
+            .expect("the model is installed (the host just loaded it)");
+            assert_eq!(remote_vectors.len(), texts.len());
+            for (remote_vector, text) in remote_vectors.iter().zip(&texts) {
+                let local_vector = local.embed(text).await;
+                assert_eq!(remote_vector.len(), local_vector.len(), "same dim");
+                let drift = remote_vector
+                    .iter()
+                    .zip(&local_vector)
+                    .map(|(remote, local)| (remote - local).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(drift < 1e-5, "remote vs in-process drift {drift}");
+            }
         }
     }
 }

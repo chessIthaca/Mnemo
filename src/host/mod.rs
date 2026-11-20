@@ -19,6 +19,12 @@ pub mod index_progress;
 pub mod disk;
 pub mod laya;
 pub mod machine_slots;
+// The machine-wide shared models host (plan d3336a8a step 2): the
+// `mnemo-models` binary's serve loop plus the instances' attach/spawn
+// client. Feature-gated like the bundled embedder it serves — a light
+// build has no models to share and keeps today's in-process behaviour.
+#[cfg(feature = "embeddings")]
+pub mod models_host;
 pub mod sccache;
 pub mod maintenance;
 pub mod memory_watcher;

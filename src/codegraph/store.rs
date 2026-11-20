@@ -32,7 +32,9 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-use crate::codegraph::extract::{lang_family, EdgeKind, RefKind, Symbol, SymbolKind};
+use crate::codegraph::extract::{
+    lang_family, EdgeKind, EMBEDDABLE_KINDS, RefKind, Symbol, SymbolKind,
+};
 use crate::codegraph::schema;
 use crate::error::Result;
 
@@ -131,6 +133,40 @@ pub struct UpsertEntry {
     pub data: FileData,
     /// The file's source text (the FTS content rows).
     pub content: String,
+}
+
+/// One embeddable symbol awaiting a vector (plan d3336a8a step 9): the
+/// background pass reads batches of these, embeds `text`, and writes
+/// the vectors keyed by `symbol_id`/`text_hash`.
+#[derive(Debug, Clone)]
+pub struct PendingSymbol {
+    /// The symbol id (`{relpath}::{name}::{start_line}`).
+    pub symbol_id: String,
+    /// The chunk text to embed: `<kind> <name>\n<signature>\n<doc>\n<file>`
+    /// — rebuilt from the stored rows exactly the way
+    /// [`symbol_chunk_text`] built the stored hash, so the two never
+    /// drift.
+    pub text: String,
+    /// The stored chunk hash — the vector row records it, so a later
+    /// text change (hash mismatch) makes the symbol pending again.
+    pub text_hash: String,
+}
+
+/// One stored symbol vector — the `cg_symbol_vec` row (plan d3336a8a
+/// step 9). `model` always names the real embedding model that produced
+/// `vec`; a model change re-embeds lazily.
+#[derive(Debug, Clone)]
+pub struct SymbolVec {
+    /// The symbol id (the row key).
+    pub symbol_id: String,
+    /// The embedding model id that produced the vector.
+    pub model: String,
+    /// The vector's dimension.
+    pub dim: usize,
+    /// The vector (raw little-endian f32 in the DB, decoded here).
+    pub vec: Vec<f32>,
+    /// The chunk text hash the vector was built from.
+    pub text_hash: String,
 }
 
 /// The graph store. Not `Sync` — wrap in a `Mutex` for shared access (the
@@ -338,6 +374,31 @@ impl Store {
         }
         drop(del);
 
+        // Symbol text + vectors (plan d3336a8a step 9): the file's old
+        // text rows go now (the fresh extract re-inserts them below);
+        // the vector rows of symbols that SURVIVE the re-upsert stay —
+        // a surviving symbol whose text is unchanged keeps its vector
+        // (same id, same text hash), a changed one turns pending (the
+        // hash comparison makes the embed pass re-embed it lazily) —
+        // only vanished symbols' vectors are pruned.
+        {
+            let mut del_text =
+                tx.prepare_cached("DELETE FROM cg_symbol_text WHERE symbol_id = ?1")?;
+            for id in &old_ids {
+                del_text.execute(params![id])?;
+            }
+        }
+        {
+            let new_ids: HashSet<&str> = data.symbols.iter().map(|s| s.id.as_str()).collect();
+            let mut del_vec =
+                tx.prepare_cached("DELETE FROM cg_symbol_vec WHERE symbol_id = ?1")?;
+            for id in &old_ids {
+                if !new_ids.contains(id.as_str()) {
+                    del_vec.execute(params![id])?;
+                }
+            }
+        }
+
         let now = now_secs();
         tx.prepare_cached(
             "INSERT INTO cg_files (path, content_hash, mtime, indexed_at)
@@ -383,6 +444,30 @@ impl Store {
             }
         }
         {
+            // One text row per real symbol (plan d3336a8a step 9) — the
+            // synthetic module has no source anchor and carries none.
+            // The text hash keys incremental embedding: the background
+            // pass embeds a symbol only when no vector row pairs this
+            // hash with the current model.
+            let mut ins_text = tx.prepare_cached(
+                "INSERT OR REPLACE INTO cg_symbol_text (symbol_id, signature, doc, text_hash)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for s in &data.symbols {
+                if s.kind == SymbolKind::Module {
+                    continue;
+                }
+                let chunk =
+                    symbol_chunk_text(s.kind.as_str(), &s.name, &s.signature, &s.doc, path);
+                ins_text.execute(params![
+                    s.id,
+                    s.signature,
+                    s.doc,
+                    crate::codegraph::content_hash(chunk.as_bytes())
+                ])?;
+            }
+        }
+        {
             let mut ins_ref = tx.prepare_cached(
                 "INSERT INTO cg_refs (file, from_id, name, kind) VALUES (?1, ?2, ?3, ?4)",
             )?;
@@ -421,6 +506,16 @@ impl Store {
             let mut del = tx.prepare("DELETE FROM cg_edges WHERE from_id = ?1 OR to_id = ?1")?;
             for id in &ids {
                 del.execute(params![id])?;
+            }
+        }
+        {
+            // Symbol text + vectors die with the symbol (plan d3336a8a
+            // step 9).
+            let mut del_text = tx.prepare("DELETE FROM cg_symbol_text WHERE symbol_id = ?1")?;
+            let mut del_vec = tx.prepare("DELETE FROM cg_symbol_vec WHERE symbol_id = ?1")?;
+            for id in &ids {
+                del_text.execute(params![id])?;
+                del_vec.execute(params![id])?;
             }
         }
         tx.commit()?;
@@ -567,6 +662,11 @@ impl Store {
                 file,
                 start_line: start_line as usize,
                 end_line: end_line as usize,
+                // The signature/doc text lives in cg_symbol_text (plan
+                // d3336a8a step 9); the symbol read path stays a light
+                // single-table SELECT, so these stay empty here.
+                signature: String::new(),
+                doc: String::new(),
             });
         }
         Ok(out)
@@ -630,6 +730,11 @@ impl Store {
                 file,
                 start_line: start_line as usize,
                 end_line: end_line as usize,
+                // The signature/doc text lives in cg_symbol_text (plan
+                // d3336a8a step 9); the symbol read path stays a light
+                // single-table SELECT, so these stay empty here.
+                signature: String::new(),
+                doc: String::new(),
             });
         }
         Ok(out)
@@ -751,6 +856,120 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// The next batch of embeddable symbols whose text has no matching
+    /// vector for `model` (plan d3336a8a step 9): no vector row, a
+    /// different model's row, or a drifted text hash. The background
+    /// pass's work queue — embeddable kinds only, in stable symbol-id
+    /// order. One SELECT under one short lock; the caller embeds WITHOUT
+    /// holding the write connection.
+    pub fn pending_symbols(&self, model: &str, limit: usize) -> Result<Vec<PendingSymbol>> {
+        let mut stmt = self.conn.prepare_cached(pending_symbols_sql())?;
+        let rows = stmt.query_map(params![model, limit as i64], |r| {
+            let kind: String = r.get(1)?;
+            let name: String = r.get(2)?;
+            let signature: String = r.get(3)?;
+            let doc: String = r.get(4)?;
+            let file: String = r.get(5)?;
+            // Rebuilt exactly the way the upsert built the stored hash
+            // (see [`symbol_chunk_text`]), so a matching vector row truly
+            // means "this text is already embedded".
+            let text = symbol_chunk_text(&kind, &name, &signature, &doc, &file);
+            Ok(PendingSymbol {
+                symbol_id: r.get(0)?,
+                text,
+                text_hash: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Store computed symbol vectors (plan d3336a8a step 9): one short
+    /// transaction, one `INSERT OR REPLACE` per row. `model` is whatever
+    /// produced the vectors — the pass validated it names the real code
+    /// model, so the vec table's `model` column always does. An
+    /// all-zero vector (a degraded embedder's zero-vector contract) is
+    /// skipped rather than stored, and so is a vector whose length
+    /// disagrees with `dim`. Returns the number of rows written.
+    pub fn store_symbol_vecs(
+        &mut self,
+        model: &str,
+        dim: usize,
+        batch: &[PendingSymbol],
+        vectors: &[Vec<f32>],
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut ins = tx.prepare_cached(
+            "INSERT OR REPLACE INTO cg_symbol_vec (symbol_id, model, dim, vec, text_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        let mut stored = 0usize;
+        for (sym, vec) in batch.iter().zip(vectors) {
+            if vec.iter().all(|f| *f == 0.0) || vec.len() != dim {
+                continue;
+            }
+            let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+            ins.execute(params![sym.symbol_id, model, dim as i64, blob, sym.text_hash])?;
+            stored += 1;
+        }
+        drop(ins);
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// How many symbol vectors are stored — the pass's progress surface
+    /// (tests and the step-9 report).
+    pub fn symbol_vec_count(&self) -> Result<usize> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM cg_symbol_vec", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// One symbol's stored vector, if any — the decode path (raw
+    /// little-endian f32 bytes → `Vec<f32>`), proven by round-trip tests.
+    pub fn symbol_vec(&self, symbol_id: &str) -> Result<Option<SymbolVec>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol_id, model, dim, vec, text_hash FROM cg_symbol_vec WHERE symbol_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![symbol_id], |r| {
+            let dim: i64 = r.get(2)?;
+            let blob: Vec<u8> = r.get(3)?;
+            let vec: Vec<f32> = blob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect();
+            Ok(SymbolVec {
+                symbol_id: r.get(0)?,
+                model: r.get(1)?,
+                dim: dim as usize,
+                vec,
+                text_hash: r.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out.into_iter().next())
+    }
+
+    /// Test seam (plan d3336a8a step 9): stamp every stored vector row
+    /// with a different model id — the exact state a future
+    /// `CODE_EMBEDDING_MODEL` change leaves behind, proving the pass
+    /// re-embeds lazily (the rows' model column no longer matches).
+    #[cfg(test)]
+    pub fn overwrite_symbol_vec_model_for_test(&mut self, model: &str) -> Result<usize> {
+        self.conn
+            .execute("UPDATE cg_symbol_vec SET model = ?1", params![model])?;
+        Ok(self.conn.changes() as usize)
+    }
 }
 
 /// Current time as unix seconds (indexed_at bookkeeping).
@@ -759,6 +978,42 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The pending-symbols query, built once: the embeddable-kind list is
+/// derived from [`crate::codegraph::extract::EMBEDDABLE_KINDS`] — the
+/// single source of truth — so the cached statement's SQL and the kind
+/// list can never drift (a per-call `format!` would defeat the statement
+/// cache).
+fn pending_symbols_sql() -> &'static str {
+    static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SQL.get_or_init(|| {
+        let kinds = EMBEDDABLE_KINDS
+            .iter()
+            .map(|k| format!("'{}'", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "SELECT t.symbol_id, s.kind, s.name, t.signature, t.doc, s.file, t.text_hash
+             FROM cg_symbol_text t
+             JOIN cg_symbols s ON s.id = t.symbol_id
+             LEFT JOIN cg_symbol_vec v ON v.symbol_id = t.symbol_id
+             WHERE s.kind IN ({kinds})
+               AND (v.symbol_id IS NULL OR v.model <> ?1 OR v.text_hash <> t.text_hash)
+             ORDER BY t.symbol_id
+             LIMIT ?2"
+        )
+    })
+}
+
+/// The embedding chunk text for one symbol (plan d3336a8a step 9):
+/// `<kind> <name>\n<signature>\n<doc>\n<file path>` — the text whose hash
+/// keys incremental embedding and the text the code-search model
+/// embeds. Built identically at upsert time (the stored `text_hash`)
+/// and at embed time (the pending batch's `text`), so the two can never
+/// drift.
+fn symbol_chunk_text(kind: &str, name: &str, signature: &str, doc: &str, file: &str) -> String {
+    format!("{kind} {name}\n{signature}\n{doc}\n{file}")
 }
 
 /// The [`RefKind`] persisted in a `cg_refs.kind` row (`"call"`,
@@ -827,6 +1082,8 @@ mod tests {
             file: file.to_string(),
             start_line: start,
             end_line: end,
+            signature: String::new(),
+            doc: String::new(),
         }
     }
 
@@ -843,6 +1100,8 @@ mod tests {
                     file: "a.rs".to_string(),
                     start_line: 1,
                     end_line: 10,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("a.rs", "caller", SymbolKind::Function, 2, 5),
                 sym("a.rs", "helper", SymbolKind::Function, 6, 9),
@@ -869,6 +1128,8 @@ mod tests {
                     file: "b.rs".to_string(),
                     start_line: 1,
                     end_line: 6,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("b.rs", "user", SymbolKind::Function, 2, 5),
             ],
@@ -942,6 +1203,8 @@ mod tests {
                     file: "a.rs".to_string(),
                     start_line: 1,
                     end_line: 10,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("a.rs", "caller", SymbolKind::Function, 2, 5),
             ],
@@ -961,6 +1224,8 @@ mod tests {
                     file: "c.rs".to_string(),
                     start_line: 1,
                     end_line: 5,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("c.rs", "helper", SymbolKind::Function, 2, 4),
             ],
@@ -1138,6 +1403,8 @@ mod tests {
                     file: "m.rs".to_string(),
                     start_line: 1,
                     end_line: 5,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("m.rs", "join", SymbolKind::Function, 683, 685),
             ],
@@ -1153,6 +1420,8 @@ mod tests {
                     file: "u.py".to_string(),
                     start_line: 1,
                     end_line: 6,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("u.py", "dump", SymbolKind::Function, 2, 4),
             ],
@@ -1188,6 +1457,8 @@ mod tests {
                     file: "model.ts".to_string(),
                     start_line: 1,
                     end_line: 5,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("model.ts", "fetch", SymbolKind::Method, 2, 4),
             ],
@@ -1206,6 +1477,8 @@ mod tests {
                     file: "view.ts".to_string(),
                     start_line: 1,
                     end_line: 4,
+                    signature: String::new(),
+                    doc: String::new(),
                 },
                 sym("view.ts", "render", SymbolKind::Function, 2, 3),
             ],
@@ -1230,6 +1503,205 @@ mod tests {
                     && e.kind == EdgeKind::Calls
             }),
             "the method call resolves to the same-language Method"
+        );
+    }
+
+    // ============ Symbol text + vectors (plan d3336a8a step 9) ============
+
+    /// A file with one real symbol carrying signature + doc, plus the
+    /// synthetic module row (which stays text-less, as the extractor
+    /// produces it).
+    fn file_with_text(doc: &str) -> FileData {
+        let mut helper = sym("t.rs", "helper", SymbolKind::Function, 3, 6);
+        helper.signature = "pub fn helper(x: u32) -> u32".to_string();
+        helper.doc = doc.to_string();
+        FileData {
+            symbols: vec![
+                Symbol {
+                    id: "t.rs::module".to_string(),
+                    name: "t.rs".to_string(),
+                    kind: SymbolKind::Module,
+                    file: "t.rs".to_string(),
+                    start_line: 1,
+                    end_line: 6,
+                    signature: String::new(),
+                    doc: String::new(),
+                },
+                helper,
+            ],
+            refs: vec![],
+            contains: vec![],
+        }
+    }
+
+    fn text_row_count(s: &Store) -> i64 {
+        s.conn
+            .query_row("SELECT COUNT(*) FROM cg_symbol_text", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The step-9 text/vector lifecycle at the store level: upserts write
+    /// text rows (real symbols only), a stored vector makes the symbol
+    /// non-pending, an UNCHANGED re-upsert keeps it non-pending (the
+    /// step's "unchanged symbol is not re-embedded"), a changed doc makes
+    /// it pending again (hash drift), and a vanished symbol's text and
+    /// vector rows are pruned while nothing else loses its vector.
+    #[test]
+    fn symbol_text_and_vecs_follow_upserts_and_prune() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.upsert_file("t.rs", "h1", 100, &file_with_text("Adds one."), "src").unwrap();
+        // Real symbols only — the module row carries no text row.
+        assert_eq!(text_row_count(&s), 1);
+
+        let pending = s
+            .pending_symbols("jina-embeddings-v2-base-code", 100)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].symbol_id, "t.rs::helper::3");
+        let expected_chunk = "function helper\npub fn helper(x: u32) -> u32\nAdds one.\nt.rs";
+        assert_eq!(pending[0].text, expected_chunk);
+        assert_eq!(
+            pending[0].text_hash,
+            crate::codegraph::content_hash(expected_chunk.as_bytes())
+        );
+        let expected_hash = pending[0].text_hash.clone();
+
+        // Embed it (the store takes the caller's word for the model — the
+        // pass validated it) and verify the round-trip decode.
+        let vectors = vec![vec![0.25, -0.5, 1.0]];
+        assert_eq!(
+            s.store_symbol_vecs("jina-embeddings-v2-base-code", 3, &pending, &vectors)
+                .unwrap(),
+            1
+        );
+        assert!(
+            s.pending_symbols("jina-embeddings-v2-base-code", 100)
+                .unwrap()
+                .is_empty()
+        );
+        let row = s.symbol_vec("t.rs::helper::3").unwrap().unwrap();
+        assert_eq!(row.model, "jina-embeddings-v2-base-code");
+        assert_eq!(row.dim, 3);
+        assert_eq!(row.vec, vec![0.25, -0.5, 1.0]);
+        assert_eq!(row.text_hash, expected_hash);
+
+        // UNCHANGED re-upsert: same text → same hash → the vector stays
+        // valid and the symbol is NOT re-embedded.
+        s.upsert_file("t.rs", "h1", 100, &file_with_text("Adds one."), "src").unwrap();
+        assert!(
+            s.pending_symbols("jina-embeddings-v2-base-code", 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.symbol_vec_count().unwrap(), 1);
+
+        // A DIFFERENT model re-embeds everything it owns (lazily: the row
+        // belongs to the old model, so the symbol is pending for the new
+        // one).
+        assert_eq!(
+            s.pending_symbols("other-model", 100).unwrap().len(),
+            1,
+            "a different model must find the symbol pending"
+        );
+
+        // CHANGED doc: the hash drifts, the symbol is pending again — even
+        // for the same model.
+        s.upsert_file("t.rs", "h2", 100, &file_with_text("Adds TWO."), "src").unwrap();
+        assert_eq!(
+            s.pending_symbols("jina-embeddings-v2-base-code", 100)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // VANISHED symbol (the file no longer defines it): its text and
+        // vector rows are pruned.
+        s.upsert_file("t.rs", "h3", 100, &FileData::default(), "src").unwrap();
+        assert_eq!(text_row_count(&s), 0);
+        assert_eq!(s.symbol_vec_count().unwrap(), 0);
+    }
+
+    /// A degraded embedder's zero vectors never persist, a vector whose
+    /// length disagrees with the declared dim is skipped as malformed,
+    /// and skipped symbols stay pending (a later pass retries them).
+    #[test]
+    fn store_symbol_vecs_skips_zero_and_mismatched_vectors() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.upsert_file("a.rs", "h1", 100, &file_a(), "fn caller() {}").unwrap();
+        let pending = s.pending_symbols("m", 100).unwrap();
+        assert_eq!(pending.len(), 2);
+        // First vector all zeros (a degraded embedder's answer), second
+        // disagrees with the declared dim — neither persists.
+        let bad = vec![vec![0.0, 0.0, 0.0], vec![0.5, 0.5]];
+        assert_eq!(s.store_symbol_vecs("m", 3, &pending, &bad).unwrap(), 0);
+        assert_eq!(s.symbol_vec_count().unwrap(), 0);
+        assert_eq!(
+            s.pending_symbols("m", 100).unwrap().len(),
+            2,
+            "skipped symbols stay pending for a later pass"
+        );
+        let good = vec![vec![0.25, 0.5, 1.0], vec![0.25, 0.5, 1.0]];
+        assert_eq!(s.store_symbol_vecs("m", 3, &pending, &good).unwrap(), 2);
+    }
+
+    /// remove_file drops the file's symbol text and vector rows along with
+    /// its symbols.
+    #[test]
+    fn remove_file_drops_symbol_text_and_vecs() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.upsert_file("a.rs", "h1", 100, &file_a(), "fn caller() {}").unwrap();
+        let pending = s.pending_symbols("m", 100).unwrap();
+        let vectors: Vec<Vec<f32>> = pending.iter().map(|_| vec![1.0, 2.0]).collect();
+        s.store_symbol_vecs("m", 2, &pending, &vectors).unwrap();
+        assert_eq!(s.symbol_vec_count().unwrap(), 2);
+        s.remove_file("a.rs").unwrap();
+        assert_eq!(s.symbol_vec_count().unwrap(), 0);
+        assert_eq!(text_row_count(&s), 0);
+    }
+
+    /// A DB from before step 9 (its two tables absent, rows stamped with
+    /// the older extractor version) migrates in place: `Store::open`
+    /// re-applies the additive schema — no migration machinery, no
+    /// delete-and-rebuild — the old rows survive, and the next upsert
+    /// fills the new text rows. (The index-level half — the version bump
+    /// making index() re-parse v1-stamped files — lives in
+    /// codegraph::mod's migration test.)
+    #[test]
+    fn migration_from_old_schema_adds_the_step9_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let mut s = Store::open(&db).unwrap();
+            s.upsert_file("a.rs", "h1", 100, &file_a(), "fn caller() {}").unwrap();
+        }
+        {
+            // The pre-step-9 database: same tables minus the two new ones,
+            // files stamped with the v1 extractor version.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "DROP TABLE cg_symbol_text;
+                 DROP TABLE cg_symbol_vec;
+                 INSERT OR REPLACE INTO cg_extract_meta (path, version) VALUES ('a.rs', 1);",
+            )
+            .unwrap();
+        }
+        let mut s = Store::open(&db).unwrap();
+        // The old rows survived the in-place migration.
+        assert_eq!(s.all_symbols().unwrap().len(), 3);
+        assert_eq!(
+            s.stored_file_meta().unwrap().get("a.rs").unwrap().extract_version,
+            Some(1)
+        );
+        // The tables exist and work; the next (re-parse) upsert fills the
+        // text rows, so the pass sees the symbols pending.
+        assert!(s.pending_symbols("m", 100).unwrap().is_empty());
+        s.upsert_file("a.rs", "h1", 100, &file_a(), "fn caller() {}").unwrap();
+        assert_eq!(text_row_count(&s), 2);
+        assert_eq!(s.pending_symbols("m", 100).unwrap().len(), 2);
+        assert_eq!(
+            s.stored_file_meta().unwrap().get("a.rs").unwrap().extract_version,
+            Some(schema::EXTRACTOR_VERSION),
+            "the re-upsert stamps the new extractor version"
         );
     }
 }

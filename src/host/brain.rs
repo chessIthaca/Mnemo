@@ -947,6 +947,24 @@ pub(crate) fn wire_brain(
             &workspace.state_dir.join("codegraph.db"),
         ) {
             Ok(graph) => {
+                // Semantic code search (plan d3336a8a step 9): arm the
+                // background symbol-embed pass before the graph is
+                // shared. The cache dir is the same one the memory
+                // embedder uses (the shared host serves both models);
+                // the configured memory model widens a SPAWNED host's
+                // serve list, so the memory side later attaches instead
+                // of spawning a second host. index() schedules the pass;
+                // the pass thread builds (or attaches) the embedder
+                // lazily — never on the startup path. The cfg'd shadow
+                // binding keeps the light build free of the unused
+                // `mut` (there is no arm method to call there).
+                #[cfg(feature = "embeddings")]
+                let mut graph = graph;
+                #[cfg(feature = "embeddings")]
+                graph.arm_symbol_embeddings(
+                    &embedder_cache_dir,
+                    config.general.general.bundled_embedding_model.as_deref(),
+                );
                 let graph = Arc::new(graph);
                 let g = graph.clone();
                 // The open-project overlay (IndexingOverlay.tsx) renders

@@ -582,21 +582,30 @@ pub fn acquire_remote_embedder(
 /// The code-search embedder (plan d3336a8a step 9's half here):
 /// [`crate::memory::embedder::CODE_EMBEDDING_MODEL`] remote-first — the
 /// shared host serves it alongside the memory model — with today's
-/// in-process load as the fallback. Not wired into memory: the code-graph
-/// vectors and the `find_code` ranking (step 9) own its use.
+/// in-process load as the fallback. Wired only into the code-graph's
+/// background symbol-embed pass: the code-graph vectors and the
+/// `find_code` ranking own its use, nothing in memory.
+///
+/// `memory_model` is the configured bundled memory model
+/// (`general.bundled_embedding_model`): when THIS side spawns the host,
+/// the serve list includes it too ([`code_serve_models`]), so the
+/// memory side later attaches to the same host instead of spawning a
+/// second one — one host per machine, whichever side starts it. The
+/// list only matters on the spawn leg: the exact-set attach rule takes
+/// any host already serving the code model regardless, and a later
+/// Settings change of the memory model never needs to update a spawned
+/// host.
 ///
 /// The in-process fallback drives its OWN fresh status `Arc` — the memory
 /// embedder's shared status is untouched.
 #[cfg(feature = "embeddings")]
-pub fn build_code_embedder(cache_dir: &Path) -> Arc<dyn Embedder> {
+pub fn build_code_embedder(cache_dir: &Path, memory_model: Option<&str>) -> Arc<dyn Embedder> {
     let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
     if let Some(config_dir) = crate::host::models_host::shared_config_dir(cache_dir) {
         let client = crate::host::models_host::shared_client(&config_dir);
+        let serve = code_serve_models(memory_model);
         if client
-            .acquire(
-                crate::memory::embedder::CODE_EMBEDDING_MODEL,
-                &[crate::memory::embedder::CODE_EMBEDDING_MODEL],
-            )
+            .acquire(crate::memory::embedder::CODE_EMBEDDING_MODEL, &serve)
             .is_some()
         {
             return Arc::new(crate::memory::embedder::RemoteEmbedder::new(
@@ -607,6 +616,27 @@ pub fn build_code_embedder(cache_dir: &Path) -> Arc<dyn Embedder> {
         }
     }
     load_bundled_or_fallback(crate::memory::embedder::CODE_EMBEDDING_MODEL, cache_dir, &status)
+}
+
+/// The serve list for a host the code side spawns (plan d3336a8a step 9):
+/// the code model plus the configured memory model, so ONE host serves
+/// both embedders whichever side spawns it. The memory model joins only
+/// when it is a real bundled model — `None`, the `"hash"` opt-out, a
+/// model unknown to the catalog (`model_for_id` refuses it, the same
+/// validation `acquire` applies to its whole list), or the code model
+/// itself all degrade to the code model alone.
+#[cfg(feature = "embeddings")]
+fn code_serve_models(memory_model: Option<&str>) -> Vec<&str> {
+    let mut serve = vec![crate::memory::embedder::CODE_EMBEDDING_MODEL];
+    if let Some(model) = memory_model {
+        let real = !model.eq_ignore_ascii_case(crate::config::EMBEDDING_MODEL_SENTINEL_HASH)
+            && model != crate::memory::embedder::CODE_EMBEDDING_MODEL
+            && crate::memory::embedder::model_for_id(model).is_ok();
+        if real {
+            serve.push(model);
+        }
+    }
+    serve
 }
 
 /// How startup should build the memory embedder for the configured bundled
@@ -1404,7 +1434,9 @@ mod tests {
     #[tokio::test]
     async fn build_code_embedder_prefers_a_healthy_host() {
         // The code embedder is remote-first too: a host serving the code
-        // model is used, nothing is downloaded into this process.
+        // model is used, nothing is downloaded into this process. The
+        // memory model in the serve list only matters on the spawn leg —
+        // the exact-set attach rule takes this host as-is.
         let home = tempfile::tempdir().unwrap();
         let cache = crate::config::embedder_cache_dir(home.path());
         crate::host::models_host::spawn_test_host(
@@ -1412,8 +1444,29 @@ mod tests {
             &[crate::memory::embedder::CODE_EMBEDDING_MODEL],
             crate::host::models_host::HOST_IDLE,
         );
-        let embedder = build_code_embedder(&cache);
+        let embedder = build_code_embedder(&cache, Some("all-MiniLM-L6-v2"));
         assert_eq!(embedder.model_id(), crate::memory::embedder::CODE_EMBEDDING_MODEL);
         assert_eq!(embedder.dim(), 768);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn code_serve_models_widens_only_for_a_real_memory_model() {
+        // Plan d3336a8a step 9: the host the code side spawns serves both
+        // models — the code model plus the configured memory model, so
+        // the memory side later attaches instead of spawning a second
+        // host. Only a REAL bundled memory model joins the list; the
+        // opt-out, an unknown id, and the code model itself degrade to
+        // the code model alone.
+        let code = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        assert_eq!(code_serve_models(None), vec![code]);
+        assert_eq!(code_serve_models(Some("hash")), vec![code]);
+        assert_eq!(code_serve_models(Some("HASH")), vec![code]);
+        assert_eq!(code_serve_models(Some("not-a-bundled-model")), vec![code]);
+        assert_eq!(code_serve_models(Some(code)), vec![code]);
+        assert_eq!(
+            code_serve_models(Some("all-MiniLM-L6-v2")),
+            vec![code, "all-MiniLM-L6-v2"]
+        );
     }
 }

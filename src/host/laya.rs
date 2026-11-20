@@ -393,8 +393,9 @@ impl ManagedChild {
     fn release(self) {
         if self.shared {
             // Dropping a `std::process::Child` never kills it; the watchdog
-            // owns the lifecycle from here.
-            drop(self.child);
+            // owns the lifecycle from here — the reaper thread only keeps
+            // the exited server from lingering as a zombie.
+            release_shared_child(self.child);
         } else {
             kill_tree(self.child, self.job, &self.created);
         }
@@ -970,7 +971,7 @@ impl LayaManager {
                     "info: this laya-serve start never became ready, but {others} \
                      other instance(s) lease it; leaving the shared server to them"
                 );
-                drop(child.child);
+                release_shared_child(child.child);
             } else {
                 // Drop the descriptor first so no later instance attaches to
                 // a server we are about to kill.
@@ -1049,7 +1050,7 @@ impl LayaManager {
             // A restart of ours never kills a shared server another instance
             // may lease; a private child is ours alone (as before).
             if previous.shared {
-                drop(previous.child);
+                release_shared_child(previous.child);
             } else {
                 kill_tree(previous.child, previous.job, &previous.created);
             }
@@ -1203,7 +1204,7 @@ impl LayaManager {
             return;
         };
         if previous.shared {
-            drop(previous.child);
+            release_shared_child(previous.child);
         } else {
             kill_tree(previous.child, previous.job, &previous.created);
         }
@@ -1507,6 +1508,21 @@ impl LayaServer {
                 | Self::Spawned { shared: true, .. }
         )
     }
+}
+
+/// Hand a DETACHED shared server's child to a tiny reaper thread instead of
+/// merely dropping it. On Unix a `std::process::Child` that is dropped
+/// without a `wait` stays a ZOMBIE once the server exits, and `ps` still
+/// lists a zombie — the spawning instance is the server's parent, so its
+/// own liveness poll would report the crashed server as alive forever and
+/// never recover it (see [`crate::process_tree::pid_alive`], which treats
+/// zombies as dead). The server itself keeps running — its lifecycle
+/// belongs to the watchdog, exactly as in
+/// [`crate::host::shared_service::spawn_detached`]'s watchdog reaper.
+fn release_shared_child(mut child: Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Kill and reap the server's whole process tree (the shared core of `stop` /

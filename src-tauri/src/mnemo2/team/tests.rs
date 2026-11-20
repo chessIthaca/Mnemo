@@ -245,6 +245,29 @@ async fn executor_denies(tool: &str, args: Value) -> bool {
     )
 }
 
+/// Runs a call through the executor's declarative gate and reports the
+/// refusal message — `None` when the call is allowed — so tests can tell
+/// the shared-stash refusal from the integration one.
+async fn executor_refusal(tool: &str, args: Value) -> Option<String> {
+    use mnemo::agent::policy::{AgentPolicy, DeclarativePolicy};
+    let policy =
+        DeclarativePolicy::new(Arc::new(executor_guardrails())).expect("rules compile");
+    match policy.gate_call(tool, &args).await {
+        GateVerdict::Deny { message } => Some(message),
+        // Not a refusal: the call is either allowed outright or proceeds
+        // to the regular approval flow.
+        GateVerdict::Allow | GateVerdict::RequireApproval => None,
+    }
+}
+
+/// Runs a call through the executor's declarative gate and reports
+/// whether it was denied as a shared-stash violation.
+async fn executor_denies_stash(tool: &str, args: Value) -> bool {
+    executor_refusal(tool, args)
+        .await
+        .is_some_and(|message| message.contains("shared by every worker checkout"))
+}
+
 #[tokio::test]
 async fn executor_gate_denies_integration_through_the_git_tool() {
     for args in [
@@ -263,7 +286,8 @@ async fn executor_gate_denies_integration_through_the_git_tool() {
         json!({"subcommand": "diff", "args": ["--stat"]}),
         json!({"subcommand": "log", "args": ["-5"]}),
         json!({"subcommand": "commit", "message": "push the button"}),
-        json!({"subcommand": "stash", "action": "push"}),
+        // `stash push` is no longer in the allowed set: the shared-stash
+        // refusal covers it (executor_gate_refuses_the_shared_stash_stack).
         json!({"subcommand": "branch", "action": "list"}),
         json!({"subcommand": "restore", "paths": ["src/lib.rs"]}),
     ] {
@@ -369,6 +393,105 @@ async fn executor_gate_denies_integration_through_job_start() {
             "{command}"
         );
     }
+}
+
+/// Every worker checkout is a worktree of the same repository, so they all
+/// share one git stash stack (`refs/stash`): a worker's pop or drop takes
+/// whatever is on top — another worker's WIP (2026-11-20: symVec01's pop
+/// applied hostToken01's stash in the wrong checkout) or a months-old stash
+/// from the lead checkout. The executor gate must refuse every push, pop and
+/// drop on that shared stack — through the structured git tool, `shell` and
+/// `job_start` alike — while the read-only forms and `git stash apply <sha>`
+/// (recovering a known dangling commit) still run.
+#[tokio::test]
+async fn executor_gate_refuses_the_shared_stash_stack() {
+    // The structured git tool has no ref parameter, so every stash pop and
+    // drop through it lands on the shared stack: every carrier of a push,
+    // pop or drop is refused.
+    for args in [
+        json!({"subcommand": "stash", "action": "push"}),
+        json!({"subcommand": "stash", "action": "pop"}),
+        json!({"subcommand": "stash", "action": "drop"}),
+        // No action — or the subcommand repeated in `action` — defaults
+        // to push.
+        json!({"subcommand": "stash"}),
+        json!({"subcommand": "stash", "action": "stash"}),
+        // Stash action names ride either field.
+        json!({"subcommand": "pop"}),
+        json!({"subcommand": "drop"}),
+        json!({"action": "pop"}),
+        json!({"action": "drop"}),
+        json!({"action": "stash"}),
+    ] {
+        assert!(executor_denies_stash("git", args.clone()).await, "{args}");
+    }
+    // `stash list` is read-only: both carrier spellings stay allowed.
+    for args in [
+        json!({"subcommand": "stash", "action": "list"}),
+        json!({"subcommand": "list", "action": "stash"}),
+    ] {
+        assert!(!executor_denies_stash("git", args.clone()).await, "{args}");
+    }
+    // A bare `git stash` is a push ("you can omit push"), and so is a bare
+    // `git stash <push-option>` (`-m`, `-- pathspec`); the named mutators
+    // and `apply` without a SHA — no argument, or a `stash@{…}` ref — all
+    // touch the shared stack.
+    for command in [
+        "git stash",
+        "git stash push",
+        "git stash save",
+        "git stash pop",
+        "git stash drop",
+        "git stash clear",
+        "git stash store",
+        "git stash branch",
+        "git stash -m \"wip\"",
+        "git stash -- src/",
+        "git -C x stash pop",
+        "cargo test && git stash",
+        "cargo test && git stash pop",
+        "git stash apply",
+        "git stash apply stash@{0}",
+        "git stash apply stash@{1}",
+        "git stash apply -q",
+    ] {
+        for tool in ["shell", "job_start"] {
+            assert!(
+                executor_denies_stash(tool, json!({"command": command, "purpose": "p"})).await,
+                "{tool}: {command}"
+            );
+        }
+    }
+    // The read-only forms and the SHA recovery run.
+    for command in [
+        "git stash list",
+        "git stash list --format=%gd",
+        "git stash show -p",
+        "git stash show --stat stash@{0}",
+        "git stash create",
+        "git stash apply 78b29bbd",
+        "git stash apply 78b29bbd1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
+    ] {
+        for tool in ["shell", "job_start"] {
+            assert!(
+                !executor_denies_stash(tool, json!({"command": command, "purpose": "p"}))
+                    .await,
+                "{tool}: {command}"
+            );
+        }
+    }
+    // The refusal names the WIP-commit alternative and the SHA recovery.
+    let refusal = executor_refusal("git", json!({"subcommand": "stash", "action": "pop"}))
+        .await
+        .expect("stash pop is refused");
+    assert!(
+        refusal.contains("Park work as a WIP commit"),
+        "the stash refusal must name the WIP-commit alternative: {refusal}"
+    );
+    assert!(
+        refusal.contains("git stash apply"),
+        "the stash refusal must name the stash-apply recovery: {refusal}"
+    );
 }
 
 /// The audit worker is read-only by construction: the job tools ride

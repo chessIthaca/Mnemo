@@ -390,7 +390,7 @@ impl CodeGraph {
 
     /// How many symbols still await a vector for `model` (plan d3336a8a
     /// step 11) — the eval waits for the pass to drain on this.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "embeddings"))]
     pub(crate) fn symbol_embed_pending(&self, model: &str) -> Result<usize> {
         Ok(self.store().pending_symbols(model, 1)?.len())
     }
@@ -407,7 +407,7 @@ impl CodeGraph {
 
     /// Test seam (plan d3336a8a step 11): store one symbol's vector row, so
     /// a ranking test needs no embed pass.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "embeddings"))]
     pub(crate) fn store_symbol_vector_for_test(
         &self,
         model: &str,

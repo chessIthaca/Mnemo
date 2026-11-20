@@ -367,6 +367,10 @@ pub struct RemoteEmbedder {
     http: Option<reqwest::Client>,
     /// The lazily created in-process fallback (created at most once).
     fallback: tokio::sync::Mutex<Option<Arc<dyn Embedder>>>,
+    /// Set whenever the in-process fallback embeds, so a later remote
+    /// answer (step 17 B2) drops the cached fallback and frees its ONNX
+    /// session and arena.
+    fallback_used: std::sync::atomic::AtomicBool,
     /// The cooldown window: no remote attempt until this instant passes.
     host_down_until: std::sync::Mutex<Option<std::time::Instant>>,
     /// Set by every remote failure: the next attempt re-reads the
@@ -376,6 +380,21 @@ pub struct RemoteEmbedder {
     last_error_log: std::sync::Mutex<Option<std::time::Instant>>,
     /// The cooldown length (tests shrink it).
     cooldown: std::time::Duration,
+}
+
+/// The outcome of one [`RemoteEmbedder::embed_remote_attempt`]: a valid
+/// answer, a transport-level failure (one immediate retry before the
+/// cooldown arms — step 17 B1), or a host-level failure (the host's own
+/// answer, a timeout, or no published endpoint — the cooldown, then the
+/// fallback).
+#[cfg(feature = "embeddings")]
+enum Attempt {
+    /// A validated answer.
+    Ok(Vec<Vec<f32>>),
+    /// A connect/send-level failure — retryable once.
+    Transport(String),
+    /// The host answered wrongly, timed out, or is not published.
+    Host(String),
 }
 
 #[cfg(feature = "embeddings")]
@@ -411,6 +430,7 @@ impl RemoteEmbedder {
             status,
             http,
             fallback: tokio::sync::Mutex::new(None),
+            fallback_used: std::sync::atomic::AtomicBool::new(false),
             host_down_until: std::sync::Mutex::new(None),
             endpoint_failed: std::sync::atomic::AtomicBool::new(false),
             last_error_log: std::sync::Mutex::new(None),
@@ -426,7 +446,10 @@ impl RemoteEmbedder {
 
     /// The shared embed path: remote first (outside the cooldown), the
     /// in-process fallback on any error — a shared service is an
-    /// optimisation, never a new single point of failure.
+    /// optimisation, never a new single point of failure. A remote answer
+    /// after a fallback period drops the cached in-process fallback
+    /// (step 17 B2): one transient request failure must not pin the
+    /// model's ONNX session and arena in this process for its lifetime.
     async fn embed_texts(&self, texts: &[String]) -> Vec<Vec<f32>> {
         if texts.is_empty() {
             return Vec::new();
@@ -435,23 +458,53 @@ impl RemoteEmbedder {
             return self.embed_fallback(texts).await;
         }
         match self.embed_remote(texts).await {
-            Some(vectors) => vectors,
+            Some(vectors) => {
+                if self
+                    .fallback_used
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    *self.fallback.lock().await = None;
+                }
+                vectors
+            }
             None => self.embed_fallback(texts).await,
         }
     }
 
-    /// The one remote attempt: resolve the endpoint (re-reading the
-    /// descriptor after any failure — the re-point rule), POST the batch,
-    /// and validate the answer's shape. Errors mark the host down and
-    /// return `None` (the caller embeds through the fallback).
+    /// One remote round (step 17 B1): a transport-level failure — a
+    /// connect or send error, never a timeout or an HTTP answer — gets ONE
+    /// immediate retry before the host is declared down. The host serves
+    /// one request per connection (`Connection: close`), so a pooled
+    /// socket can die between the client's decision points, and a single
+    /// transport blip must not arm the cooldown and pin the in-process
+    /// fallback for the rest of the process's life.
     async fn embed_remote(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
+        match self.embed_remote_attempt(texts).await {
+            Attempt::Ok(vectors) => Some(vectors),
+            Attempt::Transport(_) => match self.embed_remote_attempt(texts).await {
+                Attempt::Ok(vectors) => Some(vectors),
+                Attempt::Transport(reason) | Attempt::Host(reason) => {
+                    self.mark_host_down(&reason);
+                    None
+                }
+            },
+            Attempt::Host(reason) => {
+                self.mark_host_down(&reason);
+                None
+            }
+        }
+    }
+
+    /// One attempt: resolve the endpoint (re-reading the descriptor after
+    /// any failure — the re-point rule), POST the batch, and validate the
+    /// answer's shape. Nothing is marked down here — the caller owns the
+    /// cooldown, so a transport failure can retry before it arms.
+    async fn embed_remote_attempt(&self, texts: &[String]) -> Attempt {
         let Some(http) = &self.http else {
-            self.mark_host_down("no HTTP client could be built");
-            return None;
+            return Attempt::Host("no HTTP client could be built".into());
         };
         let Some(endpoint) = self.usable_endpoint() else {
-            self.mark_host_down("no healthy host is published");
-            return None;
+            return Attempt::Host("no healthy host is published".into());
         };
         let request = crate::host::models_host::EmbedRequest {
             model: self.model_id.clone(),
@@ -466,15 +519,21 @@ impl RemoteEmbedder {
         let answer = match answer {
             Ok(answer) if answer.status().as_u16() == 200 => answer,
             Ok(answer) => {
-                self.mark_host_down(&format!(
+                return Attempt::Host(format!(
                     "the host answered HTTP {}",
                     answer.status().as_u16()
                 ));
-                return None;
             }
             Err(err) => {
-                self.mark_host_down(&format!("the request failed: {err}"));
-                return None;
+                // A timeout is the request's own budget — retrying doubles
+                // the wait for nothing. Everything else at this point is
+                // transport-level: the host restarting mid-connection, or a
+                // pooled socket the host's one-request-per-connection
+                // policy already closed.
+                if err.is_timeout() {
+                    return Attempt::Host(format!("the request failed: {err}"));
+                }
+                return Attempt::Transport(format!("the request failed: {err}"));
             }
         };
         let decoded = match answer
@@ -483,16 +542,14 @@ impl RemoteEmbedder {
         {
             Ok(decoded) => decoded,
             Err(err) => {
-                self.mark_host_down(&format!("the host answer was unreadable: {err}"));
-                return None;
+                return Attempt::Host(format!("the host answer was unreadable: {err}"));
             }
         };
         if decoded.dim != self.dim
             || decoded.vectors.len() != texts.len()
             || decoded.vectors.iter().any(|vector| vector.len() != self.dim)
         {
-            self.mark_host_down("the host answered vectors of the wrong shape");
-            return None;
+            return Attempt::Host("the host answered vectors of the wrong shape".into());
         }
         *self
             .host_down_until
@@ -502,7 +559,7 @@ impl RemoteEmbedder {
             .status
             .write()
             .expect("embedder status lock poisoned") = EmbedderStatus::Ready;
-        Some(decoded.vectors)
+        Attempt::Ok(decoded.vectors)
     }
 
     /// The cached endpoint while it is fresh, or a re-read descriptor. The
@@ -567,11 +624,43 @@ impl RemoteEmbedder {
         *last = Some(std::time::Instant::now());
     }
 
+    /// Step 17 B3's decision, one seam so tests can pin it: whether the
+    /// in-process fallback may load for THIS embedder's model. Never for
+    /// the code model while a host is serveable (a binary resolves or a
+    /// live descriptor is published) — a window that fell back
+    /// in-process mid-pass held ~3.5 GB of weights and ONNX arena the
+    /// host already serves machine-wide. Always for the memory model
+    /// (recall must keep working), and for the truly-offline code model.
+    fn in_process_fallback_allowed(&self) -> bool {
+        self.model_id != crate::memory::embedder::CODE_EMBEDDING_MODEL
+            || !crate::provider::client_factory::host_is_serveable(
+                &crate::config::embedder_cache_dir(self.client.config_dir()),
+            )
+    }
+
     /// Embed through the lazily created in-process fallback — today's path.
     /// The fallback is created at most once: a model that cannot load
     /// becomes the permanent hash embedder with status `Failed` (the
-    /// `build_embedder` failure shape).
+    /// `build_embedder` failure shape). When the host serves again the
+    /// cached fallback is dropped (see [`Self::embed_texts`], step 17 B2),
+    /// so its ONNX session and arena are freed.
+    ///
+    /// Step 17 B3: while a host is serveable, the CODE model never loads
+    /// its ONNX in-process at all — a window that fell back in-process
+    /// mid-pass held ~3.5 GB of weights and arena the host already serves
+    /// machine-wide. The not-ready signal comes back instead: the pass
+    /// stops on the `Failed` status (and on the all-zero batch), find_code
+    /// falls back to text search. The memory model keeps its in-process
+    /// fallback (recall must keep working), and so does the truly-offline
+    /// code model (no host binary, no live descriptor).
     async fn embed_fallback(&self, texts: &[String]) -> Vec<Vec<f32>> {
+        if !self.in_process_fallback_allowed() {
+            *self
+                .status
+                .write()
+                .expect("embedder status lock poisoned") = EmbedderStatus::Failed;
+            return vec![vec![0.0; self.dim]; texts.len()];
+        }
         let embedder = {
             let mut slot = self.fallback.lock().await;
             if slot.is_none() {
@@ -612,6 +701,8 @@ impl RemoteEmbedder {
             }
             Arc::clone(slot.as_ref().expect("the fallback is set"))
         };
+        self.fallback_used
+            .store(true, std::sync::atomic::Ordering::Release);
         embedder.embed_batch(texts).await
     }
 }
@@ -1037,6 +1128,18 @@ mod tests {
         /// Publish a descriptor for the TEST process (alive, real creation
         /// identity) — the stand-in for a host another instance spawned.
         fn publish_descriptor(config_dir: &std::path::Path, port: u16, token: &str) {
+            publish_descriptor_serving(config_dir, port, token, &["not-a-real-model"]);
+        }
+
+        /// [`publish_descriptor`] with an explicit serve list — for the
+        /// tests that exercise a specific model's request path (the code
+        /// model's not-ready leg, step 17 B3).
+        fn publish_descriptor_serving(
+            config_dir: &std::path::Path,
+            port: u16,
+            token: &str,
+            models: &[&str],
+        ) {
             crate::host::shared_service::write_service(
                 &crate::host::shared_service::service_dir(config_dir, "models"),
                 &crate::host::shared_service::ServiceInfo {
@@ -1047,7 +1150,7 @@ mod tests {
                     started_ms: crate::host::shared_service::now_ms(),
                     created: crate::process_tree::process_creation_id(std::process::id())
                         .unwrap_or_default(),
-                    models: vec!["not-a-real-model".into()],
+                    models: models.iter().map(|model| model.to_string()).collect(),
                 },
             )
             .expect("publish the test descriptor");
@@ -1210,6 +1313,219 @@ mod tests {
                     .fold(0.0_f32, f32::max);
                 assert!(drift < 1e-5, "remote vs in-process drift {drift}");
             }
+        }
+
+        /// A stub whose FIRST connection is accepted and closed without an
+        /// answer — the client's send fails (a socket that died
+        /// server-side, the one-request-per-connection host's race) —
+        /// while later connections serve like [`stub_host`]: the
+        /// transport-retry fixture of step 17 B1.
+        fn flaky_then_serving_host(marker: f32, models: &[&str]) -> u16 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind the flaky stub");
+            let port = listener.local_addr().expect("a flaky stub port").port();
+            let models: Vec<String> = models.iter().map(|model| model.to_string()).collect();
+            thread::spawn(move || {
+                let mut first = true;
+                while let Ok((mut stream, _)) = listener.accept() {
+                    if first {
+                        first = false;
+                        drop(stream);
+                        continue;
+                    }
+                    let Some((method, path, body)) = read_stub_request(&mut stream) else {
+                        continue;
+                    };
+                    if method == "POST" && path == "/v1/embed" {
+                        let Ok(request) = serde_json::from_slice::<
+                            crate::host::models_host::EmbedRequest,
+                        >(&body)
+                        else {
+                            write_stub_response(&mut stream, 400, "{\"error\": \"bad body\"}");
+                            continue;
+                        };
+                        let dim = EMBEDDING_DIM;
+                        let vectors: Vec<Vec<f32>> = request
+                            .texts
+                            .iter()
+                            .map(|_| {
+                                let mut vector = vec![0.0_f32; dim];
+                                vector[0] = marker;
+                                vector
+                            })
+                            .collect();
+                        let answer =
+                            serde_json::json!({ "vectors": vectors, "dim": dim }).to_string();
+                        write_stub_response(&mut stream, 200, &answer);
+                    } else if method == "GET" && path == "/health" {
+                        let answer = serde_json::json!({ "models": models, "version": "stub" })
+                            .to_string();
+                        write_stub_response(&mut stream, 200, &answer);
+                    } else {
+                        write_stub_response(&mut stream, 404, "{\"error\": \"unknown path\"}");
+                    }
+                }
+            });
+            port
+        }
+
+        /// Step 17 B1: one transport-level send error (a connection closed
+        /// before an answer — the host serves one request per connection)
+        /// is retried immediately; the embed succeeds, no fallback is
+        /// ever constructed, and the cooldown never arms.
+        #[tokio::test]
+        async fn a_send_error_gets_one_immediate_retry() {
+            let home = tempfile::tempdir().unwrap();
+            let port = flaky_then_serving_host(9.5, &["not-a-real-model"]);
+            publish_descriptor(home.path(), port, "stub-token");
+            let client = crate::host::models_host::shared_client(home.path());
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let remote = RemoteEmbedder::new(client, "not-a-real-model", Arc::clone(&status));
+            let vectors = remote.embed_texts(&["a".to_string()]).await;
+            assert_eq!(vectors.len(), 1);
+            assert!((vectors[0][0] - 9.5).abs() < 1e-6, "the retry was served");
+            assert!(
+                remote.fallback.lock().await.is_none(),
+                "a transport blip must not construct the fallback"
+            );
+            assert!(
+                remote
+                    .host_down_until
+                    .lock()
+                    .expect("models-host cooldown lock poisoned")
+                    .is_none(),
+                "a transport blip must not arm the cooldown"
+            );
+        }
+
+        /// Step 17 B2: after a fallback period, a remote answer drops the
+        /// cached in-process fallback — its ONNX session and arena are
+        /// freed, so one transient failure cannot pin them for the
+        /// process lifetime.
+        #[tokio::test]
+        async fn remote_recovery_drops_the_cached_in_process_fallback() {
+            let home = tempfile::tempdir().unwrap();
+            // Phase 1: the published port is dead — the remote fails (the
+            // connect error retries once, then arms the cooldown), and the
+            // fallback loads: the unknown model cannot, so it is the hash
+            // embedder with Failed — the observable shape of the cached
+            // in-process path.
+            let dead_port = {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            publish_descriptor(home.path(), dead_port, "stub-token");
+            let client = crate::host::models_host::shared_client(home.path());
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let mut remote = RemoteEmbedder::new(client, "not-a-real-model", Arc::clone(&status));
+            remote.override_cooldown(std::time::Duration::from_millis(20));
+            let vectors = remote.embed_texts(&["a".to_string()]).await;
+            assert_eq!(vectors.len(), 1);
+            assert!(
+                remote.fallback.lock().await.is_some(),
+                "the failed remote cached the in-process fallback"
+            );
+            // Phase 2: a replacement host publishes at a new port; after
+            // the (short) cooldown the remote answer must drop it again.
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let port = stub_host(7.5, &["not-a-real-model"], 8);
+            publish_descriptor(home.path(), port, "stub-token");
+            let vectors = remote.embed_texts(&["a".to_string()]).await;
+            assert!(
+                (vectors[0][0] - 7.5).abs() < 1e-6,
+                "the replacement host served the embed"
+            );
+            assert!(
+                remote.fallback.lock().await.is_none(),
+                "the recovery dropped the cached fallback (step 17 B2)"
+            );
+        }
+
+        /// Step 17 B3: while a host is serveable, the CODE model never
+        /// loads in-process — a failed remote (the dead port) comes back
+        /// as the not-ready signal: the all-zero batch plus the `Failed`
+        /// status, and no fallback is ever constructed. The pass stops on
+        /// `Failed`, find_code falls back to text search.
+        #[tokio::test]
+        async fn the_code_model_never_falls_back_in_process_while_a_host_is_serveable() {
+            let home = tempfile::tempdir().unwrap();
+            let dead_port = {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            publish_descriptor_serving(
+                home.path(),
+                dead_port,
+                "stub-token",
+                &[crate::memory::embedder::CODE_EMBEDDING_MODEL],
+            );
+            let client = crate::host::models_host::shared_client(home.path());
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let remote = RemoteEmbedder::new(
+                client,
+                crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                Arc::clone(&status),
+            );
+            let vectors = remote.embed_texts(&["a".to_string()]).await;
+            assert_eq!(vectors.len(), 1);
+            assert!(
+                vectors
+                    .iter()
+                    .all(|vector| vector.iter().all(|value| *value == 0.0)),
+                "the not-ready signal is the all-zero batch"
+            );
+            assert_eq!(
+                *status.read().expect("embedder status lock poisoned"),
+                EmbedderStatus::Failed
+            );
+            assert!(
+                remote.fallback.lock().await.is_none(),
+                "the code model must never load in-process while a host is serveable"
+            );
+        }
+
+        /// The step-17 B3 decision itself: the code model is barred from
+        /// the in-process fallback ONLY while a host is serveable — the
+        /// memory model is never barred (recall must keep working), and
+        /// the truly-offline code model keeps today's fallback.
+        #[test]
+        fn in_process_fallback_is_barred_only_for_a_serveable_code_model() {
+            // Serveable: a live descriptor under the home.
+            let home = tempfile::tempdir().unwrap();
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            publish_descriptor(home.path(), port, "stub-token");
+            let client = crate::host::models_host::shared_client(home.path());
+            let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+            let code = RemoteEmbedder::new(
+                client.clone(),
+                crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                Arc::clone(&status),
+            );
+            assert!(!code.in_process_fallback_allowed());
+            let memory = RemoteEmbedder::new(
+                client,
+                "not-a-real-model",
+                Arc::clone(&status),
+            );
+            assert!(
+                memory.in_process_fallback_allowed(),
+                "the memory model keeps its in-process fallback"
+            );
+            // Offline (no descriptor, no host binary): the code model
+            // keeps today's in-process fallback.
+            let bare = tempfile::tempdir().unwrap();
+            let bare_client = crate::host::models_host::shared_client(bare.path());
+            let code = RemoteEmbedder::new(
+                bare_client,
+                crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                status,
+            );
+            assert!(
+                code.in_process_fallback_allowed(),
+                "the offline code model keeps the in-process fallback"
+            );
         }
     }
 }

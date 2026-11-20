@@ -1322,6 +1322,13 @@ impl Brain {
     /// (attach-or-spawn, a background budget; the startup arm above
     /// stayed attach-only). Only when no host can be had does the
     /// in-process ONNX load run, exactly as before.
+    ///
+    /// d3336a8a step 17: the acquire retries with a short doubling backoff
+    /// while a host is serveable — the spawn's health wait can race a slow
+    /// cold start, and the host it spawned is usually healthy seconds
+    /// later. The memory model keeps its in-process fallback after the
+    /// retries (recall must keep working), and the remote path drops it
+    /// again once the host serves.
     #[cfg(feature = "embeddings")]
     pub fn spawn_startup_embedder_load(
         &self,
@@ -1346,7 +1353,7 @@ impl Brain {
             let remote_model = model.clone();
             let remote_cache = cache_dir.join("models");
             let remote = tokio::task::spawn_blocking(move || {
-                crate::provider::client_factory::acquire_remote_embedder(
+                crate::provider::client_factory::acquire_remote_embedder_with_retry(
                     &remote_model,
                     &remote_cache,
                     remote_status,

@@ -37,17 +37,20 @@
 //! false`, so until then recall stays keyword-only for a
 //! not-yet-installed model.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
 use mnemo::config::settings_dto::{
-    BudgetConfigDto, ModelRefDto, ModelsConfigDto, SettingsSaveDto, VisionModelDto,
+    BudgetConfigDto, MachineConfigDto, ModelRefDto, ModelsConfigDto, SettingsSaveDto, VisionModelDto,
     deserialize_optional_nullable,
 };
 use mnemo::config::{Config, ModelRef, EMBEDDING_MODEL_SENTINEL_HASH};
 use mnemo::headless::{EventReceiver, RecvError, Setup, SetupEvent};
 use mnemo::memory::embedder::EmbedderStatus;
+use mnemo::provider::client_factory::vision_warning;
 
 use crate::mnemo2::ipc::{settings_refresh, settings_setup, Mnemo2State};
 
@@ -68,12 +71,68 @@ pub struct ModelSettingsWire {
     /// The vision model as `"endpoint/model"`, or `null` (a multimodal
     /// main model serves vision directly).
     pub vision_model: Option<String>,
+    /// Why the vision model yields no image tools (or only a warning that it
+    /// may not): the endpoint is missing from `endpoints.toml`, is
+    /// Anthropic-kind, or does not list the model. `null` when vision is unset
+    /// or resolves cleanly. Shown under the page's Vision field.
+    pub vision_warning: Option<String>,
     /// The code-indexing (bundled embedding) model state.
     pub embedding: EmbeddingWire,
     /// The token-optimizer levers + knobs (`[general.optimizer]`).
     pub optimizer: OptimizerWire,
     /// The deterministic budget caps (`[general.budget]`).
     pub budget: BudgetWire,
+    /// The machine-wide limits + disk status (`[general.machine]`, plan
+    /// d3336a8a step 3) — the Machine page.
+    pub machine: MachineWire,
+}
+
+/// The Machine page's snapshot: the shared heavy-command limit and how much
+/// room the volumes that grow have left, in page order.
+///
+/// The disk lines are READ-ONLY and re-read on every `model_settings_get`, so
+/// opening Settings refreshes them. The page renders each as
+/// `Free disk: N GB on <volume>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineWire {
+    /// Heavy commands (builds/tests/lints) allowed to run at once across every
+    /// Mnemo2 instance on this machine.
+    pub heavy_commands: usize,
+    /// The setting's lower bound (the page's number field).
+    pub min_heavy_commands: usize,
+    /// The setting's upper bound (the page's number field).
+    pub max_heavy_commands: usize,
+    /// One line per volume worth showing: the open project's, and the config
+    /// dir's when it lives on a different volume. Empty when neither volume
+    /// can be read.
+    pub disks: Vec<DiskWire>,
+    /// The read-only shared-build-cache line (plan d3336a8a step 7).
+    pub sccache: SccacheWire,
+}
+
+/// The Machine page's read-only "Shared Rust build cache" line.
+///
+/// `sccache` is discovered on `PATH`, never configured: when it is there, every
+/// agent command, verification and proof run gets `RUSTC_WRAPPER` pointing at
+/// it, so the whole machine compiles each dependency graph once.
+#[derive(Debug, Clone, Serialize)]
+pub struct SccacheWire {
+    /// Whether an `sccache` binary is on `PATH`.
+    pub found: bool,
+    /// The resolved binary, for the page to name it; `null` when not found.
+    pub path: Option<String>,
+}
+
+/// One "Free disk" line of the Machine page.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiskWire {
+    /// What the line is about: `"project"` (the worktrees' `target/` folders
+    /// and `node_modules`) or `"config"` (downloaded models, the memory DB).
+    pub role: &'static str,
+    /// The volume label, e.g. `C:` or `/`.
+    pub volume: String,
+    /// Whole GB free.
+    pub free_gb: u64,
 }
 
 /// The one `[models]` slot Mnemo2's Models page owns — the compaction
@@ -177,8 +236,21 @@ pub struct BudgetWire {
 /// Read every model-role section from the config dir this `Setup`
 /// targets — the core of `model_settings_get`, testable without Tauri
 /// state. The embedding catalog is checked against the same dir, and
-/// `status` reflects the live embedder when a lead is open.
+/// `status` reflects the live embedder when a lead is open. Test-only view: the
+/// command goes through [`model_settings_read_for`] so it can name the open
+/// project's volume on the Machine page.
+#[cfg(test)]
 pub(crate) fn model_settings_read(setup: &Setup) -> Result<ModelSettingsWire, String> {
+    model_settings_read_for(setup, None)
+}
+
+/// The same snapshot, told which checkout is open so the Machine section can
+/// report the volume that holds its `target/` folders (plan d3336a8a step 3).
+/// `None` reports the config dir's volume only.
+pub(crate) fn model_settings_read_for(
+    setup: &Setup,
+    project_root: Option<&Path>,
+) -> Result<ModelSettingsWire, String> {
     let config = Config::load(setup.config_dir()).map_err(|err| err.to_string())?;
     let general = &config.general.general;
     Ok(ModelSettingsWire {
@@ -189,6 +261,9 @@ pub(crate) fn model_settings_read(setup: &Setup) -> Result<ModelSettingsWire, St
             .vision_model
             .as_ref()
             .map(|v| format!("{}/{}", v.endpoint, v.model)),
+        // One shared rule with the client factory, so the warning shown here
+        // and the tools the workers get never disagree.
+        vision_warning: vision_warning(&config),
         embedding: embedding_wire(setup, &config),
         optimizer: OptimizerWire {
             delta_reads: general.optimizer.delta_reads,
@@ -211,7 +286,63 @@ pub(crate) fn model_settings_read(setup: &Setup) -> Result<ModelSettingsWire, St
             max_escalations_per_plan: general.budget.max_escalations_per_plan,
             max_retries_per_lane: general.budget.max_retries_per_lane,
         },
+        machine: MachineWire {
+            heavy_commands: general.machine.heavy_commands,
+            min_heavy_commands: mnemo::config::MIN_HEAVY_COMMANDS,
+            max_heavy_commands: mnemo::config::MAX_HEAVY_COMMANDS,
+            disks: disk_wires(setup.config_dir(), project_root),
+            sccache: sccache_wire(),
+        },
     })
+}
+
+/// The Machine page's build-cache line: re-resolved on every Settings read, so
+/// a `cargo install sccache` done while the app runs shows up the next time the
+/// page opens, without a restart (plan d3336a8a step 7).
+fn sccache_wire() -> SccacheWire {
+    let found = mnemo::sccache::refresh();
+    SccacheWire {
+        path: found.as_ref().map(|path| path.display().to_string()),
+        found: found.is_some(),
+    }
+}
+
+/// The Machine page's disk lines: the open project's volume, plus the config
+/// dir's when it is a DIFFERENT volume (the two things that fill a machine's
+/// disk). With no project open, the config dir's volume alone.
+fn disk_wires(config_dir: &Path, project_root: Option<&Path>) -> Vec<DiskWire> {
+    let config = mnemo::disk::free_space(config_dir);
+    let project = project_root.and_then(mnemo::disk::free_space);
+    match (project, config) {
+        (Some(project), Some(config)) if project.volume == config.volume => vec![DiskWire {
+            role: "project",
+            volume: project.volume,
+            free_gb: project.free_gb,
+        }],
+        (Some(project), Some(config)) => vec![
+            DiskWire {
+                role: "project",
+                volume: project.volume,
+                free_gb: project.free_gb,
+            },
+            DiskWire {
+                role: "config",
+                volume: config.volume,
+                free_gb: config.free_gb,
+            },
+        ],
+        (Some(project), None) => vec![DiskWire {
+            role: "project",
+            volume: project.volume,
+            free_gb: project.free_gb,
+        }],
+        (None, Some(config)) => vec![DiskWire {
+            role: "config",
+            volume: config.volume,
+            free_gb: config.free_gb,
+        }],
+        (None, None) => Vec::new(),
+    }
 }
 
 /// Compact wire form of one `[models]` slot: `"endpoint/model"`.
@@ -286,9 +417,10 @@ pub(crate) async fn model_settings_apply(
         "embedding" => apply_embedding(setup, value).await,
         "optimizer" => apply_optimizer(setup, value).await,
         "budget" => apply_budget(setup, value).await,
+        "machine" => apply_machine(setup, value).await,
         other => Err(format!(
             "unknown model-settings section '{other}' \
-             (expected models, vision, embedding, optimizer or budget)"
+             (expected models, vision, embedding, optimizer, budget or machine)"
         )),
     }
 }
@@ -470,7 +602,28 @@ async fn apply_budget(setup: &Setup, value: Value) -> Result<(), String> {
         .patch_settings(dto)
         .await
         .map_err(|err| err.to_string())
-}// ── Tauri commands ─────────────────────────────────────────────────────────
+}
+
+/// The `"machine"` section (plan d3336a8a step 3): the machine-wide
+/// heavy-command limit. A partial object; an absent field keeps the stored
+/// value. Out-of-range numbers are REJECTED by the shared pipeline (a typo in
+/// the dialog must never silently become a different limit); a hand-edited
+/// `config.toml` is clamped on load instead, so the machine always runs at
+/// least one build and never more than [`MAX_HEAVY_COMMANDS`].
+///
+/// The disk lines are read-only status, so they are not part of the patch.
+async fn apply_machine(setup: &Setup, value: Value) -> Result<(), String> {
+    let machine: MachineConfigDto = serde_json::from_value(value)
+        .map_err(|err| format!("invalid machine section: {err}"))?;
+    let dto = SettingsSaveDto {
+        machine: Some(machine),
+        ..Default::default()
+    };
+    setup
+        .patch_settings(dto)
+        .await
+        .map_err(|err| err.to_string())
+} // ── Tauri commands ───────────────────────────────────────────────────────────
 
 /// Read every model-role section for the Models and Savings pages.
 /// With a lead open this targets the lead's config dir (and reports the
@@ -480,15 +633,22 @@ pub async fn model_settings_get(
     state: State<'_, Mnemo2State>,
 ) -> Result<ModelSettingsWire, String> {
     let (setup, _) = settings_setup(&state).await?;
-    model_settings_read(&setup)
+    // The Machine page's disk lines name the volume the open project's
+    // `target/` folders live on (plan d3336a8a step 3).
+    let project = state
+        .open_lead()
+        .await
+        .map(|lead| lead.workspace_root().to_path_buf());
+    model_settings_read_for(&setup, project.as_deref())
 }
 
 /// Save one page-owned section (`"models"`, `"vision"`, `"embedding"`,
-/// `"optimizer"` or `"budget"`), writing only that section
+/// `"optimizer"`, `"budget"` or `"machine"`), writing only that section
 /// and keeping every other key. The engine reads `[models]`,
-/// `vision_model`, `optimizer` and `budget` at build time, so
-/// those apply after the project is reopened; an open lead additionally
-/// gets the pipeline's live rewire, and the lead/team catalog is
+/// `vision_model`, `optimizer`, `budget` and `[general.machine]` at build or
+/// command time, so those apply after the project is reopened (the machine
+/// limit is read per heavy command, so it applies even sooner); an open lead
+/// additionally gets the pipeline's live rewire, and the lead/team catalog is
 /// refreshed so the next dispatch sees the new models.
 #[tauri::command]
 pub async fn model_settings_save(
@@ -697,6 +857,106 @@ simple = ["ep1/exec-model"]
             .options
             .iter()
             .any(|o| o.id == "all-MiniLM-L6-v2" && !o.installed));
+    }
+
+    /// A temp config dir holding only a vision model and the endpoints it names
+    /// (plus an empty fixture where needed) — enough for the warning rules,
+    /// which read nothing else.
+    fn vision_fixture(
+        endpoint: &str,
+        model: &str,
+        endpoints: &str,
+    ) -> (tempfile::TempDir, Setup) {
+        let dir = tempfile::tempdir().expect("config dir");
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!("[general.vision_model]\nendpoint = \"{endpoint}\"\nmodel = \"{model}\"\n"),
+        )
+        .expect("write config.toml");
+        std::fs::write(dir.path().join("endpoints.toml"), endpoints)
+            .expect("write endpoints.toml");
+        let setup = Setup::open(Some(dir.path().to_path_buf())).expect("setup");
+        (dir, setup)
+    }
+
+    /// With vision pointing at an endpoint `endpoints.toml` does not have (what
+    /// deleting an endpoint leaves behind), the page must SAY why the image tools
+    /// are missing instead of leaving the user with a silently dead feature.
+    #[test]
+    fn vision_warning_names_a_missing_endpoint() {
+        let (dir, setup) = fixture();
+        // The save path validates the endpoint, so seed the dangling one on disk.
+        let path = dir.path().join("config.toml");
+        let text = std::fs::read_to_string(&path).expect("read config.toml");
+        let seeded = text.replace(
+            "[general.vision_model]\nendpoint = \"ep1\"",
+            "[general.vision_model]\nendpoint = \"ghost\"",
+        );
+        assert_ne!(seeded, text, "the fixture carries the vision block");
+        std::fs::write(&path, seeded).expect("write config.toml");
+        let wire = model_settings_read(&setup).expect("read");
+        assert_eq!(
+            wire.vision_warning.as_deref(),
+            Some(
+                "Vision endpoint 'ghost' is not in endpoints.toml, so workers and agents have no image tools."
+            )
+        );
+    }
+
+    /// A vision model that resolves carries no warning — neither a listed model
+    /// nor an endpoint that lists no models at all.
+    #[test]
+    fn vision_warning_absent_for_a_valid_endpoint() {
+        let (_dir, setup) = fixture();
+        assert_eq!(model_settings_read(&setup).expect("read").vision_warning, None);
+        let (_listed, listed) = vision_fixture(
+            "ep1",
+            "vision-x",
+            "[[endpoint]]\nname = \"ep1\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = [\"plan-model\", \"vision-x\"]\n",
+        );
+        assert_eq!(model_settings_read(&listed).expect("read").vision_warning, None);
+        let (_empty, empty) = vision_fixture(
+            "ep1",
+            "any-model",
+            "[[endpoint]]\nname = \"ep1\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = []\n",
+        );
+        assert_eq!(model_settings_read(&empty).expect("read").vision_warning, None);
+    }
+
+    /// The vision client is OpenAI-compatible only, so an Anthropic-kind vision
+    /// endpoint yields no image tools — and the page says which endpoint it is.
+    #[test]
+    fn vision_warning_for_an_anthropic_endpoint() {
+        let (_dir, setup) = vision_fixture(
+            "claude",
+            "claude-sonnet-4-5",
+            "[[endpoint]]\nname = \"claude\"\nkind = \"anthropic\"\nbase_url = \"https://api.anthropic.com/v1/\"\nmodels = [\"claude-sonnet-4-5\"]\n",
+        );
+        let wire = model_settings_read(&setup).expect("read");
+        assert_eq!(
+            wire.vision_warning.as_deref(),
+            Some(
+                "Vision endpoint 'claude' is an Anthropic endpoint, which the vision client does not support."
+            )
+        );
+    }
+
+    /// An id the endpoint does not list is a warning, never a dead feature —
+    /// unlisted ids can still work (the reason this one is not an error).
+    #[test]
+    fn vision_warning_for_an_unlisted_model() {
+        let (_dir, setup) = vision_fixture(
+            "ep1",
+            "deepseek-v4.1-flash:1017",
+            "[[endpoint]]\nname = \"ep1\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1\"\nmodels = [\"plan-model\"]\n",
+        );
+        let wire = model_settings_read(&setup).expect("read");
+        assert_eq!(
+            wire.vision_warning.as_deref(),
+            Some(
+                "Vision model 'deepseek-v4.1-flash:1017' is not listed for endpoint 'ep1'; it may still work."
+            )
+        );
     }
 
     #[test]
@@ -936,6 +1196,45 @@ simple = ["ep1/exec-model"]
         let wire = model_settings_read(&setup).expect("read");
         assert_eq!(wire.budget.max_tokens_per_plan, 999, "the patch set the cap");
         assert!(wire.budget.enabled, "the fixture flag survives");
+    }
+
+    /// The Machine section (plan d3336a8a step 3): the read reports the shared
+    /// build limit with its bounds and at least the config dir's disk line; a
+    /// save writes `[general.machine] heavy_commands`; an out-of-range number is
+    /// refused instead of written.
+    #[tokio::test]
+    async fn machine_section_round_trips_and_rejects_out_of_range() {
+        let (_dir, setup) = fixture();
+        let wire = model_settings_read(&setup).expect("read");
+        assert_eq!(wire.machine.heavy_commands, 2, "the out-of-box limit");
+        assert_eq!(wire.machine.min_heavy_commands, 1);
+        assert_eq!(wire.machine.max_heavy_commands, 16);
+        assert!(
+            !wire.machine.disks.is_empty(),
+            "the config dir's volume is readable in a temp dir"
+        );
+        assert_eq!(
+            wire.machine.disks[0].role, "config",
+            "with no project open the config dir's volume is the line"
+        );
+
+        model_settings_apply(&setup, "machine", json!({ "heavy_commands": 1 }))
+            .await
+            .expect("save");
+        let wire = model_settings_read(&setup).expect("read back");
+        assert_eq!(wire.machine.heavy_commands, 1);
+        let text = std::fs::read_to_string(setup.config_dir().join("config.toml")).unwrap();
+        assert!(
+            text.contains("[general.machine]") && text.contains("heavy_commands = 1"),
+            "the setting lands in config.toml: {text}"
+        );
+
+        let err = model_settings_apply(&setup, "machine", json!({ "heavy_commands": 99 }))
+            .await
+            .expect_err("out of range");
+        assert!(err.contains("machine.heavy_commands"), "{err}");
+        let wire = model_settings_read(&setup).expect("read back");
+        assert_eq!(wire.machine.heavy_commands, 1, "a refused save changes nothing");
     }
 
     #[tokio::test]

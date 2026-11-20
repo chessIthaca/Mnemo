@@ -1568,6 +1568,7 @@ mod tests {
             store.as_ref(),
             &coding.join("plans"),
             &coding.join("backlog.jsonl"),
+            None,
             &|_, _| {},
         )
         .await
@@ -1678,6 +1679,7 @@ mod tests {
             store.as_ref(),
             &project.root().join(".coding").join("knowledge"),
             std::slice::from_ref(&rel),
+            false,
         )
         .await
         .expect("targeted reindex");

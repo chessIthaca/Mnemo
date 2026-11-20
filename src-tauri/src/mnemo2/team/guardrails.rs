@@ -23,7 +23,11 @@ pub(crate) fn executor_prompt() -> PromptSpec {
             "arrives later as a new message that starts with a [From …] header; do not assume ",
             "or invent a reply — continue your task or end your turn. Never modify ",
             "TeamManager state or use Git/files as worker lifecycle status. Run relevant ",
-            "checks, commit on the assigned worker branch, and report the actual commit and checks."
+            "checks, commit on the assigned worker branch, and report the actual commit and checks.",
+            " After a visual change (UI, rendering, animation), when the image tools are ",
+            "available (load_tools image), take a screenshot with the project's own tool or a ",
+            "browser screenshot, check it with image_analysis or compare before and after with ",
+            "image_ui_diff, and report what you saw."
         )
         .to_string(),
         blocks: vec![PromptBlock::FileToolRules],
@@ -77,7 +81,9 @@ pub(crate) fn audit_prompt() -> PromptSpec {
             "files, run shell commands, commit, merge, push, spawn work, ask the user, or tick ",
             "plan steps. Audit correctness, error handling, integration with neighbouring ",
             "contracts, persistence, concurrency, security, and test quality against the plan's ",
-            "intent and acceptance scenarios. Report findings with file/line evidence through ",
+            "intent and acceptance scenarios. When the change is visual and the image tools are ",
+            "available, look at the screenshots the worker or the project produced with ",
+            "image_analysis before you judge it. Report findings with file/line evidence through ",
             "message_parent, then end your turn; the lead adjudicates your audit on the ",
             "implementation worker's review. Never merge, never mutate files, and never use ",
             "Git or files as lifecycle status."
@@ -94,7 +100,7 @@ pub(crate) fn audit_prompt() -> PromptSpec {
 /// shell, no git writes, no spawning, no user questions, no plan-board or
 /// step ticks, and no durable-memory mutations (writes, amendments, or
 /// consolidation).
-fn audit_guardrails() -> Guardrails {
+pub(super) fn audit_guardrails() -> Guardrails {
     let mut tools = ToolSelection::all();
     tools.exclude = vec![
         "create_plan".to_string(),
@@ -107,6 +113,16 @@ fn audit_guardrails() -> Guardrails {
         "multi_edit".to_string(),
         "convert_line_endings".to_string(),
         "shell".to_string(),
+        // A job runs commands too, so the whole job surface is a mutation
+        // path: an audit worker must not be able to start, wait on, tail or
+        // kill a job (plan 5b85ab61 step 2).
+        "job_start".to_string(),
+        "job_wait".to_string(),
+        "job_tail".to_string(),
+        "job_kill".to_string(),
+        // `run_checks` executes the project's commands too, so an audit worker
+        // must not be able to run them either (plan 5b85ab61 step 3).
+        "run_checks".to_string(),
         "git".to_string(),
         "memory_write".to_string(),
         "memory_amend".to_string(),
@@ -183,22 +199,65 @@ fn executor_gate_rules() -> Vec<GateRule> {
         "git",
         r#"(?i)"action":"(?:push|merge|checkout)""#.to_string(),
     ));
-    // The `shell` tool: any git invocation, however chained or qualified.
+    // The `shell` tool and `job_start` — a job runs the same commands, so it
+    // must not become a way around the gate: any git invocation, however
+    // chained or qualified.
     let pre = SHELL_CMD_PREFIX;
     let git = SHELL_GIT;
-    for sub in [
-        r"(?:push|merge|rebase|switch|worktree)\b",
-        // Branch deletion: `-d`, `-D`, a combined short flag, or `--delete`.
-        r#"branch\s+(?:[^;&|\\"]*\s)?(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)(?:\s|[;&|\\"]|$)"#,
-    ] {
-        rules.push(deny_rule("shell", format!("{pre}{git}{sub}")));
+    for tool in ["shell", "job_start"] {
+        for sub in [
+            r"(?:push|merge|rebase|switch|worktree)\b",
+            // Branch deletion: `-d`, `-D`, a combined short flag, or `--delete`.
+            r#"branch\s+(?:[^;&|\\"]*\s)?(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)(?:\s|[;&|\\"]|$)"#,
+        ] {
+            rules.push(deny_rule(tool, format!("{pre}{git}{sub}")));
+        }
+        // `checkout` of a branch; `checkout -- paths` and `checkout rev -- paths`
+        // restore files and stay allowed.
+        rules.push(deny_rule(
+            tool,
+            format!("{pre}{git}checkout(?:\\s+{SHELL_ARG_NOT_DASHDASH})+{SHELL_CMD_END}"),
+        ));
+        rules.push(deny_rule(tool, format!(r"{pre}gh\s+pr\b")));
     }
-    // `checkout` of a branch; `checkout -- paths` and `checkout rev -- paths`
-    // restore files and stay allowed.
-    rules.push(deny_rule(
-        "shell",
-        format!("{pre}{git}checkout(?:\\s+{SHELL_ARG_NOT_DASHDASH})+{SHELL_CMD_END}"),
-    ));
-    rules.push(deny_rule("shell", format!(r"{pre}gh\s+pr\b")));
     rules
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Workers check visual work themselves: the executor prompt names the
+    /// deferred `image` group and the two tools a visual change needs, so a
+    /// screenshot the worker takes is actually looked at.
+    #[test]
+    fn executor_prompt_asks_for_a_visual_check_with_the_image_tools() {
+        let identity = executor_prompt().identity;
+        assert!(
+            identity.contains("when the image tools are available (load_tools image)"),
+            "executor prompt must gate the visual check on the image group: {identity}"
+        );
+        assert!(
+            identity.contains("image_analysis") && identity.contains("image_ui_diff"),
+            "executor prompt must name image_analysis and image_ui_diff: {identity}"
+        );
+    }
+
+    /// The audit worker looks at the screenshots itself instead of trusting a
+    /// worker's description of them.
+    #[test]
+    fn audit_prompt_looks_at_screenshots_with_the_image_tools() {
+        let identity = audit_prompt().identity;
+        assert!(
+            identity.contains(
+                "When the change is visual and the image tools are available, look at the \
+                 screenshots"
+            ),
+            "audit prompt must ask for a look at the screenshots: {identity}"
+        );
+        assert!(
+            identity.contains("image_analysis"),
+            "audit prompt must name image_analysis: {identity}"
+        );
+    }
 }

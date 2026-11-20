@@ -1,6 +1,6 @@
 [package]
 name = "mnemo"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 description = "Mnemo — a coding-first agentic harness in Rust with persistent memory"
 license = "MIT"
@@ -66,6 +66,8 @@ clap = { version = "4", features = ["derive"] }
 
 # Paths / IDs / dirs
 directories = "6"
+# Finding `sccache` on PATH (the shared Rust build cache, plan d3336a8a step 7).
+which = "8"
 glob = "0.3"
 uuid = { version = "1", features = ["v4", "v5"] }
 regex = "1"
@@ -154,6 +156,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# Unix-only: `statvfs` for the Machine settings page's free-disk line (plan
+# d3336a8a step 3). Windows uses GetDiskFreeSpaceExW from windows-sys above.
+libc = "0.2"
 
 [dev-dependencies]
 # test-util enables tokio's paused/advanceable test clock (tokio::test

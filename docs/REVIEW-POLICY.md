@@ -59,14 +59,45 @@ each one with `team_check` (name, passed or failed, detail). Checks bind to the
 worker's current commit: any later commit (a `review_fix`, a worker fix, a
 routed fix round) clears them and the review, so both are repeated.
 
+Mnemo2 proves the regression test itself instead of taking it on trust. After a
+`bug_fixing` worker's turn whose diff adds the plan's `regression_test`, it
+reverses only the change's source hunks in the worker's own checkout and runs
+that test again: the outcome is the check `regression test fails without the
+fix` when the test fails without the fix, the high finding `regression-not-red`
+when it still passes, or `regression-proof-inconclusive` (low, wontfixable with
+a written reason) when the run could not decide. For a high-risk worker, when
+the project configured `[mutation]` in `.coding/checks.toml`, it also reports
+every changed line no test catches as a low `No test catches: ...` finding. An
+automatic mutation run is skipped when this session already mutated that tip
+or the change touches only test files, and a missing mutation tool is reported
+once as a notice, not as a worker error.
+Both are ordinary checks and findings: open ones block the merge, and the merge
+gate refuses a bug fix whose regression test has not been proven red at the tip
+being merged. Only a proof finding resolved `wontfix`, with a written reason,
+waives that refusal — a finding closed `fixed` never does: fixed must be shown
+by the red check. `team_prove_regression` and `team_mutation_check` rerun either
+proof on demand; while a proof runs, `team_message`, `team_resume`,
+`team_route_fix`, `review_fix` and `team_merge` refuse for that worker with a
+message naming the proof.
+
 ## Findings
 
 Every open finding (title, detail, file, line, severity high or low) blocks the
 merge, whatever its severity. A finding closes as fixed with evidence, or as
-wontfix with a written justification. The lead can apply a tiny exact fix
-itself with `review_fix` (one replacement in one non-test source file); larger
-fixes go back to the worker with `team_route_fix`, which hands it every open
-finding at once.
+wontfix with a written justification. The lead can apply a tiny fix
+itself with `review_fix` (one replacement in one non-test source file, matched
+and written exactly as the worker edit tool would — line endings need not
+match); larger fixes go back to the worker with `team_route_fix`, which hands
+it every open finding at once.
+
+Each finding can name its kind (`category`, a short kebab-case slug reused
+across reviews) and where the mistake could be stopped for good (`enforce`:
+`code`, `build`, `test`, or `review` when only a person can judge it). Mnemo2
+keeps a findings ledger at `.coding/reviews/findings.jsonl` and, when one
+category has come up in three workers' reviews with a `code`, `build` or `test`
+enforcement, proposes a guard as a single backlog item whose text ends with
+`[finding-category:<category>]`. The lesson then belongs in the code or the
+build, not in another review.
 
 ## Risk and independent audit
 

@@ -54,3 +54,7 @@
 # Laya's dispatch routing learnings: two computers appending their own rows
 # must merge by concatenation, never a conflict.
 .coding/laya/dispatch_routing.jsonl merge=union
+
+# The review findings ledger is jsonl (one finding per line): two computers
+# reviewing on their own must merge by concatenation, never a conflict.
+.coding/reviews/findings.jsonl merge=union

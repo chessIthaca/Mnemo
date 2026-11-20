@@ -96,6 +96,7 @@ A worker's turn ends with a "finished its turn" notice. Then:
    - the worker in review, with a review of the exact current tip and complete evidence;
    - no open finding;
    - at least one check, and every check passed on that tip;
+   - for a bug fix whose diff adds the plan's `regression_test`, the check `regression test fails without the fix` at that tip. Mnemo2 proves it after the worker's turn; `team_prove_regression` reruns it on demand (for example after recording `regression_test` late), no proof may be running for the worker, and the only waiver is a proof finding resolved `wontfix` with a written reason — a finding closed `fixed` never waives;
    - the worker idle with a clean worktree;
    - a clean, non-main lead checkout.
 
@@ -174,7 +175,7 @@ Mnemo keeps the project's knowledge in `.coding/knowledge/` (specs, decisions, b
 - `memory_search` with `record_type` "bug" before diagnosing any defect: a recorded root cause and regression test may already exist. A `bug_fixing` `plan_create` is refused until one ran in the same window.
 - `graph_search`, `graph_context`, `graph_impact` and `graph_path` answer "where is X defined, who calls it, what does a change touch". Use `graph_impact` to size a step and to choose which files a worker owns.
 
-`memory_write` the moment you learn something durable — deferred is lost. Give it a typed title: `SPEC:` how a feature works, `DECISION:` a choice and its rationale, `BUG:` symptom -> root cause -> fix and its regression test name, `HOW:` a recurring workflow. Keep records compact and pointer-first (the gist plus a file or path pointer; the file carries the detail) and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, so it does not count as durable knowledge. (`PLAN:` and `REVIEW:` records are digests Mnemo writes itself.) Say how the record is known with `evidence` (a test name, a file and line, a run, the user said so) — never required, and a record without it simply reads as unconfirmed.
+`memory_write` the moment you learn something durable — deferred is lost. Give it a typed title: `SPEC:` how a feature works, `DECISION:` a choice and its rationale, `BUG:` symptom -> root cause -> fix and its regression test name, `HOW:` a recurring workflow. Keep records compact and pointer-first (the gist plus a file or path pointer; the file carries the detail) and leave out plan IDs, branch names and commit hashes — a record carrying them is a plan-scoped note, retired at plan close, so it does not count as durable knowledge. (`PLAN:` and `REVIEW:` records are digests Mnemo writes itself.) Say how the record is known with `evidence` (a test name, a file and line, a run, the user said so) — never required, and a record without it simply reads as unconfirmed. Use `scope: "machine"` when a `HOW:` or `DECISION:` record holds for every project on this machine (the toolchain, the OS, a shared service) rather than this repository: it lands in `~/.mnemo/knowledge/`, every Mnemo2 instance indexes it read-only, and its results read `[machine]`.
 
 Keep records current: `memory_supersede` when a new fact makes a stored one obsolete (never leave both live), `memory_update` to refine a still-current record, `memory_amend` to append a dated amendment. Supersede rather than delete.
 

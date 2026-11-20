@@ -68,6 +68,10 @@ struct PreparedFile {
     validated: PathBuf,
     /// This file's own unified diff (concatenated into the combined one).
     diff: String,
+    /// The bytes as they were before this call's ops — the pre-write
+    /// content `note_write` needs once the file is on disk (plan f89fd63d
+    /// step 2).
+    original_content: String,
     new_content: String,
     notes: Vec<String>,
 }
@@ -205,6 +209,7 @@ fn prepare_files(
             &ops,
             false,
             args.artifact_check != Some(false),
+            &validated,
         )
         .map_err(|e| file_error(idx, &path, e))?;
         let diff = compute_diff(&path, &content, &new_content);
@@ -212,6 +217,7 @@ fn prepare_files(
             path,
             validated,
             diff,
+            original_content: content,
             new_content,
             notes,
         });
@@ -266,6 +272,85 @@ fn write_failure_message(
     )
 }
 
+/// Plan f89fd63d step 4 (c): the one-line note a flattened call's success
+/// output ends with, naming the declared shape. Shared with the dispatch
+/// seam, which now normalises the flattened form before the tool sees it
+/// (review f-81b42635) and so has to say it on the tool's behalf.
+pub(crate) const FLATTENED_NOTE: &str =
+    "NOTE: files was sent flattened; the shape is {\"files\":[{\"path\":...,\"ops\":[...]}]}";
+
+/// Plan f89fd63d step 4 (c): the model sometimes sends a multi_edit call
+/// "flattened" — the ops of one file directly as `files` items with the
+/// target `path` beside them:
+///
+/// `{"files":[{"old_string":…,"new_string":…}], "path":"src/a.rs"}`
+///
+/// Rewrite that to the declared `files:[{path, ops:[…]}]`: every bare op
+/// joins the top-level path, an item that carries its own `path` joins that
+/// path, and consecutive items of the same path stay in order in one entry.
+/// Returns `true` when the call was repaired (the success output then says
+/// so). A shape that is not a clean flat form — an item with `ops`, or a
+/// bare op with no top-level path — is left untouched for the caller's
+/// argument error.
+pub(crate) fn normalize_flattened_files(args: &mut serde_json::Value) -> bool {
+    let Some(args_obj) = args.as_object_mut() else {
+        return false;
+    };
+    let top_path = match args_obj.get("path") {
+        Some(value) => match value.as_str() {
+            Some(path) => Some(path.to_string()),
+            None => return false,
+        },
+        None => None,
+    };
+    let items = match args_obj.get("files").and_then(|files| files.as_array()) {
+        Some(items) if !items.is_empty() => items.clone(),
+        _ => return false,
+    };
+    let mut groups: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for item in items {
+        let Some(item_obj) = item.as_object() else {
+            return false;
+        };
+        if item_obj.contains_key("ops") {
+            return false;
+        }
+        let is_op = item_obj.contains_key("new_string") || item_obj.contains_key("from_read");
+        if !is_op {
+            return false;
+        }
+        let item_path = match item_obj.get("path") {
+            Some(value) => match value.as_str() {
+                Some(path) => Some(path.to_string()),
+                None => return false,
+            },
+            None => None,
+        };
+        let path = match item_path.or_else(|| top_path.clone()) {
+            Some(path) => path,
+            None => return false,
+        };
+        let mut op = item_obj.clone();
+        op.remove("path");
+        match groups.last_mut() {
+            Some((group_path, ops)) if *group_path == path => {
+                ops.push(serde_json::Value::Object(op));
+            }
+            _ => groups.push((path, vec![serde_json::Value::Object(op)])),
+        }
+    }
+    let files: Vec<serde_json::Value> = groups
+        .into_iter()
+        .map(|(path, ops)| json!({"path": path, "ops": ops}))
+        .collect();
+    args_obj.insert("files".to_string(), serde_json::Value::Array(files));
+    // The hoisted path has moved into the file entry it belonged to.
+    if top_path.is_some() {
+        args_obj.remove("path");
+    }
+    true
+}
+
 #[async_trait]
 impl Tool for MultiEditTool {
     fn name(&self) -> &str {
@@ -309,7 +394,11 @@ impl Tool for MultiEditTool {
     }
 
     fn approval_preview(&self, args: &serde_json::Value) -> Option<ApprovalPreview> {
-        let args: MultiEditArgs = serde_json::from_value(args.clone()).ok()?;
+        // The flattened shape is decoded exactly as `execute` decodes it, so
+        // the approval diff shows what will run (plan f89fd63d step 4).
+        let mut args = args.clone();
+        normalize_flattened_files(&mut args);
+        let args: MultiEditArgs = serde_json::from_value(args).ok()?;
         self.prepare_for_approval(&args).ok()
     }
 
@@ -323,6 +412,11 @@ impl Tool for MultiEditTool {
         // call, one full round-trip per retry.
         let received_note =
             crate::tool::error_message::received_truncation_note(&args);
+        // Plan f89fd63d step 4 (c): a flattened call (bare ops with the target
+        // path beside them) is decoded into the declared shape here, before
+        // serde — the same rewrite the approval preview applies.
+        let mut args = args;
+        let flattened = normalize_flattened_files(&mut args);
         let args: MultiEditArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
             Err(e) => {
@@ -356,6 +450,15 @@ impl Tool for MultiEditTool {
                         &e,
                     ));
                 }
+                // The bytes are on disk — record the write against every read
+                // receipt of this file (one call per file written), so a later
+                // from_read cite in that read's numbering is translated
+                // through it (plan f89fd63d step 2).
+                crate::tool::agent::read_registry::note_write(
+                    &file.validated,
+                    &file.original_content,
+                    &file.new_content,
+                );
                 written.push(file.path.clone());
             }
             let mut output = String::new();
@@ -367,9 +470,19 @@ impl Tool for MultiEditTool {
                     output.push_str(&format!("{}: {note}\n", file.path));
                 }
             }
+            let mut output = output.trim_end().to_string();
+            if flattened {
+                // Plan f89fd63d step 4 (c): name the repaired shape once, at
+                // the end of the success output, so the model learns the
+                // declared form.
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(FLATTENED_NOTE);
+            }
             ToolResult {
                 success: true,
-                output: output.trim_end().to_string(),
+                output,
                 data: Some(json!({
                     "diff": combined_diff(&prepared),
                     "paths": prepared.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
@@ -438,6 +551,72 @@ mod tests {
         assert!(diff.contains("--- a.txt"), "{diff}");
         assert!(diff.contains("--- b.txt"), "{diff}");
         assert_eq!(data["paths"].as_array().map(|p| p.len()), Some(2));
+    }
+
+    /// Plan f89fd63d step 4 (c), simFactories01[439]: the model sent the ops
+    /// of one file directly as `files` items with the target `path` beside
+    /// them. The flattened form applies, and the success output names the
+    /// declared shape once at the end.
+    #[tokio::test]
+    async fn multi_edit_flattened_ops_with_top_level_path_applies() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let result = tool
+            .execute(json!({
+                "files": [
+                    {"old_string": "b", "new_string": "B"},
+                    {"old_string": "c", "new_string": "C"},
+                ],
+                "path": "a.txt"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nB\nC\n"
+        );
+        assert!(
+            result.output.ends_with(
+                "NOTE: files was sent flattened; the shape is {\"files\":[{\"path\":...,\"ops\":[...]}]}"
+            ),
+            "{}",
+            result.output
+        );
+    }
+
+    /// Plan f89fd63d step 4 (c): items that carry their own `path` group into
+    /// one entry per path, consecutive items of a path staying in order.
+    #[tokio::test]
+    async fn multi_edit_items_with_own_path_are_grouped() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "x\ny\n").unwrap();
+        let result = tool
+            .execute(json!({
+                "files": [
+                    {"path": "a.txt", "old_string": "a", "new_string": "A"},
+                    {"path": "a.txt", "old_string": "b", "new_string": "B"},
+                    {"path": "b.txt", "old_string": "x", "new_string": "X"},
+                ]
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "A\nB\nc\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "X\ny\n"
+        );
+        let data = result.data.expect("result data");
+        assert_eq!(
+            data["paths"],
+            json!(["a.txt", "b.txt"]),
+            "one entry per path, in order"
+        );
     }
 
     /// THE atomicity regression: the second file's op fails, so the FIRST
@@ -741,6 +920,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_edit_write_shifts_receipts_for_a_later_file_edit() {
+        // Plan f89fd63d step 2 (evidence: simFactories01 messages 211 ->
+        // 213): a multi_edit write ABOVE the cited lines must move the read
+        // receipt's numbers too, so a later file_edit cite resolves in read
+        // coordinates instead of failing "line N changed since read".
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let read = crate::tool::agent::read_files::ReadFilesTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let read_result = read.execute(json!({"files": [{"path": "a.txt"}]})).await;
+        assert!(read_result.success, "{}", read_result.output);
+        let id = read_result
+            .output
+            .lines()
+            .find(|l| l.contains("[read receipt "))
+            .and_then(|l| l.split("[read receipt ").nth(1))
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .unwrap_or_else(|| panic!("read must mint a receipt: {}", read_result.output));
+        let multi = make_tool(dir.path());
+        let written = multi
+            .execute(json!({"files": [{"path": "a.txt", "ops": ["i2:NEW1\nNEW2"]}]}))
+            .await;
+        assert!(written.success, "{}", written.output);
+        // The read served l4 as line 4; it sits at line 6 now.
+        let edit = crate::tool::agent::file_edit::FileEditTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let cite = edit
+            .execute(json!({
+                "path": "a.txt", "from_read": id, "lines": [4, 4], "new_string": "L4"
+            }))
+            .await;
+        assert!(cite.success, "multi_edit's write must shift the receipt: {}", cite.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "l1\nl2\nNEW1\nNEW2\nl3\nL4\nl5\n"
+        );
+    }
+
+    #[tokio::test]
     async fn refuses_protected_paths_and_escapes_without_writing() {
         let dir = tempdir().unwrap();
         let tool = make_tool(dir.path());
@@ -816,6 +1036,7 @@ mod tests {
             path: path.to_string(),
             validated: PathBuf::from(path),
             diff: String::new(),
+            original_content: String::new(),
             new_content: String::new(),
             notes: Vec::new(),
         };

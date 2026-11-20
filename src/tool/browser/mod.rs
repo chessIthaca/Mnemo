@@ -215,7 +215,7 @@ impl Tool for OffscreenClosePageTool {
 }
 
 /// `offscreen_browser_screenshot` — capture a PNG to `.coding/browser/screenshots/` and
-/// return the sandbox-relative path (AutoRun). Pair with `describe_image` so the
+/// return the sandbox-relative path (AutoRun). Pair with `image_analysis` so the
 /// vision model can "see" the page.
 pub struct OffscreenScreenshotTool(pub(crate) Ctx);
 
@@ -235,7 +235,8 @@ impl Tool for OffscreenScreenshotTool {
             "offscreen_browser_screenshot",
             "Capture a PNG screenshot of a headless-browser page (default: active). The PNG \
              is written to .coding/browser/screenshots/ and the sandbox-relative path is \
-             returned — pass it to describe_image to have the vision model read the page. \
+             returned — check it with image_analysis (or image_ui_diff to compare two \
+             screenshots) to have the vision model read the page. \
              Read-only (captures pixels; does not change page state).",
             json!({
                 "type": "object",
@@ -861,10 +862,10 @@ mod vision_tests {
     }
 
     /// The debugging payoff: an `offscreen_browser_screenshot` PNG path must feed straight
-    /// into `describe_image` (both are sandbox-relative) so the vision model can
+    /// into the image tools (both are sandbox-relative) so the vision model can
     /// "see" the page. This guards the two tools' contract from drifting.
     #[tokio::test]
-    async fn screenshot_path_feeds_describe_image() {
+    async fn screenshot_path_feeds_the_image_tools() {
         let dir = tempdir().unwrap();
         let c = vctx(dir.path());
         OffscreenNavigateTool(c.clone())
@@ -875,12 +876,29 @@ mod vision_tests {
         assert!(res.success, "screenshot failed: {}", res.output);
         let rel = res.data.as_ref().unwrap()["path"].as_str().unwrap();
 
-        // Feed the sandbox-relative path to describe_image with a mock vision model.
+        // Feed the sandbox-relative path to the image tools with a mock vision model.
         let vision = RecordingDescriber;
         let description = describe_image_file(&c.sandbox, &vision, rel, Some("What is shown?"))
             .await
-            .expect("describe_image should accept the screenshot path");
+            .expect("the image tools should accept the screenshot path");
         assert!(description.starts_with("described "), "got: {description}");
         c.manager.close().await.unwrap();
+    }
+
+    /// The description must name a tool that exists: `image_analysis` (and its
+    /// before/after sibling) are the image tools; `describe_image` is gone, so a
+    /// model told to "pass it to describe_image" would hunt for nothing.
+    #[test]
+    fn screenshot_description_names_the_image_tools() {
+        let dir = tempdir().unwrap();
+        let description = OffscreenScreenshotTool(vctx(dir.path())).schema().description;
+        assert!(
+            description.contains("image_analysis"),
+            "description must name image_analysis: {description}"
+        );
+        assert!(
+            !description.contains("describe_image"),
+            "description must not name the removed describe_image tool: {description}"
+        );
     }
 }

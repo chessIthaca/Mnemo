@@ -459,9 +459,15 @@ mod tests {
         // Fingerprints now uniformly match the active embedder…
         let fps = store.stored_model_fingerprints().await.unwrap();
         assert_eq!(fps, vec![("tiny-test".to_string(), 4)]);
-        // …and FTS recall still finds rows through the rebuilt index.
+        // …and recall still finds the row through the rebuilt index. The
+        // candidate set is now the FTS matches UNIONED with the top-50 semantic
+        // pool (plan d3336a8a step 10), so a meaning-only neighbour may rank
+        // alongside the keyword hit — this asserts findability, not a count.
         let hits = store.recall("jwt", &MemoryFilter::new()).await.unwrap();
-        assert_eq!(hits.len(), 1, "the jwt memory is still findable");
+        assert!(
+            hits.iter().any(|hit| hit.memory.title == "jwt"),
+            "the jwt memory is still findable: {hits:?}"
+        );
         // Progress: one embedding tick per row, then the label-only tail.
         assert_eq!(
             *seen.lock().unwrap(),

@@ -16,6 +16,7 @@ function sampleSettings(): ModelSettings {
       summarize: null,
     },
     vision_model: "openrouter/gpt-5.2",
+    vision_warning: null,
     embedding: {
       selected: "all-MiniLM-L6-v2",
       status: "missing",
@@ -42,6 +43,13 @@ function sampleSettings(): ModelSettings {
       compress_extra_commands: ["cargo test"],
     },
     budget: { enabled: true, max_tokens_per_plan: 2_000_000, max_escalations_per_plan: 3, max_retries_per_lane: 2 },
+    machine: {
+      heavy_commands: 2,
+      min_heavy_commands: 1,
+      max_heavy_commands: 16,
+      disks: [{ role: "project", volume: "C:", free_gb: 250 }],
+      sccache: { found: false, path: null },
+    },
   };
 }
 
@@ -54,6 +62,7 @@ function sampleEndpoints(): EndpointDetailDto[] {
       has_api_key: true,
       max_context: null,
       max_output_tokens: null,
+      max_concurrent: null,
       multimodal: false,
       supports_reasoning_effort: true,
       reasoning_effort: null,
@@ -73,6 +82,7 @@ function sampleEndpoints(): EndpointDetailDto[] {
       has_api_key: false,
       max_context: null,
       max_output_tokens: null,
+      max_concurrent: null,
       multimodal: false,
       supports_reasoning_effort: false,
       reasoning_effort: null,
@@ -174,6 +184,22 @@ describe("ModelsPage", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Use the default for Vision" }));
     await fireEvent.click(screen.getByRole("button", { name: "Save vision" }));
     await waitFor(() => expect(made.transport.save).toHaveBeenCalledWith("vision", null));
+  });
+
+  it("warns under the Vision field when the saved model cannot serve", async () => {
+    const made = makeTransport();
+    const warning =
+      "Vision endpoint 'gemini' is not in endpoints.toml, so workers and agents have no image tools.";
+    made.settings.vision_warning = warning;
+    render(ModelsPage, { props: { transport: made.transport, endpoints: sampleEndpoints() } });
+    const vision = await screen.findByRole("region", { name: "Vision" });
+    expect(within(vision).getByRole("status").textContent).toBe(warning);
+  });
+
+  it("shows no vision warning when the saved model resolves", async () => {
+    page();
+    await screen.findByLabelText("Vision model");
+    expect(within(screen.getByRole("region", { name: "Vision" })).queryByRole("status")).toBeNull();
   });
 
   it("saves the code-indexing selection and names the reopen note", async () => {

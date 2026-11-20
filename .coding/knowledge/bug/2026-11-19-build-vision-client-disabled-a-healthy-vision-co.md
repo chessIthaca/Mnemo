@@ -1,0 +1,7 @@
++++
+title = "build_vision_client disabled a healthy vision config (`?` on an Option classifier)"
+created = "2026-11-19"
+evidence = "Red-before proven by temporarily restoring the early return (both new tests failed with \"a resolvable vision config must build a VisionClient\" / \"a valid vision config must build a client\"); green after; cargo test --workspace, cargo clippy --workspace --all-targets, npm test/check --workspace mnemo2 all pass."
++++
+
+In src/provider/client_factory.rs, `build_vision_client` must not `?` the issue classifier: `vision_issue(config)` returns `None` when the config is *healthy*, so `match vision_issue(config)? { … }` returned None from the function and built no VisionClient for a valid `[general.vision_model]`, leaving every executor/audit worker without the image tools. Correct shape: `if let Some(issue) = vision_issue(config) { match issue { UnlistedModel => {}, MissingEndpoint => return None, AnthropicEndpoint => { warn; return None } } }`, then build. General rule: a classifier returning `Option<Problem>` must never be `?`-ed — `None` is the success path. Tests that catch it: `build_vision_client_builds_for_a_valid_endpoint`, `build_vision_client_builds_for_an_unlisted_model`, and `a_valid_vision_config_offers_the_image_group` in src/agent/factory.rs (the other factory image-group tests inject a MockDescriber and never reach build_vision_client, so they cannot catch it).

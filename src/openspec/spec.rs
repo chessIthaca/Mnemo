@@ -86,6 +86,11 @@ pub enum SpecError {
 impl Spec {
     /// Parse an OpenSpec `spec.md` document.
     pub fn parse(text: &str) -> Result<Self, SpecError> {
+        // Windows tools write a UTF-8 byte-order mark (PowerShell 5's
+        // `Set-Content -Encoding utf8` does); one leading U+FEFF must not
+        // hide the `# <Capability>` heading. Only the very first character is
+        // dropped, and every offset below is relative to the stripped text.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let lines = markdown_lines(text);
         let title = lines
             .iter()
@@ -504,6 +509,17 @@ mod tests {
             ["team_status shows the destination tier"]
         );
         assert_eq!(spec.render(), REALISTIC);
+    }
+
+    #[test]
+    fn parse_accepts_a_leading_byte_order_mark() {
+        // PowerShell 5's `Set-Content -Encoding utf8` prefixes the file with
+        // EF BB BF; the mark must not hide the `# <Capability>` heading.
+        let text = format!("\u{feff}{REALISTIC}");
+        let spec = Spec::parse(&text).expect("a leading BOM must not break the parse");
+        assert_eq!(spec.capability(), "Dispatch routing");
+        assert_eq!(spec.requirements().len(), 2);
+        assert_eq!(spec.requirements()[1].name, "Explicit routing".to_string());
     }
 
     #[test]

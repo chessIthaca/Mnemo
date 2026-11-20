@@ -949,6 +949,7 @@ mod tests {
             audits: 0,
             cost_micros: 0,
             label: label.map(str::to_string),
+            merge_commit: None,
         }
     }
 

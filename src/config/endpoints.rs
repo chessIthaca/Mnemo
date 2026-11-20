@@ -312,6 +312,10 @@ pub(crate) fn save_tier_ladder_unlocked(path: &Path, ladder: &TierLadder) -> Res
     file.legacy_tiers = None;
     let text = toml::to_string_pretty(&file)?;
     crate::config::write_atomic_unlocked(path, &text)?;
+    // The live-settings watcher must treat this write as this process's own
+    // save: the tier ladder is applied through the caller's own read (the
+    // dispatch tiers), not through a config reload.
+    crate::config::record_live_file_written(path, &text);
     Ok(())
 }
 
@@ -436,6 +440,15 @@ pub struct Endpoint {
     /// is fixed by config, not code. Model-level entries override these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_boundary_strings: Vec<String>,
+    /// Optional machine-wide cap on concurrent requests to this endpoint
+    /// (plan d3336a8a step 4): each request holds one of that many OS
+    /// file-lock slots under `<config dir>/run/endpoint-<hash>/` until its
+    /// response body is fully read, so every Mnemo2 instance on the machine
+    /// shares the cap. `None` = unlimited (the behaviour without the field).
+    /// Validated 1-64 at save time; OpenAI and Local kinds only (an Anthropic
+    /// endpoint ignores it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
     /// Arbitrary extra body parameters merged into the request payload.
     /// Merged last: keys here can override any request field including model/messages/stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -462,6 +475,7 @@ impl Default for Endpoint {
             stop: Vec::new(),
             stop_token_ids: Vec::new(),
             stop_boundary_strings: Vec::new(),
+            max_concurrent: None,
             extra_body: None,
         }
     }
@@ -1049,6 +1063,10 @@ pub(crate) fn save_unlocked(
     };
     let text = toml::to_string_pretty(&file)?;
     crate::config::write_atomic_unlocked(path, &text)?;
+    // The live-settings watcher must treat this write as this process's own
+    // save (the endpoints writer behind the upsert/patch paths; the caller's
+    // refresh_live applies it live).
+    crate::config::record_live_file_written(path, &text);
     Ok(())
 }
 
@@ -1171,6 +1189,48 @@ workspace_id = "ws_abc123"
             !ser.contains("workspace_id"),
             "None workspace_id must be skipped when serializing"
         );
+    }
+
+    #[test]
+    fn max_concurrent_round_trips_and_none_skips_serialization() {
+        // Plan d3336a8a step 4: the machine-wide endpoint cap is an optional
+        // `endpoints.toml` field; absent means unlimited, and `None` must not
+        // serialize so hand-maintained files stay unchanged.
+        let text = r#"
+[[endpoint]]
+name = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1/"
+models = ["gpt-4o"]
+max_concurrent = 2
+"#;
+        let file: EndpointsFile = toml::from_str(text).unwrap();
+        assert_eq!(file.endpoint[0].max_concurrent, Some(2));
+
+        let mut bare = file.endpoint[0].clone();
+        bare.max_concurrent = None;
+        let ser = toml::to_string_pretty(&EndpointsFile {
+            endpoint: vec![bare],
+            pricing: vec![],
+            ..EndpointsFile::default()
+        })
+        .unwrap();
+        assert!(
+            !ser.contains("max_concurrent"),
+            "None max_concurrent must be skipped when serializing"
+        );
+
+        // A save/load cycle keeps the value (the Settings save path).
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+        let capped = Endpoint {
+            max_concurrent: Some(3),
+            ..file.endpoint[0].clone()
+        };
+        save(&path, &[capped], &[]).unwrap();
+        let (reloaded, _) = load_or_default(&path).unwrap();
+        assert_eq!(reloaded[0].max_concurrent, Some(3));
     }
 
     #[test]

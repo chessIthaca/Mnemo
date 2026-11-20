@@ -191,7 +191,16 @@ only the app.
 - **Host tools.** The lead gets `team_dispatch`, `team_message`, `team_status`,
   `team_stop`, `team_resume`, `team_compact`, `team_review`, `team_check`,
   `team_resolve_finding`, `review_fix`, `team_route_fix`, `team_audit_dispatch`,
-  `team_merge`, and `team_revert_merge`. Dispatch accepts a caller-stable worker
+  `team_merge`, `team_revert_merge`, and `team_quality`. `team_quality` reports,
+  per final tier and per model, how often merged work was first-pass, how many
+  fix rounds and findings it took, how often it was reverted and how often a
+  bug-fix plan merged the same files soon after — the evidence for tier and
+  model choices. It also reports the window's edit-tool attempts and their
+  failures by cause (misshapen arguments, receipt drift, emission artifact,
+  out-of-range cite, `old_string` mismatch, stale-read interception, other), per
+  model and worker and for the files that failed most, read back from the worker
+  transcripts. Dispatch accepts a
+  caller-stable worker
   ID, an optional `review_risk` (`standard`/`high`), and returns a
   model-facing JSON receipt with its real ID/status. Its `model` parameter is
   an enum of the exact configured `endpoint/model` specs. Retrying that ID with the
@@ -218,6 +227,15 @@ only the app.
   instead of removing its folder. A branch that another worker record still
   uses (legacy ids sharing an 8-character prefix) is kept until its last record
   is deleted. The lead has no delete tool.
+- **Instances overview.** Mission Control lists every Mnemo2 window running on
+  this machine, this one included (marked "this window"): its open project, its
+  running and waiting workers, today's cost (the Cost tab's per-day figure) and
+  its version, refreshed every 10 seconds while the page is open. The rows come
+  from the run files under `~/.mnemo/run` (stale ones are pruned) plus each
+  instance's authenticated `POST /instance/summary`, asked in parallel with a
+  1.5-second timeout; a window that does not answer keeps its row and shows
+  "not answering". Clicking another window asks it to come forward through its
+  `POST /instance/show`. The bearer tokens never leave the app process.
 
 ## Native workbench and project lifecycle
 
@@ -287,8 +305,12 @@ only the app.
    closes live worker sessions while retaining their work. Token and cost
    figures are telemetry; there is no agent token or cost budget.
 8. Open the side panel from the top bar on any main tab, then switch between
-   **Browser / Diff / Plan / Files / Git / Trace / Graph / Memory**; the panel is
-   resizable on desktop and full-screen on narrow layouts.
+   **Browser / Diff / Plan / Files / Git / Trace / Graph / Memory / Quality**; the
+   panel is resizable on desktop and full-screen on narrow layouts. The Quality
+   tab shows how merged work held up per tier and per model over a 7, 30 or 90
+   day window: merges, first-pass share, fix rounds, findings, reverts, later
+   bug-fix merges touching the same files, cost per merge and the most
+   recurring review finding categories.
 
 ## Review and merge policy
 

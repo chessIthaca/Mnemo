@@ -66,6 +66,12 @@ pub(super) struct StreamTask {
     /// The stream guard's stop-boundary list (config `stop` +
     /// `stop_boundary_strings`, de-duplicated).
     pub(super) stop_boundaries: Vec<String>,
+    /// The endpoint's machine-wide request slot (plan d3336a8a step 4),
+    /// held for this stream's whole life: the guard releases the OS file
+    /// lock at EOF, on error, or when the caller drops the event stream (the
+    /// task is cancelled). `SlotGuard::none()` when the endpoint is unlimited
+    /// or its run folder is unusable.
+    pub(super) slot: crate::host::machine_slots::SlotGuard,
 }
 
 /// The parse-loop stage of the pipeline: pump the raw SSE byte stream into
@@ -91,7 +97,12 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
         think_tags_enabled,
         use_responses_api,
         stop_boundaries: stream_stop_boundaries,
+        slot,
     } = task;
+    // Held (not read) for the task's lifetime: dropping it at the end of the
+    // pump — or when a cancel drops this future — frees the endpoint slot for
+    // the next request on the machine.
+    let _slot = slot;
     use futures::StreamExt;
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();

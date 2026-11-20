@@ -38,7 +38,9 @@ use std::sync::{Arc, RwLock};
 
 use crate::agent::context::ContextManager;
 use crate::agent::{reflex::ReflexHandle, step_verify::StepVerifyHandle, AgentLoop, AgentLoopConfig};
-use crate::config::{BudgetConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig};
+use crate::config::{
+    BudgetConfig, MachineConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig,
+};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::MemoryStoreTrait;
 use crate::project::ConstitutionSource;
@@ -54,6 +56,7 @@ use crate::tool::agent::{
     file_write::FileWriteTool,
     git::GitTool,
     git_read_tool::GitReadTool,
+    jobs::{JobKillTool, JobRegistry, JobStartTool, JobTailTool, JobWaitTool},
     image_tools::tools::{
         ImageAnalysisTool, ImageAnalyzeChartTool, ImageDiagnoseErrorTool, ImageExtractTextTool,
         ImageUiDiffTool, ImageUiToArtifactTool, ImageUnderstandDiagramTool,
@@ -61,6 +64,7 @@ use crate::tool::agent::{
     list_models::ListModelsTool,
     multi_edit::MultiEditTool,
     read_files::ReadFilesTool,
+    run_checks::RunChecksTool,
     search::SearchTool,
     search_read::SearchReadTool,
     shell::ShellTool,
@@ -309,6 +313,12 @@ pub struct AgentLoopFactory {
     /// once at construction and shared by the memory tools + the finish
     /// capture. `None` when the plans dir implies no project root.
     knowledge: Option<Arc<KnowledgeStore>>,
+    /// The MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8): the HOW/DECISION records shared by every project on
+    /// the machine, indexed read-only into this project's store and written
+    /// by `memory_write scope=machine`. `None` until the host wires it (tests,
+    /// a build without a config dir) — a machine write is then refused.
+    machine_knowledge: Option<Arc<KnowledgeStore>>,
     sandbox: Arc<Sandbox>,
     project_root: PathBuf,
     safety_rules: Option<Arc<SafetyRules>>,
@@ -316,7 +326,7 @@ pub struct AgentLoopFactory {
     plans_dir: PathBuf,
     /// Shared swappable vision slot. Always present so Settings can enable,
     /// disable, or re-point the vision model at runtime; agents and the
-    /// `describe_image` tool all share this `Arc`.
+    /// image tools all share this `Arc`.
     vision: Arc<SwappableVision>,
     /// Shared swappable provider slot — a handle to the main LLM client that
     /// sees runtime model swaps. Held (not snapshotted) so tools that need an
@@ -441,6 +451,16 @@ pub struct AgentLoopFactory {
     /// reads it at its plan-step gates, so a Settings save is observed on the
     /// next boundary with no rebuild (mirrors `verify`).
     budget: Arc<RwLock<BudgetConfig>>,
+    /// Live mirror of `[general.machine]` (the machine-wide heavy-command slots,
+    /// plan d3336a8a step 3), shared with every command-running tool this
+    /// factory builds (`ShellTool`, `RunChecksTool`, the job registry and the
+    /// `StepVerifyHandle`). Defaults to the out-of-box limit; the IPC layer
+    /// overrides via [`with_machine_config`](Self::with_machine_config).
+    machine: Arc<RwLock<MachineConfig>>,
+    /// The machine's heavy-slot directory (`<config dir>/run/heavy`). `None`
+    /// until the IPC layer wires it, so headless runs and tests execute heavy
+    /// commands unslotted (the limit is an optimisation, never a failure mode).
+    machine_dir: Option<PathBuf>,
     /// The persistent index-staleness log (backlog fc1d57fe) handed to every
     /// search/graph tool this factory builds: each stale-index repair appends
     /// one record per file, and the freshness note points at it. Defaults to
@@ -467,6 +487,22 @@ pub struct FactoryDeps {
 }
 
 impl AgentLoopFactory {
+    /// Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    /// d3336a8a step 8) — builder-style, once, from the host that knows the
+    /// config dir. Every memory tool built afterwards routes `[machine]`
+    /// records to this store and accepts `memory_write scope=machine`; the
+    /// project store indexes its records read-only.
+    pub fn with_machine_knowledge(mut self, machine: Option<Arc<KnowledgeStore>>) -> Self {
+        self.machine_knowledge = machine;
+        self
+    }
+
+    /// The machine knowledge corpus this factory was wired with, if any (the
+    /// host hands the same dir to the derived-index runs).
+    pub fn machine_knowledge(&self) -> Option<&Arc<KnowledgeStore>> {
+        self.machine_knowledge.as_ref()
+    }
+
     /// The factory's steering counters (2c.4/G4) — the instance-scoped
     /// replacement for the deleted process-wide singleton. The IPC
     /// `get_steering_stats` command reads this; every loop this factory
@@ -538,6 +574,11 @@ impl AgentLoopFactory {
                 .map(|p| p.join(knowledge::KNOWLEDGE_DIR_NAME))
                 .map(KnowledgeStore::new)
                 .map(Arc::new),
+            // No machine corpus at construction — the host wires it via
+            // `with_machine_knowledge` once the config dir is known (plan
+            // d3336a8a step 8). Until then `memory_write scope=machine` is
+            // refused and no machine record is indexed.
+            machine_knowledge: None,
             sandbox,
             project_root,
             safety_rules,
@@ -590,6 +631,11 @@ impl AgentLoopFactory {
             // fires); the IPC layer overrides via `with_budget_config` from
             // the loaded config at startup (mirrors `verify`).
             budget: Arc::new(RwLock::new(BudgetConfig::default())),
+            // Machine limit at its out-of-box default (2 slots); the IPC layer
+            // overrides via `with_machine_config` from the loaded config at
+            // startup and wires the slot directory (mirrors `budget`).
+            machine: Arc::new(RwLock::new(MachineConfig::default())),
+            machine_dir: None,
             // The global index-staleness log (backlog fc1d57fe) unless a test
             // overrides it.
             staleness_log: crate::index_staleness::StalenessLog::global(),
@@ -836,6 +882,22 @@ impl AgentLoopFactory {
         self
     }
 
+    /// Wire the shared `[general.machine]` config AND the machine's heavy-slot
+    /// directory (`<config dir>/run/heavy`, plan d3336a8a step 3). Called once
+    /// by the IPC layer at startup; every command-running tool built after this
+    /// call shares the same `Arc<RwLock<MachineConfig>>` and the same slot
+    /// directory, so a Settings save applies to the next heavy command with no
+    /// rebuild (mirrors [`with_optimizer_config`](Self::with_optimizer_config)).
+    pub fn with_machine_config(
+        mut self,
+        cfg: Arc<RwLock<MachineConfig>>,
+        slots_dir: PathBuf,
+    ) -> Self {
+        self.machine = cfg;
+        self.machine_dir = Some(slots_dir);
+        self
+    }
+
     /// Wire in the [`AgentSpawner`] that backs the `spawn_agent` tool.
     ///
     /// Called once by the IPC layer after the `AgentManager` + factory exist.
@@ -930,6 +992,17 @@ impl AgentLoopFactory {
         *self.budget.write().expect("budget lock poisoned") = cfg;
     }
 
+    /// Update the live `[general.machine]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is persisted
+    /// and reloaded). Every command-running tool shares the same
+    /// `Arc<RwLock<MachineConfig>>` (see
+    /// [`with_machine_config`](Self::with_machine_config)) and reads it per
+    /// command, so a Settings save lands on the next heavy command — no rebuild
+    /// and no restart.
+    pub fn set_machine_config(&self, cfg: MachineConfig) {
+        *self.machine.write().expect("machine lock poisoned") = cfg;
+    }
+
     /// Swap in a new provider (e.g. when the user switches models from the
     /// status bar). Rebuilds the context manager from the new provider's max
     /// context so freshly built agents summarize at the right threshold.
@@ -974,7 +1047,7 @@ impl AgentLoopFactory {
 
     /// Replace the vision client at runtime (Settings → Vision, or after an
     /// endpoint/key edit that the vision model uses). Shared with every live
-    /// agent loop and the `describe_image` tool via [`SwappableVision`].
+    /// agent loop and the image tools via [`SwappableVision`].
     pub fn set_vision(&self, vision: Option<Arc<dyn ImageDescriber>>) {
         self.vision.set(vision);
     }
@@ -1574,21 +1647,82 @@ impl AgentLoopFactory {
             registry.register(Box::new(ConvertLineEndingsTool::new(sandbox.clone())));
         }
         if want(ToolGroup::Shell, "shell") {
-            registry.register(Box::new(
-                ShellTool::new(sandbox.clone())
-                    .with_check_commands(
-                        root.map(|spec| spec.check_commands.clone())
-                            .unwrap_or_default(),
-                    )
-                    .with_filter_config(Arc::clone(&self.shell_filter))
-                    // Same handle as GitTool: `shell git merge|push` must raise the
-                    // always-on core-operation prompt too (follow-up A, 2027-01-11).
-                    .with_core_operations(Arc::clone(&self.core_operations))
-                    // Token-optimizer lever 2 (backlog e4a50d22): the shared
-                    // `[general.optimizer]` handle, read per call so a config
-                    // save lands on the next command without a rebuild.
-                    .with_optimizer(Arc::clone(&self.optimizer)),
-            ));
+            let mut shell = ShellTool::new(sandbox.clone())
+                .with_check_commands(
+                    root.map(|spec| spec.check_commands.clone())
+                        .unwrap_or_default(),
+                )
+                .with_filter_config(Arc::clone(&self.shell_filter))
+                // Same handle as GitTool: `shell git merge|push` must raise the
+                // always-on core-operation prompt too (follow-up A, 2027-01-11).
+                .with_core_operations(Arc::clone(&self.core_operations))
+                // Token-optimizer lever 2 (backlog e4a50d22): the shared
+                // `[general.optimizer]` handle, read per call so a config
+                // save lands on the next command without a rebuild.
+                .with_optimizer(Arc::clone(&self.optimizer));
+            // Plan d3336a8a step 3: a heavy command takes one of the machine's
+            // slots (unwired → it runs unslotted, today's behaviour).
+            if let Some(dir) = &self.machine_dir {
+                shell = shell.with_machine(Arc::clone(&self.machine), dir.clone());
+            }
+            registry.register(Box::new(shell));
+        }
+        // Plan 5b85ab61 step 3: ONE call runs every configured check command
+        // and reports which passed. Registered only when the session HAS
+        // checks, so a project without `.coding/checks.toml` never sees it;
+        // `NeedsApproval` and the validated allow-list are shell's own.
+        if want(ToolGroup::Shell, "run_checks") {
+            let mut checks = RunChecksTool::new(sandbox.clone()).with_check_commands(
+                root.map(|spec| spec.check_commands.clone())
+                    .unwrap_or_default(),
+            );
+            // Every check command is heavy (plan d3336a8a step 3).
+            if let Some(dir) = &self.machine_dir {
+                checks = checks.with_machine(Arc::clone(&self.machine), dir.clone());
+            }
+            if checks.has_checks() {
+                registry.register(Box::new(
+                    checks.with_core_operations(Arc::clone(&self.core_operations)),
+                ));
+            }
+        }
+        // Long commands without polling (plan 5b85ab61 step 2): ONE registry per
+        // agent session's tool set, so every job's tree dies with the session
+        // (stop, merge, app exit) instead of outliving its call.
+        let wants_jobs = ["job_start", "job_wait", "job_tail", "job_kill"]
+            .iter()
+            .any(|name| want(ToolGroup::Shell, name));
+        if wants_jobs {
+            let mut job_registry = JobRegistry::new(sandbox.clone(), Arc::clone(&self.shell_filter))
+                // The session's own check commands count as heavy in a job too.
+                .with_check_commands(
+                    root.map(|spec| spec.check_commands.clone())
+                        .unwrap_or_default(),
+                );
+            // Plan d3336a8a step 3: a job of a heavy command waits for a slot.
+            if let Some(dir) = &self.machine_dir {
+                job_registry =
+                    job_registry.with_machine(Arc::clone(&self.machine), dir.clone());
+            }
+            let jobs = Arc::new(job_registry);
+            if want(ToolGroup::Shell, "job_start") {
+                registry.register(Box::new(
+                    JobStartTool::new(Arc::clone(&jobs), Arc::clone(&self.core_operations))
+                        .with_check_commands(
+                            root.map(|spec| spec.check_commands.clone())
+                                .unwrap_or_default(),
+                        ),
+                ));
+            }
+            if want(ToolGroup::Shell, "job_wait") {
+                registry.register(Box::new(JobWaitTool::new(Arc::clone(&jobs))));
+            }
+            if want(ToolGroup::Shell, "job_tail") {
+                registry.register(Box::new(JobTailTool::new(Arc::clone(&jobs))));
+            }
+            if want(ToolGroup::Shell, "job_kill") {
+                registry.register(Box::new(JobKillTool::new(jobs)));
+            }
         }
         let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone())
             .with_staleness_log(self.staleness_log.clone());
@@ -1672,7 +1806,14 @@ impl AgentLoopFactory {
             Some(spec) => spec.sandbox.root().to_path_buf(),
             None => self.sandbox.root().to_path_buf(),
         };
-        StepVerifyHandle::new(Arc::clone(&self.verify), Arc::clone(&self.optimizer)).with_root(root)
+        let mut handle =
+            StepVerifyHandle::new(Arc::clone(&self.verify), Arc::clone(&self.optimizer))
+                .with_root(root);
+        // The verification command is heavy (plan d3336a8a step 3).
+        if let Some(dir) = &self.machine_dir {
+            handle = handle.with_machine(Arc::clone(&self.machine), dir.clone());
+        }
+        handle
     }
 
 
@@ -1815,6 +1956,10 @@ impl AgentLoopFactory {
             // reindexing. `None` (a plans dir that implies no root) keeps
             // the historical DB-only behavior.
             let knowledge = self.knowledge.clone();
+            // The machine tier (plan d3336a8a step 8): every memory tool routes
+            // a `[machine]` record's edit to the shared corpus and accepts
+            // `memory_write scope=machine`. `None` until the host wires it.
+            let machine = self.machine_knowledge.clone();
             let typing = self.typing.clone();
             let mk_write = |store: Arc<dyn MemoryStoreTrait>| {
                 let tool = match &knowledge {
@@ -1825,7 +1970,8 @@ impl AgentLoopFactory {
                     )
                     // A worktree lane agent shares the factory-wide knowledge
                     // store (main tree) — the tool's result says so explicitly.
-                    .with_agent_root(root.map(|r| r.project_root.clone())),
+                    .with_agent_root(root.map(|r| r.project_root.clone()))
+                    .with_machine_knowledge(machine.clone()),
                     None => MemoryWriteTool::new(store.clone()),
                 };
                 // The Laya auto-typing gate rides every memory_write —
@@ -1860,28 +2006,36 @@ impl AgentLoopFactory {
             // junk delete, and query-less browsing.
             match &knowledge {
                 Some(k) => {
-                    registry.register(Box::new(MemoryUpdateTool::with_knowledge(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
-                    registry.register(Box::new(MemorySupersedeTool::with_knowledge(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
-                    registry.register(Box::new(MemoryDeleteTool::with_knowledge(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
+                    registry.register(Box::new(
+                        MemoryUpdateTool::with_knowledge(
+                            store.clone(),
+                            k.clone(),
+                            self.plans_dir.clone(),
+                        )
+                        .with_machine_knowledge(machine.clone()),
+                    ));
+                    registry.register(Box::new(
+                        MemorySupersedeTool::with_knowledge(
+                            store.clone(),
+                            k.clone(),
+                            self.plans_dir.clone(),
+                        )
+                        .with_machine_knowledge(machine.clone()),
+                    ));
+                    registry.register(Box::new(
+                        MemoryDeleteTool::with_knowledge(
+                            store.clone(),
+                            k.clone(),
+                            self.plans_dir.clone(),
+                        )
+                        .with_machine_knowledge(machine.clone()),
+                    ));
                     // memory_amend is file-only (it appends to the knowledge
                     // FILE) — registered only when the backing is wired.
-                    registry.register(Box::new(MemoryAmendTool::new(
-                        store.clone(),
-                        k.clone(),
-                        self.plans_dir.clone(),
-                    )));
+                    registry.register(Box::new(
+                        MemoryAmendTool::new(store.clone(), k.clone(), self.plans_dir.clone())
+                            .with_machine_knowledge(machine.clone()),
+                    ));
                 }
                 None => {
                     registry.register(Box::new(MemoryUpdateTool::new(store.clone())));
@@ -2129,7 +2283,7 @@ mod tests {
     }
 
     /// Build a factory with an optional vision model (to exercise the
-    /// `describe_image` tool registration).
+    /// image-tool registration).
     fn make_factory_with(
         dir: &std::path::Path,
         vision: Option<Arc<dyn ImageDescriber>>,
@@ -2707,7 +2861,12 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Planning at 17_568 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Planning, 17_800),
+            // 17_800 → 18_900 (2026-11-19): the job tools (plan 5b85ab61
+            // step 2) — job_wait/job_tail/job_kill are Agent + AutoRun, so
+            // they ride the Planning set; measures Planning at 18_379 chars
+            // after their descriptions were trimmed. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Planning, 18_900),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -2836,7 +2995,11 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Executing at 31_562 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Executing, 31_700),
+            // 31_700 → 33_400 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // ride the shell surface — Executing carries all four schemas;
+            // measures Executing at 32_906 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::Executing, 33_400),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -2905,7 +3068,12 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures PlanFrozen at 32_455 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::PlanFrozen, 32_600),
+            // 32_600 → 34_700 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // — same cause and figure class as the Executing raise above
+            // (PlanFrozen = Executing ∪ finish); measures PlanFrozen at 33_799
+            // chars after their descriptions were trimmed. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 34_700),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -2977,7 +3145,11 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures ExecutingResearch at 23_079 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::ExecutingResearch, 23_300),
+            // 23_300 → 25_400 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // ride the shell surface into the research set too; measures
+            // ExecutingResearch at 24_423 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::ExecutingResearch, 25_400),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -3067,7 +3239,11 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Reviewing at 25_579 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Reviewing, 25_700),
+            // 25_700 → 27_400 (2026-11-19): the job tools (plan 5b85ab61 step 2)
+            // share the advertised array (Reviewing carries every Agent tool's
+            // schema); measures Reviewing at 26_923 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Reviewing, 27_400),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -3116,7 +3292,10 @@ mod tests {
             // shortened (internal ids, stale tool names, repeated syntax,
             // implementation detail); measures Complete at 17_568 chars. Ceiling =
             // measured + headroom, lowered on purpose so the saving holds.
-            (ToolFilter::Complete, 17_800),
+            // 17_800 → 18_900 (2026-11-19): same cause as the Planning raise
+            // (plan 5b85ab61 step 2 — Complete carries the same read-only job
+            // readers). Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Complete, 18_900),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(
@@ -3285,6 +3464,53 @@ mod tests {
         // Runtime rewire enables the slot.
         factory_no_vision.set_vision(Some(Arc::new(MockDescriber)));
         assert!(factory_no_vision.vision_slot().is_configured());
+    }
+
+    /// End-to-end from a *config*, not an injected mock: a valid
+    /// `[general.vision_model]` must reach the factory as a configured vision
+    /// slot, which is what puts the deferred `image` group in the tool index.
+    /// Regression for the `?`-on-the-classifier bug that built no client (hence
+    /// offered no image tools) for a healthy config.
+    #[test]
+    fn a_valid_vision_config_offers_the_image_group() {
+        let config = crate::config::Config {
+            general: crate::config::GeneralConfig {
+                general: crate::config::GeneralSection {
+                    vision_model: Some(crate::config::VisionModel {
+                        endpoint: "ollama-cloud".into(),
+                        model: "deepseek-v4.1-flash:1017".into(),
+                    }),
+                    ..crate::config::GeneralSection::default()
+                },
+                ..crate::config::GeneralConfig::default()
+            },
+            endpoints: vec![crate::config::Endpoint {
+                name: "ollama-cloud".into(),
+                kind: crate::config::EndpointKind::OpenAI,
+                base_url: "https://ollama.com/v1/".into(),
+                models: vec!["deepseek-v4.1-flash:1017".into()],
+                ..crate::config::Endpoint::test_default()
+            }],
+            ..crate::config::Config::default()
+        };
+        let vision = crate::provider::client_factory::build_vision_client(&config);
+        assert!(vision.is_some(), "a valid vision config must build a client");
+        let dir = tempdir().unwrap();
+        let factory = make_factory_with(dir.path(), vision);
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
+        assert!(
+            registry
+                .hidden_groups_for(&crate::tool::ToolFilter::Executing)
+                .iter()
+                .any(|(g, _)| *g == "image"),
+            "a valid vision config must offer the image group to the model"
+        );
     }
 
     /// A mock descendant tracker that always reports "no descendants running".
@@ -3498,6 +3724,12 @@ mod tests {
             "file_write",
             "convert_line_endings",
             "shell",
+            // long commands without polling (plan 5b85ab61 step 2): one job
+            // registry per session, four tools on the shell surface.
+            "job_start",
+            "job_wait",
+            "job_tail",
+            "job_kill",
             "search",
             "search_read",
             "git",
@@ -3672,6 +3904,12 @@ mod tests {
             "file_edit",
             "file_write",
             "shell",
+            // The job tools ride the shell surface, so the free agent gets
+            // them too (plan 5b85ab61 step 2).
+            "job_start",
+            "job_wait",
+            "job_tail",
+            "job_kill",
             "search",
             "web_fetch",
             "load_tools",
@@ -3689,7 +3927,7 @@ mod tests {
         // platform (the on-screen WebView2 tools are gone).
         // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
         let browser = if cfg!(feature = "browser") { 10 } else { 0 };
-        let expected = 26 + browser;
+        let expected = 30 + browser;
         assert_eq!(
             count,
             expected,
@@ -3784,7 +4022,7 @@ mod tests {
         // platform (the on-screen WebView2 tools are gone).
         // The git pair is repo-gated (2c.3) — the tempdir is not a repo.
         let browser = if cfg!(feature = "browser") { 10 } else { 0 };
-        let expected = 25 + browser;
+        let expected = 29 + browser;
         assert_eq!(
             count,
             expected,
@@ -3934,6 +4172,13 @@ mod tests {
             vec![
                 "expand_result",
                 "git_read",
+                // The three job readers/watchdogs are Agent+AutoRun on purpose
+                // (plan 5b85ab61 step 2): they only read or stop THIS session's
+                // own jobs and start no process — `job_start` is the
+                // NeedsApproval half and stays behind the allow-list.
+                "job_kill",
+                "job_tail",
+                "job_wait",
                 "load_tools",
                 "read_files",
                 "search",

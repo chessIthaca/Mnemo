@@ -84,37 +84,10 @@ impl InstanceMarker {
 /// indistinguishable from a live one — accepted: the marker warns, it
 /// never locks.
 pub fn pid_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-
-        // SAFETY: fixed flags, no handle inheritance; the handle is
-        // closed on every path below.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle.is_null() {
-            return false;
-        }
-        // SAFETY: the handle comes from OpenProcess above and outlives
-        // this call; query access suffices for GetExitCodeProcess.
-        let mut exit_code: u32 = 0;
-        let probed = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
-        // SAFETY: the handle is no longer used.
-        unsafe { CloseHandle(handle) };
-        probed != 0 && exit_code == STILL_ACTIVE as u32
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new("ps")
-            .arg("-p")
-            .arg(pid.to_string())
-            .output()
-            .ok()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    }
+    // One implementation for the whole workspace: the shared-service leases
+    // and their watchdog must agree with the marker checks (mnemo's
+    // `process_tree::pid_alive`).
+    mnemo::process_tree::pid_alive(pid)
 }
 
 /// The marker file: `<dir>/.coding/instance.json`.

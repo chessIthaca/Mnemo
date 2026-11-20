@@ -83,6 +83,10 @@ pub struct EndpointDetailDto {
     /// Endpoint-level output-token cap.
     #[serde(default)]
     pub max_output_tokens: Option<usize>,
+    /// Machine-wide cap on concurrent requests to this endpoint (`None` =
+    /// unlimited; OpenAI and Local kinds only).
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
     /// Whether the endpoint's models are multimodal by default.
     #[serde(default)]
     pub multimodal: bool,
@@ -230,6 +234,11 @@ impl Setup {
     /// one): the shared config + the model resolver, so the very next spawn
     /// sees new endpoints, models and keys.
     pub async fn refresh_live(&self) {
+        // One live-config change at a time (see [`Setup::apply_lock`]): this
+        // swaps the shared config, so it must not interleave with a reload or
+        // a settings save on another Setup of the same config dir (every
+        // settings IPC opens a fresh one).
+        let _apply = self.apply_lock.lock().await;
         let Some(live) = &self.live else { return };
         if let Ok(cfg) = self.load_config() {
             crate::host::rewire::sync_model_resolver(Some(&live.model_resolver), &cfg);
@@ -245,6 +254,7 @@ impl Setup {
             has_api_key: has_key,
             max_context: e.max_context,
             max_output_tokens: e.max_output_tokens,
+            max_concurrent: e.max_concurrent,
             multimodal: e.multimodal,
             supports_reasoning_effort: e.supports_reasoning_effort,
             reasoning_effort: e.reasoning_effort.clone(),
@@ -388,6 +398,7 @@ impl Setup {
                 model_configs,
                 max_context: dto.max_context,
                 max_output_tokens: dto.max_output_tokens,
+                max_concurrent: dto.max_concurrent,
                 multimodal: dto.multimodal,
                 supports_reasoning_effort: dto.supports_reasoning_effort,
                 reasoning_effort: dto

@@ -6,6 +6,8 @@
 //! is offered, the executor for lead tool calls, and the answer builders
 //! (`team_status`, worker answers) they return.
 
+use std::path::Path;
+
 use mnemo::headless::HostToolSpec;
 use mnemo::memory::transcript_index::{
     SyncReport, TranscriptHit, TranscriptIndex, TranscriptSource,
@@ -17,6 +19,7 @@ use serde_json::{json, Value};
 use crate::mnemo2::dispatch_routing::RoutingMode;
 use crate::mnemo2::phase3::{self, ReviewEvidence};
 
+use super::findings_ledger;
 use super::record::{ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
 use super::dispatch::{dispatch_result, DispatchRequest, DispatchSource, PlanRef};
@@ -113,6 +116,20 @@ impl TeamRuntime {
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
+                name: "team_prove_regression".to_string(),
+                description: "Prove a bug-fixing worker's regression test fails without its fix, in the worker's own checkout while it is idle. The outcome arrives as the check 'regression test fails without the fix', as the finding 'regression-not-red' when the test still passes without the fix, or as 'regression-proof-inconclusive' when the run could not decide, plus a notice. Refused unless the worker is idle and its plan is bug_fixing with a regression test. Returns at once; the proof runs in the background and team_message, team_resume, team_route_fix, review_fix and team_merge are refused for that worker until it finishes.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_mutation_check".to_string(),
+                description: "Run the project's mutation command over one worker's change diff and report every changed line that no test catches as a low-severity 'No test catches: ...' finding. Refused with 'configure [mutation] in .coding/checks.toml' when the project configured no mutation command, and refused while the worker is busy. Returns at once; the run is expensive (minutes to hours) and finishes with a notice.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_message".to_string(),
                 description: "Send a message to a worker; a busy worker receives it as a steer.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"text":{"type":"string"}},"required":["worker_id","text"]}),
@@ -168,7 +185,9 @@ impl TeamRuntime {
                             "severity":{"type":"string","enum":crate::mnemo2::phase3::FINDING_SEVERITIES,"description":"Every open finding blocks the merge, whatever its severity."},
                             "status":{"type":"string","enum":crate::mnemo2::phase3::FINDING_STATUSES,"default":"open"},
                             "evidence":{"type":"string","description":"Required when status is fixed."},
-                            "justification":{"type":"string","description":"Required when status is wontfix."}
+                            "justification":{"type":"string","description":"Required when status is wontfix."},
+                            "category":{"type":"string","description":"Optional kebab-case name for the kind of mistake, reused across reviews so Mnemo2 can count it (for example vacuous-test, missing-error-path, docs-out-of-sync). Reuse a category from the list in earlier team_review results when one fits."},
+                            "enforce":{"type":"string","enum":["code","build","test","review"],"description":"Optional: where this kind of mistake could be stopped for good. code: a type or API that makes it impossible to write; build: a lint or policy test that fails the build; test: a test or check that catches it; review: only a person can judge it."}
                         },
                         "required":["title","detail","file","severity"]
                     }},
@@ -227,6 +246,15 @@ impl TeamRuntime {
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(120_000),
+            },
+            HostToolSpec {
+                name: "team_quality".to_string(),
+                description: "Whether merged work holds up, per tier and per model: merges, first-pass share, average fix rounds and findings, high findings, reverts, merges a later bug-fix plan changed the same files for, and cost per merge. Read-only; use it when deciding a tier or model on evidence rather than on impressions.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "window_days":{"type":"integer","description":"Days back from now to count merges over (default 30)."}
+                }}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(30_000),
             },
             HostToolSpec {
                 name: "session_search".to_string(),
@@ -388,6 +416,43 @@ impl TeamRuntime {
                 explicit_model,
             );
         }
+        if name == "team_prove_regression" || name == "team_mutation_check" {
+            let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
+                return ToolResult::error(format!("{name} requires a 'worker_id' string"));
+            };
+            let result = if name == "team_prove_regression" {
+                self.prove_regression_tool(worker_id).await
+            } else {
+                self.mutation_check_tool(worker_id).await
+            };
+            return match result {
+                Ok(text) => ToolResult::success(text),
+                Err(error) => ToolResult::error(error),
+            };
+        }
+        if name == "team_quality" {
+            let window_days = args
+                .get("window_days")
+                .and_then(Value::as_u64)
+                .and_then(|days| u32::try_from(days).ok())
+                .unwrap_or(crate::mnemo2::quality::DEFAULT_WINDOW_DAYS);
+            return match crate::mnemo2::quality::report(
+                self.workspace_root.clone(),
+                window_days,
+            )
+            .await
+            {
+                Ok(report) => {
+                    let text = crate::mnemo2::quality::summary(&report);
+                    let data = serde_json::to_value(&report).unwrap_or(Value::Null);
+                    ToolResult::success(text.clone()).with_data(json!({
+                        "summary": text,
+                        "report": data,
+                    }))
+                }
+                Err(error) => ToolResult::error(error),
+            };
+        }
         if name == "team_status" {
             let plan_id = args
                 .get("plan_id")
@@ -546,7 +611,25 @@ impl TeamRuntime {
             "team_revert_merge" => self.revert_merge_as(worker_id, true).await,
             _ => Err(format!("unknown team host tool '{name}'")),
         };
-        worker_result(result, name)
+        let reviewed = result.as_ref().ok().cloned();
+        let mut answer = worker_result(result, name);
+        if name == "team_review" && answer.success {
+            if let Some(line) = finding_categories_line(&self.workspace_root) {
+                answer.output = format!("{}\n{line}", answer.output);
+            }
+            // A category that keeps coming back is one line in the answer, so
+            // the lead reads "this is now a proposal" instead of reviewing it
+            // for the fourth time.
+            if let Some(reviewed) = &reviewed {
+                let lines =
+                    findings_ledger::recurrence_lines(&self.workspace_root, &reviewed.findings);
+                for line in lines {
+                    answer.output.push('\n');
+                    answer.output.push_str(&line);
+                }
+            }
+        }
+        answer
     }
 
     /// `session_search`: search the past worker and lead transcripts, or read
@@ -860,4 +943,20 @@ fn worker_result(result: Result<WorkerRecord, String>, action: &str) -> ToolResu
         Ok(worker) => worker_answer(&worker, action),
         Err(err) => team_tool_error(err),
     }
+}
+
+/// The finding categories in use and their worker counts, for the lead
+/// reading a fresh review; `None` until some review names a category.
+fn finding_categories_line(root: &Path) -> Option<String> {
+    let counts = findings_ledger::category_counts(&findings_ledger::read_rows(root));
+    if counts.is_empty() {
+        return None;
+    }
+    let listed = counts
+        .iter()
+        .take(10)
+        .map(|(category, count)| format!("{category} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("Finding categories in use: {listed}"))
 }

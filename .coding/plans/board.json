@@ -2776,6 +2776,249 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Version bump, dependency updates and changelog only."
+    },
+    {
+      "id": "895098cb",
+      "status": "closed",
+      "created_at_ms": 1794867304235,
+      "closed_at_ms": 1794867518879,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-895098cb-20261116-221838.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Worker guidance text only."
+    },
+    {
+      "id": "bb7b2d99",
+      "status": "closed",
+      "created_at_ms": 1794922067559,
+      "closed_at_ms": 1794929968472,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-bb7b2d99-20261117-153928.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "953c3481",
+      "status": "closed",
+      "created_at_ms": 1794931014181,
+      "closed_at_ms": 1794932038058,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-953c3481-20261117-161358.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "970d8d66",
+      "status": "closed",
+      "created_at_ms": 1794931643554,
+      "closed_at_ms": 1795117947860,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-970d8d66-20261119-195227.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds a new proof mechanism and merge-gate condition; no requirement of dispatch-routing, external-lead, tier-ladder or worker-brief changes (routing, lead attachment, tiers and worker briefs behave as before)."
+    },
+    {
+      "id": "0ff83146",
+      "status": "closed",
+      "created_at_ms": 1794931687974,
+      "closed_at_ms": 1795015386553,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-0ff83146-20261118-152306.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds advisory notes to shell output and repository policy tests; no specified capability's requirements change."
+    },
+    {
+      "id": "3c2ec71c",
+      "status": "open",
+      "created_at_ms": 1794931735010,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds optional finding fields, a findings ledger and backlog proposals; no requirement of the governed team capabilities changes."
+    },
+    {
+      "id": "dac2028d",
+      "status": "closed",
+      "created_at_ms": 1794931808476,
+      "closed_at_ms": 1795014896525,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-dac2028d-20261118-151456.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds two optional fields/rows to the routing log and a read-only report; Laya's routing requirements and labels are unchanged (new rows are ignored by the training readers)."
+    },
+    {
+      "id": "41874823",
+      "status": "closed",
+      "created_at_ms": 1794947437374,
+      "closed_at_ms": 1794948742423,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-41874823-20261117-205222.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Input validation inside the quality report's git call; no specified behaviour changes."
+    },
+    {
+      "id": "f89fd63d",
+      "status": "closed",
+      "created_at_ms": 1795021986512,
+      "closed_at_ms": 1795034626182,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f89fd63d-20261118-204346.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Edit-tool robustness, review_fix matching and a Quality-tab metric; no OpenSpec capability governs these files' specified behavior."
+    },
+    {
+      "id": "5b85ab61",
+      "status": "closed",
+      "created_at_ms": 1795085061064,
+      "closed_at_ms": 1795102583485,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-5b85ab61-20261119-153623.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Stale-read redirects are not strikes",
+              "text": "The system SHALL NOT count a failed tool result that is a stale-read gate redirect (EDIT INTERCEPTED) or an unknown read receipt error toward a worker's strike streak, and SHALL NOT let it reset the streak either. An exact repeat of the previous call SHALL still count as a strike.",
+              "scenarios": [
+                {
+                  "name": "Intercepted edit followed by a re-read",
+                  "when": [
+                    "a worker's edit is intercepted by the stale-read gate",
+                    "the worker re-reads the file and edits again"
+                  ],
+                  "then": [
+                    "no strike nudge is sent for those calls"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Repeated identical intercepted call",
+                  "when": [
+                    "a worker sends the same intercepted edit call three times in a row"
+                  ],
+                  "then": [
+                    "the repeats count as strikes as before"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Only dispatch-routing changes (its spec delta is attached). external-lead, tier-ladder and worker-brief requirements are unchanged: lead attachment, tiers and the worker brief behave as before; pump.rs, nudge.rs and tests.rs are touched only for strike counting and check recording."
+    },
+    {
+      "id": "873a756d",
+      "status": "closed",
+      "created_at_ms": 1795092807339,
+      "closed_at_ms": 1795095645526,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-873a756d-20261119-134045.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Adds one prompt sentence and a settings warning, and fixes tool description text. Requirements of worker-brief, external-lead, dispatch-routing and tier-ladder are unchanged: briefs, routing and tiers behave as before."
+    },
+    {
+      "id": "d3336a8a",
+      "status": "open",
+      "created_at_ms": 1795096814665,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Settings has a Machine page",
+              "text": "The Settings dialog SHALL have a Machine page under All projects that edits how many heavy build and test commands may run at once across every Mnemo2 instance on the machine, and SHALL show whether a shared Rust build cache (sccache) was found and the shared model host's status.",
+              "scenarios": [
+                {
+                  "name": "Changing the build limit",
+                  "when": [
+                    "the user sets Builds and tests at once to 1 and saves"
+                  ],
+                  "then": [
+                    "config.toml carries [general.machine] heavy_commands = 1",
+                    "every running instance applies it to the next heavy command"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "The Models page says what the embedding models are for",
+              "text": "The Models page SHALL describe the memory embedding model as serving memory search over specs, decisions, bugs and HOW records, plan, review and backlog summaries, and routing and failure-triage examples, and SHALL describe the code-search model separately.",
+              "scenarios": [
+                {
+                  "name": "Reading the Models page",
+                  "when": [
+                    "the user opens Settings > Models"
+                  ],
+                  "then": [
+                    "the embedding section names memory search, routing examples and code search with their models"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Besides the settings-dialog deltas attached, endpoints.rs gains an optional max_concurrent field that does not change tier or ladder behaviour (tier-ladder), and no step changes dispatch-routing, external-lead, worker-brief, plan-board or llm-trace requirements."
+    },
+    {
+      "id": "4b4377ce",
+      "status": "closed",
+      "created_at_ms": 1795112665951,
+      "closed_at_ms": 1795117945065,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-4b4377ce-20261119-195225.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Changes a shell default only; no requirement of any OpenSpec capability is affected."
+    },
+    {
+      "id": "8283acc5",
+      "status": "closed",
+      "created_at_ms": 1795131418064,
+      "closed_at_ms": 1795132572902,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-8283acc5-20261119-235612.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Version strings, lockfile versions and the CHANGELOG only; no behaviour changes."
+    },
+    {
+      "id": "c7ad776e",
+      "status": "closed",
+      "created_at_ms": 1795132770235,
+      "closed_at_ms": 1795133206511,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-c7ad776e-20261120-000646.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Dependency placement only; no behaviour change."
     }
   ]
 }

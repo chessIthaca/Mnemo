@@ -1504,6 +1504,7 @@ mod tests {
             &store,
             ks.dir(),
             std::slice::from_ref(&rel),
+            false,
         )
         .await
         .unwrap();

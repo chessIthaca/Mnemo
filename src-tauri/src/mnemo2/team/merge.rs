@@ -16,6 +16,7 @@ use mnemo::app::worktrees::{
     remove_agent_worktree,
 };
 
+use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
 use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::phase3::{self, MergeRecord};
 
@@ -28,7 +29,7 @@ use super::external_lead::EXTERNAL_LEAD_MEMORY_REMINDER;
 use super::nudge::nudge_ignored_row;
 use super::record::{validate_worker_id, WorkerRecord, WorkerStatus};
 use super::routing::{logs_label, logs_routing, outcome_row};
-use super::{now_key, project_relative, TeamRuntime};
+use super::{now_key, project_relative, unix_ms, TeamRuntime};
 
 /// Whether a record's branch is exactly the one its id names, so Git
 /// cleanup can never touch a branch the worker does not own.
@@ -228,7 +229,11 @@ pub(super) fn validate_merge(
     tip: &str,
     records: &[WorkerRecord],
     lane: &phase3::ReviewLane,
+    proof: &super::proving::MergeProof,
 ) -> Result<(), String> {
+    if proof.running {
+        return Err(super::proving::proving_error(&worker.id));
+    }
     if worker.status != WorkerStatus::InReview {
         return Err(format!("worker is {:?}, not in review", worker.status));
     }
@@ -275,6 +280,15 @@ pub(super) fn validate_merge(
             check.name
         ));
     }
+    // The regression test of a bug fix must be proven red at the exact tip
+    // being merged: the proof is what shows the test reproduces the defect.
+    // A resolved proof finding (wontfix with a written reason) waives it.
+    if proof.regression_required && !proof.regression_proven && !proof.regression_waived {
+        return Err(
+            "the regression test has not been proven red at this tip; wait for the proof or run team_prove_regression"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -304,6 +318,7 @@ impl TeamRuntime {
 
     async fn merge_locked(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         // An audit worker is a read-only reviewer: it is never mergeable in ANY
         // state, so this refusal comes before every other gate. A still-running
         // audit (or a differently-named lead branch) must not mask the reason.
@@ -360,8 +375,9 @@ impl TeamRuntime {
         // merge-time tip requires: a light review merges, and a tip that grew
         // past the light lane since the review needs the full evidence.
         let lane = self.review_lane(&tip, &worker.review_risk).await?;
+        let proof = self.proof_ctx().merge_inputs(&worker, &tip).await;
         let records = self.records.lock().await.clone();
-        validate_merge(&worker, &tip, &records, &lane)?;
+        validate_merge(&worker, &tip, &records, &lane, &proof)?;
         let previous = worker.clone();
         self.update_worker(worker_id, |worker| worker.status = WorkerStatus::Merging)
             .await;
@@ -730,13 +746,26 @@ impl TeamRuntime {
         let revert = phase3::tip(&self.workspace_root).await?;
         self.update_worker(worker_id, |worker| {
             if let Some(merge) = worker.merge.as_mut() {
-                merge.revert_commit = Some(revert);
+                merge.revert_commit = Some(revert.clone());
             }
             worker.error = None;
         })
         .await;
         self.persist().await?;
-        self.worker(worker_id).await
+        let record = self.worker(worker_id).await?;
+        // The revert is a quality signal about the merge, not a Laya routing
+        // decision, so it is logged in every routing mode: the quality report
+        // pairs it with the worker's `outcome` row by `worker_id` (plan
+        // dac2028d). Appended after the record is saved, so the row never
+        // describes a revert that did not persist.
+        self.append_dispatch_routing_row(&DispatchRoutingRow::Reverted {
+            ts: unix_ms(),
+            worker_id: record.id.clone(),
+            plan_id: record.plan_id.clone().unwrap_or_default(),
+            step: record.plan_step.map_or(0, |step| step + 1),
+            revert_commit: revert,
+        });
+        Ok(record)
     }
 
     /// After a merge: tick the worker's plan step once its tasks are all

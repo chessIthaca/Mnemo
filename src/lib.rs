@@ -54,6 +54,7 @@ pub mod workspace;
 // `mnemo::host::*`/`mnemo::runtime`/`mnemo::agent`); add deliberately,
 // with the consumer named.
 pub use crate::agent::approval::needs_approval;
+pub use crate::agent::EDIT_GATE_MARK;
 pub use crate::agent::context::ContextManager;
 pub use crate::agent::factory::AgentLoopFactory;
 pub use crate::agent::failure_triage::{
@@ -82,9 +83,18 @@ pub use crate::host::index_progress;
 pub use crate::host::laya;
 pub use crate::host::maintenance;
 pub use crate::host::rewire;
+pub use crate::host::shared_service;
 pub use crate::host::brain;
 pub use crate::host::notifier;
 pub use crate::host::startup;
+// Machine-wide limits shared by every instance on a computer (plan d3336a8a
+// step 3): the app's Machine page reads the free-disk status and the Mnemo2
+// proofs take a heavy-command slot, both on BARE crate-root paths.
+pub use crate::host::disk;
+pub use crate::host::machine_slots;
+// The shared Rust build cache (plan d3336a8a step 7): the Mnemo2 proofs and
+// the Machine page read it on the same bare crate-root path.
+pub use crate::host::sccache;
 pub use crate::runtime::turn_resolve;
 
 #[cfg(test)]

@@ -44,7 +44,11 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::config::{OptimizerConfig, VerifyConfig};
+use crate::config::{MachineConfig, OptimizerConfig, VerifyConfig};
+use crate::host::machine_slots::HeavySlots;
+// The shared Rust build cache (plan d3336a8a step 7): the verification run is
+// a build+test like any other, so it gets RUSTC_WRAPPER=sccache too.
+use crate::host::sccache;
 use crate::tool::agent::output_compactor;
 
 /// The greppable head tag on every evidence note.
@@ -101,6 +105,12 @@ pub struct StepVerifyHandle {
     cfg: Arc<RwLock<VerifyConfig>>,
     optimizer: Arc<RwLock<OptimizerConfig>>,
     root: PathBuf,
+    /// Machine-wide heavy-command limit (the `[general.machine]` section, plan
+    /// d3336a8a). A verification run is ALWAYS heavy — it is a test suite.
+    machine: Arc<RwLock<MachineConfig>>,
+    /// The machine's heavy-slot directory (`<config dir>/run/heavy`). `None`
+    /// (headless, unit tests) runs the verification unslotted.
+    slots_dir: Option<PathBuf>,
 }
 
 impl StepVerifyHandle {
@@ -113,7 +123,20 @@ impl StepVerifyHandle {
             cfg,
             optimizer,
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            machine: Arc::new(RwLock::new(MachineConfig::default())),
+            slots_dir: None,
         }
+    }
+
+    /// Wire the shared `[general.machine]` handle and the machine's slot
+    /// directory. The verification command is heavy, so it waits for a free
+    /// machine slot BEFORE the timeout clock starts (plan d3336a8a step 3): a
+    /// suite queued behind another instance's build is never reported as a
+    /// timed-out verification.
+    pub fn with_machine(mut self, cfg: Arc<RwLock<MachineConfig>>, slots_dir: PathBuf) -> Self {
+        self.machine = cfg;
+        self.slots_dir = Some(slots_dir);
+        self
     }
 
     /// Override the directory the verification command runs in (the project
@@ -143,6 +166,20 @@ impl StepVerifyHandle {
         } else {
             ("sh", "-c")
         };
+        // Plan d3336a8a step 3: a verification run is heavy. Take a machine
+        // slot first, so the timeout below measures the command, not the wait.
+        // The guard lives until this function returns — i.e. the whole run.
+        let _slot = match &self.slots_dir {
+            Some(dir) => {
+                let slots = self
+                    .machine
+                    .read()
+                    .expect("machine config lock poisoned")
+                    .heavy_commands;
+                HeavySlots::new(dir.clone(), slots).acquire(|_| {}).await
+            }
+            None => crate::host::machine_slots::SlotGuard::none(),
+        };
         let mut cmd = Command::new(program);
         cmd.arg(flag)
             .arg(&command)
@@ -157,6 +194,9 @@ impl StepVerifyHandle {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Plan d3336a8a step 7: the shared Rust build cache, when present and
+        // the user has not named a wrapper of their own.
+        sccache::apply_env(&mut cmd);
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {

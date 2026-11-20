@@ -13,6 +13,7 @@ function sampleSettings(): ModelSettings {
   return {
     task_models: { summarize: null },
     vision_model: null,
+    vision_warning: null,
     embedding: { selected: "hash", status: "keyword_only", options: [] },
     optimizer: {
       delta_reads: true,
@@ -30,6 +31,13 @@ function sampleSettings(): ModelSettings {
       compress_extra_commands: ["cargo test", "npm run build"],
     },
     budget: { enabled: false, max_tokens_per_plan: 0, max_escalations_per_plan: 0, max_retries_per_lane: 0 },
+    machine: {
+      heavy_commands: 2,
+      min_heavy_commands: 1,
+      max_heavy_commands: 16,
+      disks: [{ role: "project", volume: "C:", free_gb: 250 }],
+      sccache: { found: false, path: null },
+    },
   };
 }
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Activity, ArrowLeft, Brain, FileDiff, FolderTree, GitBranch, Globe, ListTree, Network, X } from "@lucide/svelte";
+  import { Activity, ArrowLeft, Brain, ChartColumn, FileDiff, FolderTree, GitBranch, Globe, ListTree, Network, X } from "@lucide/svelte";
   import { onMount, type Component } from "svelte";
   import { actions, app, isWideWorkbenchTab, workbenchPanelWidth } from "../lib/store";
   import type { WorkbenchTab } from "../lib/types";
@@ -9,6 +9,7 @@
   import GitTab from "./GitTab.svelte";
   import MemoryView from "./MemoryView.svelte";
   import PlanTab from "./PlanTab.svelte";
+  import QualityView from "./QualityView.svelte";
 
   const tabs: { id: WorkbenchTab; label: string; icon: Component }[] = [
     { id: "browser", label: "Browser", icon: Globe },
@@ -19,6 +20,7 @@
     { id: "trace", label: "Trace", icon: Activity },
     { id: "graph", label: "Graph", icon: Network },
     { id: "memory", label: "Memory", icon: Brain },
+    { id: "quality", label: "Quality", icon: ChartColumn },
   ];
 
   let resizing = $state(false);
@@ -121,6 +123,8 @@
         {/await}
       {:else if $app.workbenchTab === "memory"}
         <MemoryView />
+      {:else if $app.workbenchTab === "quality"}
+        <QualityView />
       {:else}
         <PlanTab scope="open" />
       {/if}

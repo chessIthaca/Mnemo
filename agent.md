@@ -10,19 +10,7 @@ Mnemo2 reads this file into the prompt of its lead and of every worker. Their ro
   shell commands, never Linux paths or bash syntax in the `shell` tool. The
   project root is the folder the session opened.
 - Never commit to `main`. Work happens on the lead branch (`wt/mnemo`) and on worker branches (`wt/agent-*`); **Branch policy** says how work reaches `main`.
-- **Do not pipe a command through a cmdlet and then trust the reported exit
-  code** — it's the *pipe's* code, not the command's, and can read `1` even
-  when the command succeeded. To check whether a command actually failed,
-  run it unpiped and read `$LASTEXITCODE` directly:
-
-  ```powershell
-  cargo test
-  "exit=$LASTEXITCODE"
-  ```
-
-  …or, if you must filter noise, rely on the command's own `test result:` /
-  `error:` lines rather than the exit code. A non-zero code from a piped
-  invocation is **not** by itself evidence of failure.
+- **Read the exit code the shell tool reports.** Every shell result ends with `[exit code: N]` for the whole command line; after a pipe or a following statement it is that last part's code. When a run of a `.coding/checks.toml` command does not count as your check, the shell result says why.
 
 ## Code style
 
@@ -46,7 +34,7 @@ Mnemo2 reads this file into the prompt of its lead and of every worker. Their ro
   `src-tauri/mnemo2-app/src/main.rs`) any warning fails the build, so a green
   `cargo test` already proves there are zero warnings. Never add `#[allow(...)]`
   to silence a warning — fix the root cause (remove the dead code, drop the
-  unused import, drop the unneeded `mut`, etc.).
+  unused import, drop the unneeded `mut`, etc.). `tests/integration/policy.rs` fails when a file gains an `#[allow(...)]`.
 - **Deletion hygiene — pre-flight import-orphan check.** After any deletion
   edit, for every symbol named in the touched files' `use` statements, run a
   literal search (glob the file, engine: index) for remaining use sites BEFORE
@@ -64,7 +52,7 @@ Mnemo2 reads this file into the prompt of its lead and of every worker. Their ro
   one-liners (`Set-Content`, `Out-File`, `Add-Content`, `>>`, `sed -i`,
   `tee`, python scripts). The file tools preview diffs for approval, preserve
   line endings, and feed the stale-read gate; shell surgery bypasses all of
-  that.
+  that. The shell tool adds a note when a command writes files this way.
 - Shell-based mutation is a last resort, permitted only for (a) paths the
   file tools refuse by design (`.coding/knowledge/**` — use `memory_amend`
   for amendments, or `memory_update`'s `find`/`replace_with` targeted repair
@@ -131,7 +119,7 @@ The lead checks these in every review, in addition to correctness, bugs and secu
 A worker runs the same checklist against its own diff before it commits and reports what it checked.
 
 - **Documentation sync.** A change to behaviour, settings or commands updates the docs that describe them: `README.md`, `docs/FEATURES.md`, `docs/CONFIGURATION.md`, `docs/REVIEW-POLICY.md`, `mnemo2/README.md`, `mnemo2/plugin/README.md` and its skills, module doc comments, and config examples. Missing or stale docs are a finding.
-- **Multi-platform neutrality.** The change builds and behaves on both macOS and Windows: no Windows-only APIs, paths or shell syntax in library or app code. The one sanctioned exception is the WebView2 Browser pane and its tools, which are Windows-only by design and gated with `cfg(windows)`. Any other `cfg(windows)`-only addition is a finding.
+- **Multi-platform neutrality.** The change builds and behaves on both macOS and Windows: no Windows-only APIs, paths or shell syntax in library or app code. The one sanctioned exception is the WebView2 Browser pane and its tools, which are Windows-only by design and gated with `cfg(windows)`. Any other `cfg(windows)`-only addition is a finding. `tests/integration/policy.rs` fails when `cfg(windows)` appears in a file not on its list.
 - **File tools first.** Shell-based file mutation (`Set-Content`, `Out-File`, `Add-Content`, `>>`, `sed -i`, `tee`, python scripts) where `file_edit`/`file_write` would work is a finding, and so is a fallback without a stated justification.
 - **Regression test.** A defect fix carries a regression test that fails without the fix and passes with it (see Code style).
 - **Checks on the exact commit.** The checks recorded for a review ran on the commit being merged (see the Mnemo2 team merge policy).

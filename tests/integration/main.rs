@@ -15,4 +15,5 @@ mod headless;
 mod headless_kernel;
 mod headless_setup;
 mod ipc_bridge;
+mod policy;
 mod workflow_integration;

@@ -13,6 +13,9 @@
 //! - `convert_line_endings` (CRLF↔LF conversion in place, without a shell
 //!   invocation)
 //! - `shell` (platform-aware: PowerShell on Windows, sh elsewhere)
+//! - `run_checks` (every `.coding/checks.toml` command in one call, with
+//!   per-command PASS/FAIL blocks and the failing lines; a passing unchanged
+//!   run is recorded like a counted `shell` run)
 //! - `expand_result` (auto-run; serves back a tool result that was archived
 //!   for size — by row id, or a keyword search over the archive. Always
 //!   registered, because archive rows can outlive the flag that created them)
@@ -40,6 +43,7 @@ pub mod git_diff;
 pub mod git_read;
 pub mod git_read_tool;
 pub mod image_tools;
+pub mod jobs;
 pub mod line_endings;
 pub mod list_models;
 pub mod load_tools;
@@ -51,6 +55,7 @@ pub mod read_cache;
 pub mod read_files;
 pub mod read_registry;
 pub mod sandbox;
+pub mod run_checks;
 pub mod search;
 pub mod search_read;
 pub mod shell;

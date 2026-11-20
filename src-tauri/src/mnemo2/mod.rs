@@ -104,6 +104,10 @@ pub mod git_view;
 /// The per-instance run file the `mnemo2-mcp` helper finds a live Mnemo2 by.
 pub mod run_file;
 
+/// The machine-wide instances overview: every running Mnemo2, its open
+/// project, its workers and today's cost, probed over the run files.
+pub mod instances;
+
 /// The Laya decision-model settings commands (status, setup, disable,
 /// save) — the backend of the Settings dialog's Laya page (plan
 /// e02de747).
@@ -178,6 +182,15 @@ pub mod memory_maintenance;
 /// be looked up.
 pub mod ui_log;
 
+/// Does merged work hold up? The per-model and per-tier quality report over
+/// the routing log (plan dac2028d): first-pass share, fix rounds, reverts and
+/// bug-fix follow-ups.
+pub mod quality;
+
+/// Edit attempts and their failures by cause, read back from the persisted
+/// worker transcripts for the Quality tab's `Edits` section (plan f89fd63d
+/// step 5).
+pub mod edit_outcomes;
 
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView, which also exposes `__TAURI_INTERNALS__`.
@@ -768,6 +781,7 @@ pub fn run() {
             backlog::backlog_set_deferred,
             backlog::backlog_set_done,
             backlog::backlog_clear_finished,
+            quality::quality_report,
             backlog::plan_this,
             ipc::settings_endpoints,
             ipc::settings_upsert_endpoint,
@@ -802,6 +816,8 @@ pub fn run() {
             ipc::team_delete_preview,
             ipc::team_delete,
             ipc::team_messages,
+            ipc::instances_list,
+            ipc::instance_show,
             ipc::project_list,
             ipc::project_add,
             ipc::project_create,

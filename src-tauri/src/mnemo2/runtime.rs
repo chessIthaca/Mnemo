@@ -19,8 +19,9 @@ use mnemo::app::plan_board::PlanBoard;
 use mnemo::app::policy_factory::WorkflowPolicyFactory;
 use mnemo::config::{Config, SafetyMode};
 use mnemo::headless::{
-    AgentPlan, AgentSession, Engine, EngineOptions, EventReceiver, MemoryBackend,
-    PendingInteraction, SessionCommand, SessionEvent, SessionId, SpawnOptions, Transcript,
+    AgentPlan, AgentSession, ConfigWatcher, Engine, EngineOptions, EventReceiver, MemoryBackend,
+    PendingInteraction, ReloadNotice, SessionCommand, SessionEvent, SessionId, SpawnOptions,
+    Transcript, CONFIG_DEBOUNCE,
 };
 use mnemo::laya::LayaManager;
 use mnemo::provider::LlmClient;
@@ -48,6 +49,9 @@ const LEAD_STATE_FILE: &str = "lead.json";
 
 /// How many transient lead events the broadcast bus keeps for a slow consumer.
 const EVENT_BUFFER: usize = 512;
+
+/// How many live-settings notices the broadcast bus keeps for a slow consumer.
+const SETTINGS_NOTICE_BUFFER: usize = 8;
 
 /// Runtime startup options.
 #[derive(Clone, Debug)]
@@ -253,10 +257,19 @@ pub struct LeadRuntime {
     config_dir: PathBuf,
     workspace_root: PathBuf,
     state_dir: PathBuf,
-    models: std::sync::RwLock<Vec<LeadModel>>,
-    default_model: std::sync::RwLock<Option<String>>,
+    models: Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    default_model: Arc<std::sync::RwLock<Option<String>>>,
     policy: Option<String>,
     team: crate::mnemo2::ledger::TeamSlot,
+    /// The live-settings notices (a hand edit reloaded, or was rejected) —
+    /// the IPC forwarder turns each into the window's toast.
+    settings_notices: broadcast::Sender<ReloadNotice>,
+    /// The live-settings watcher started with the project
+    /// ([`LeadRuntime::start_config_watcher`]): it reloads a hand-edited
+    /// `~/.mnemo/*.toml` through the same live-apply a Settings save uses.
+    /// Dropped in [`LeadRuntime::shutdown`] so a closed project's engine is
+    /// never reloaded.
+    config_watcher: std::sync::Mutex<Option<ConfigWatcher>>,
     /// The project's one plan board: the lead's board tools and the team's
     /// dispatch validation, tick, and close all use this instance.
     board: std::sync::Mutex<Option<Arc<PlanBoard>>>,
@@ -295,6 +308,34 @@ struct ProjectStores {
     codegraph: Option<Arc<mnemo::codegraph::CodeGraph>>,
     /// `.coding/plans`, which the knowledge tools reindex against.
     plans_dir: PathBuf,
+}
+
+/// The catalog handles a live-settings reload refreshes — clones of the
+/// runtime's Arcs, so the watcher task (which cannot hold `&LeadRuntime`) can
+/// re-read endpoints/models/tiers and push them into the open team.
+#[derive(Clone)]
+struct CatalogHandles {
+    config_dir: PathBuf,
+    models: Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    default_model: Arc<std::sync::RwLock<Option<String>>>,
+    team: crate::mnemo2::ledger::TeamSlot,
+}
+
+impl CatalogHandles {
+    /// See [`LeadRuntime::refresh_catalog`].
+    async fn refresh(&self) -> Result<(), String> {
+        let (models, default) = load_models(&self.config_dir)?;
+        *self.models.write().unwrap_or_else(|e| e.into_inner()) = models.clone();
+        *self
+            .default_model
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = default;
+        let team = self.team.lock().await.clone();
+        if let Some(team) = team {
+            team.set_catalog(models, tiers_of(&self.config_dir), pricing_of(&self.config_dir)?);
+        }
+        Ok(())
+    }
 }
 
 impl LeadRuntime {
@@ -364,10 +405,12 @@ impl LeadRuntime {
             config_dir,
             workspace_root: options.workspace_root,
             state_dir: options.state_dir,
-            models: std::sync::RwLock::new(models),
-            default_model: std::sync::RwLock::new(configured_default),
+            models: Arc::new(std::sync::RwLock::new(models)),
+            default_model: Arc::new(std::sync::RwLock::new(configured_default)),
             policy,
             team: Arc::new(Mutex::new(None)),
+            settings_notices: broadcast::channel(SETTINGS_NOTICE_BUFFER).0,
+            config_watcher: std::sync::Mutex::new(None),
             board: std::sync::Mutex::new(None),
             stores: std::sync::Mutex::new(None),
             indexing: crate::mnemo2::indexing::IndexingTracker::new(),
@@ -376,10 +419,10 @@ impl LeadRuntime {
         };
         runtime.start_engine(provider).await?;
         let engine = runtime.engine_handle().await?;
-        let classifier = mnemo::headless::Setup::open(Some(runtime.config_dir.clone()))
+        let setup = mnemo::headless::Setup::open(Some(runtime.config_dir.clone()))
             .map_err(|error| format!("open the lead settings: {error}"))?
-            .for_engine(&engine)
-            .classifier_slot();
+            .for_engine(&engine);
+        let classifier = setup.classifier_slot();
         let team = TeamRuntime::open(TeamRuntimeOptions {
             engine,
             workspace_root: runtime.workspace_root.clone(),
@@ -399,6 +442,13 @@ impl LeadRuntime {
             team.attach_board(board);
         }
         *runtime.team.lock().await = Some(team);
+        // Live settings: a hand edit of `~/.mnemo/*.toml` (or another
+        // instance's save) reloads this engine through the same live-apply a
+        // Settings save uses. Best effort — a watcher that cannot start leaves
+        // the instance on the startup config, never broken.
+        if let Err(error) = runtime.start_config_watcher(&setup) {
+            eprintln!("mnemo2: live settings disabled for this project: {error}");
+        }
         let live = runtime
             .spawn_live(1, selected, spawn_model, spawn_effort, persisted.transcript)
             .await?;
@@ -427,25 +477,83 @@ impl LeadRuntime {
 
     /// The configured model tiers, read fresh from disk.
     pub(crate) fn tiers(&self) -> mnemo::headless::TiersDto {
-        mnemo::headless::Setup::open(Some(self.config_dir.clone()))
-            .and_then(|setup| setup.tiers())
-            .unwrap_or_default()
+        tiers_of(&self.config_dir)
     }
 
     /// Re-read endpoints, models, prices and tiers after a settings save, so
     /// new dispatches (and the next lead session's tool schema) see them.
     /// The running lead session keeps its already-advertised tool schema.
     pub async fn refresh_catalog(&self) -> Result<(), String> {
-        let (models, default) = load_models(&self.config_dir)?;
-        *self.models.write().unwrap_or_else(|e| e.into_inner()) = models.clone();
-        *self
-            .default_model
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = default;
-        let team = self.team.lock().await.clone();
-        if let Some(team) = team {
-            team.set_catalog(models, self.tiers(), self.pricing()?);
+        self.catalog().refresh().await
+    }
+
+    /// The catalog handles as a cloneable bundle — what the live-settings
+    /// watcher task refreshes after a reload (it cannot hold `&self`).
+    fn catalog(&self) -> CatalogHandles {
+        CatalogHandles {
+            config_dir: self.config_dir.clone(),
+            models: Arc::clone(&self.models),
+            default_model: Arc::clone(&self.default_model),
+            team: Arc::clone(&self.team),
         }
+    }
+
+    /// Subscribe to the live-settings notices (a reload applied, or a rejected
+    /// file edit) — the IPC forwarder turns each into the window's toast.
+    pub fn subscribe_settings_reloads(&self) -> broadcast::Receiver<ReloadNotice> {
+        self.settings_notices.subscribe()
+    }
+
+    /// Start watching the config files for outside edits: every debounced
+    /// burst re-checks the file fingerprints and, when they differ, applies
+    /// the freshly loaded config through the same live-apply a Settings save
+    /// uses — then re-reads the model catalog for the next dispatch and sends
+    /// the window a notice.
+    fn start_config_watcher(&self, setup: &mnemo::headless::Setup) -> Result<(), String> {
+        let setup = setup.clone();
+        let catalog = self.catalog();
+        let notices = self.settings_notices.clone();
+        let watcher = ConfigWatcher::spawn(
+            self.config_dir.clone(),
+            CONFIG_DEBOUNCE,
+            move || {
+                let setup = setup.clone();
+                let catalog = catalog.clone();
+                let notices = notices.clone();
+                async move {
+                    let outcome = setup.reload_if_changed().await;
+                    if !outcome.changed() {
+                        return;
+                    }
+                    let mut notice = outcome.notice();
+                    if outcome.reloaded() {
+                        // A hand-added endpoint/model/tier reaches the next
+                        // dispatch without a restart; a failure to re-read
+                        // them is the window's business, not a silent stderr
+                        // line.
+                        if let Err(error) = catalog.refresh().await {
+                            notice = Some(ReloadNotice {
+                                ok: false,
+                                message: format!(
+                                    "Settings reloaded, but the model list could not be refreshed: \
+                                     {error}"
+                                ),
+                            });
+                        }
+                    }
+                    if let Some(notice) = notice {
+                        // No window listening (a headless run) drops the
+                        // notice — the reload itself already happened.
+                        let _ = notices.send(notice);
+                    }
+                }
+            },
+        )
+        .map_err(|error| format!("could not watch the config files: {error}"))?;
+        *self
+            .config_watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(watcher);
         Ok(())
     }
 
@@ -582,9 +690,7 @@ impl LeadRuntime {
 
     /// Load configured model prices for team telemetry.
     pub(crate) fn pricing(&self) -> Result<Vec<mnemo::config::PricingEntry>, String> {
-        Config::load(&self.config_dir)
-            .map(|config| config.pricing)
-            .map_err(|err| format!("could not load model pricing: {err}"))
+        pricing_of(&self.config_dir)
     }
 
     /// The trace backend for the current engine — the raised ring, the
@@ -974,6 +1080,13 @@ impl LeadRuntime {
 
     /// Stop the session and discard the engine handles.
     pub async fn shutdown(&self) {
+        // Stop the live-settings watcher with the project: a closed project's
+        // engine must never be reloaded from a file event that lands after
+        // this point.
+        self.config_watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         self.indexing.stop();
         if let Some(team) = self.team.lock().await.take() {
             team.shutdown().await;
@@ -1112,8 +1225,9 @@ impl LeadRuntime {
     /// every worker session. A disabled or uninstalled Laya changes
     /// nothing — the slot stays empty, a byte-identical pre-Laya
     /// startup — and no error here ever fails the engine start. The
-    /// manager Arc is held on the runtime: dropping it would kill the
-    /// `laya-serve` child, so it must outlive this call.
+    /// manager Arc is held on the runtime: dropping it releases this
+    /// instance's lease on the machine-wide shared `laya-serve` (or ends a
+    /// private child), so it must outlive this call.
     async fn attach_laya(&self, engine: &Arc<Engine>) {
         let setup = match mnemo::headless::Setup::open(Some(self.config_dir.clone())) {
             Ok(setup) => setup.for_engine(engine),
@@ -1891,6 +2005,21 @@ fn configured_default(config: &Config) -> Option<String> {
         .find(|endpoint| endpoint.models.iter().any(|spec| spec.id == model))
         .map(|endpoint| format!("{}/{}", endpoint.name, model))
 }
+
+/// The configured model tiers, read fresh from disk (`Setup::tiers`).
+fn tiers_of(config_dir: &Path) -> mnemo::headless::TiersDto {
+    mnemo::headless::Setup::open(Some(config_dir.to_path_buf()))
+        .and_then(|setup| setup.tiers())
+        .unwrap_or_default()
+}
+
+/// Configured model prices for team telemetry.
+fn pricing_of(config_dir: &Path) -> Result<Vec<mnemo::config::PricingEntry>, String> {
+    Config::load(config_dir)
+        .map(|config| config.pricing)
+        .map_err(|err| format!("could not load model pricing: {err}"))
+}
+
 /// Trace identity tests (plan c3ba2b58 step B) — in their own module so the
 /// append-heavy `mod tests` below stays untouched by concurrent work.
 #[cfg(test)]

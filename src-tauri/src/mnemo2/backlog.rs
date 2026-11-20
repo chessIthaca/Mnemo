@@ -51,7 +51,10 @@ pub const BACKLOG_CHANGED_CHANNEL: &str = "mnemo2://backlog-changed";
 const MAX_IDEA_CHARS: usize = 2000;
 
 /// The backlog file under a project root.
-fn backlog_file(root: &Path) -> PathBuf {
+///
+/// Shared with the team's recurring-finding proposals, which append the item
+/// that proposes enforcing a category without the IPC layer in between.
+pub(crate) fn backlog_file(root: &Path) -> PathBuf {
     root.join(".coding").join("backlog.jsonl")
 }
 
@@ -70,7 +73,7 @@ async fn backlog_path(state: &Mnemo2State) -> Result<PathBuf, String> {
 /// A missing file is an empty backlog (the store opens it empty); a corrupt
 /// line is skipped by the store's parser — the same tolerance every other
 /// backlog reader has.
-fn read_items(path: &Path) -> Vec<BacklogItem> {
+pub(crate) fn read_items(path: &Path) -> Vec<BacklogItem> {
     BacklogStore::open(path.to_path_buf()).items()
 }
 
@@ -101,7 +104,10 @@ fn unknown_item(id: &str) -> String {
 }
 
 /// Append one idea at the end of the queue and return the new list.
-fn add_item(path: &Path, text: &str) -> Result<Vec<BacklogItem>, String> {
+///
+/// Shared with the team's recurring-finding proposals: a category of review
+/// finding that keeps coming back is captured here as one idea.
+pub(crate) fn add_item(path: &Path, text: &str) -> Result<Vec<BacklogItem>, String> {
     let text = normalize_idea(text)?;
     let mut store = BacklogStore::open(path.to_path_buf());
     store.add(text, Vec::new());

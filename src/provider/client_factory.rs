@@ -85,6 +85,7 @@ pub fn openai_client_config(
     model: &str,
     multimodal: bool,
     reasoning_effort: Option<String>,
+    run_dir: Option<std::path::PathBuf>,
 ) -> OpenAiClientConfig {
     OpenAiClientConfig {
         base_url: endpoint.base_url.clone(),
@@ -105,6 +106,8 @@ pub fn openai_client_config(
         stop_token_ids: endpoint.stop_token_ids_for(model),
         stop_boundary_strings: endpoint.stop_boundary_strings_for(model),
         extra_body: endpoint.extra_body_json_for(model),
+        run_dir,
+        max_concurrent: endpoint.max_concurrent,
     }
 }
 
@@ -157,11 +160,20 @@ pub fn build_client(
     multimodal: bool,
     reasoning_effort: Option<String>,
     trace: Option<Arc<LlmRequestLog>>,
+    run_dir: Option<std::path::PathBuf>,
 ) -> Arc<dyn LlmClient> {
     match endpoint.kind {
-        EndpointKind::OpenAI | EndpointKind::Local => {
-            build_openai_client(config, endpoint, model, multimodal, reasoning_effort, trace)
-        }
+        EndpointKind::OpenAI | EndpointKind::Local => build_openai_client(
+            config,
+            endpoint,
+            model,
+            multimodal,
+            reasoning_effort,
+            trace,
+            run_dir,
+        ),
+        // Anthropic endpoints have no machine-wide limit (plan d3336a8a
+        // step 4): the `max_concurrent` field is OpenAI/Local-only.
         EndpointKind::Anthropic => Arc::new(AnthropicClient::new_with_trace(
             anthropic_client_config(config, endpoint, model, multimodal, reasoning_effort),
             trace,
@@ -184,9 +196,17 @@ pub fn build_openai_client(
     multimodal: bool,
     reasoning_effort: Option<String>,
     trace: Option<Arc<LlmRequestLog>>,
+    run_dir: Option<std::path::PathBuf>,
 ) -> Arc<dyn LlmClient> {
     Arc::new(OpenAiClient::new_with_trace(
-        openai_client_config(config, endpoint, model, multimodal, reasoning_effort),
+        openai_client_config(
+            config,
+            endpoint,
+            model,
+            multimodal,
+            reasoning_effort,
+            run_dir,
+        ),
         trace,
     ))
 }
@@ -212,6 +232,7 @@ pub fn build_provider_for(
     config: &Config,
     model: &ModelRef,
     trace: Option<Arc<LlmRequestLog>>,
+    run_dir: Option<std::path::PathBuf>,
 ) -> Option<Arc<dyn LlmClient>> {
     let endpoint = config.endpoint(&model.endpoint)?;
     Some(build_client(
@@ -221,6 +242,7 @@ pub fn build_provider_for(
         endpoint.multimodal_for(&model.model),
         resolve_effort(endpoint, model),
         trace,
+        run_dir,
     ))
 }
 
@@ -263,9 +285,73 @@ pub fn context_manager_for_model(
 ) -> Option<ContextManager> {
     // Context sizing only — no capture needed (the real turn provider, built
     // by the resolver with the shared log, does the recording).
-    let provider = build_provider_for(config, model, None)?;
+    let provider = build_provider_for(config, model, None, None)?;
     let max_context = provider.capabilities().max_context;
     Some(ContextManager::new(max_context, fill_rate))
+}
+
+/// Why the configured `[general.vision_model]` cannot serve the image tools — or
+/// only a warning about a model that may still work.
+///
+/// The single rule shared by [`build_vision_client`] and the Settings surfaces
+/// (Mnemo2's Models page), so the image tools' availability and the warning a
+/// user sees can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionIssue {
+    /// The named endpoint is not in `endpoints.toml`.
+    MissingEndpoint,
+    /// The endpoint is Anthropic-kind; the vision client is OpenAI-only.
+    AnthropicEndpoint,
+    /// The endpoint lists models and the vision model id is not among them —
+    /// a warning only, since an unlisted id can still work.
+    UnlistedModel,
+}
+
+impl VisionIssue {
+    /// The user-facing one-liner for this issue (Settings → Models, under the
+    /// Vision field), naming the offending endpoint and model.
+    pub fn message(&self, endpoint: &str, model: &str) -> String {
+        match self {
+            Self::MissingEndpoint => format!(
+                "Vision endpoint '{endpoint}' is not in endpoints.toml, so workers and agents have no image tools."
+            ),
+            Self::AnthropicEndpoint => format!(
+                "Vision endpoint '{endpoint}' is an Anthropic endpoint, which the vision client does not support."
+            ),
+            Self::UnlistedModel => format!(
+                "Vision model '{model}' is not listed for endpoint '{endpoint}'; it may still work."
+            ),
+        }
+    }
+}
+
+/// Classify `[general.vision_model]` against the loaded endpoints: `None` when
+/// it is unset (the multimodal main model serves vision) or resolves cleanly.
+fn vision_issue(config: &Config) -> Option<VisionIssue> {
+    let vm = config.general.general.vision_model.as_ref()?;
+    let ep = match config.endpoint(&vm.endpoint) {
+        Some(ep) => ep,
+        None => return Some(VisionIssue::MissingEndpoint),
+    };
+    if ep.kind == EndpointKind::Anthropic {
+        return Some(VisionIssue::AnthropicEndpoint);
+    }
+    // An endpoint that lists no models makes no claim to contradict, and an
+    // unlisted id can still be served — a warning, never a disabled client.
+    if !ep.models.is_empty() && !ep.has_model(&vm.model) {
+        return Some(VisionIssue::UnlistedModel);
+    }
+    None
+}
+
+/// The Settings-facing reason `[general.vision_model]` yields no image tools, or
+/// a warning that it may not — `None` when vision is unset or resolves cleanly.
+///
+/// Mnemo2's Models page shows it under the Vision field, so an unresolvable
+/// vision model is visible where the user sets it instead of only on stderr.
+pub fn vision_warning(config: &Config) -> Option<String> {
+    let vm = config.general.general.vision_model.as_ref()?;
+    vision_issue(config).map(|issue| issue.message(&vm.endpoint, &vm.model))
 }
 
 /// Build the vision image-to-text client from config, if configured and the
@@ -279,17 +365,32 @@ pub fn context_manager_for_model(
 /// client that would fail at call time.
 pub fn build_vision_client(config: &Config) -> Option<Arc<dyn ImageDescriber>> {
     let vm = config.general.general.vision_model.as_ref()?;
-    let ep = config.endpoint(&vm.endpoint)?;
-    if ep.kind == EndpointKind::Anthropic {
-        eprintln!(
-            "warning: vision_model endpoint '{}' is kind 'anthropic' — vision is \
-             OpenAI-compatible only; image-to-text fallback disabled",
-            vm.endpoint
-        );
-        return None;
+    // A clean config MUST build — `vision_issue` returns `None` when there is
+    // no problem, so never `?` it here: an early return on `None` would starve
+    // every worker of the image tools for a perfectly valid vision model. Only
+    // a missing or Anthropic-kind endpoint disables the client; an unlisted
+    // model is a warning (the endpoint may still serve it).
+    if let Some(issue) = vision_issue(config) {
+        match issue {
+            VisionIssue::UnlistedModel => {}
+            VisionIssue::MissingEndpoint => return None,
+            VisionIssue::AnthropicEndpoint => {
+                eprintln!(
+                    "warning: vision_model endpoint '{}' is kind 'anthropic' — vision is \
+                     OpenAI-compatible only; image-to-text fallback disabled",
+                    vm.endpoint
+                );
+                return None;
+            }
+        }
     }
+    let ep = config.endpoint(&vm.endpoint)?;
+    // Vision sends stay outside the machine-wide endpoint limits (plan
+    // d3336a8a step 4): this builder has no config dir to key the slots on,
+    // and a description request is a one-shot side call — the chat/completion
+    // sends are the ones that can pile up across instances.
     let client: Arc<dyn ImageDescriber> = Arc::new(VisionClient::new(openai_client_config(
-        config, ep, &vm.model, true, None,
+        config, ep, &vm.model, true, None, None,
     )));
     Some(client)
 }
@@ -465,7 +566,7 @@ mod tests {
     fn config_resolves_key_and_maps_kind() {
         let config = Config::default();
         let ep = endpoint(EndpointKind::OpenAI);
-        let cfg = openai_client_config(&config, &ep, "gpt-4o", false, Some("high".into()));
+        let cfg = openai_client_config(&config, &ep, "gpt-4o", false, Some("high".into()), None);
         assert_eq!(cfg.model, "gpt-4o");
         assert_eq!(cfg.base_url, "http://localhost/v1/");
         assert!(matches!(cfg.kind, ProviderKind::OpenAI));
@@ -478,7 +579,7 @@ mod tests {
     fn config_maps_local_kind() {
         let config = Config::default();
         let ep = endpoint(EndpointKind::Local);
-        let cfg = openai_client_config(&config, &ep, "m", false, None);
+        let cfg = openai_client_config(&config, &ep, "m", false, None, None);
         assert!(matches!(cfg.kind, ProviderKind::Local));
     }
 
@@ -489,7 +590,7 @@ mod tests {
         // API). build_client routes it to AnthropicClient instead.
         let config = Config::default();
         let ep = endpoint(EndpointKind::Anthropic);
-        let client = build_client(&config, &ep, "claude-sonnet-4-5", false, None, None);
+        let client = build_client(&config, &ep, "claude-sonnet-4-5", false, None, None, None);
         assert_eq!(client.kind(), ProviderKind::Anthropic);
         assert_eq!(client.model(), "claude-sonnet-4-5");
         assert!(client.capabilities().supports_tool_choice);
@@ -504,11 +605,11 @@ mod tests {
         let config = Config::default();
         let mut ep = endpoint(EndpointKind::OpenAI);
         ep.supports_strict_schema = Some(false);
-        let client = build_client(&config, &ep, "gpt-4o", false, None, None);
+        let client = build_client(&config, &ep, "gpt-4o", false, None, None, None);
         assert!(!client.capabilities().supports_strict_schema);
 
         let ep = endpoint(EndpointKind::OpenAI);
-        let client = build_client(&config, &ep, "gpt-4o", false, None, None);
+        let client = build_client(&config, &ep, "gpt-4o", false, None, None, None);
         assert!(client.capabilities().supports_strict_schema);
     }
 
@@ -590,13 +691,82 @@ mod tests {
         );
     }
 
+    /// A config that resolves cleanly MUST build a client. Regression: an early
+    /// `?` on the issue classifier returned `None` for a *healthy* config, so a
+    /// valid vision model (Ollama Cloud / `deepseek-v4.1-flash:1017`) silently
+    /// left every worker without the image tools. Fails without the fix.
+    #[test]
+    fn build_vision_client_builds_for_a_valid_endpoint() {
+        let config = Config {
+            general: crate::config::GeneralConfig {
+                general: crate::config::GeneralSection {
+                    vision_model: Some(crate::config::VisionModel {
+                        endpoint: "ollama-cloud".into(),
+                        model: "deepseek-v4.1-flash:1017".into(),
+                    }),
+                    ..crate::config::GeneralSection::default()
+                },
+                ..crate::config::GeneralConfig::default()
+            },
+            endpoints: vec![Endpoint {
+                name: "ollama-cloud".into(),
+                kind: EndpointKind::OpenAI,
+                base_url: "https://ollama.com/v1/".into(),
+                models: vec!["deepseek-v4.1-flash:1017".into()],
+                ..Endpoint::test_default()
+            }],
+            ..Config::default()
+        };
+        assert_eq!(vision_issue(&config), None, "the fixture must resolve cleanly");
+        assert!(
+            build_vision_client(&config).is_some(),
+            "a resolvable vision config must build a VisionClient — without it no worker has image tools"
+        );
+        assert_eq!(vision_warning(&config), None);
+    }
+
+    /// An endpoint that lists models but not the vision model is a WARNING, not
+    /// a disable: the id can still be served, so the client must build.
+    #[test]
+    fn build_vision_client_builds_for_an_unlisted_model() {
+        let config = Config {
+            general: crate::config::GeneralConfig {
+                general: crate::config::GeneralSection {
+                    vision_model: Some(crate::config::VisionModel {
+                        endpoint: "ep1".into(),
+                        model: "deepseek-v4.1-flash:1017".into(),
+                    }),
+                    ..crate::config::GeneralSection::default()
+                },
+                ..crate::config::GeneralConfig::default()
+            },
+            endpoints: vec![Endpoint {
+                name: "ep1".into(),
+                kind: EndpointKind::OpenAI,
+                base_url: "http://127.0.0.1:9/v1/".into(),
+                models: vec!["plan-model".into()],
+                ..Endpoint::test_default()
+            }],
+            ..Config::default()
+        };
+        assert_eq!(vision_issue(&config), Some(VisionIssue::UnlistedModel));
+        assert!(
+            build_vision_client(&config).is_some(),
+            "an unlisted model is a warning only — the client still builds"
+        );
+        assert!(
+            vision_warning(&config).is_some(),
+            "and that warning is what the Models page shows"
+        );
+    }
+
     #[test]
     fn multimodal_override_is_respected() {
         // The vision client forces multimodal=true even when the endpoint
         // declares false; the main provider passes the endpoint's own flag.
         let config = Config::default();
         let ep = endpoint(EndpointKind::OpenAI);
-        let cfg = openai_client_config(&config, &ep, "m", true, None);
+        let cfg = openai_client_config(&config, &ep, "m", true, None, None);
         assert!(cfg.multimodal);
     }
 
@@ -684,6 +854,7 @@ mod tests {
                 reasoning_effort: None,
             },
             None,
+            None,
         )
         .expect("known endpoint should resolve");
         assert_eq!(provider.model(), "gpt-4o");
@@ -728,6 +899,7 @@ mod tests {
                 reasoning_effort: None,
             },
             None,
+            None,
         )
         .expect("known endpoint should resolve");
         assert!(
@@ -741,6 +913,7 @@ mod tests {
                 model: "glm".into(),
                 reasoning_effort: None,
             },
+            None,
             None,
         )
         .expect("known endpoint should resolve");
@@ -800,6 +973,7 @@ mod tests {
                 model: "x".into(),
                 reasoning_effort: None,
             },
+            None,
             None,
         );
         assert!(provider.is_none(), "dangling reference should drop to None");
@@ -994,7 +1168,7 @@ mod tests {
         };
 
         // For overridden model
-        let cfg1 = openai_client_config(&config, &ep, "glm-5.3-flash", false, None);
+        let cfg1 = openai_client_config(&config, &ep, "glm-5.3-flash", false, None, None);
         assert_eq!(cfg1.temperature, Some(0.2));
         assert_eq!(cfg1.top_p, Some(0.8));
         assert_eq!(
@@ -1012,7 +1186,7 @@ mod tests {
         assert_eq!(extra1.get("shared_key").unwrap(), 2);
 
         // For default model
-        let cfg2 = openai_client_config(&config, &ep, "default-model", false, None);
+        let cfg2 = openai_client_config(&config, &ep, "default-model", false, None, None);
         assert_eq!(cfg2.temperature, Some(0.7));
         assert_eq!(cfg2.top_p, Some(0.9));
         assert_eq!(cfg2.stop, vec!["<|endoftext|>"]);

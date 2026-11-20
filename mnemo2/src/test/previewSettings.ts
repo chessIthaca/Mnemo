@@ -38,6 +38,7 @@ const previewEndpoints: EndpointDetailDto[] = [
     has_api_key: true,
     max_context: null,
     max_output_tokens: null,
+    max_concurrent: null,
     multimodal: false,
     supports_reasoning_effort: true,
     reasoning_effort: null,
@@ -57,6 +58,7 @@ const previewEndpoints: EndpointDetailDto[] = [
     has_api_key: false,
     max_context: null,
     max_output_tokens: null,
+    max_concurrent: null,
     multimodal: false,
     supports_reasoning_effort: false,
     reasoning_effort: null,
@@ -86,6 +88,7 @@ function previewSettings(): ModelSettings {
       summarize: null,
     },
     vision_model: "openrouter/gpt-5.2",
+    vision_warning: null,
     embedding: {
       selected: "all-MiniLM-L6-v2",
       status: "missing",
@@ -112,6 +115,16 @@ function previewSettings(): ModelSettings {
       compress_extra_commands: ["cargo test", "npm run build"],
     },
     budget: { enabled: true, max_tokens_per_plan: 2_000_000, max_escalations_per_plan: 3, max_retries_per_lane: 2 },
+    machine: {
+      heavy_commands: 2,
+      min_heavy_commands: 1,
+      max_heavy_commands: 16,
+      disks: [
+        { role: "project", volume: "C:", free_gb: 250 },
+        { role: "config", volume: "D:", free_gb: 80 },
+      ],
+      sccache: { found: true, path: "C:\\Users\\me\\.cargo\\bin\\sccache.exe" },
+    },
   };
 }
 

@@ -42,6 +42,7 @@ use crate::mnemo2::mcp_server::{McpServer, OpenFailure};
 use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
 use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
+use crate::mnemo2::instances::{self, InstanceRow};
 use crate::mnemo2::laya_learnings::{self, LearningsOffer, LearningsSource};
 use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
@@ -59,6 +60,11 @@ pub const BOARD_CHANGED_CHANNEL: &str = "mnemo2://board-changed";
 /// answer: the full list, which may be empty when a stale question closes.
 pub const LAYA_LEARNINGS_CHANNEL: &str = "mnemo2://laya-learnings";
 
+/// Live settings: a hand edit of `~/.mnemo/*.toml` (or another instance's
+/// save) was reloaded into this instance, or the edit was rejected. Payload is
+/// a [`mnemo::headless::ReloadNotice`] — the window shows it as a toast.
+pub const SETTINGS_RELOAD_CHANNEL: &str = "mnemo2://settings-reload";
+
 /// The shared Mnemo2 app state: one live lead and its event forwarder.
 #[derive(Default)]
 pub struct Mnemo2State {
@@ -67,6 +73,7 @@ pub struct Mnemo2State {
     team_forwarder: Mutex<Option<JoinHandle<()>>>,
     board_forwarder: Mutex<Option<JoinHandle<()>>>,
     indexing_forwarder: Mutex<Option<JoinHandle<()>>>,
+    settings_forwarder: Mutex<Option<JoinHandle<()>>>,
     marker_root: Mutex<Option<PathBuf>>,
     preferences: Mutex<Option<(PathBuf, ProjectPreferences)>>,
     notified: Mutex<HashSet<String>>,
@@ -251,6 +258,9 @@ impl Mnemo2State {
             forwarder.abort();
         }
         if let Some(forwarder) = self.indexing_forwarder.lock().await.take() {
+            forwarder.abort();
+        }
+        if let Some(forwarder) = self.settings_forwarder.lock().await.take() {
             forwarder.abort();
         }
         let marker_root = self.marker_root.lock().await.take();
@@ -533,6 +543,9 @@ pub async fn project_cleanup(
         &root,
         &state_dir,
         &crate::mnemo2::dispatch_routing::dispatch_routing_log_path(),
+        // No runtime is open at the start screen, so no proof can be
+        // running: an empty proving list (finding cleanupDuringProof).
+        &[],
     )
     .await;
     project::detach(&root);
@@ -572,6 +585,9 @@ pub async fn lead_open(
         forwarder.abort();
     }
     if let Some(forwarder) = state.indexing_forwarder.lock().await.take() {
+        forwarder.abort();
+    }
+    if let Some(forwarder) = state.settings_forwarder.lock().await.take() {
         forwarder.abort();
     }
     state.release_external_lead(&app).await;
@@ -673,6 +689,19 @@ pub async fn lead_open(
             }
         }
     });
+    let mut settings_events = runtime.subscribe_settings_reloads();
+    let settings_app = app.clone();
+    let settings_forwarder = tauri::async_runtime::spawn(async move {
+        loop {
+            match settings_events.recv().await {
+                Ok(notice) => {
+                    let _ = settings_app.emit(SETTINGS_RELOAD_CHANNEL, &notice);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     // The Laya check (plan 8106337a) starts with the project: unforced, it
     // skips silently when routing is off, Laya is down or the record's
     // fingerprint still matches. It must come after the indexing forwarder
@@ -701,6 +730,7 @@ pub async fn lead_open(
     *state.team_forwarder.lock().await = Some(team_forwarder);
     *state.board_forwarder.lock().await = Some(board_forwarder);
     *state.indexing_forwarder.lock().await = Some(indexing_forwarder);
+    *state.settings_forwarder.lock().await = Some(settings_forwarder);
     state.sync_run_file(Some(&root));
     crate::mnemo2::show_open_project(&app, Some(&root));
 
@@ -1533,6 +1563,29 @@ pub async fn settings_save_tiers(
         .map_err(|err| err.to_string())?;
     settings_refresh(runtime).await?;
     Ok(saved)
+}
+
+/// Every Mnemo2 instance running on this machine, this window included.
+///
+/// No project is needed: this is the machine-wide Mission Control instances
+/// overview, so it also answers on the start screen.
+#[tauri::command]
+pub async fn instances_list() -> Result<Vec<InstanceRow>, String> {
+    Ok(instances::list(&machine_config_dir(), std::process::id()).await)
+}
+
+/// Ask another running instance to bring its window to the front.
+///
+/// The run file's bearer token stays in this process; the window only names
+/// the pid.
+#[tauri::command]
+pub async fn instance_show(pid: u32) -> Result<(), String> {
+    instances::show(&machine_config_dir(), pid).await
+}
+
+/// The machine-wide config directory, which holds the `run` folder.
+fn machine_config_dir() -> PathBuf {
+    mnemo::config::resolve_config_dir(None)
 }
 
 #[cfg(test)]

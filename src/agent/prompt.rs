@@ -40,6 +40,21 @@ you hit a real choice point or need the user.
 - Be precise. Use exact string matches for file_edit (its schema lists the \
 regex, counted, line-range, and fuzzy-whitespace modes, plus the compact \
 line-ops array `ops`).
+- After a format (cargo fmt, rustfmt, prettier) or any shell command that \
+rewrites files, re-read the file before you edit it again. Your own file_edit \
+and multi_edit edits need no re-read: read receipts follow them.
+- Keep old_string short and unique: the few lines that pin the spot, not the \
+whole block. Several small edits beat one large one. If an edit misses near \
+the right spot, the error shows the current text there with a read receipt: \
+cite that instead of re-reading.
+- For a build or test that may run longer than a few minutes, or to work on \
+while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
+Never poll with sleep or Start-Sleep, and never start detached processes.
+- Run the project checks with run_checks before you report: it runs every \
+check and records the passing ones; a check typed into shell counts only when \
+it is the exact command from the checkout root.
+- Send files, ops and lines as real JSON arrays, never as a quoted string. For \
+a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
 files with file_edit (targeted) — or `multi_edit` for several files in one \
 atomic call — not a full file_write rewrite; for large files, write the first \
@@ -476,6 +491,21 @@ user.
 - Be precise. Use exact string matches for file_edit (its schema lists the \
 regex, counted, line-range, and fuzzy-whitespace modes, plus the compact \
 line-ops array `ops`).
+- After a format (cargo fmt, rustfmt, prettier) or any shell command that \
+rewrites files, re-read the file before you edit it again. Your own file_edit \
+and multi_edit edits need no re-read: read receipts follow them.
+- Keep old_string short and unique: the few lines that pin the spot, not the \
+whole block. Several small edits beat one large one. If an edit misses near \
+the right spot, the error shows the current text there with a read receipt: \
+cite that instead of re-reading.
+- For a build or test that may run longer than a few minutes, or to work on \
+while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
+Never poll with sleep or Start-Sleep, and never start detached processes.
+- Run the project checks with run_checks before you report: it runs every \
+check and records the passing ones; a check typed into shell counts only when \
+it is the exact command from the checkout root.
+- Send files, ops and lines as real JSON arrays, never as a quoted string. For \
+a change to one file, use file_edit.
 - To cut round-trips, read several files at once with read_files. Edit existing \
 files with file_edit (targeted) — or `multi_edit` for several files in one \
 atomic call — not a full file_write rewrite; for large files, write the first \
@@ -764,16 +794,31 @@ pub fn format_recall_context(memories: &[ScoredMemory]) -> String {
 }
 
 /// One full recalled-memory entry: tier, title, stable id, score, and the
-/// first 160 chars of content.
+/// first 160 chars of content. A record indexed from the machine-wide corpus
+/// carries the `[machine]` tag right after its title (plan d3336a8a step 8),
+/// so a shared claim is never mistaken for a project-specific one.
 fn format_recall_entry(sm: &ScoredMemory) -> String {
     format!(
-        "[{}] {} (id: {}, score: {:.2})\n  {}\n\n",
+        "[{}] {}{} (id: {}, score: {:.2})\n  {}\n\n",
         sm.memory.tier,
         sm.memory.title,
+        machine_tag(&sm.memory),
         sm.memory.id,
         sm.score,
         sm.memory.content.chars().take(160).collect::<String>(),
     )
+}
+
+/// The `[machine]` tag for a record indexed from the machine-wide knowledge
+/// corpus (`<config dir>/knowledge/`, plan d3336a8a step 8) — a claim that
+/// holds for every project on this machine. Empty for a project record.
+pub(crate) fn machine_tag(m: &crate::memory::Memory) -> &'static str {
+    if m.data.get("source").and_then(|v| v.as_str()) == Some(crate::memory::indexer::MACHINE_SOURCE)
+    {
+        " [machine]"
+    } else {
+        ""
+    }
 }
 
 /// Format recalled memories with the `recall_delta` lever applied: an entry
@@ -798,8 +843,13 @@ pub fn format_recall_context_delta(
     for (i, sm) in memories.iter().enumerate() {
         match elide(i, sm) {
             Some(turn) => out.push_str(&format!(
-                "[{}] {} (id: {}, score: {:.2}) — unchanged since injection (turn {}); re-read with memory_search if needed.\n\n",
-                sm.memory.tier, sm.memory.title, sm.memory.id, sm.score, turn,
+                "[{}] {}{} (id: {}, score: {:.2}) — unchanged since injection (turn {}); re-read with memory_search if needed.\n\n",
+                sm.memory.tier,
+                sm.memory.title,
+                machine_tag(&sm.memory),
+                sm.memory.id,
+                sm.score,
+                turn,
             )),
             None => out.push_str(&format_recall_entry(sm)),
         }
@@ -1075,8 +1125,18 @@ mod tests {
         // Bumped 2026-11-08 (plan 373dec00 step 4): the memory_write habit
         // gained one sentence on `evidence` — the prompt side of the
         // confirmation bonus.
+        // Bumped 2026-11-18 (plan f89fd63d step 6): three edit-guidance
+        // bullets joined the `Be precise` bullet — re-read after a formatter
+        // or shell rewrite, keep old_string short and cite the near-miss
+        // excerpt instead of re-reading, and send arrays as arrays.
+        // Bumped 2026-11-19 (plan 5b85ab61 step 2): the job-tool bullet —
+        // job_start a long build, then job_wait; never poll with sleep and
+        // never start detached processes.
+        // Bumped 2026-11-19 (plan 5b85ab61 step 3): the run_checks bullet —
+        // run every project check in one call, and only the exact command from
+        // the checkout root counts in `shell`.
         const GOLDEN_HEAD: &str =
-            "len=12706|sha256=e50d693bbb4d772ef7b1504d5608721077c211b375cbc0955ff28634978dd121";
+            "len=13730|sha256=5e6084c3b152dccda5c3a40d04925119a16cba94799d08f6e4b06017ef4b6794";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",
@@ -2313,6 +2373,41 @@ mod tests {
         assert!(!head.contains("plan-first"), "no plan-first text");
         assert!(!head.contains("create_plan"), "no create_plan text");
         assert!(!head.contains("complete_step"), "no complete_step text");
+    }
+
+    /// Plan f89fd63d step 6: the edit-guidance bullets live in BOTH the
+    /// workflow preamble and the kernel-safe principles, so a worker sees the
+    /// same advice in either variant. The two consts are maintained by hand —
+    /// this test is the sync check that keeps a future edit from landing in
+    /// only one of them.
+    #[test]
+    fn both_variants_carry_the_edit_guidance_bullets() {
+        for bullet in [
+            "- After a format (cargo fmt, rustfmt, prettier) or any shell command \
+that rewrites files, re-read the file before you edit it again. Your own \
+file_edit and multi_edit edits need no re-read: read receipts follow them.",
+            "- Keep old_string short and unique: the few lines that pin the spot, \
+not the whole block. Several small edits beat one large one. If an edit misses \
+near the right spot, the error shows the current text there with a read \
+receipt: cite that instead of re-reading.",
+            "- Send files, ops and lines as real JSON arrays, never as a quoted \
+string. For a change to one file, use file_edit.",
+            "- For a build or test that may run longer than a few minutes, or to \
+work on while it runs: job_start it, then job_wait (with a pattern to stop at a \
+line). Never poll with sleep or Start-Sleep, and never start detached processes.",
+            "- Run the project checks with run_checks before you report: it runs \
+every check and records the passing ones; a check typed into shell counts only \
+when it is the exact command from the checkout root.",
+        ] {
+            assert!(
+                CODING_SYSTEM_PREAMBLE.contains(bullet),
+                "the workflow preamble lacks the edit-guidance bullet: {bullet}"
+            );
+            assert!(
+                KERNEL_CODING_PRINCIPLES.contains(bullet),
+                "the kernel principles lack the edit-guidance bullet: {bullet}"
+            );
+        }
     }
 
     /// 2c.1/G1 (§5.9.1 :621): the spec's constitution mode filters the

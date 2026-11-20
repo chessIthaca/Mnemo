@@ -37,6 +37,14 @@ pub struct Finding {
     /// Required explanation for `wontfix`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub justification: Option<String>,
+    /// Optional kebab-case name for the kind of mistake this finding names,
+    /// reused across reviews so the findings ledger can count recurrences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Optional place this kind of mistake could be stopped for good:
+    /// `code`, `build`, `test`, or `review`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforce: Option<String>,
 }
 
 /// Structured lead-review evidence: the lead's own unanchored read of the
@@ -585,6 +593,22 @@ pub fn validate_findings(findings: &[Finding]) -> Result<(), String> {
                 FINDING_SEVERITIES.join(", ")
             ));
         }
+        if let Some(category) = &finding.category {
+            if !is_kebab_slug(category) {
+                return Err(format!(
+                    "finding '{}': category must be kebab-case, 3-40 chars",
+                    finding.id
+                ));
+            }
+        }
+        if let Some(enforce) = &finding.enforce {
+            if !FINDING_ENFORCEMENTS.contains(&enforce.as_str()) {
+                return Err(format!(
+                    "finding '{}': enforce must be code, build, test or review",
+                    finding.id
+                ));
+            }
+        }
         match finding.status.as_str() {
             "open" => {}
             "fixed" if finding.evidence.as_deref().unwrap_or("").trim().is_empty() => {
@@ -621,6 +645,21 @@ pub fn validate_findings(findings: &[Finding]) -> Result<(), String> {
 pub const FINDING_SEVERITIES: [&str; 2] = ["high", "low"];
 /// Allowed finding statuses.
 pub const FINDING_STATUSES: [&str; 3] = ["open", "fixed", "wontfix"];
+/// Allowed places a recurring kind of mistake can be stopped for good, in the
+/// order the tool schema lists them.
+pub const FINDING_ENFORCEMENTS: [&str; 4] = ["code", "build", "test", "review"];
+
+/// Whether `slug` is a kebab-case category slug: 3-40 characters of lowercase
+/// ASCII letters and digits, single hyphens between them, no edge hyphen.
+fn is_kebab_slug(slug: &str) -> bool {
+    let length = slug.chars().count();
+    if !(3..=40).contains(&length) {
+        return false;
+    }
+    slug.split('-').all(|part| {
+        !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    })
+}
 
 /// Parse a reviewer's `findings` array leniently: common field aliases map to
 /// the canonical names (`path` → `file`, `description`/`message` → `detail`),
@@ -732,6 +771,8 @@ pub fn parse_findings(value: &serde_json::Value) -> Result<Vec<Finding>, String>
             fix_commit: text(&["fix_commit"]),
             evidence: text(&["evidence"]),
             justification: text(&["justification"]),
+            category: text(&["category"]),
+            enforce: text(&["enforce"]),
         });
     }
     if errors.is_empty() {
@@ -804,6 +845,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_findings_keeps_category_and_enforce() {
+        let parsed = parse_findings(&serde_json::json!([{
+            "title": "vacuous assert",
+            "detail": "asserts true",
+            "file": "src/lib.rs",
+            "severity": "low",
+            "category": "vacuous-test",
+            "enforce": "test"
+        }]))
+        .expect("category and enforce");
+        assert_eq!(parsed[0].category.as_deref(), Some("vacuous-test"));
+        assert_eq!(parsed[0].enforce.as_deref(), Some("test"));
+    }
+
     fn finding(status: &str) -> Finding {
         Finding {
             id: "F-1".into(),
@@ -816,7 +872,55 @@ mod tests {
             fix_commit: None,
             evidence: None,
             justification: None,
+            category: None,
+            enforce: None,
         }
+    }
+
+    #[test]
+    fn finding_category_must_be_kebab_case() {
+        let mut tested = finding("open");
+        for bad in ["Vacuous_Test", "ab", "vacuous--test", "-vacuous", ""] {
+            tested.category = Some(bad.to_string());
+            let err = validate_findings(&[tested.clone()]).expect_err("a bad category");
+            assert_eq!(
+                err, "finding 'F-1': category must be kebab-case, 3-40 chars",
+                "for {bad:?}"
+            );
+        }
+        tested.category = Some("a".repeat(41));
+        validate_findings(&[tested.clone()]).expect_err("41 characters is too long");
+        tested.category = Some("docs-out-of-sync".to_string());
+        validate_findings(&[tested]).expect("a kebab-case category is accepted");
+    }
+
+    #[test]
+    fn finding_enforce_must_be_known() {
+        let mut tested = finding("open");
+        tested.enforce = Some("lint".to_string());
+        let err = validate_findings(&[tested.clone()]).expect_err("an unknown enforcement");
+        assert_eq!(
+            err,
+            "finding 'F-1': enforce must be code, build, test or review"
+        );
+        for offered in FINDING_ENFORCEMENTS {
+            tested.enforce = Some(offered.to_string());
+            validate_findings(&[tested.clone()]).expect("an offered enforcement is accepted");
+        }
+    }
+    #[test]
+    fn legacy_finding_decodes_without_category() {
+        let legacy = serde_json::json!({
+            "id": "F-1",
+            "severity": "low",
+            "title": "an old finding",
+            "detail": "recorded before categories existed",
+            "file": "src/lib.rs",
+            "line": 0,
+            "status": "open"
+        });
+        let decoded: Finding = serde_json::from_value(legacy).expect("an old finding decodes");
+        assert_eq!((decoded.category, decoded.enforce), (None, None));
     }
 
     #[test]

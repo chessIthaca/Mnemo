@@ -68,6 +68,7 @@ function endpoint(name: string, overrides: Partial<EndpointDetailDto> = {}): End
     has_api_key: true,
     max_context: null,
     max_output_tokens: null,
+    max_concurrent: null,
     multimodal: false,
     supports_reasoning_effort: true,
     reasoning_effort: null,
@@ -523,6 +524,7 @@ describe("SettingsDialog", () => {
       get: vi.fn(async () => ({
         task_models: { summarize: null },
         vision_model: null,
+        vision_warning: null,
         embedding: {
           selected: "hash",
           status: "keyword_only",
@@ -657,6 +659,7 @@ describe("unsaved edits", () => {
       get: vi.fn(async () => ({
         task_models: { summarize: null },
         vision_model: null,
+        vision_warning: null,
         embedding: {
           selected: "hash",
           status: "keyword_only",

@@ -3343,7 +3343,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3356,6 +3356,7 @@ dependencies = [
  "futures",
  "glob",
  "image",
+ "libc",
  "notify",
  "regex",
  "reqwest 0.12.28",
@@ -3386,6 +3387,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "uuid",
+ "which",
  "windows-sys 0.61.2",
  "zeroize",
  "zip",
@@ -3393,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-app"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3426,7 +3428,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo2-app"
-version = "2.6.0"
+version = "2.7.0"
 dependencies = [
  "dunce",
  "mnemo",

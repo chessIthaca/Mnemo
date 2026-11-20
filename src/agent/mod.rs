@@ -72,6 +72,7 @@ mod loop_impl;
 mod recall_delta;
 mod turn;
 
+pub use dispatch::EDIT_GATE_MARK;
 pub use loop_impl::{drop_cancelled_steers, AgentLoop, AgentLoopConfig, StopReason, TurnOutcome};
 
 /// Maximum consecutive tool-EXECUTION error INTERACTIONS (tool batches)

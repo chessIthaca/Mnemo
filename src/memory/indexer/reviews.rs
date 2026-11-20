@@ -43,6 +43,10 @@ pub(super) fn scan_reviews(
 /// the Phase-4 `## Verdict:` line when present; legacy reports fall back to
 /// a findings summary ("no findings" / "N finding sections").
 fn review_record(stem: &str, text: &str, config: &MemorySearchConfig) -> SourceRecord {
+    // A leading UTF-8 byte-order mark (Windows tools write one) would hide the
+    // `# Review:` heading, so the gist would fall back to the marked line.
+    // Drop only that first character, never one mid-text.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let heading = text
         .lines()
         .map(str::trim)
@@ -76,5 +80,23 @@ fn review_record(stem: &str, text: &str, config: &MemorySearchConfig) -> SourceR
         key: format!("review:{stem}"),
         title: truncate_title(&format!("REVIEW: {stem}")),
         content: budgeted_digest(&gist, &pointer, budget),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_record_accepts_a_leading_byte_order_mark() {
+        // Same report with and without the mark must yield the same digest:
+        // the heading stays the gist instead of the whole marked line.
+        let text = "# Review: plan 953c3481\n\n## Verdict: PASS\n";
+        let config = MemorySearchConfig::default();
+        let plain = review_record("2026-11-17-953c3481", text, &config);
+        let marked_text = format!("\u{feff}{text}");
+        let marked = review_record("2026-11-17-953c3481", &marked_text, &config);
+        assert_eq!(marked.content, plain.content);
+        assert!(plain.content.starts_with("plan 953c3481"));
     }
 }

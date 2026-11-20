@@ -376,6 +376,70 @@ pub(super) fn counted_check(
     Some((command.to_string(), tree_before.to_string()))
 }
 
+/// Every allow-listed passing check a tool result carries, with the unchanged
+/// content tree it measured (plan 5b85ab61 step 3).
+///
+/// `shell` yields at most one run ([`counted_check`]); `run_checks` yields one
+/// per entry of `data.checks` that exited 0, ran the exact allow-listed command
+/// from the checkout root, and measured a tree equal before and after — the
+/// same rules a counted `shell` run obeys, so both tools record identically.
+pub(super) fn counted_checks(
+    tool: &str,
+    args: &Value,
+    result: &ToolResult,
+    checkout: &Path,
+    check_commands: &[String],
+) -> Vec<(String, String)> {
+    if tool == "shell" {
+        return counted_check(tool, args, result, checkout, check_commands)
+            .into_iter()
+            .collect();
+    }
+    if tool != "run_checks" || !result.success {
+        return Vec::new();
+    }
+    let Some(entries) = result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("checks"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let Ok(checkout) = checkout.canonicalize() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.get("exit_code")?.as_i64()? != 0 {
+                return None;
+            }
+            let command = validated_check_command(entry.get("command")?.as_str()?)?;
+            if !check_commands.iter().any(|allowed| allowed == command) {
+                return None;
+            }
+            // `run_checks` always runs from the checkout root; an entry naming
+            // anything else is not this worker's checkout.
+            let cwd = Path::new(entry.get("cwd")?.as_str()?);
+            let cwd = if cwd.is_absolute() {
+                cwd.to_path_buf()
+            } else {
+                checkout.join(cwd)
+            };
+            if cwd.canonicalize().ok()? != checkout {
+                return None;
+            }
+            let tree_before = entry.get("tree_before")?.as_str()?;
+            let tree_after = entry.get("tree_after")?.as_str()?;
+            if tree_before.is_empty() || tree_before != tree_after {
+                return None;
+            }
+            Some((command.to_string(), tree_before.to_string()))
+        })
+        .collect()
+}
+
 async fn record_turn_checks(
     worker_id: &str,
     generation: u64,
@@ -401,6 +465,19 @@ const FOLLOW_UP_GRACE: std::time::Duration = if cfg!(test) {
 } else {
     std::time::Duration::from_secs(60)
 };
+
+/// Fire the turn-end proofs off the pump: the trigger never delays the event
+/// loop behind a proof decision, and the pump keeps folding this worker's
+/// events while the proof runs. Every path that settles a turn as Completed
+/// calls this — the natural finished turn, a parked steered turn end, and the
+/// follow-up deadline below (F4/F5).
+async fn fire_turn_end_proofs(proof: &super::proving::ProofCtx, worker_id: &str) {
+    let proof = proof.clone();
+    let proved_worker = worker_id.to_string();
+    tokio::spawn(async move {
+        super::proving::spawn_turn_proofs(&proof, proved_worker).await;
+    });
+}
 
 // Each parameter is one shared worker handle — the pump's wiring stays flat.
 #[allow(clippy::too_many_arguments)]
@@ -430,6 +507,7 @@ pub(super) async fn pump_worker(
     live: Arc<Mutex<HashMap<String, LiveWorker>>>,
     fail_next_close: Arc<AtomicBool>,
     board: Option<Arc<PlanBoard>>,
+    proof: super::proving::ProofCtx,
 ) {
     let mut turn_active = false;
     // A steered turn end is held here until its follow-up turn starts (the
@@ -541,6 +619,14 @@ pub(super) async fn pump_worker(
                             generation,
                             event,
                         });
+                    }
+                    if completed {
+                        // F5 (steerTimeoutTrigger): this deadline settled the
+                        // steered turn end as this worker's finished turn, so
+                        // it owes its proofs like any other turn end — this
+                        // branch continues and never reaches the trigger
+                        // below.
+                        fire_turn_end_proofs(&proof, &worker_id).await;
                     }
                     continue;
                 }
@@ -711,10 +797,28 @@ pub(super) async fn pump_worker(
                         previous_signature.as_deref() == Some(signature.as_str());
                     previous_signature = Some(signature.clone());
                     let failed = !result.success;
-                    if strikes.lock().await.observe(signature, failed) {
+                    // A steering redirect (the stale-read gate's EDIT
+                    // INTERCEPTED, an unknown read receipt) is neither a
+                    // failure nor a success (plan 5b85ab61 step 4): it leaves
+                    // the strike count exactly as it was, so following the
+                    // gate's "re-read, then retry" advice cannot push the
+                    // worker toward the stuck nudge. An exact repeat of the
+                    // previous call still strikes.
+                    let steering = route_question::is_steering_redirect(result);
+                    let fired = if steering {
+                        strikes.lock().await.observe_neutral(signature)
+                    } else {
+                        strikes.lock().await.observe(signature, failed)
+                    };
+                    if fired {
                         strike_fired = Some(repeated);
                     }
-                    tool_outcome = Some((name.clone(), result.success, result.output.clone()));
+                    // Only a real outcome feeds the nudge's error list: a
+                    // redirect adds nothing and clears nothing.
+                    if !steering {
+                        tool_outcome =
+                            Some((name.clone(), result.success, result.output.clone()));
+                    }
                     let checkout = {
                         let records = records.lock().await;
                         records
@@ -727,7 +831,7 @@ pub(super) async fn pump_worker(
                             .map(|worker| worker.worktree.clone())
                     };
                     if let Some(checkout) = checkout {
-                        if let Some((check, tree)) = counted_check(
+                        for (check, tree) in counted_checks(
                             &name,
                             &parsed,
                             result,
@@ -762,6 +866,10 @@ pub(super) async fn pump_worker(
             None
         };
         let mut terminal = false;
+        // Whether the event left the worker's record reading Completed (F4
+        // parkedTrigger): only a turn that ended Completed has finished work
+        // to prove. Read under the records lock below.
+        let mut completed_turn_end = false;
         let mut refresh = false;
         let mut changed = false;
         let mut telemetry = false;
@@ -1175,6 +1283,7 @@ pub(super) async fn pump_worker(
                     }
                     _ => {}
                 }
+                completed_turn_end = matches!(worker.status, WorkerStatus::Completed);
             }
         }
         // An audit that ended its turn without a message_parent report (bug
@@ -1220,6 +1329,14 @@ pub(super) async fn pump_worker(
                 &ledger,
             )
             .await;
+            // The turn is over: prove what it owes while nothing else may
+            // touch the checkout — but only when the turn ended Completed (F4
+            // parkedTrigger): a LimitReached park or an interrupted exit has
+            // not finished the work, and its resume would run under the
+            // proof's checkout.
+            if completed_turn_end {
+                fire_turn_end_proofs(&proof, &worker_id).await;
+            }
         }
         // A suppressed repeated report is not forwarded (plan 9a6cffc1):
         // no TeamEvent means the runtime never turns it into a lead

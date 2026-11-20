@@ -81,6 +81,7 @@ describe("preview scenes", () => {
       "worker-thread",
       "lead-chat",
       "settings-models",
+      "settings-machine",
       "settings-tiers",
       "settings-safety",
       "settings-mcp",

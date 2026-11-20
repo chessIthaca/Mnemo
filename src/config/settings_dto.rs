@@ -129,6 +129,18 @@ pub struct BudgetConfigDto {
     pub max_retries_per_lane: Option<u32>,
 }
 
+/// The `[general.machine]` section patch (plan d3336a8a step 3): the limits
+/// every Mnemo2 instance on this computer shares. Present fields replace the
+/// stored values, absent fields keep them, an absent section keeps the whole
+/// section (the plain-Option convention the other section patches use).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MachineConfigDto {
+    /// Heavy commands (builds/tests/lints) allowed to run at once across every
+    /// instance on this machine.
+    #[serde(default)]
+    pub heavy_commands: Option<usize>,
+}
+
 /// Deserialize an `Option<Option<T>>` so that a field **absent** from the JSON
 /// yields `None` (outer — "keep the existing value"), while an explicit `null`
 /// yields `Some(None)` (inner — "clear the override"). A present object yields
@@ -366,6 +378,10 @@ pub struct SettingsSaveDto {
     /// a25a5323). Absent = keep the stored section; see [`BudgetConfigDto`].
     #[serde(default)]
     pub budget: Option<BudgetConfigDto>,
+    /// The machine-wide limits (`[general.machine]`, plan d3336a8a). Absent =
+    /// keep the stored section; see [`MachineConfigDto`].
+    #[serde(default)]
+    pub machine: Option<MachineConfigDto>,
     #[serde(default)]
     pub pricing: Option<Vec<PricingDto>>,
     #[serde(default)]
@@ -414,6 +430,17 @@ pub fn validate_and_apply_settings_patch(
             return Err(format!(
                 "trace_request_body_cap_kb must be between 16 and 8192 (got {kb})"
             ));
+        }
+    }
+    if let Some(machine) = &patch.machine {
+        if let Some(slots) = machine.heavy_commands {
+            if !(super::MIN_HEAVY_COMMANDS..=super::MAX_HEAVY_COMMANDS).contains(&slots) {
+                return Err(format!(
+                    "machine.heavy_commands must be between {} and {} (got {slots})",
+                    super::MIN_HEAVY_COMMANDS,
+                    super::MAX_HEAVY_COMMANDS
+                ));
+            }
         }
     }
     if let Some(memory) = &patch.memory {
@@ -791,6 +818,12 @@ pub fn validate_and_apply_settings_patch(
         }
         if let Some(retries) = budget.max_retries_per_lane {
             general.general.budget.max_retries_per_lane = retries;
+        }
+    }
+    if let Some(machine) = &patch.machine {
+        if let Some(slots) = machine.heavy_commands {
+            general.general.machine.heavy_commands =
+                super::general::MachineConfig::clamp_heavy_commands(slots);
         }
     }
 
@@ -1401,6 +1434,72 @@ mod tests {
         let next3 = validate_and_apply_settings_patch(&next2, &patch).unwrap();
         assert!(next3.general.general.budget.enabled);
         assert_eq!(next3.general.general.budget.max_tokens_per_plan, 250_000);
+    }
+
+    /// The `[general.machine]` patch (plan d3336a8a step 3): sets the shared
+    /// build limit, keeps it when the field is absent, and REJECTS an
+    /// out-of-range number instead of silently clamping a typo.
+    #[test]
+    fn machine_patch_sets_keeps_and_rejects_out_of_range() {
+        let current = Config::default();
+        assert_eq!(
+            current.general.general.machine.heavy_commands, 2,
+            "the out-of-box limit is 2 builds at once"
+        );
+        let patch = SettingsSaveDto {
+            machine: Some(MachineConfigDto {
+                heavy_commands: Some(1),
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(next.general.general.machine.heavy_commands, 1);
+
+        // The section survives a serialize → parse round-trip.
+        let json = serde_json::to_string(&patch).unwrap();
+        let back: SettingsSaveDto = serde_json::from_str(&json).unwrap();
+        let next2 = validate_and_apply_settings_patch(&next, &back).unwrap();
+        assert_eq!(next2.general.general.machine.heavy_commands, 1);
+
+        // An absent section keeps the stored value entirely.
+        let next3 = validate_and_apply_settings_patch(&next2, &SettingsSaveDto::default()).unwrap();
+        assert_eq!(next3.general.general.machine.heavy_commands, 1);
+
+        // A typo is an ERROR, not a silently different limit.
+        for bad in [0, 17, 1000] {
+            let patch = SettingsSaveDto {
+                machine: Some(MachineConfigDto {
+                    heavy_commands: Some(bad),
+                }),
+                ..Default::default()
+            };
+            let err = validate_and_apply_settings_patch(&current, &patch)
+                .expect_err("out-of-range must be rejected");
+            assert!(
+                err.contains("machine.heavy_commands"),
+                "the error names the key: {err}"
+            );
+        }
+    }
+
+    /// A hand-edited config.toml is CLAMPED on load: a `0` still runs one build
+    /// (the limit may never wedge the machine shut) and 1000 opens 16 slots.
+    #[test]
+    fn hand_edited_heavy_commands_are_clamped_on_load() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general.machine]\nheavy_commands = 0\n").unwrap();
+        let cfg = Config::load(dir.path()).expect("config loads");
+        assert_eq!(cfg.general.general.machine.heavy_commands, 1);
+        std::fs::write(&path, "[general.machine]\nheavy_commands = 1000\n").unwrap();
+        let cfg = Config::load(dir.path()).expect("config loads");
+        assert_eq!(cfg.general.general.machine.heavy_commands, 16);
+        // The default is omitted from a saved config, so an untouched file keeps
+        // its exact pre-machine shape.
+        let default = Config::default();
+        let text = serde_norway::to_string(&default.general).unwrap();
+        assert!(!text.contains("machine"), "{text}");
     }
 
     #[test]

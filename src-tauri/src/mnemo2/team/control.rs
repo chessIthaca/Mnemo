@@ -50,6 +50,7 @@ impl TeamRuntime {
         sender: MessageSender,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         self.message_inner(worker_id, text, sender).await
     }
 
@@ -425,6 +426,7 @@ impl TeamRuntime {
     /// session comes back idle; the lead then sends it a message.
     pub async fn resume(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         self.resume_inner(worker_id).await
     }
 
@@ -536,6 +538,7 @@ impl TeamRuntime {
             self.live.clone(),
             self.fail_next_close.clone(),
             self.board(),
+            self.proof_ctx(),
         ));
         self.live.lock().await.insert(
             worker_id.to_string(),
@@ -589,6 +592,7 @@ impl TeamRuntime {
         source: ChangeSource,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         self.change_model_locked(worker_id, model, reasoning_effort, source)
             .await
     }
@@ -731,6 +735,7 @@ impl TeamRuntime {
     /// Compact a quiescent worker. Blocked or stopped sessions are resumed once.
     pub async fn compact(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
         let mut record = self.worker(worker_id).await?;
         if record.compacting {
             return Err(format!("worker '{worker_id}' is already compacting"));

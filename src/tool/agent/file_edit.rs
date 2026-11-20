@@ -42,8 +42,9 @@ use serde_json::json;
 use crate::error::Result;
 use crate::provider::{ApprovalPreview, ToolSchema};
 use crate::tool::agent::edit_ops::{
-    apply_ops, literal_splice, near_miss_diagnostic, parse_ops, validate_emission_artifacts,
-    validate_op_items, with_fresh_read_nudge, EditOp, MatchOrigin, SpliceOutcome,
+    apply_ops, drift_error_with_excerpt, literal_splice, near_miss_diagnostic, parse_ops,
+    validate_emission_artifacts, validate_op_items, with_fresh_read_nudge, EditOp, MatchOrigin,
+    SpliceOutcome,
 };
 use crate::tool::agent::line_endings::{
     denormalize_literal_newlines, detect_line_ending, normalize_line_endings,
@@ -241,7 +242,11 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
     // path stands in for the validated one. A from_read cite resolves
     // against the receipt's sandbox-canonical path, so the tool paths
     // (execute + the approval preview) thread the real validated path
-    // through prepare_edit_ctx — the tests never mint receipts.
+    // through prepare_edit_ctx. This layer still MINTS: every near-miss
+    // literal miss mints its current-text excerpt receipt (plan f89fd63d
+    // step 3) under the path it is handed — the display path here — so a
+    // direct caller's excerpt receipt is citable only through the same
+    // spelling.
     prepare_edit_ctx(args, content, "", Path::new(&args.path))
 }
 
@@ -308,7 +313,7 @@ fn prepare_edit_ctx(
         if args.use_regex {
             prepare_edit_regex(args, content)
         } else {
-            prepare_edit_literal(args, content)
+            prepare_edit_literal(args, content, validated_path)
         }
     }
 }
@@ -368,17 +373,25 @@ fn prepare_edit_lines(
     // read served — drift hard-fails with the fresh-read steering,
     // never a fuzzy apply. Without a cite the range stays blind (the
     // historical line-range semantics).
-    if let Some(id) = &args.from_read {
-        if !args.old_string.is_empty() {
-            return Err(crate::error::Error::InvalidInput(
-                "from_read and old_string are BOTH set — exactly one anchor form: \
-                 {old_string, new_string} (verbatim) or {from_read, lines, \
-                 new_string} (read-receipt cite)"
-                    .to_string(),
-            ));
+    //
+    // A cite names lines in the READ's numbering, so the receipt's
+    // recorded file-tool writes since that read are translated first
+    // (plan f89fd63d step 2): `resolve` returns where those lines ARE
+    // now, and that is the range this edit must splice.
+    let (start, end) = match &args.from_read {
+        Some(id) => {
+            if !args.old_string.is_empty() {
+                return Err(crate::error::Error::InvalidInput(
+                    "from_read and old_string are BOTH set — exactly one anchor form: \
+                     {old_string, new_string} (verbatim) or {from_read, lines, \
+                     new_string} (read-receipt cite)"
+                        .to_string(),
+                ));
+            }
+            crate::tool::agent::read_registry::resolve(id, validated_path, start, end, content)?
         }
-        crate::tool::agent::read_registry::resolve(id, validated_path, start, end, content)?;
-    }
+        None => (start, end),
+    };
 
     // Split into lines. Rust's `str::lines()` splits on \n (dropping the
     // terminator) and does NOT yield a trailing empty element for a trailing
@@ -455,7 +468,11 @@ fn prepare_edit_lines(
 /// replacement is spliced into the ORIGINAL content at the mapped byte
 /// offsets (untouched bytes keep their exact endings), with `new_string`
 /// re-emitted in the file's detected (majority) ending style.
-fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
+fn prepare_edit_literal(
+    args: &FileEditArgs,
+    content: &str,
+    validated_path: &Path,
+) -> Result<PreparedEdit> {
     let limit = if args.replace_all {
         usize::MAX
     } else {
@@ -485,7 +502,17 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
             let detail = near_miss_diagnostic(content, &args.old_string)
                 .map(|d| format!(" — {d}"))
                 .unwrap_or_default();
-            return Err(with_fresh_read_nudge(format!("{base}{detail}")));
+            // Plan f89fd63d step 3: after the nudge's single line, hand back
+            // the current text near the closest match with a fresh receipt,
+            // so the corrected retry needs no full re-read. `content` is the
+            // file's bytes (a miss writes nothing), which is what the
+            // receipt's line hashes are checked against.
+            return Err(drift_error_with_excerpt(
+                format!("{base}{detail}"),
+                validated_path,
+                content,
+                &args.old_string,
+            ));
         }
     };
 
@@ -550,6 +577,7 @@ fn prepare_edit_ops(
         &ops,
         args.fuzzy_whitespace,
         artifact_checks_enabled(args),
+        validated_path,
     )?;
     notes.extend(apply_notes);
     let diff = compute_diff(&args.path, content, &new_content);
@@ -1043,6 +1071,15 @@ impl Tool for FileEditTool {
             if let Err(e) = std::fs::write(&validated, &prepared.new_content) {
                 return ToolResult::error(format!("failed to write '{}': {e}", args.path));
             }
+            // The bytes are on disk — record the write against every read
+            // receipt of this file, so a later from_read cite that still
+            // names lines in its read's numbering is translated through it
+            // (plan f89fd63d step 2).
+            crate::tool::agent::read_registry::note_write(
+                &validated,
+                &content,
+                &prepared.new_content,
+            );
 
             // H5 advisory (backlog e8b39d72): a large payload gets a NOTE on
             // the success result — never a rejection.
@@ -1214,6 +1251,128 @@ mod tests {
         );
     }
 
+    /// The receipt id and line span a miss's current-text excerpt advertises
+    /// (plan f89fd63d step 3), so a test can cite exactly what it served.
+    fn excerpt_header(output: &str) -> (String, usize, usize) {
+        let header = output
+            .lines()
+            .find(|l| l.starts_with(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK))
+            .unwrap_or_else(|| panic!("the miss serves an excerpt: {output}"));
+        let id = header
+            .split("read receipt ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("the header names a receipt: {header}"))
+            .to_string();
+        let range = header
+            .split("(lines ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_else(|| panic!("the header names a range: {header}"));
+        let (start, end) = range.split_once('-').expect("a start-end span");
+        (id, start.parse().unwrap(), end.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn first_error_line_unchanged_with_excerpt() {
+        // Plan f89fd63d step 3: the current-text excerpt is APPENDED after
+        // the drift nudge — after its single line, which carries the
+        // EditStaleRead steering marker. The first line must stay
+        // byte-identical, or marker detection and the gate stop seeing the
+        // drift class.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "alpha line\nbeta line\ngamma line\n",
+        )
+        .unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "old_string": "alpha line\nbeta LINE\ngamma line",
+                "new_string": "x"
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        let mut lines = result.output.lines();
+        let first = lines.next().unwrap();
+        assert!(
+            first
+                .starts_with("not found: old_string not found in file — near-miss: matched "),
+            "{first}"
+        );
+        assert!(
+            first.ends_with(&format!(
+                "{} (read_files, this exact path) and retry with the exact current text; \
+                 do not edit without a fresh read.",
+                crate::agent::steering_stats::EDIT_STALE_READ_MARK
+            )),
+            "the marker line is unchanged: {first}"
+        );
+        assert!(
+            !first.contains(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK),
+            "the excerpt never shares the marker line: {first}"
+        );
+        assert!(
+            lines
+                .next()
+                .unwrap()
+                .starts_with(crate::tool::agent::edit_ops::NEAR_MISS_EXCERPT_MARK),
+            "the excerpt follows on the next line"
+        );
+        // The drift marker still fires on the shipped first line.
+        assert!(
+            crate::agent::steering_stats::is_edit_drift_failure("file_edit", &result.output),
+            "{}",
+            result.output
+        );
+        // Nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha line\nbeta line\ngamma line\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn excerpt_receipt_cite_applies_without_reread() {
+        // Plan f89fd63d step 3 acceptance: a misremembered old_string is
+        // fixed in ONE retry. The miss serves the current text with a fresh
+        // receipt; citing exactly those lines applies with no read_files
+        // call in between.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "alpha line\nbeta line\ngamma line\ndelta line\n",
+        )
+        .unwrap();
+        let miss = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "old_string": "alpha line\nbeta LINE\ngamma line",
+                "new_string": "alpha line\nbeta line\nGAMMA line"
+            }))
+            .await;
+        assert!(!miss.success, "{}", miss.output);
+        let (id, start, end) = excerpt_header(&miss.output);
+        assert_eq!((start, end), (1, 4), "the window covers the served lines");
+        let cite = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [start, end], "new_string": "FIXED"
+            }))
+            .await;
+        assert!(
+            cite.success,
+            "the excerpt's receipt applies without a re-read: {}",
+            cite.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "FIXED\n"
+        );
+    }
+
     #[tokio::test]
     async fn from_read_anchor_hard_fails_on_drift_never_fuzzy() {
         // Backlog 3fdc605f acceptance (2): when the file changed since the
@@ -1341,16 +1500,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cite_after_own_edit_above_resolves_in_read_coordinates() {
+        // Plan f89fd63d step 2 regression (evidence: simFactories01
+        // messages 199 -> 201, 211 -> 213): a worker read a file, edited
+        // lines 80-96 (growing them by 20 lines), then cited the SAME
+        // receipt at lines 180-190. The receipt's hashes were still valid —
+        // the edit sat entirely above the cited range — but the cite's
+        // numbers no longer matched the file's, so the edit was refused
+        // with "line 180 changed since read" and the worker burned a turn
+        // on a full re-read. The registry now translates a cite through
+        // every file-tool write to its path, so the cite lands on the lines
+        // the read served.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let original: String = (1..=300).map(|n| format!("l{n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), &original).unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        // Own edit ABOVE the cite: lines 80-96 (17 lines) become 37 lines,
+        // so every line below moves down by 20.
+        let grown: Vec<String> = (1..=37).map(|n| format!("x{n}")).collect();
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "lines": [80, 96], "new_string": grown.join("\n")
+            }))
+            .await;
+        assert!(first.success, "{}", first.output);
+        // No re-read: the same receipt, cited in ITS OWN numbering. The
+        // lines it served as 180-190 now sit at 200-210.
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [180, 190],
+                "new_string": "REPLACED"
+            }))
+            .await;
+        assert!(
+            second.success,
+            "a cite above an own edit must resolve in read coordinates: {}",
+            second.output
+        );
+        let after = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        let lines: Vec<&str> = after.lines().collect();
+        assert_eq!(lines.len(), 310, "300 lines + 20 inserted - 11 + 1");
+        assert_eq!(lines[0], "l1", "the edit above left lines 1-79 alone");
+        assert_eq!(lines[79], "x1");
+        assert_eq!(lines[198], "l179");
+        assert_eq!(
+            lines[199], "REPLACED",
+            "the line the read served as line 180"
+        );
+        assert_eq!(lines[200], "l191");
+    }
+
+    #[tokio::test]
+    async fn cite_into_rewritten_region_is_refused_with_drift_nudge() {
+        // A cite whose lines an earlier FILE-TOOL write rewrote can never
+        // apply: those bytes are gone from the file, so no translation lands
+        // on them — drift class, and the nudge names the read and the
+        // rewritten range (plan f89fd63d step 2).
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "lines": [2, 3], "new_string": "B\nC"
+            }))
+            .await;
+        assert!(first.success, "{}", first.output);
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [3, 3], "new_string": "X"
+            }))
+            .await;
+        assert!(
+            !second.success,
+            "a rewritten cite must fail: {}",
+            second.output
+        );
+        assert!(
+            second
+                .output
+                .contains(crate::agent::steering_stats::EDIT_STALE_READ_MARK),
+            "drift class carries the fresh-read steering: {}",
+            second.output
+        );
+        assert!(
+            second
+                .output
+                .contains("were rewritten by an edit since that read"),
+            "{}",
+            second.output
+        );
+        assert!(
+            second.output.contains("lines 2-3 at the time"),
+            "the rewritten range is named: {}",
+            second.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "l1\nB\nC\nl4\nl5\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn crlf_preserving_edit_does_not_count_as_full_rewrite() {
+        // A CRLF-preserving write must not look like a whole-file rewrite:
+        // the shift is computed on EOL-agnostic lines, so it covers only
+        // what actually changed and a cite ABOVE it still resolves.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\r\nb\r\nc\r\nd\r\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "lines": [3, 3], "new_string": "C"
+            }))
+            .await;
+        assert!(first.success, "{}", first.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\r\nb\r\nC\r\nd\r\n"
+        );
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [1, 2], "new_string": "A\nB"
+            }))
+            .await;
+        assert!(second.success, "{}", second.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "A\r\nB\r\nC\r\nd\r\n",
+            "the file keeps its CRLF style throughout"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_rewrite_still_fails_hash_check() {
+        // Only FILE-TOOL writes are recorded. A shell command (or a format
+        // run) rewrites the file behind the registry's back, so a cite over
+        // the changed lines still fails its hash check — today's behavior,
+        // unchanged by the shift bookkeeping.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        std::fs::write(dir.path().join("a.txt"), "a\nZZ\nc\n").unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [2, 2], "new_string": "B"
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("line 2 changed since read"),
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nZZ\nc\n"
+        );
+    }
+
+    #[tokio::test]
     async fn from_read_cite_after_an_insert_lands_on_the_cited_lines() {
         // Plan f302cc0e regression (bug 2026-11-02): a batched ops array
         // whose earlier ops shift line numbers applied a from_read cite at
         // its raw cited numbers against the RUNNING content — the
         // replacement landed three lines too high and silently corrupted
         // the file (store.ts et al., worker memoryPaths122 on
-        // deepseek-flash). The cite's range lives in the CITED READ's
-        // coordinates — the file as the receipt validated it, BEFORE any
-        // op applies — and must land on exactly those lines however many
-        // ops precede it in the array.
+        // deepseek-flash). The cite's range arrives in PRE-CALL coordinates
+        // — the read's numbering translated through every file-tool write
+        // recorded since that read, i.e. the file as it is BEFORE any op in
+        // this array applies — and must land on exactly those lines however
+        // many ops precede it in the array.
         let dir = tempdir().unwrap();
         let tool = make_tool(dir.path());
         std::fs::write(

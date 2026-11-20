@@ -627,10 +627,17 @@ pub struct CleanupReport {
 }
 
 /// Clean only inactive, clean worker checkouts; retain every worker branch.
+///
+/// `proving` carries the worker ids whose tests are being proved right now:
+/// a proved worker keeps its checkout (finding cleanupDuringProof). The
+/// runtime's cleanup builds the list under its merge lock, so a new claim
+/// and this check are serialized; the start-screen cleanup passes an empty
+/// list — no runtime is open, so no proof can be running in this instance.
 pub async fn cleanup_workspace(
     root: &Path,
     state_dir: &Path,
     routing_log_path: &Path,
+    proving: &[String],
 ) -> Result<CleanupReport, String> {
     current_branch(root)?;
     let persistence = TeamPersistence::new(state_dir);
@@ -658,6 +665,17 @@ pub async fn cleanup_workspace(
                     | WorkerStatus::Conflict
             )
         {
+            continue;
+        }
+        if proving.iter().any(|id| id == &worker.id) {
+            // A proof is mutating or restoring this checkout right now:
+            // cleanup must not remove it underneath (finding
+            // cleanupDuringProof).
+            report.skipped.push(format!(
+                "{}: {}",
+                worker.branch,
+                super::proving::proving_error(&worker.id)
+            ));
             continue;
         }
         let id = worker.id.clone();
@@ -887,7 +905,17 @@ impl TeamRuntime {
         let mut stopped: Vec<(usize, WorkerDeletion)> = Vec::new();
         for (position, preview) in previews.into_iter().enumerate() {
             match Self::deletion_decision(&preview, discard_work) {
-                Ok(()) => stopped.push((position, preview)),
+                Ok(()) => match self.proving_guard(&preview.worker_id) {
+                    // A proof is mutating or restoring this worker's
+                    // checkout right now: deleting the worker — and its
+                    // checkout — under it is refused with the proof's
+                    // refusal text (finding deleteDuringProof).
+                    Ok(()) => stopped.push((position, preview)),
+                    Err(error) => {
+                        outcomes[position].error = Some(error.clone());
+                        on_result(outcomes[position].clone());
+                    }
+                },
                 Err(error) => {
                     outcomes[position].error = Some(error.clone());
                     on_result(outcomes[position].clone());

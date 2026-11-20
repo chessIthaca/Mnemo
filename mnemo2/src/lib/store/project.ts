@@ -13,6 +13,7 @@ import { app, leadError, withToast } from "./core";
 import { flushWorkbenchPreferences, hasPendingPreferences } from "./preferences";
 import { connectBoard, disconnectBoard } from "./board";
 import { connectIndexing, disconnectIndexing, syncIndexing } from "./indexing";
+import { connectSettingsReload, disconnectSettingsReload } from "./settingsReload";
 import { connectTeam, disconnectTeam, getTeamTransport, syncTeam } from "./team";
 import { disconnectWorkbench, restoreWorkbench } from "./workbench";
 import { openTeam } from "./navigation";
@@ -87,6 +88,7 @@ export async function openProject(projectId: string, allowConflict = false): Pro
   await disconnectTeam();
   await disconnectBoard();
   disconnectIndexing();
+  disconnectSettingsReload();
   await disconnectWorkbench();
   app.update((state) => ({
     ...state,
@@ -132,7 +134,7 @@ export async function openProject(projectId: string, allowConflict = false): Pro
   await connectNativeLead(project, allowConflict);
   // A project switch during the lead open owns the rest of the startup.
   if (get(app).projectId !== projectId) return;
-  await Promise.all([connectTeam(), connectBoard(), connectIndexing()]);
+  await Promise.all([connectTeam(), connectBoard(), connectIndexing(), connectSettingsReload()]);
   // The runtime (and its indexing status) exists once the lead has opened.
   await syncIndexing();
   await syncExternalLead(project);
@@ -268,6 +270,7 @@ async function closeProjectNow(): Promise<void> {
   await disconnectTeam();
   await disconnectBoard();
   disconnectIndexing();
+  disconnectSettingsReload();
   await disconnectWorkbench();
   app.update((state) => ({
     ...state,

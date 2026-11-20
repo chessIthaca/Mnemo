@@ -55,6 +55,10 @@
 use std::collections::BTreeMap;
 
 use crate::memory::classifier::{Answer, Question};
+use crate::tool::ToolResult;
+
+use super::dispatch::EDIT_GATE_MARK;
+use crate::tool::agent::read_registry::UNKNOWN_RECEIPT_MARK;
 
 /// The label for a small, local, mechanical change.
 pub const LABEL_TRIVIAL: &str = "trivial";
@@ -331,6 +335,26 @@ fn canonical_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Is this failed tool result a STEERING redirect — the harness pointed the
+/// model at the next step instead of failing work it did wrong?
+///
+/// Two results are steering: the stale-read gate's interception
+/// ([`EDIT_GATE_MARK`]) and the registry's unknown receipt
+/// ([`UNKNOWN_RECEIPT_MARK`]). Both are followed by exactly one correct move
+/// (re-read the file, then retry), so counting them as strikes pushes a worker
+/// that is doing the right thing toward the "looks stuck" nudge. They count as
+/// neither a failure nor a success (plan 5b85ab61 step 4); the other receipt
+/// errors — a cite naming another path, a cite outside the read's range — are
+/// real mistakes and stay strikes.
+///
+/// A successful result is never a redirect, whatever its output says.
+pub fn is_steering_redirect(result: &ToolResult) -> bool {
+    if result.success {
+        return false;
+    }
+    result.output.contains(EDIT_GATE_MARK) || result.output.contains(UNKNOWN_RECEIPT_MARK)
+}
+
 /// Consecutive failed-or-repeated tool calls: the strike counter behind the
 /// one-shot "this session looks stuck" nudge.
 ///
@@ -363,6 +387,26 @@ impl Strikes {
             self.count = 0;
         }
         self.last = Some(signature);
+        self.count == self.limit
+    }
+
+    /// Observe a STEERING call — one the harness redirected rather than
+    /// failed (see [`is_steering_redirect`]): it is neither a strike nor a
+    /// success, so the count is left exactly as it was.
+    ///
+    /// An exact repeat of the previous call's signature is still a strike
+    /// (the model re-emitting the same call verbatim is stuck whatever the
+    /// last result said), and only that branch can fire. `last` becomes this
+    /// signature either way, so the next call is compared against it.
+    pub fn observe_neutral(&mut self, signature: String) -> bool {
+        let repeated = self.last.as_deref() == Some(signature.as_str());
+        self.last = Some(signature);
+        if !repeated {
+            // No add and no reset: a redirect must not push the session
+            // toward the nudge, and must not wipe a streak that is real.
+            return false;
+        }
+        self.count += 1;
         self.count == self.limit
     }
 
@@ -672,5 +716,58 @@ mod tests {
         assert!(!strikes.observe("call-a".into(), false));
         assert!(!strikes.observe("call-a".into(), false));
         assert!(strikes.observe("call-a".into(), false));
+    }
+
+    #[test]
+    fn neutral_calls_neither_strike_nor_reset() {
+        // fail, neutral, fail: the redirect in the middle is invisible to the
+        // counter — it neither adds nor wipes what the real failure started.
+        let mut strikes = Strikes::new(3);
+        assert!(!strikes.observe("call-a".into(), true));
+        assert!(!strikes.observe_neutral("call-b".into()), "a neutral call never fires");
+        assert!(!strikes.observe("call-c".into(), true));
+        assert_eq!(strikes.count, 2, "the neutral call neither added nor reset a strike");
+
+        // fail, fail, neutral, fail: the last real failure is the third.
+        let mut strikes = Strikes::new(3);
+        assert!(!strikes.observe("call-a".into(), true));
+        assert!(!strikes.observe("call-b".into(), true));
+        assert!(!strikes.observe_neutral("call-c".into()));
+        assert!(strikes.observe("call-d".into(), true), "the streak survives the neutral call");
+
+        // A neutral call after the streak already fired does not fire again.
+        assert!(!strikes.observe_neutral("call-e".into()));
+        assert_eq!(strikes.count, 3);
+    }
+
+    #[test]
+    fn neutral_repeat_still_strikes() {
+        // The same signature sent again is a strike even when the harness
+        // answered it with a redirect: the model is stuck on one call.
+        let mut strikes = Strikes::new(2);
+        assert!(!strikes.observe_neutral("same".into()));
+        assert_eq!(strikes.count, 0, "the first call has no predecessor to repeat");
+        assert!(!strikes.observe_neutral("same".into()));
+        assert_eq!(strikes.count, 1);
+        assert!(strikes.observe_neutral("same".into()), "the repeated redirects fire at the limit");
+    }
+
+    #[test]
+    fn steering_redirects_are_the_two_gate_markers_on_a_failure() {
+        assert!(is_steering_redirect(&ToolResult::error(format!(
+            "{EDIT_GATE_MARK}: your last 1 file_edit attempts failed because the old_string \
+             did not match"
+        ))));
+        assert!(is_steering_redirect(&ToolResult::error(format!(
+            "{UNKNOWN_RECEIPT_MARK} 'r7' — it is not in the registry"
+        ))));
+        // A real receipt mistake stays a strike (plan 5b85ab61 step 4).
+        assert!(!is_steering_redirect(&ToolResult::error(
+            "read receipt 'r7' belongs to src/a.rs, not src/b.rs"
+        )));
+        // A success that merely mentions the marker is not a redirect.
+        assert!(!is_steering_redirect(&ToolResult::success(format!(
+            "read 3 lines; the next {EDIT_GATE_MARK} note tells you what to do"
+        ))));
     }
 }

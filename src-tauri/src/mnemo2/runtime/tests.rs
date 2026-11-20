@@ -3002,6 +3002,8 @@ async fn review_fix_preserves_scope_evidence_and_requires_delta_review() {
         fix_commit: None,
         evidence: None,
         justification: None,
+        category: None,
+        enforce: None,
     };
     team.review(&worker.id, "initial review".into(), vec![finding], review_evidence())
         .await
@@ -3130,6 +3132,8 @@ async fn larger_findings_route_to_the_tracked_worker_for_delta_review() {
         fix_commit: None,
         evidence: None,
         justification: None,
+        category: None,
+        enforce: None,
     };
     team.review(&worker.id, "initial review".into(), vec![finding], review_evidence())
         .await
@@ -4962,6 +4966,8 @@ async fn audit_workers_are_read_only_and_unanchored_from_implementer_claims() {
             fix_commit: None,
             evidence: None,
             justification: None,
+            category: None,
+            enforce: None,
         }],
         review_evidence(),
     )

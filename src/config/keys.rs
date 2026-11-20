@@ -121,6 +121,10 @@ impl KeyStore {
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = self.to_toml_string()?;
         crate::config::write_atomic(path, &text)?;
+        // The live-settings watcher must treat this write as this process's own
+        // save, not as a hand edit (the MCP token store writes through here on
+        // every OAuth refresh).
+        crate::config::record_live_file_written(path, &text);
         // Best-effort permission restriction: never block the write on a
         // hardening failure (the secrets are already safely on disk).
         if let Err(e) = restrict_permissions(path) {

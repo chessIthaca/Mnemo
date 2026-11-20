@@ -112,6 +112,12 @@ pub struct Brain {
     /// is never read by name (it exists purely for its Drop semantics), so it
     /// is underscore-prefixed rather than `#[allow(dead_code)]`ed.
     pub _graph_watcher: Option<crate::codegraph::watcher::GraphWatcher>,
+    /// The derived-memory-index OS file watcher — held only to keep the watch
+    /// alive for the app's lifetime (dropping it stops watching). `None` when
+    /// no memory store is wired or the watcher failed to start. Like
+    /// [`Brain::_graph_watcher`] it is never read by name (it exists purely
+    /// for its Drop semantics), hence the underscore prefix.
+    pub _memory_watcher: Option<crate::host::memory_watcher::MemoryWatcher>,
 }
 
 /// The shared wiring tail (3a.4): everything from an EXPLICIT config dir +
@@ -272,6 +278,7 @@ pub(crate) fn wire_brain(
             ep.multimodal_for(&model),
             ep.effective_reasoning_effort_for(Some(&model)),
             Some(trace.clone()),
+            Some(config_dir.join("run")),
         )
     } else {
         eprintln!("warning: no endpoint configured; using a dummy provider");
@@ -536,6 +543,11 @@ pub(crate) fn wire_brain(
         let notifier = notifier.clone();
         let plans_dir = workspace.state_dir.join("plans");
         let backlog_path = workspace.state_dir.join("backlog.jsonl");
+        // The MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+        // d3336a8a step 8) — HOW/DECISION records shared by every project on
+        // the machine, indexed READ-ONLY into this project's store in the same
+        // pass as the project corpus.
+        let machine_knowledge_dir = crate::memory::knowledge::machine_knowledge_dir(&config_dir);
         rt.spawn(async move {
             // Console mode (no app handle) has no frontend to notify — the
             // reconcile still runs, but silently (the events are dropped).
@@ -556,6 +568,7 @@ pub(crate) fn wire_brain(
                     store_for_index.as_ref(),
                     &plans_dir,
                     &backlog_path,
+                    Some(&machine_knowledge_dir),
                     &noop,
                 )
                 .await
@@ -686,6 +699,7 @@ pub(crate) fn wire_brain(
                 store_for_index.as_ref(),
                 &plans_dir,
                 &backlog_path,
+                Some(&machine_knowledge_dir),
             )
             .await
             {
@@ -709,6 +723,7 @@ pub(crate) fn wire_brain(
                 store_for_index.as_ref(),
                 &plans_dir,
                 &backlog_path,
+                Some(&machine_knowledge_dir),
                 &progress,
             )
             .await
@@ -816,8 +831,8 @@ pub(crate) fn wire_brain(
     );
 
     // Vision client from config (shared helper — also used by Settings rewire).
-    // Still useful when the main provider is multimodal (describe_image tool
-    // for on-disk image files). Warn if configured but endpoint is missing.
+    // Still useful when the main provider is multimodal (the image tools read
+    // on-disk image files). Warn if configured but endpoint is missing.
     let vision = build_vision_client(&config);
     if config.general.general.vision_model.is_some() && vision.is_none() {
         if let Some(vm) = &config.general.general.vision_model {
@@ -837,10 +852,15 @@ pub(crate) fn wire_brain(
     // sync handle to the config (separate from the async `state.project.config`
     // mutex) so the turn driver can read it without an await; the IPC layer
     // pushes reloaded config into it after a Settings save.
-    let model_resolver = Arc::new(crate::model_resolver::ConfigModelResolver::new(
-        Arc::new(RwLock::new(config.clone())),
-        trace.clone(),
-    ));
+    let model_resolver = Arc::new(
+        crate::model_resolver::ConfigModelResolver::new(
+            Arc::new(RwLock::new(config.clone())),
+            trace.clone(),
+        )
+        // Per-context model overrides honour the same machine-wide endpoint
+        // slots and shared 429 cooldowns as the startup provider.
+        .with_run_dir(Some(config_dir.join("run"))),
+    );
     // The shared headless debug browser — one instance for the agent tools
     // and the host's browser UI. Lazily spawned on first use.
     // 3a.1 (D1): browser-feature only (the bare build has no browser module).
@@ -875,6 +895,14 @@ pub(crate) fn wire_brain(
     // each plan-step gate) — a save_settings call flips it via
     // factory.set_budget_config.
     let budget_config = Arc::new(std::sync::RwLock::new(config.general.general.budget.clone()));
+    // Machine-wide heavy-command slots (plan d3336a8a step 3): live mirror of
+    // `[general.machine]` plus the machine's slot directory, shared with every
+    // command-running tool the factory builds (read per command) — a
+    // save_settings call flips it via factory.set_machine_config.
+    let machine_config = Arc::new(std::sync::RwLock::new(
+        config.general.general.machine.clone(),
+    ));
+    let machine_dir = crate::host::machine_slots::default_dir(&config_dir);
     // The per-project code knowledge graph (GitNexus-style). Opened here and
     // indexed on a background thread — startup must never block on parsing
     // the codebase. A DB-open failure disables the graph outright (the
@@ -1075,6 +1103,19 @@ pub(crate) fn wire_brain(
     // each plan-step gate by every agent built from this factory (a Settings
     // save flips the mirror live).
     .with_budget_config(budget_config)
+    // Wire the MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
+    // d3336a8a step 8): the HOW/DECISION records shared by every project on
+    // the machine. The memory tools route `[machine]` edits to it and accept
+    // `memory_write scope=machine`; the derived-index runs index it read-only.
+    .with_machine_knowledge(Some(Arc::new(
+        crate::memory::KnowledgeStore::new_machine(
+            crate::memory::knowledge::machine_knowledge_dir(&config_dir),
+        ),
+    )))
+    // Wire the machine-wide heavy-command slots ([general.machine]): the limit
+    // and the slot directory are read per command by shell / run_checks / jobs /
+    // step_verify, so a Settings save lands on the next heavy command.
+    .with_machine_config(machine_config, machine_dir)
     // Wire the shared Laya auto-typing gate (backlog a147b63c):
     // memory_write reads the classifier slot + flag at call time, and
     // Settings saves flip the flag via `set_auto_typing_enabled` — no
@@ -1154,6 +1195,34 @@ pub(crate) fn wire_brain(
         }
     });
 
+    // Start the derived-memory-index OS file watcher so `memory_search` picks
+    // up a `.coding/` write from ANY source (a hand edit, a git merge, a plan
+    // tool in another process, an agent writing OpenSpec specs) within a
+    // couple of seconds — no restart, and no reconcile splash dialog: the live
+    // pass is silent by design (the startup events are unchanged). Best-effort:
+    // a start failure logs + disables live refresh, never fatal. The handle
+    // MUST live on Brain — dropping it stops the watch.
+    let memory_watcher = store_trait.clone().and_then(|store| {
+        match crate::host::memory_watcher::MemoryWatcher::spawn(
+            store,
+            workspace.state_dir.clone(),
+            // The machine corpus is a second watched root (plan d3336a8a
+            // step 8): a machine record written by another instance or by
+            // hand reaches this project's store without a restart.
+            Some(crate::memory::knowledge::machine_knowledge_dir(&config_dir)),
+            std::time::Duration::from_millis(1500),
+        ) {
+            Ok(w) => {
+                eprintln!("memory: file watcher started (live index refresh)");
+                Some(w)
+            }
+            Err(e) => {
+                eprintln!("memory: file watcher failed to start: {e}; live refresh disabled");
+                None
+            }
+        }
+    });
+
     Ok(Brain {
         factory,
         memory_store: store_trait,
@@ -1174,6 +1243,7 @@ pub(crate) fn wire_brain(
         pending_model_download: pending_download,
         pending_model_load: pending_load,
         _graph_watcher: graph_watcher,
+        _memory_watcher: memory_watcher,
     })
 }
 

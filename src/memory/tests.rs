@@ -4051,3 +4051,345 @@ async fn prune_old_archive_rows_clears_every_old_row() {
         .unwrap();
     assert_eq!(remaining, 1, "only the row inside the window survives");
 }
+
+/// One pool entry as compared between the incremental cache and a rebuild:
+/// rowid, id, tier and record_type as their stored strings (no enum equality
+/// needed), the cached norm, and the exact vector.
+#[derive(Debug, PartialEq)]
+struct PoolRow {
+    rowid: i64,
+    id: String,
+    tier: String,
+    record_type: String,
+    norm: f32,
+    embedding: Vec<f32>,
+}
+
+/// Snapshot pool entries for a cache-vs-rebuild comparison, rowid-ordered.
+fn pool_snapshot(entries: &[CachedEmbedding]) -> Vec<PoolRow> {
+    let mut out: Vec<PoolRow> = entries
+        .iter()
+        .map(|e| PoolRow {
+            rowid: e.rowid,
+            id: e.id.clone(),
+            tier: e.tier.as_str().to_string(),
+            record_type: e.record_type.as_str().to_string(),
+            norm: e.norm,
+            embedding: e.embedding.clone(),
+        })
+        .collect();
+    out.sort_by_key(|e| e.rowid);
+    out
+}
+
+/// Assert the incrementally maintained cosine pool equals a fresh SQL rebuild
+/// (plan d3336a8a step 10): the hot write paths patch one entry, so drift
+/// would let recall rank a stale vector without any visible error.
+fn assert_cache_matches_rebuild(store: &MemoryStore) {
+    let cached = {
+        let cache = store
+            .embedding_cache
+            .lock()
+            .expect("embedding cache lock poisoned");
+        assert!(
+            cache.built_generation.is_some(),
+            "the pool must be built before it can be compared"
+        );
+        pool_snapshot(&cache.entries)
+    };
+    let rebuilt = {
+        let conn = store.read_conn().lock().expect("read conn lock poisoned");
+        pool_snapshot(&MemoryStore::load_embedding_pool_locked(&conn).unwrap())
+    };
+    assert_eq!(cached, rebuilt, "the incremental pool must match a rebuild");
+}
+
+#[tokio::test]
+async fn meaning_only_match_beyond_newest_200_is_found() {
+    // Plan d3336a8a step 10: recall's candidate set is the FTS matches
+    // UNIONED with the top-50 cosine over EVERY live row. Before the pool a
+    // meaning-only match older than the 200 most-recent rows was invisible:
+    // FTS had no keyword hit and the fallback only scanned the 200 newest.
+    // The anchor embedder maps "pipeline"/"conduit" to one axis, so the two
+    // wordings are vector-aligned while sharing ZERO tokens.
+    let store = make_anchor_store("anchor-test");
+    let target = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "conduit stages",
+            "conduit conduit conduit",
+            1000,
+        ))
+        .await
+        .unwrap();
+    // 300 newer rows — beyond FULL_SCAN_FALLBACK_CAP (200) — push the target
+    // out of the 200-newest window the old fallback scanned.
+    for index in 0..300u32 {
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                format!("filler {index}"),
+                format!("apple banana {index}"),
+                1000,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let results = store.recall("pipeline", &MemoryFilter::new()).await.unwrap();
+    assert!(
+        results.iter().any(|sm| sm.memory.id == target),
+        "a meaning-only match older than the 200 newest must be recalled"
+    );
+    assert_eq!(
+        results[0].memory.id, target,
+        "the vector-aligned record (cosine 1.0) must rank first"
+    );
+}
+
+#[tokio::test]
+async fn superseded_rows_not_in_cosine_pool() {
+    // The cosine pool holds LIVE rows only: a superseded record must not
+    // resurface through the meaning-only path (a stale answer would win on
+    // semantics alone). Its successor stays recallable.
+    let store = make_anchor_store("anchor-test");
+    let old = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "conduit stages",
+            "conduit conduit",
+            1000,
+        ))
+        .await
+        .unwrap();
+    let successor = store
+        .supersede_memory(
+            &old,
+            Memory::new(
+                MemoryTier::Semantic,
+                "pipeline replacement",
+                "unrelated unrelated",
+                1000,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let results = store.recall("pipeline", &MemoryFilter::new()).await.unwrap();
+    assert!(
+        results.iter().all(|sm| sm.memory.id != old),
+        "a superseded row must never enter the cosine pool"
+    );
+    assert!(
+        results.iter().any(|sm| sm.memory.id == successor),
+        "the successor (a keyword hit) must stay recallable"
+    );
+
+    let cache = store
+        .embedding_cache
+        .lock()
+        .expect("embedding cache lock poisoned");
+    assert!(cache.entries.iter().all(|e| e.id != old));
+    assert!(cache.entries.iter().any(|e| e.id == successor));
+}
+
+#[tokio::test]
+async fn hash_embedder_behaviour_unchanged() {
+    // The hash embedder's cosine is token-overlap noise, so recall keeps the
+    // historic candidate paths exactly: FTS matches when the query has a
+    // keyword, and the capped 200-newest fallback when it has none — never an
+    // all-row semantic pool.
+    let store = make_store();
+    store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "old target",
+            "ancient zebra fact",
+            1000,
+        ))
+        .await
+        .unwrap();
+    for index in 0..300u32 {
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                format!("filler {index}"),
+                format!("apple banana {index}"),
+                1000,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // A query with no keyword hit keeps the 200-newest fallback: the old row
+    // is outside that window, so it does NOT surface (today's behaviour,
+    // which the hash embedder must not change). Run this BEFORE the keyword
+    // recall below: a recall bumps last_accessed_at, which would move the
+    // target into the newest window.
+    let fallback = store.recall("quokka", &MemoryFilter::new()).await.unwrap();
+    assert!(!fallback.iter().any(|sm| sm.memory.title == "old target"));
+
+    // A keyword hit still finds the old row (the FTS candidate path).
+    let hits = store.recall("zebra", &MemoryFilter::new()).await.unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].memory.title, "old target");
+}
+
+#[tokio::test]
+async fn incremental_embedding_cache_matches_a_fresh_rebuild() {
+    // The pool is patched one entry at a time on the hot write paths and
+    // invalidated by the rare ones. A mixed sequence must leave the cache
+    // identical to a fresh SQL rebuild, or recall would rank a stale row.
+    let store = make_anchor_store("anchor-test");
+    let superseded = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "conduit",
+            "conduit conduit",
+            1000,
+        ))
+        .await
+        .unwrap();
+    let updated = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "pipeline notes",
+            "pipeline pipeline",
+            1000,
+        ))
+        .await
+        .unwrap();
+    let deleted = store
+        .write(Memory::new(
+            MemoryTier::Semantic,
+            "temp",
+            "unrelated temp",
+            1000,
+        ))
+        .await
+        .unwrap();
+
+    // Build the pool with one recall, then exercise the hot paths.
+    store.recall("pipeline", &MemoryFilter::new()).await.unwrap();
+    assert_cache_matches_rebuild(&store);
+
+    store
+        .update_memory(
+            &updated,
+            Some("BUG: pipeline notes"),
+            Some("transpiler compiler"),
+        )
+        .await
+        .unwrap();
+    assert_cache_matches_rebuild(&store);
+
+    store.delete_memory(&deleted).await.unwrap();
+    let successor = store
+        .supersede_memory(
+            &superseded,
+            Memory::new(
+                MemoryTier::Semantic,
+                "successor",
+                "conduit conduit",
+                1000,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_cache_matches_rebuild(&store);
+
+    // A rare path invalidates the pool; the next recall rebuilds it and the
+    // rebuilt entries match SQL again.
+    store
+        .quarantine_memory(&successor, "test quarantine")
+        .await
+        .unwrap();
+    store.recall("pipeline", &MemoryFilter::new()).await.unwrap();
+    assert_cache_matches_rebuild(&store);
+}
+
+#[test]
+fn cosine_pool_honours_the_recall_filter() {
+    // The pool applies tier / working-exclusion / record_type exactly like
+    // the SQL candidate paths, so a filtered recall never gets an
+    // out-of-filter row from the semantic union.
+    let entry = |rowid: i64, tier: MemoryTier, record_type: MemoryRecordType| CachedEmbedding {
+        rowid,
+        id: format!("m{rowid}"),
+        embedding: vec![1.0, 0.0],
+        norm: 1.0,
+        tier,
+        record_type,
+    };
+    let entries = vec![
+        entry(1, MemoryTier::Semantic, MemoryRecordType::Bug),
+        entry(2, MemoryTier::Working, MemoryRecordType::None),
+        entry(3, MemoryTier::Episodic, MemoryRecordType::How),
+    ];
+    let query = vec![1.0, 0.0];
+
+    let top = MemoryStore::top_cosine_rowids(&entries, &query, &MemoryFilter::new(), 10);
+    assert_eq!(top, vec![1, 3], "working rows are excluded by default");
+
+    let top = MemoryStore::top_cosine_rowids(
+        &entries,
+        &query,
+        &MemoryFilter::new().include_working(),
+        10,
+    );
+    assert_eq!(top, vec![1, 2, 3]);
+
+    let top = MemoryStore::top_cosine_rowids(
+        &entries,
+        &query,
+        &MemoryFilter::new().tier(MemoryTier::Working),
+        10,
+    );
+    assert_eq!(top, vec![2], "an explicit tier wins over the exclusion");
+
+    let top = MemoryStore::top_cosine_rowids(
+        &entries,
+        &query,
+        &MemoryFilter::new().record_type(MemoryRecordType::How),
+        10,
+    );
+    assert_eq!(top, vec![3]);
+}
+
+#[test]
+fn cosine_pool_ranks_5000_rows_under_200ms_in_debug() {
+    // Performance guard for the all-row cosine pass (plan d3336a8a step 10):
+    // 5,000 rows × 768 dims must stay well inside a recall's blocking-pool
+    // task. The plan's release target is under 20 ms; a debug build is slower,
+    // so the assertion is the debug budget of 200 ms (release stays documented
+    // here, not measured — tests run in debug).
+    const ROWS: usize = 5_000;
+    const DIM: usize = 768;
+    let entries: Vec<CachedEmbedding> = (0..ROWS)
+        .map(|index| {
+            let mut embedding = vec![0.0_f32; DIM];
+            embedding[index % DIM] = 1.0;
+            embedding[(index * 7 + 3) % DIM] = 0.5;
+            CachedEmbedding {
+                rowid: index as i64,
+                id: format!("m{index}"),
+                norm: MemoryStore::vector_norm(&embedding),
+                embedding,
+                tier: MemoryTier::Semantic,
+                record_type: MemoryRecordType::None,
+            }
+        })
+        .collect();
+    let mut query = vec![0.0_f32; DIM];
+    query[0] = 1.0;
+
+    let started = std::time::Instant::now();
+    let top = MemoryStore::top_cosine_rowids(&entries, &query, &MemoryFilter::new(), 50);
+    let elapsed = started.elapsed();
+
+    assert_eq!(top.len(), 50, "the cosine pass returns the top-50 pool");
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "the 5,000-row cosine pass took {elapsed:?} (debug budget 200 ms; release target 20 ms)"
+    );
+}

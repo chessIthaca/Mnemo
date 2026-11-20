@@ -27,7 +27,7 @@ pub mod strength;
 pub mod transcript_index;
 pub mod types;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -669,22 +669,69 @@ pub struct MemoryStore {
     /// (Relaxed) on every recall-result-changing write so the per-turn
     /// auto-recall cache can detect mid-turn writes.
     store_version: std::sync::atomic::AtomicU64,
+    /// The in-memory cosine pool behind fully semantic recall: every live
+    /// row's embedding, so recall can rank the WHOLE store by meaning instead
+    /// of only the FTS pre-filter's candidates. `Arc` so recall's blocking
+    /// task can hold its own handle.
+    embedding_cache: Arc<Mutex<EmbeddingCache>>,
+    /// The pool's invalidation counter — bumped by every mutation the
+    /// incremental path cannot express in one row (bulk deletes, quarantine,
+    /// superseded flips, re-embedding, an embedder swap). The next recall
+    /// rebuilds the pool when this moves ahead of
+    /// [`EmbeddingCache::built_generation`].
+    embedding_cache_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The outcome of an FTS5 candidate lookup, distinguishing "FTS unavailable"
-/// (→ fall back to a capped full scan) from "FTS available but no matches"
-/// (→ also fall back to the capped semantic scan — a zero-keyword recall is
-/// precisely the case the embeddings exist for).
+/// (→ the caller keeps its historic fallback paths) from "FTS available but no
+/// matches" (→ likewise: a zero-keyword recall is precisely the case the
+/// embeddings exist for, and a real embedding model reaches those rows through
+/// the all-row cosine pool).
 enum FtsResult {
     /// FTS5 is not available (old SQLite / extension missing) — fall back to a
     /// capped full scan.
     Unavailable,
-    /// FTS5 is available but the query matched no memories — fall back to the
-    /// capped semantic scan (same as Unavailable): the query vector still
-    /// gets a brute-force cosine pass over the 200 most-recent memories.
+    /// FTS5 is available but the query matched no memories — the caller falls
+    /// back to the capped 200-most-recent scan when the semantic pool does not
+    /// apply (hash embedder, zero query vector, history-opt-in filter).
     NoMatches,
     /// FTS5 matched these rowids — load + score only these.
     Matches(Vec<i64>),
+}
+
+/// One live row in the in-memory embedding pool behind fully semantic recall
+/// (plan d3336a8a step 10): the vector, its precomputed L2 norm, and the
+/// metadata a recall filter needs. Superseded, quarantined and synthetic
+/// turn-boundary rows never enter the pool — every ranked path treats them as
+/// non-knowledge, so the pool never has to re-check liveness per query.
+struct CachedEmbedding {
+    /// The row's `memories.rowid` — the candidate key the FTS path shares.
+    rowid: i64,
+    /// The row's public id — the key incremental cache maintenance uses.
+    id: String,
+    /// The stored embedding vector (unit length is NOT assumed; `norm` is).
+    embedding: Vec<f32>,
+    /// The vector's L2 norm, computed once at insert so a recall pays one dot
+    /// product per row instead of two norms plus a square root.
+    norm: f32,
+    /// The row's tier (the filter's explicit tier / working-tier exclusion).
+    tier: MemoryTier,
+    /// The row's typed-record class (the filter's `record_type`).
+    record_type: MemoryRecordType,
+}
+
+/// The cosine-pool cache: the entries built for one generation of the store.
+///
+/// The pool is maintained incrementally on the hot write paths (one entry
+/// upserted or removed per write) and rebuilt lazily when a rare bulk mutation
+/// bumps [`MemoryStore`]'s `embedding_cache_gen` — so a working-memory write
+/// does not force a reload of every live embedding.
+struct EmbeddingCache {
+    /// The generation the entries were built for; `None` before the first
+    /// build. A mismatch makes the entries stale (the next recall rebuilds).
+    built_generation: Option<u64>,
+    /// The live rows' cached vectors, one per row.
+    entries: Vec<CachedEmbedding>,
 }
 
 impl MemoryStore {
@@ -710,6 +757,11 @@ impl MemoryStore {
             access_log: Mutex::new(VecDeque::new()),
             search_config: RwLock::new(MemorySearchConfig::default()),
             store_version: std::sync::atomic::AtomicU64::new(0),
+            embedding_cache: Arc::new(Mutex::new(EmbeddingCache {
+                built_generation: None,
+                entries: Vec::new(),
+            })),
+            embedding_cache_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -718,6 +770,9 @@ impl MemoryStore {
     /// previous vectors until re-written.
     pub fn set_embedder(&self, embedder: Arc<dyn Embedder>) {
         *self.embedder.write().expect("embedder lock poisoned") = embedder;
+        // The cached vectors are in the OLD embedder's space (and may have a
+        // different dimension) — drop the pool so the next recall rebuilds it.
+        self.invalidate_embedding_pool();
     }
 
     /// The live retrieval/indexing scale knobs (the Phase 2 `[memory]`
@@ -867,14 +922,19 @@ impl MemoryStore {
     /// keeps the index in sync row by row. Returns the number deleted.
     pub async fn delete_derived(&self) -> Result<usize> {
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize> {
+        let deleted = tokio::task::spawn_blocking(move || -> Result<usize> {
             let conn = conn.lock().expect("conn lock poisoned");
             let deleted =
                 conn.execute("DELETE FROM memories WHERE record_class = 'derived'", [])?;
             Ok(deleted)
         })
         .await
-        .map_err(|e| Error::Memory(format!("delete_derived task failed: {e}")))?
+        .map_err(|e| Error::Memory(format!("delete_derived task failed: {e}")))??;
+        if deleted > 0 {
+            // A bulk delete — the pool is rebuilt on the next recall.
+            self.invalidate_embedding_pool();
+        }
+        Ok(deleted)
     }
 
     /// Fetch a single memory by id — `None` when no such row exists. A
@@ -1037,7 +1097,7 @@ impl MemoryStore {
         let id = id.to_string();
         let superseded_by = superseded_by.map(str::to_string);
         let data = serde_json::to_string(data).unwrap_or_else(|_| "{}".into());
-        tokio::task::spawn_blocking(move || -> Result<bool> {
+        let updated = tokio::task::spawn_blocking(move || -> Result<bool> {
             let conn = conn.lock().expect("conn lock poisoned");
             let updated = conn.execute(
                 "UPDATE memories SET superseded_by = ?1, data = ?2 \
@@ -1047,7 +1107,13 @@ impl MemoryStore {
             Ok(updated > 0)
         })
         .await
-        .map_err(|e| Error::Memory(format!("set_derived_metadata task failed: {e}")))?
+        .map_err(|e| Error::Memory(format!("set_derived_metadata task failed: {e}")))??;
+        if updated {
+            // The row's liveness may have flipped — drop the pool (this is the
+            // knowledge indexer's reconciliation write, not a per-turn path).
+            self.invalidate_embedding_pool();
+        }
+        Ok(updated)
     }
 
     /// Open an in-memory store (for tests).
@@ -1099,6 +1165,11 @@ impl MemoryStore {
             access_log: Mutex::new(VecDeque::new()),
             search_config: RwLock::new(MemorySearchConfig::default()),
             store_version: std::sync::atomic::AtomicU64::new(0),
+            embedding_cache: Arc::new(Mutex::new(EmbeddingCache {
+                built_generation: None,
+                entries: Vec::new(),
+            })),
+            embedding_cache_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -1227,14 +1298,16 @@ impl MemoryStore {
     /// the semantic-record columns (`record_class` / `record_type` /
     /// `superseded_by` / `quarantined`) — faithfully from the struct. The
     /// FTS sync triggers
-    /// keep the index in step.
+    /// keep the index in step. Returns the inserted row's rowid (a REPLACE
+    /// that hits an existing id assigns a new one), which the caller needs to
+    /// key the row's embedding-pool entry.
     fn insert_memory_locked(
         conn: &Connection,
         memory: &Memory,
         embedding_blob: &[u8],
         embed_model: &str,
         embed_dim: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let data_json = serde_json::to_string(&memory.data).unwrap_or_else(|_| "{}".into());
         let source_json =
             serde_json::to_string(&memory.source_session_ids).unwrap_or_else(|_| "[]".into());
@@ -1260,7 +1333,7 @@ impl MemoryStore {
                 memory.quarantined,
             ],
         )?;
-        Ok(())
+        Ok(conn.last_insert_rowid())
     }
 
     /// Parse a single memory row into a `Memory` value.
@@ -1330,6 +1403,250 @@ impl MemoryStore {
             out.push(Self::parse_memory_row(row)?);
         }
         Ok(out)
+    }
+
+    /// The cosine-pool entry for one memory row, when that row belongs in the
+    /// live pool: a non-empty embedding, not superseded, not quarantined, and
+    /// not a synthetic turn-boundary summary (the rules every ranked path
+    /// applies). `rowid` is the row's `memories.rowid` — for a fresh INSERT,
+    /// `Connection::last_insert_rowid()`.
+    fn cache_entry(memory: &Memory, rowid: i64) -> Option<CachedEmbedding> {
+        if memory.embedding.is_empty()
+            || memory.superseded_by.is_some()
+            || memory.quarantined.is_some()
+            || (memory.tier == MemoryTier::Episodic
+                && memory.content.starts_with(SYNTHETIC_SUMMARY_PREFIX))
+        {
+            return None;
+        }
+        Some(CachedEmbedding {
+            rowid,
+            id: memory.id.clone(),
+            norm: Self::vector_norm(&memory.embedding),
+            embedding: memory.embedding.clone(),
+            tier: memory.tier,
+            record_type: memory.record_type,
+        })
+    }
+
+    /// Load one row's pool entry from an already-held connection — `None` when
+    /// the row is gone or no longer live. Used to refresh the pool after an
+    /// in-place UPDATE (the rowid is unchanged, but the embedding and/or the
+    /// record_type may have moved).
+    fn cache_entry_locked(conn: &Connection, id: &str) -> Result<Option<CachedEmbedding>> {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, id, tier, content, embedding, record_type, superseded_by, quarantined \
+             FROM memories WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let rowid: i64 = row.get(0)?;
+        let memory_id: String = row.get(1)?;
+        let tier_str: String = row.get(2)?;
+        let content: String = row.get(3)?;
+        let embedding_blob: Option<Vec<u8>> = row.get(4)?;
+        let rtype_str: String = row.get(5)?;
+        let superseded_by: Option<String> = row.get(6)?;
+        let quarantined: Option<String> = row.get(7)?;
+        let tier = MemoryTier::from_str_opt(&tier_str).unwrap_or(MemoryTier::Working);
+        if superseded_by.is_some()
+            || quarantined.is_some()
+            || (tier == MemoryTier::Episodic && content.starts_with(SYNTHETIC_SUMMARY_PREFIX))
+        {
+            return Ok(None);
+        }
+        let embedding = embedding_blob
+            .as_deref()
+            .map(Self::decode_embedding)
+            .unwrap_or_default();
+        if embedding.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(CachedEmbedding {
+            rowid,
+            id: memory_id,
+            norm: Self::vector_norm(&embedding),
+            embedding,
+            tier,
+            record_type: MemoryRecordType::from_str_opt(&rtype_str).unwrap_or_default(),
+        }))
+    }
+
+    /// Load every live row's cosine-pool entry from the database — the pool a
+    /// fully semantic recall ranks. Live = a non-empty embedding, not
+    /// superseded, not quarantined, and not a synthetic turn-boundary summary
+    /// (the same rules the ranked SQL paths apply, so the pool never offers a
+    /// row the filter would reject as non-knowledge).
+    fn load_embedding_pool_locked(conn: &Connection) -> Result<Vec<CachedEmbedding>> {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, id, tier, content, embedding, record_type \
+             FROM memories \
+             WHERE embedding IS NOT NULL \
+               AND superseded_by IS NULL \
+               AND quarantined IS NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let id: String = row.get(1)?;
+            let tier_str: String = row.get(2)?;
+            let content: String = row.get(3)?;
+            let embedding_blob: Option<Vec<u8>> = row.get(4)?;
+            let rtype_str: String = row.get(5)?;
+            let tier = MemoryTier::from_str_opt(&tier_str).unwrap_or(MemoryTier::Working);
+            if tier == MemoryTier::Episodic && content.starts_with(SYNTHETIC_SUMMARY_PREFIX) {
+                continue;
+            }
+            let embedding = embedding_blob
+                .as_deref()
+                .map(Self::decode_embedding)
+                .unwrap_or_default();
+            if embedding.is_empty() {
+                continue;
+            }
+            out.push(CachedEmbedding {
+                rowid,
+                id,
+                norm: Self::vector_norm(&embedding),
+                embedding,
+                tier,
+                record_type: MemoryRecordType::from_str_opt(&rtype_str).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Refresh the pool cache from SQL when `generation` moved past the built
+    /// snapshot, then rank it. The cache lock is held across the build so a
+    /// concurrent incremental upsert/remove cannot land between the build and
+    /// the store and be lost (writers commit first, then take the lock).
+    /// A build failure degrades to an empty pool: recall then keeps its
+    /// historic FTS / fallback candidates rather than failing.
+    fn cosine_candidates_locked(
+        conn: &Connection,
+        cache: &Mutex<EmbeddingCache>,
+        generation: u64,
+        query: &[f32],
+        filter: &MemoryFilter,
+        k: usize,
+    ) -> Vec<i64> {
+        let mut cache = cache.lock().expect("embedding cache lock poisoned");
+        if cache.built_generation != Some(generation) {
+            match Self::load_embedding_pool_locked(conn) {
+                Ok(entries) => cache.entries = entries,
+                Err(_) => cache.entries.clear(),
+            }
+            cache.built_generation = Some(generation);
+        }
+        Self::top_cosine_rowids(&cache.entries, query, filter, k)
+    }
+
+    /// Rank the cached pool against `query` and return the top-`k` rowids the
+    /// filter admits. The pure cosine pass — kept free of SQL so its cost is
+    /// testable on its own.
+    fn top_cosine_rowids(
+        entries: &[CachedEmbedding],
+        query: &[f32],
+        filter: &MemoryFilter,
+        k: usize,
+    ) -> Vec<i64> {
+        let query_norm = Self::vector_norm(query);
+        if k == 0 || query_norm == 0.0 {
+            return Vec::new();
+        }
+        let mut scored: Vec<(f32, i64)> = entries
+            .iter()
+            .filter(|entry| Self::pool_entry_matches(entry, filter))
+            .map(|entry| (Self::cosine_with_norm(query, query_norm, entry), entry.rowid))
+            .collect();
+        // Score descending, rowid ascending as the deterministic tiebreaker —
+        // the final ranking re-sorts by score anyway; this only decides who
+        // survives the top-`k` cut.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        scored.truncate(k);
+        scored.into_iter().map(|(_, rowid)| rowid).collect()
+    }
+
+    /// Whether a cached (already live-only) entry passes the filter's tier and
+    /// record_type restrictions — the same rules `fts_candidates_locked` and
+    /// `load_recent_locked` apply in SQL, so the cosine pool never widens a
+    /// filtered recall beyond its filter.
+    fn pool_entry_matches(entry: &CachedEmbedding, filter: &MemoryFilter) -> bool {
+        let tier_ok = match filter.tier {
+            Some(tier) => entry.tier == tier,
+            None => !filter.exclude_working || entry.tier != MemoryTier::Working,
+        };
+        tier_ok && filter.record_type.is_none_or(|rt| entry.record_type == rt)
+    }
+
+    /// Cosine similarity using the entry's precomputed norm (the query's norm
+    /// is hoisted by the caller): one dot product per row, no square roots in
+    /// the ranking loop.
+    fn cosine_with_norm(query: &[f32], query_norm: f32, entry: &CachedEmbedding) -> f32 {
+        if query_norm == 0.0 || entry.norm == 0.0 {
+            return 0.0;
+        }
+        let dot = query
+            .iter()
+            .zip(&entry.embedding)
+            .map(|(x, y)| x * y)
+            .sum::<f32>();
+        dot / (query_norm * entry.norm)
+    }
+
+    /// The L2 norm of a vector (0.0 for an all-zero vector).
+    fn vector_norm(v: &[f32]) -> f32 {
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+
+    /// Insert or replace one row's pool entry — the hot-path incremental
+    /// maintenance. A no-op while the cache is stale (the next recall rebuilds
+    /// it from SQL, which already reflects the change).
+    fn cache_upsert_entry(&self, entry: CachedEmbedding) {
+        let generation = self
+            .embedding_cache_gen
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut cache = self
+            .embedding_cache
+            .lock()
+            .expect("embedding cache lock poisoned");
+        if cache.built_generation != Some(generation) {
+            return;
+        }
+        match cache.entries.iter_mut().find(|e| e.id == entry.id) {
+            Some(slot) => *slot = entry,
+            None => cache.entries.push(entry),
+        }
+    }
+
+    /// Drop one row's pool entry — the hot-path incremental maintenance.
+    fn cache_remove_entry(&self, id: &str) {
+        let generation = self
+            .embedding_cache_gen
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut cache = self
+            .embedding_cache
+            .lock()
+            .expect("embedding cache lock poisoned");
+        if cache.built_generation != Some(generation) {
+            return;
+        }
+        cache.entries.retain(|entry| entry.id != id);
+    }
+
+    /// Mark the pool stale: the next recall reloads it from SQL. Used by the
+    /// mutations the incremental path cannot express in one row (bulk deletes,
+    /// quarantine, superseded flips, re-embedding, an embedder swap).
+    fn invalidate_embedding_pool(&self) {
+        self.embedding_cache_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Load the most-recent `limit` memories matching `filter` with their
@@ -1433,11 +1750,12 @@ impl MemoryStore {
     }
 
     /// Query the FTS5 index for the top-K candidate rowids matching `query`,
-    /// ranked by FTS relevance. Distinguishes "FTS unavailable" (→ caller
-    /// falls back to a capped full scan) from "FTS available but no matches"
-    /// (→ caller also falls back to the capped semantic scan — zero-keyword
-    /// recall is the embeddings' core case). Applies the filter at SQL level so
-    /// the candidate pool never needs post-filtering: an explicit `tier`
+    /// ranked by FTS relevance. Distinguishes "FTS unavailable" from "FTS
+    /// available but no matches"; recall unions the matches with the all-row
+    /// cosine pool for a real embedding model, and keeps the capped fallback
+    /// for the hash embedder, a zero query vector and history-opt-in filters.
+    /// Applies the filter at SQL level so the candidate pool never needs
+    /// post-filtering: an explicit `tier`
     /// wins over the default working-tier exclusion (working memories are
     /// consolidation input, not recall output); superseded rows are excluded
     /// unless the filter opted in; a `record_type` restricts the pool.
@@ -1534,7 +1852,7 @@ impl MemoryStore {
     ) -> Result<usize> {
         let conn = self.conn.clone();
         let session_id = session_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<usize> {
+        let deleted = tokio::task::spawn_blocking(move || -> Result<usize> {
             let conn = conn.lock().expect("conn lock poisoned");
             // Same JSON1 session match as delete_working_for_session,
             // bounded to rows written at or before the turn boundary.
@@ -1552,7 +1870,12 @@ impl MemoryStore {
             Ok(deleted)
         })
         .await
-        .map_err(|e| Error::Memory(format!("delete_working_for_session_before task failed: {e}")))?
+        .map_err(|e| Error::Memory(format!("delete_working_for_session_before task failed: {e}")))??;
+        if deleted > 0 {
+            // A bulk delete — the pool is rebuilt on the next recall.
+            self.invalidate_embedding_pool();
+        }
+        Ok(deleted)
     }
 
     /// Turn-boundary auto-consolidation (backlog 4100f5e3 pillar C).
@@ -1636,9 +1959,11 @@ impl MemoryStoreTrait for MemoryStore {
         // into the spawn_blocking closure. `MemoryTier` is `Copy`.
         let tier = memory.tier;
         let title = memory.title.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let cached = tokio::task::spawn_blocking(move || -> Result<Option<CachedEmbedding>> {
             let conn = conn.lock().expect("conn lock poisoned");
-            Self::insert_memory_locked(&conn, &memory, &embedding_blob, &embed_model, embed_dim)
+            let rowid =
+                Self::insert_memory_locked(&conn, &memory, &embedding_blob, &embed_model, embed_dim)?;
+            Ok(Self::cache_entry(&memory, rowid))
         })
         .await
         .map_err(|e| Error::Memory(format!("write task failed: {e}")))??;
@@ -1650,6 +1975,12 @@ impl MemoryStoreTrait for MemoryStore {
         // necessarily bumps above the stamped version (review LOW-3).
         self.store_version
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The row just entered the live pool — keep the cosine cache in step
+        // incrementally (a full rebuild per write would reload every live
+        // embedding; working-tier rows are written every turn).
+        if let Some(entry) = cached {
+            self.cache_upsert_entry(entry);
+        }
         Ok(id)
     }
 
@@ -1683,19 +2014,34 @@ impl MemoryStoreTrait for MemoryStore {
         let embedder = self.embedder_handle();
         let query_vec = embedder.embed(query).await;
 
-        // Pre-filter candidates via the FTS5 index when available. This reduces
-        // the cosine-rank pass from O(N) (every memory) to O(K) where K is the
-        // number of keyword-matching candidates (K << N for large stores).
-        // We over-fetch (top 50) so the cosine re-rank still has a good pool to
-        // choose from, then apply the caller's `limit` after scoring.
+        // Fully semantic recall (plan d3336a8a step 10): the hash embedder's
+        // cosine is token-overlap noise, so it keeps the historic candidate
+        // paths exactly; a real embedding model encodes meaning, so its
+        // candidate set is the FTS matches UNIONED with the top-50 cosine over
+        // EVERY live row — a meaning-only match sharing no keyword with the
+        // query is then rankable instead of being limited to the 200
+        // most-recent rows. A zero query vector (a failed remote embed)
+        // carries no semantic signal and also keeps the historic paths.
+        let semantic_pool = embedder.model_id() != "hash" && Self::vector_norm(&query_vec) > 0.0;
+        // A filter that opts into history (superseded / quarantined rows)
+        // keeps today's 200-newest fallback IN ADDITION to the union: the
+        // cosine pool is live-only, so those rows would otherwise vanish from
+        // the candidate set when no keyword matches them.
+        let history_opt_in = !filter.exclude_superseded || !filter.exclude_quarantined;
+
+        // Pre-filter candidates via the FTS5 index when available. This is the
+        // keyword half of the candidate set; the semantic half is the
+        // all-row cosine pool below (plan d3336a8a step 10). Both over-fetch
+        // (top 50) so the cosine re-rank still has a good pool to choose
+        // from, then the caller's `limit` applies after scoring.
         const FTS_CANDIDATE_POOL: usize = 50;
-        // Cap the full-scan paths at the 200 most-recent memories so a large
-        // store doesn't load every row every turn (P2). Used both when FTS
-        // is unavailable AND when FTS returns no matches: a zero-keyword
-        // recall is precisely the case the embeddings exist for (paraphrase,
-        // stemming misses under unicode61, zero token overlap), so the
-        // query vector still gets a capped brute-force cosine pass instead
-        // of an empty result.
+        // Cap the historic full-scan paths at the 200 most-recent memories so a
+        // large store doesn't load every row every turn (P2). Still used when
+        // FTS is unavailable, when the query vector is zero (a failed embed),
+        // when the embedder is the hash fallback, and in addition to the union
+        // when the filter opts into history — the cosine pool is live-only, so
+        // superseded/quarantined rows would otherwise vanish from a filter
+        // that asked for them.
         const FULL_SCAN_FALLBACK_CAP: usize = 200;
 
         let memories = {
@@ -1708,28 +2054,64 @@ impl MemoryStoreTrait for MemoryStore {
             let read_conn = self.read_conn().clone();
             let query_owned = query.to_string();
             let filter = filter.clone();
+            let query_vec_owned = query_vec.clone();
+            let cache = Arc::clone(&self.embedding_cache);
+            let cache_gen = Arc::clone(&self.embedding_cache_gen);
             tokio::task::spawn_blocking(move || -> Result<Vec<Memory>> {
                 let conn = read_conn.lock().expect("read conn lock poisoned");
-                match Self::fts_candidates_locked(&conn, &query_owned, &filter, FTS_CANDIDATE_POOL)
-                {
-                    FtsResult::Matches(rowids) => {
-                        Self::load_by_rowids_locked(&conn, &rowids, filter.tier)
-                    }
-                    FtsResult::NoMatches => {
-                        // FTS available but no keyword matches — fall through
-                        // to the capped semantic scan (same as Unavailable).
-                        // Zero keyword overlap is the recall case embeddings
-                        // exist for; the query vector is already computed, so
-                        // ranking the 200 most-recent by cosine is cheap and
-                        // finds what the keyword net missed.
-                        Self::load_recent_locked(&conn, &filter, FULL_SCAN_FALLBACK_CAP)
-                    }
-                    FtsResult::Unavailable => {
-                        // FTS unavailable — fall back to a capped full scan (the
-                        // 200 most-recent memories).
-                        Self::load_recent_locked(&conn, &filter, FULL_SCAN_FALLBACK_CAP)
+                let fts = Self::fts_candidates_locked(
+                    &conn,
+                    &query_owned,
+                    &filter,
+                    FTS_CANDIDATE_POOL,
+                );
+                let fts_rowids = match fts {
+                    FtsResult::Matches(rowids) => rowids,
+                    FtsResult::NoMatches | FtsResult::Unavailable => Vec::new(),
+                };
+                let cosine_rowids = if semantic_pool {
+                    Self::cosine_candidates_locked(
+                        &conn,
+                        &cache,
+                        cache_gen.load(std::sync::atomic::Ordering::SeqCst),
+                        &query_vec_owned,
+                        &filter,
+                        FTS_CANDIDATE_POOL,
+                    )
+                } else {
+                    Vec::new()
+                };
+                // The candidate union, deduplicated by rowid (FTS and the
+                // cosine pool can name the same row).
+                let mut seen = HashSet::new();
+                let mut union: Vec<i64> =
+                    Vec::with_capacity(fts_rowids.len() + cosine_rowids.len());
+                for rowid in fts_rowids.into_iter().chain(cosine_rowids) {
+                    if seen.insert(rowid) {
+                        union.push(rowid);
                     }
                 }
+                if union.is_empty() {
+                    // Historic paths: the hash embedder, a zero query vector,
+                    // or a store with no live rows — the capped 200-newest
+                    // scan (today's behaviour, unchanged).
+                    return Self::load_recent_locked(&conn, &filter, FULL_SCAN_FALLBACK_CAP);
+                }
+                let mut memories = Self::load_by_rowids_locked(&conn, &union, filter.tier)?;
+                if semantic_pool && history_opt_in {
+                    // Keep today's 200-newest candidates too when the filter
+                    // opted into history: superseded / quarantined rows are
+                    // outside the live-only pool.
+                    let recent = Self::load_recent_locked(&conn, &filter, FULL_SCAN_FALLBACK_CAP)?;
+                    let mut present: HashSet<String> =
+                        memories.iter().map(|m| m.id.clone()).collect();
+                    for memory in recent {
+                        if present.insert(memory.id.clone()) {
+                            memories.push(memory);
+                        }
+                    }
+                }
+                Ok(memories)
             })
             .await
             .map_err(|e| Error::Memory(format!("recall load task failed: {e}")))??
@@ -2021,42 +2403,55 @@ impl MemoryStoreTrait for MemoryStore {
         let id_owned = id.to_string();
         let title = title.map(|t| t.to_string());
         let content = content.map(|c| c.to_string());
-        let updated = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let conn = conn.lock().expect("conn lock poisoned");
-            if title.is_none() && content.is_none() {
-                // Nothing to change — report existence (the contract is
-                // "false when the id is unknown") without a no-op UPDATE.
-                let exists: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
-                    params![id_owned],
-                    |row| row.get(0),
+        let updated =
+            tokio::task::spawn_blocking(move || -> Result<(bool, Option<CachedEmbedding>)> {
+                let conn = conn.lock().expect("conn lock poisoned");
+                if title.is_none() && content.is_none() {
+                    // Nothing to change — report existence (the contract is
+                    // "false when the id is unknown") without a no-op UPDATE.
+                    let exists: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)",
+                        params![id_owned],
+                        |row| row.get(0),
+                    )?;
+                    return Ok((exists, None));
+                }
+                // COALESCE keeps unchanged fields at their stored values; the
+                // FTS UPDATE trigger's WHEN guard (title/content changed) then
+                // re-indexes only when one of them actually moved.
+                let updated = conn.execute(
+                    "UPDATE memories SET \
+                       title = COALESCE(?2, title), \
+                       content = COALESCE(?3, content), \
+                       record_type = COALESCE(?4, record_type), \
+                       embedding = COALESCE(?5, embedding), \
+                       embed_model = COALESCE(?6, embed_model), \
+                       embed_dim = COALESCE(?7, embed_dim) \
+                     WHERE id = ?1",
+                    params![id_owned, title, content, record_type, blob, model, dim],
                 )?;
-                return Ok(exists);
-            }
-            // COALESCE keeps unchanged fields at their stored values; the
-            // FTS UPDATE trigger's WHEN guard (title/content changed) then
-            // re-indexes only when one of them actually moved.
-            let updated = conn.execute(
-                "UPDATE memories SET \
-                   title = COALESCE(?2, title), \
-                   content = COALESCE(?3, content), \
-                   record_type = COALESCE(?4, record_type), \
-                   embedding = COALESCE(?5, embedding), \
-                   embed_model = COALESCE(?6, embed_model), \
-                   embed_dim = COALESCE(?7, embed_dim) \
-                 WHERE id = ?1",
-                params![id_owned, title, content, record_type, blob, model, dim],
-            )?;
-            Ok(updated > 0)
-        })
-        .await
-        .map_err(|e| Error::Memory(format!("update_memory task failed: {e}")))??;
+                if updated == 0 {
+                    return Ok((false, None));
+                }
+                // Refresh this one row's pool entry: an in-place UPDATE keeps
+                // the rowid, but the embedding and/or record_type may have
+                // moved (a content change re-embeds the row).
+                let entry = Self::cache_entry_locked(&conn, &id_owned)?;
+                Ok((true, entry))
+            })
+            .await
+            .map_err(|e| Error::Memory(format!("update_memory task failed: {e}")))??;
+        let (updated, cached) = updated;
         if updated {
             // Invalidate per-turn auto-recall caches (the version counter) —
             // only when a row actually changed, and AFTER it is committed/
             // visible (review LOW-3 — see write()).
             self.store_version
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match cached {
+                Some(entry) => self.cache_upsert_entry(entry),
+                None => self.cache_remove_entry(id),
+            }
         }
         Ok(updated)
     }
@@ -2079,7 +2474,12 @@ impl MemoryStoreTrait for MemoryStore {
             Ok(())
         })
         .await
-        .map_err(|e| Error::Memory(format!("quarantine_memory task failed: {e}")))?
+        .map_err(|e| Error::Memory(format!("quarantine_memory task failed: {e}")))??;
+        // A quarantined row leaves the live pool. Quarantine is a rare path
+        // (the startup integrity sweep), so the pool is dropped and rebuilt on
+        // the next recall rather than patched row by row.
+        self.invalidate_embedding_pool();
+        Ok(())
     }
 
     async fn supersede_memory(&self, old_id: &str, mut new_memory: Memory) -> Result<String> {
@@ -2089,10 +2489,11 @@ impl MemoryStoreTrait for MemoryStore {
         new_memory.record_type = MemoryRecordType::from_title(&new_memory.title);
         let conn = self.conn.clone();
         let old_id_owned = old_id.to_string();
+        let old_id_for_cache = old_id_owned.clone();
         let new_id = new_memory.id.clone();
         let tier = new_memory.tier;
         let title = new_memory.title.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let cached = tokio::task::spawn_blocking(move || -> Result<Option<CachedEmbedding>> {
             let mut conn = conn.lock().expect("conn lock poisoned");
             // ONE transaction: insert the successor + mark the old row, or
             // neither (a partial supersede would corrupt the history chain;
@@ -2122,13 +2523,14 @@ impl MemoryStoreTrait for MemoryStore {
                 }
                 Some(None) => {}
             }
-            Self::insert_memory_locked(&tx, &new_memory, &embedding_blob, &embed_model, embed_dim)?;
+            let new_rowid =
+                Self::insert_memory_locked(&tx, &new_memory, &embedding_blob, &embed_model, embed_dim)?;
             tx.execute(
                 "UPDATE memories SET superseded_by = ?1 WHERE id = ?2",
                 params![new_memory.id, old_id_owned],
             )?;
             tx.commit()?;
-            Ok(())
+            Ok(Self::cache_entry(&new_memory, new_rowid))
         })
         .await
         .map_err(|e| Error::Memory(format!("supersede_memory task failed: {e}")))??;
@@ -2137,12 +2539,19 @@ impl MemoryStoreTrait for MemoryStore {
         // Bumped AFTER the transaction commits (review LOW-3 — see write()).
         self.store_version
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The predecessor left the live pool, the successor entered it —
+        // incrementally, not by rebuilding every live embedding.
+        self.cache_remove_entry(&old_id_for_cache);
+        if let Some(entry) = cached {
+            self.cache_upsert_entry(entry);
+        }
         Ok(new_id)
     }
 
     async fn delete_memory(&self, id: &str) -> Result<bool> {
         let conn = self.conn.clone();
         let id = id.to_string();
+        let id_for_cache = id.clone();
         let deleted = tokio::task::spawn_blocking(move || -> Result<bool> {
             let conn = conn.lock().expect("conn lock poisoned");
             // The FTS AFTER DELETE trigger keeps the index in sync.
@@ -2157,6 +2566,8 @@ impl MemoryStoreTrait for MemoryStore {
             // committed/visible (review LOW-3 — see write()).
             self.store_version
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // The row left the live pool.
+            self.cache_remove_entry(&id_for_cache);
         }
         Ok(deleted)
     }
@@ -2379,7 +2790,7 @@ impl MemoryStoreTrait for MemoryStore {
     async fn delete_working_for_session(&self, session_id: &str) -> Result<usize> {
         let conn = self.conn.clone();
         let session_id = session_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<usize> {
+        let deleted = tokio::task::spawn_blocking(move || -> Result<usize> {
             let conn = conn.lock().expect("conn lock poisoned");
             // source_session_ids is a JSON array (e.g. ["sess-1"]). Use JSON1's
             // json_each to match rows whose array contains session_id, restricted
@@ -2396,7 +2807,12 @@ impl MemoryStoreTrait for MemoryStore {
             Ok(deleted)
         })
         .await
-        .map_err(|e| Error::Memory(format!("delete_working_for_session task failed: {e}")))?
+        .map_err(|e| Error::Memory(format!("delete_working_for_session task failed: {e}")))??;
+        if deleted > 0 {
+            // A bulk delete — the pool is rebuilt on the next recall.
+            self.invalidate_embedding_pool();
+        }
+        Ok(deleted)
     }
 
     async fn stored_model_fingerprints(&self) -> Result<Vec<(String, usize)>> {
@@ -2468,6 +2884,9 @@ impl MemoryStoreTrait for MemoryStore {
                 report(count, total);
             }
         }
+        // Every embedding in the store was rewritten — the pool's vectors are
+        // from the OLD space until the next recall rebuilds it from SQL.
+        self.invalidate_embedding_pool();
         Ok(count)
     }
 

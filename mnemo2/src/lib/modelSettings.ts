@@ -75,17 +75,61 @@ export interface BudgetCaps {
   max_retries_per_lane: number;
 }
 
+/** One "Free disk" line of the Machine page (read-only status). */
+export interface DiskLine {
+  /** What the line is about: the open project's build caches, or the config
+   * dir (models, memory DB) when it sits on a different volume. */
+  role: "project" | "config";
+  /** The volume label, e.g. `C:` or `/`. */
+  volume: string;
+  /** Whole GB free. */
+  free_gb: number;
+}
+
+/**
+ * The machine-wide limits the Machine page edits (plan d3336a8a step 3): how
+ * many heavy commands run at once across every Mnemo2 instance on this
+ * computer, plus the read-only disk lines.
+ */
+export interface MachineSection {
+  heavy_commands: number;
+  /** The setting's bounds, straight from the backend's range. */
+  min_heavy_commands: number;
+  max_heavy_commands: number;
+  /** One line per volume worth showing; empty when none could be read. */
+  disks: DiskLine[];
+  /** The read-only shared-build-cache line. */
+  sccache: SccacheLine;
+}
+
+/**
+ * Whether the machine has `sccache` — the shared Rust build cache that every
+ * agent command, verification and proof run uses automatically (plan d3336a8a
+ * step 7). Read-only: there is no toggle, and a user's own `RUSTC_WRAPPER` is
+ * never replaced.
+ */
+export interface SccacheLine {
+  /** Whether an `sccache` binary was found on PATH. */
+  found: boolean;
+  /** The resolved binary path, or `null` when none was found. */
+  path: string | null;
+}
+
 /** The full `model_settings_get` response. */
 export interface ModelSettings {
   task_models: TaskModels;
   vision_model: string | null;
+  /** Why the vision model yields no image tools (or may not) — shown under the
+   * Vision field; `null` when vision is unset or resolves cleanly. */
+  vision_warning: string | null;
   embedding: EmbeddingSection;
   optimizer: OptimizerSettings;
   budget: BudgetCaps;
+  machine: MachineSection;
 }
 
 /** One page-owned section a save writes in isolation. */
-export type ModelSettingsSection = "models" | "vision" | "embedding" | "optimizer" | "budget";
+export type ModelSettingsSection = "models" | "vision" | "embedding" | "optimizer" | "budget" | "machine";
 
 /** A `SetupEvent` payload from `embedding_install`: progress, then done/failed. */
 export interface EmbedderEvent {
@@ -247,6 +291,33 @@ export function optimizerWire(draft: OptimizerDraft): { value?: Partial<Optimize
     .map((command) => command.trim())
     .filter((command) => command.length > 0);
   return { value: { ...value, ...knobs } };
+}
+
+/** An editable machine draft: the build limit as input text plus its bounds. */
+export interface MachineDraft {
+  heavy_commands: string;
+  min: number;
+  max: number;
+}
+
+/** Seed a machine draft from the wire section. */
+export function machineDraft(section: MachineSection): MachineDraft {
+  return {
+    heavy_commands: String(section.heavy_commands),
+    min: section.min_heavy_commands,
+    max: section.max_heavy_commands,
+  };
+}
+
+/** Parse a machine draft into the save payload, or the first error. */
+export function machineWire(draft: MachineDraft): { value?: { heavy_commands: number }; error?: string } {
+  const parsed = parseWholeNumber(draft.heavy_commands);
+  if (parsed === null || parsed < draft.min || parsed > draft.max) {
+    return {
+      error: `Builds and tests at once must be a whole number from ${draft.min} to ${draft.max}`,
+    };
+  }
+  return { value: { heavy_commands: parsed } };
 }
 
 /** Parse a budget draft into the save caps, or the first error. */

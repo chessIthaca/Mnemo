@@ -1033,6 +1033,7 @@ fn build_request_json_carries_per_model_configured_effort() {
         "glm",
         false,
         ep.effective_reasoning_effort_for(Some("glm")),
+        None,
     ));
     let body = client
         .build_request_json(&[Message::user_text("hi")], &[], None)
@@ -5045,5 +5046,363 @@ async fn reasoning_effort_retry_accumulates_both_attempts_server_ms() {
     assert!(
         connect >= 250,
         "connect covers both attempts (got {connect}ms)"
+    );
+}
+
+// ---- Machine-wide endpoint limits (plan d3336a8a step 4) -------------------
+
+/// One canned response for [`LimitsStub`]: like [`StubResponse`], plus the
+/// extra header lines a `Retry-After` needs.
+#[derive(Clone, Copy)]
+struct LimitsResponse {
+    status: u16,
+    content_type: &'static str,
+    /// Extra header lines, each terminated by `\r\n` (may be empty).
+    headers: &'static str,
+    body: &'static str,
+}
+
+/// A stub that serves every request on its own task, so overlapping requests
+/// stay overlapping, and records the peak number in flight plus each arrival.
+struct LimitsStub {
+    addr: std::net::SocketAddr,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    arrivals: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+}
+
+impl LimitsStub {
+    /// Start the stub. `responses[i]` answers the i-th request (the last one
+    /// repeats); `hold` keeps every response pending, widening the window in
+    /// which two requests can be in flight at once.
+    async fn start(responses: Vec<LimitsResponse>, hold: std::time::Duration) -> Self {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind limits stub");
+        let addr = listener.local_addr().expect("limits stub addr");
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (peak_task, live_task, arrivals_task) =
+            (Arc::clone(&peak), Arc::clone(&live), Arc::clone(&arrivals));
+        tokio::spawn(async move {
+            let mut served = 0usize;
+            while let Ok((mut socket, _peer)) = listener.accept().await {
+                let index = served.min(responses.len().saturating_sub(1));
+                served += 1;
+                let response = responses[index];
+                let (peak, live, arrivals) = (
+                    Arc::clone(&peak_task),
+                    Arc::clone(&live_task),
+                    Arc::clone(&arrivals_task),
+                );
+                tokio::spawn(async move {
+                    arrivals
+                        .lock()
+                        .expect("arrivals lock")
+                        .push(std::time::Instant::now());
+                    let in_flight = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(in_flight, Ordering::SeqCst);
+                    // Read the head + body so the client's write completes.
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let head_end = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(buf.len());
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            let lower = line.to_ascii_lowercase();
+                            lower
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < head_end + content_length {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    tokio::time::sleep(hold).await;
+                    let reason = match response.status {
+                        200 => "OK",
+                        429 => "Too Many Requests",
+                        _ => "Bad Request",
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\n{}connection: close\r\n\r\n",
+                        response.status,
+                        reason,
+                        response.content_type,
+                        response.body.len(),
+                        response.headers,
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(response.body.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    live.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        Self {
+            addr,
+            peak,
+            arrivals,
+        }
+    }
+}
+
+/// A client for the limits tests. Both handles get the same endpoint name
+/// ("test", from [`OpenAiClientConfig::test_default`]) and the same run
+/// folder, so they share one endpoint slot folder — the two-instance case.
+fn limits_client(
+    stub: &LimitsStub,
+    run_dir: &std::path::Path,
+    max_concurrent: Option<u32>,
+) -> OpenAiClient {
+    OpenAiClient::new(OpenAiClientConfig {
+        base_url: format!("http://{}/v1", stub.addr),
+        run_dir: Some(run_dir.to_path_buf()),
+        max_concurrent,
+        ..OpenAiClientConfig::test_default()
+    })
+}
+
+/// Drain a completion stream to its end: the request slot is released when
+/// the pump task ends, which only happens after the last event.
+async fn drain_completion(mut stream: futures::stream::BoxStream<'_, LlmEvent>) {
+    use futures::StreamExt;
+    while stream.next().await.is_some() {}
+}
+
+/// The peak in-flight count a stub saw, and the number of requests.
+fn peak_and_count(stub: &LimitsStub) -> (usize, usize) {
+    use std::sync::atomic::Ordering;
+    let peak = stub.peak.load(Ordering::SeqCst);
+    let count = stub.arrivals.lock().expect("arrivals lock").len();
+    (peak, count)
+}
+
+#[tokio::test]
+async fn concurrency_capped_across_handles() {
+    let run_dir = tempfile::tempdir().expect("temp run dir");
+    let sse = LimitsResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        headers: "",
+        body: SSE_OK,
+    };
+    let hold = std::time::Duration::from_millis(150);
+
+    // Control: two slots let both requests overlap, so a peak of 2 is what an
+    // uncapped endpoint looks like — the cap test below can see the difference.
+    let open = LimitsStub::start(vec![sse], hold).await;
+    let first = limits_client(&open, run_dir.path(), Some(2));
+    let second = limits_client(&open, run_dir.path(), Some(2));
+    let (open_a, open_b) = (
+        [Message::user_text("a")],
+        [Message::user_text("b")],
+    );
+    let (a, b) = tokio::join!(
+        first.complete(&open_a, &[], None),
+        second.complete(&open_b, &[], None),
+    );
+    drain_completion(a.expect("first request")).await;
+    drain_completion(b.expect("second request")).await;
+    assert_eq!(
+        peak_and_count(&open),
+        (2, 2),
+        "two slots must allow two requests in flight"
+    );
+
+    // The cap: one slot, two handles, the same run folder — never more than
+    // one request in flight on the machine.
+    let capped = LimitsStub::start(vec![sse], hold).await;
+    let first = limits_client(&capped, run_dir.path(), Some(1));
+    let second = limits_client(&capped, run_dir.path(), Some(1));
+    let (capped_a, capped_b) = (
+        [Message::user_text("a")],
+        [Message::user_text("b")],
+    );
+    let (a, b) = tokio::join!(
+        first.complete(&capped_a, &[], None),
+        second.complete(&capped_b, &[], None),
+    );
+    drain_completion(a.expect("first request")).await;
+    drain_completion(b.expect("second request")).await;
+    assert_eq!(
+        peak_and_count(&capped),
+        (1, 2),
+        "max_concurrent = 1 must serialise two handles sharing the run folder"
+    );
+}
+
+#[tokio::test]
+async fn cooldown_written_on_429_and_honoured() {
+    let run_dir = tempfile::tempdir().expect("temp run dir");
+    let stub = LimitsStub::start(
+        vec![
+            LimitsResponse {
+                status: 429,
+                content_type: "application/json",
+                headers: "retry-after: 1\r\n",
+                body: "{\"error\":{\"message\":\"rate limited\"}}",
+            },
+            LimitsResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: "",
+                body: SSE_OK,
+            },
+        ],
+        std::time::Duration::ZERO,
+    )
+    .await;
+
+    let first = limits_client(&stub, run_dir.path(), None);
+    // Bracket the request with wall-clock reads: the cooldown is written
+    // somewhere between them, so `before + 1 s <= until <= after + 1 s` is
+    // exact for a `Retry-After: 1` — a `now` read after the fact would make
+    // the window too tight whenever the machine stalls the test between the
+    // write and the read (it did under load: until - now = 419 ms).
+    let before = wall_now_ms();
+    let outcome = first
+        .complete(&[Message::user_text("a")], &[], None)
+        .await;
+    assert!(outcome.is_err(), "a 429 is a request error");
+    let after = wall_now_ms();
+
+    // The 429 armed the machine-wide cooldown: now + Retry-After (1 s).
+    let dir = super::limits::endpoint_dir(run_dir.path(), "test");
+    let until: u64 = std::fs::read_to_string(dir.join("cooldown"))
+        .expect("the 429 must write the cooldown")
+        .trim()
+        .parse()
+        .expect("an until-ms timestamp");
+    assert!(
+        until >= before + 1_000 && until <= after + 1_000,
+        "cooldown should be 1 s after the 429, got {until} (request spanned {before}..{after})"
+    );
+
+    // A second handle (the "other instance") waits it out before sending.
+    let second = limits_client(&stub, run_dir.path(), None);
+    let started = std::time::Instant::now();
+    let stream = second
+        .complete(&[Message::user_text("b")], &[], None)
+        .await
+        .expect("the second request goes out after the cooldown");
+    let waited = started.elapsed();
+    drain_completion(stream).await;
+    assert!(
+        waited >= std::time::Duration::from_millis(600),
+        "the shared cooldown must delay the send, waited only {waited:?}"
+    );
+    let arrivals = stub.arrivals.lock().expect("arrivals lock").clone();
+    assert_eq!(arrivals.len(), 2, "two requests reached the stub");
+    assert!(
+        arrivals[1].duration_since(arrivals[0]) >= std::time::Duration::from_millis(600),
+        "the stub saw the second send only after the cooldown"
+    );
+}
+
+#[tokio::test]
+async fn no_limit_no_lock() {
+    let run_dir = tempfile::tempdir().expect("temp run dir");
+    let stub = LimitsStub::start(
+        vec![LimitsResponse {
+            status: 200,
+            content_type: "text/event-stream",
+            headers: "",
+            body: SSE_OK,
+        }],
+        std::time::Duration::ZERO,
+    )
+    .await;
+    // A run dir IS configured — only `max_concurrent` is empty, which must
+    // mean "no slot, no folder", exactly today's behaviour.
+    let client = limits_client(&stub, run_dir.path(), None);
+    let stream = client
+        .complete(&[Message::user_text("hi")], &[], None)
+        .await
+        .expect("an unlimited endpoint always sends");
+    drain_completion(stream).await;
+    assert!(
+        !super::limits::endpoint_dir(run_dir.path(), "test").exists(),
+        "an unlimited endpoint must not create a slot folder"
+    );
+    assert_eq!(peak_and_count(&stub), (1, 1));
+}
+
+/// Wall-clock milliseconds since the epoch — the unit the cooldown file uses.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64
+}
+
+/// Finding queuedIgnoresCooldown: a request queued for a slot must not slip
+/// past a cooldown armed by the request it queued behind. With
+/// `max_concurrent = 1`, A holds the only slot and gets a 429 with
+/// `Retry-After: 1`; B is already waiting for the slot, so it acquires the
+/// moment A releases it — the very release the 429 causes. B must then sleep
+/// out the remainder of the cooldown WITH the slot held, so its send reaches
+/// the stub at least ~900 ms after A's, not straight away.
+#[tokio::test]
+async fn a_request_queued_behind_a_429_waits_out_the_cooldown() {
+    let run_dir = tempfile::tempdir().expect("temp run dir");
+    let stub = LimitsStub::start(
+        vec![
+            LimitsResponse {
+                status: 429,
+                content_type: "application/json",
+                headers: "retry-after: 1\r\n",
+                body: "{\"error\":{\"message\":\"rate limited\"}}",
+            },
+            LimitsResponse {
+                status: 200,
+                content_type: "text/event-stream",
+                headers: "",
+                body: SSE_OK,
+            },
+        ],
+        // Hold every response briefly, so B is queued on the slot before A's
+        // 429 releases it — the exact interleaving of the finding.
+        std::time::Duration::from_millis(200),
+    )
+    .await;
+    let first = limits_client(&stub, run_dir.path(), Some(1));
+    let second = limits_client(&stub, run_dir.path(), Some(1));
+    let (a_msgs, b_msgs) = ([Message::user_text("a")], [Message::user_text("b")]);
+    let (a, b) = tokio::join!(
+        first.complete(&a_msgs, &[], None),
+        second.complete(&b_msgs, &[], None),
+    );
+    assert!(a.is_err(), "the first request ends with the 429");
+    drain_completion(b.expect("the queued request still goes out")).await;
+
+    let (peak, count) = peak_and_count(&stub);
+    assert_eq!(count, 2, "both requests reached the stub");
+    assert_eq!(peak, 1, "max_concurrent = 1 holds across the whole exchange");
+    let gap = {
+        let arrivals = stub.arrivals.lock().expect("arrivals lock");
+        arrivals[1].duration_since(arrivals[0])
+    };
+    assert!(
+        gap >= std::time::Duration::from_millis(900),
+        "the queued send must wait out the cooldown, but it arrived {gap:?} after the 429ing one"
     );
 }

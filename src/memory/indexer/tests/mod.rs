@@ -41,6 +41,46 @@ fn write_backlog(root: &Path, json: &str) {
 
 fn noop_progress(_: usize, _: usize) {}
 
+/// The project-only `index_derived` the pre-existing tests call — no machine
+/// knowledge corpus (`None`), so their expectations stay exactly as they were.
+/// Machine-tier tests call [`super::index_derived`] with a root of their own.
+async fn index_derived(
+    store: &dyn MemoryStoreTrait,
+    plans_dir: &Path,
+    backlog_path: &Path,
+    progress: &(dyn Fn(usize, usize) + Send + Sync),
+) -> Result<IndexReport> {
+    super::index_derived(store, plans_dir, backlog_path, None, progress).await
+}
+
+/// The project-only `rebuild_derived` twin of the helper above.
+async fn rebuild_derived(
+    store: &dyn MemoryStoreTrait,
+    plans_dir: &Path,
+    backlog_path: &Path,
+    progress: &(dyn Fn(usize, usize) + Send + Sync),
+) -> Result<IndexReport> {
+    super::rebuild_derived(store, plans_dir, backlog_path, None, progress).await
+}
+
+/// The project-only `corpus_is_stale` twin of the helper above.
+async fn corpus_is_stale(
+    store: &dyn MemoryStoreTrait,
+    plans_dir: &Path,
+    backlog_path: &Path,
+) -> Result<bool> {
+    super::corpus_is_stale(store, plans_dir, backlog_path, None).await
+}
+
+/// The project-corpus `reindex_knowledge_files` twin of the helpers above.
+async fn reindex_knowledge_files(
+    store: &dyn MemoryStoreTrait,
+    knowledge_dir: &Path,
+    rels: &[String],
+) -> Result<IndexReport> {
+    super::reindex_knowledge_files(store, knowledge_dir, rels, false).await
+}
+
 const PLAN_A: &str = "# Plan: Add feature X\n\n## Goal\nShip the X feature safely.\n\n## Kind\nimplementation\n\n## Context\ncommit fa9dcdd landed the base\n\n## Steps\n- [x] **One** — done\n- [ ] **Two** — todo\n";
 
 const REVIEW_A: &str = "# Review: Storage layer refactor\n\n**Date:** 2026-08-01\n\n## Findings\n\n### High — connection leak\n\ndetails\n\n### Low — naming\n\ndetails\n";

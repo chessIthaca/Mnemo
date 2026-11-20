@@ -84,11 +84,19 @@ pub fn compute_diff(path: &str, old: &str, new: &str) -> String {
 /// one line: the error text IS the result output's first line, the marker
 /// surface.
 pub(crate) fn with_fresh_read_nudge(msg: impl std::fmt::Display) -> crate::error::Error {
-    crate::error::Error::NotFound(format!(
+    crate::error::Error::NotFound(fresh_read_nudge_text(msg))
+}
+
+/// The nudge's own text — no error-class prefix — so a caller that has to
+/// append after the marker line (the current-text excerpt, plan f89fd63d
+/// step 3) rebuilds the exact same first line instead of wrapping the
+/// nudge's Display and doubling the `not found: ` prefix.
+fn fresh_read_nudge_text(msg: impl std::fmt::Display) -> String {
+    format!(
         "{msg} — the content has likely drifted from your last read. \
          {EDIT_STALE_READ_MARK} (read_files, this exact path) and retry with the \
          exact current text; do not edit without a fresh read."
-    ))
+    )
 }
 
 /// Extensions treated as code files for the markdown-heading artifact check
@@ -643,19 +651,17 @@ fn escape_display(s: &str) -> String {
     s.replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
 }
 
-/// The first-difference miss diagnostic (backlog 838b6f4e D): on a genuine
-/// literal miss, find the position in the LF-projected content sharing the
-/// longest common prefix with the needle (>= 8 chars) and report how far it
-/// matched and where the two diverge — turning a blind retry loop into a
-/// one-shot fix. Returns None when no position shares the threshold prefix
-/// (nothing useful to say). Char-based (not bytes) so the reported position
-/// and snippets are display-accurate.
-pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<String> {
-    const MIN_PREFIX: usize = 8;
-    let (content_lf, _) = normalize_lf_with_offsets(content);
-    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
-    let hay: Vec<char> = content_lf.chars().collect();
-    if needle.len() < MIN_PREFIX {
+/// Minimum shared prefix (chars) for a near-miss position to be worth
+/// reporting — below it the "closest" match is noise.
+const MIN_NEAR_MISS_PREFIX: usize = 8;
+
+/// The best shared-prefix position of `needle` in `hay`, in char
+/// coordinates: `(start, matched_chars)`. None when nothing reaches
+/// [`MIN_NEAR_MISS_PREFIX`]. Shared by the first-difference diagnostic and
+/// the current-text excerpt (plan f89fd63d step 3) so both name the same
+/// place.
+fn near_miss_position(hay: &[char], needle: &[char]) -> Option<(usize, usize)> {
+    if needle.len() < MIN_NEAR_MISS_PREFIX {
         return None;
     }
     // Work budget (review L3): bound the worst case — long runs of the
@@ -683,9 +689,29 @@ pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<St
             best_start = start;
         }
     }
-    if best_len < MIN_PREFIX {
+    if best_len < MIN_NEAR_MISS_PREFIX {
         return None;
     }
+    Some((best_start, best_len))
+}
+
+/// The excerpt header a drift-class miss carries when it served the current
+/// text near the closest match (plan f89fd63d step 3). One constant for the
+/// emitter and the dispatch funnel's detector, so the two cannot drift.
+pub(crate) const NEAR_MISS_EXCERPT_MARK: &str = "Current text near the closest match (lines";
+
+/// The first-difference miss diagnostic (backlog 838b6f4e D): on a genuine
+/// literal miss, find the position in the LF-projected content sharing the
+/// longest common prefix with the needle (>= 8 chars) and report how far it
+/// matched and where the two diverge — turning a blind retry loop into a
+/// one-shot fix. Returns None when no position shares the threshold prefix
+/// (nothing useful to say). Char-based (not bytes) so the reported position
+/// and snippets are display-accurate.
+pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<String> {
+    let (content_lf, _) = normalize_lf_with_offsets(content);
+    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
+    let hay: Vec<char> = content_lf.chars().collect();
+    let (best_start, best_len) = near_miss_position(&hay, &needle)?;
     let file_next: String = hay[best_start + best_len..].iter().take(4).collect();
     let sent_next: String = needle[best_len..].iter().take(4).collect();
     Some(format!(
@@ -697,6 +723,128 @@ pub(crate) fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<St
         escape_display(&file_next),
         escape_display(&sent_next)
     ))
+}
+
+/// The current text near the closest match, served as a fresh read receipt
+/// (plan f89fd63d step 3): on a literal miss with a near-miss position, hand
+/// back the numbered lines around it — `read_files`' own format — plus a
+/// receipt minted over exactly those lines, so a corrected retry can cite
+/// them with no full re-read. `content` must be the bytes on disk (the
+/// pre-call content), because the receipt's per-line hashes are checked
+/// against them; `validated_path` must be the sandbox-validated path the
+/// reader mints under, or a later cite fails the receipt's path check.
+///
+/// The window is three lines of context on each side of the best match plus
+/// the needle's own line span, capped at 40 lines: past that the window
+/// re-centres on the first-difference line (the line where the sent text
+/// diverges), which is the line a retry has to change.
+pub(crate) fn near_miss_excerpt(
+    validated_path: &Path,
+    content: &str,
+    old_string: &str,
+) -> Option<String> {
+    const CONTEXT_LINES: usize = 3;
+    const MAX_EXCERPT_LINES: usize = 40;
+    let (content_lf, offsets) = normalize_lf_with_offsets(content);
+    let hay: Vec<char> = content_lf.chars().collect();
+    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
+    let (best_start, best_len) = near_miss_position(&hay, &needle)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let last = lines.len();
+    if last == 0 {
+        return None;
+    }
+    // 1-indexed line of a projection position, in the SAME frame the served
+    // lines use: `content.lines()` splits on '\n' only, while the projection
+    // also turns a lone '\r' into '\n'. Counting the projection's newlines
+    // would overstate the line on CR-only or stray-'\r' content, push the
+    // window past the last line and make `end - first + 1` underflow — so map
+    // the position back to the original bytes through `offsets` and count the
+    // real newlines there.
+    let char_bytes: Vec<usize> = content_lf.char_indices().map(|(b, _)| b).collect();
+    let line_of = |projection_char: usize| -> Option<usize> {
+        let projection_byte = if projection_char == hay.len() {
+            content_lf.len()
+        } else {
+            *char_bytes.get(projection_char)?
+        };
+        let source_byte = if projection_byte == content_lf.len() {
+            content.len()
+        } else {
+            *offsets.get(projection_byte)?
+        };
+        if source_byte > content.len() || !content.is_char_boundary(source_byte) {
+            return None;
+        }
+        Some(
+            content.as_bytes()[..source_byte]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count()
+                + 1,
+        )
+    };
+    // A position that cannot be mapped into the served frame yields no
+    // excerpt: better none than a window in the wrong coordinates.
+    let match_line = line_of(best_start)?;
+    let diff_line = line_of(best_start + best_len)?;
+    let needle_lines = needle.iter().filter(|c| **c == '\n').count() + 1;
+    let mut first = match_line.saturating_sub(CONTEXT_LINES).max(1);
+    let mut end = match_line
+        .saturating_add(needle_lines)
+        .saturating_add(CONTEXT_LINES)
+        .min(last);
+    if first > end {
+        return None;
+    }
+    if end - first + 1 > MAX_EXCERPT_LINES {
+        // Too wide: 40 lines centred on the first-difference line, clamped
+        // into the file so the window is always exactly 40 when it can be.
+        let centre = diff_line.clamp(1, last);
+        first = centre.saturating_sub(MAX_EXCERPT_LINES / 2).max(1);
+        end = first.saturating_add(MAX_EXCERPT_LINES - 1).min(last);
+        first = end.saturating_sub(MAX_EXCERPT_LINES - 1).max(1);
+    }
+    let served: Vec<&str> = lines[first - 1..end].to_vec();
+    let receipt = crate::tool::agent::read_registry::mint(
+        validated_path.to_path_buf(),
+        first,
+        &served,
+    );
+    let mut out = format!(
+        "{NEAR_MISS_EXCERPT_MARK} {first}-{end}, read receipt {receipt} — cite it with \
+         from_read and lines):"
+    );
+    for (offset, line) in served.iter().enumerate() {
+        out.push('\n');
+        out.push_str(&crate::tool::agent::read_files::numbered_line(
+            first + offset,
+            line,
+        ));
+    }
+    Some(out)
+}
+
+/// The drift-class error for a literal miss: the fresh-read nudge (whose
+/// single line carries the `EditStaleRead` marker) with, after that line and
+/// never inside it, the current text near the closest match when there is
+/// one (plan f89fd63d step 3). None of the near-miss diagnostics change —
+/// the excerpt is appended.
+pub(crate) fn drift_error_with_excerpt(
+    msg: impl std::fmt::Display,
+    validated_path: &Path,
+    content: &str,
+    old_string: &str,
+) -> crate::error::Error {
+    match near_miss_excerpt(validated_path, content, old_string) {
+        // Same Error class and the same single-line prefix as
+        // [`with_fresh_read_nudge`]; the excerpt goes AFTER that line.
+        Some(excerpt) => crate::error::Error::NotFound(format!(
+            "{}\n{excerpt}",
+            fresh_read_nudge_text(msg)
+        )),
+        None => with_fresh_read_nudge(msg),
+    }
 }
 
 /// Resolve the effective needle for a literal match (backlog 838b6f4e C):
@@ -822,8 +970,11 @@ pub(crate) fn literal_splice(
 
 /// Count non-overlapping matches of `needle` in `content` using the same
 /// EOL-agnostic (and optionally fuzzy-whitespace) matching as the literal
-/// splice — the batch ambiguity guard's counter (plan be16ea36 step 4).
-pub(crate) fn count_matches(content: &str, needle: &str, fuzzy: bool) -> usize {
+/// splice — the batch ambiguity guard's counter (plan be16ea36 step 4). Public
+/// because the lead's `review_fix` (mnemo2) reuses it for its exactly-once
+/// guard instead of carrying a second matcher (plan f89fd63d step 1): the
+/// lead's fix must match exactly what a worker `file_edit` would match.
+pub fn count_matches(content: &str, needle: &str, fuzzy: bool) -> usize {
     let (content_lf, _) = normalize_lf_with_offsets(content);
     let needle_lf = normalize_line_endings(needle, "\n");
     if needle_lf.is_empty() {
@@ -963,16 +1114,20 @@ pub(crate) fn map_lf_region_to_original(
 /// (`'i101:text'`, `'b5:x'`, `'d202-205'`, `'r102:x'`) or an anchor-based [`EditItem`]
 /// object. One array carries both forms, so a single field covers compact
 /// line-targeted ops and byte-exact anchor edits. A read-receipt cite gets
-/// its OWN variant (plan f302cc0e) rather than riding in as a line op: its
-/// range is in the cited read's coordinates, which only the apply phase —
-/// seeing the ops that precede it — can translate and check for overlap.
+/// its OWN variant (plans f302cc0e, f89fd63d step 2) rather than riding in
+/// as a line op: its range arrives in PRE-CALL coordinates — the cited
+/// read's numbering translated through every file-tool write recorded since
+/// that read — and only the apply phase, seeing the ops that precede it,
+/// can map it on through them and check for overlap.
 #[derive(Debug)]
 pub(crate) enum EditOp {
     Line(LineOp),
     Anchor(EditItem),
     /// A `from_read` cite that [`resolve_read_anchors`] validated against
-    /// the pre-ops bytes; its range stays in read coordinates until
-    /// [`apply_ops`] maps it through the earlier ops.
+    /// the pre-call bytes and already mapped into PRE-CALL coordinates (the
+    /// cited read's numbering translated through the file-tool writes
+    /// recorded since that read); [`apply_ops`] maps that range on through
+    /// the earlier ops.
     ReadCite(ReadCiteOp),
 }
 
@@ -1016,12 +1171,14 @@ pub(crate) struct LineOp {
     pub(crate) payload: Option<String>,
 }
 
-/// A validated read-receipt cite (plan f302cc0e): `start`/`end` are
-/// 1-indexed inclusive lines in the CITED READ's coordinates — the file as
-/// the receipt validated it, before this call's ops ran. [`apply_ops`] maps
-/// the range through every preceding op's line shifts (a line-level diff of
-/// the pre-ops content against the running content) and refuses the array
-/// when an earlier op already changed one of the cited lines.
+/// A validated read-receipt cite (plans f302cc0e, f89fd63d step 2):
+/// `start`/`end` are 1-indexed inclusive lines in the cited read's
+/// numbering, already translated through every file-tool write recorded
+/// since that read — i.e. the coordinates of the file as it is on disk
+/// when this call starts. [`apply_ops`] maps that range on through every
+/// preceding op's line shifts (a line-level diff of the pre-ops content
+/// against the running content) and refuses the array when an earlier op
+/// already changed one of the cited lines.
 #[derive(Debug)]
 pub(crate) struct ReadCiteOp {
     /// The cite's label, echoed in error messages (`from_read <id>`).
@@ -1274,9 +1431,11 @@ pub(crate) fn validate_op_items(ops: &[EditOp]) -> Result<()> {
 /// is server-side (path match + range-within-coverage + per-line hash), so
 /// ANY drift hard-fails here with the fresh-read steering and nothing is
 /// written. Each validated cite becomes an [`EditOp::ReadCite`], which
-/// keeps its range in the CITED READ's coordinates (plan f302cc0e): the
-/// apply phase translates it through the ops that precede it in the array
-/// and refuses an in-call overlap, because the read's line numbers and the
+/// keeps its range in the cited read's coordinates TRANSLATED through the
+/// file-tool writes recorded since that read (plan f89fd63d step 2) — the
+/// pre-call coordinates apply_ops' in-call translation expects. The apply
+/// phase translates it on through the ops that precede it in the array and
+/// refuses an in-call overlap, because the read's line numbers and the
 /// running content's diverge as soon as an earlier op changes the line
 /// count. Verbatim anchors and compact line ops pass through untouched.
 pub(crate) fn resolve_read_anchors(
@@ -1307,15 +1466,17 @@ pub(crate) fn resolve_read_anchors(
                  end >= start) — got {lines:?}"
             )));
         }
-        super::read_registry::resolve(&id, validated_path, lines[0], lines[1], content)?;
-        // The cite keeps its OWN coordinates (plan f302cc0e): the range is
-        // in the cited read's line numbers, so it must NOT be collapsed
-        // into a line op here — apply_ops translates it through the earlier
-        // ops' perturbations and refuses an in-call overlap.
+        let (start, end) =
+            super::read_registry::resolve(&id, validated_path, lines[0], lines[1], content)?;
+        // The cite keeps the READ's coordinates, translated through the
+        // file-tool writes recorded since that read (plan f89fd63d step 2)
+        // — they are pre-call coordinates, exactly the frame apply_ops'
+        // in-call translation starts from, so it must NOT be collapsed
+        // into a line op here.
         resolved.push(EditOp::ReadCite(ReadCiteOp {
             raw: format!("from_read {id}"),
-            start: lines[0],
-            end: lines[1],
+            start,
+            end,
             payload: Some(item.new_string.clone()),
         }));
     }
@@ -1331,10 +1492,12 @@ pub(crate) fn resolve_read_anchors(
 /// first-difference pointer, per-item success notes). Line ops are matched
 /// against the content AS LEFT by the preceding ops — the same contract the
 /// anchors have, so a mixed array's line numbers reflect every earlier op.
-/// Read-receipt cites are the one exception (plan f302cc0e): their ranges
-/// are in the CITED READ's coordinates, so each is translated through the
-/// earlier ops' line shifts before it is applied, and a cite whose lines
-/// an earlier op already changed refuses the whole array.
+/// Read-receipt cites are the one exception (plans f302cc0e, f89fd63d step
+/// 2): their ranges arrive in PRE-CALL coordinates — the cited read's
+/// numbering translated through every file-tool write recorded since that
+/// read — so each is mapped on through the earlier ops' line shifts before
+/// it is applied, and a cite whose lines an earlier op already changed
+/// refuses the whole array.
 /// Emission artifacts are validated per op on its payload and once on the
 /// combined result's brace delta — a growth names the offending op(s) from
 /// the deficit trail (backlog 08d2125d); the diff itself is the caller's job.
@@ -1347,17 +1510,20 @@ pub(crate) fn apply_ops(
     ops: &[EditOp],
     fuzzy_default: bool,
     artifact_check: bool,
+    validated_path: &Path,
 ) -> Result<(String, Vec<String>)> {
     let le = detect_line_ending(content);
     let total = ops.len();
     let track = artifact_check && checks_brace_balance(path);
     let mut current = content.to_string();
     let mut notes: Vec<String> = Vec::new();
-    // Read-receipt cites ride in the CITED READ's coordinates (plan
-    // f302cc0e) — the file as the receipt validated it, before any op in
-    // this array ran — so capture the pre-ops lines once: the translation
-    // in the loop is exactly the line-level diff between these and the
-    // running content, and an untouched cite short-circuits on equality.
+    // Read-receipt cites ride in PRE-CALL coordinates: the cited read's
+    // numbering already translated through every file-tool write recorded
+    // since that read (plans f302cc0e, f89fd63d step 2), so they name the
+    // file as it is before any op in this array runs — capture the pre-ops
+    // lines once: the translation in the loop is exactly the line-level
+    // diff between these and the running content, and an untouched cite
+    // short-circuits on equality.
     let read_lines: Vec<&str> = content.lines().collect();
     // The running brace/bracket/paren deficit after each op — the exact
     // attribution trail for a positive combined delta (backlog 08d2125d).
@@ -1410,7 +1576,12 @@ pub(crate) fn apply_ops(
                     }
                     None => {
                         // First-difference pointer (backlog 838b6f4e D), scoped
-                        // to the content as left by the preceding ops.
+                        // to the content as left by the preceding ops. The
+                        // current-text excerpt and its receipt describe the
+                        // PRE-CALL `content` — the bytes on disk, since a
+                        // failure writes nothing (plan f89fd63d step 3): a
+                        // receipt over the running content could hash lines
+                        // the file never holds.
                         let detail = near_miss_diagnostic(&current, &item.old_string)
                             .map(|d| format!(" — {d}"))
                             .unwrap_or_default();
@@ -1418,9 +1589,12 @@ pub(crate) fn apply_ops(
                             idx,
                             total,
                             &item.old_string,
-                            with_fresh_read_nudge(format!(
-                                "old_string not found in file{detail}"
-                            )),
+                            drift_error_with_excerpt(
+                                format!("old_string not found in file{detail}"),
+                                validated_path,
+                                content,
+                                &item.old_string,
+                            ),
                         ));
                     }
                 }
@@ -1428,13 +1602,14 @@ pub(crate) fn apply_ops(
             EditOp::Line(line_op) => {
                 current = apply_line_op(&current, le, line_op, idx)?;
             }
-            // A read-receipt cite names lines in the CITED READ's
-            // coordinates — the content as it was before this call — while
-            // every other op works in the running coordinates (plan
-            // f302cc0e). Translate through the earlier ops' perturbations
-            // first, so the cite lands on exactly the lines it validated
-            // (a cite no earlier op disturbed is byte-identical to the
-            // pre-fix blind apply).
+            // A read-receipt cite names lines in PRE-CALL coordinates — the
+            // cited read's numbering, translated through every file-tool
+            // write recorded since that read (plans f302cc0e, f89fd63d
+            // step 2), i.e. the content as it was before this call — while
+            // every other op works in the running coordinates. Translate
+            // through the earlier ops' perturbations first, so the cite
+            // lands on exactly the lines it validated (a cite no earlier op
+            // disturbed is byte-identical to the pre-fix blind apply).
             EditOp::ReadCite(cite) => {
                 let current_lines: Vec<&str> = current.lines().collect();
                 let (start, end) =
@@ -1493,15 +1668,16 @@ pub(crate) fn apply_ops(
     Ok((current, notes))
 }
 
-/// Map a read-receipt cite's range from the cited read's coordinates (the
-/// bytes the receipt validated — the file BEFORE this call's ops) into the
-/// running content's coordinates (plan f302cc0e). The mapping rides a
-/// line-level diff of the pre-ops content against the running content:
-/// every line the earlier ops left untouched survives in an Equal block,
-/// so a cite whose range fits entirely inside one block lands on exactly
-/// the lines it validated, however many insert/delete/replace/anchor ops
-/// preceded it — including an earlier cite, whose replacement is itself
-/// just another perturbation.
+/// Map a read-receipt cite's range from PRE-CALL coordinates into the
+/// running content's coordinates (plans f302cc0e, f89fd63d step 2).
+/// "Pre-call" is the cited read's numbering translated through every
+/// file-tool write recorded since that read, i.e. the bytes the file had
+/// before this call's ops. The mapping rides a line-level diff of the
+/// pre-ops content against the running content: every line the earlier ops
+/// left untouched survives in an Equal block, so a cite whose range fits
+/// entirely inside one block lands on exactly the lines it validated,
+/// however many insert/delete/replace/anchor ops preceded it — including an
+/// earlier cite, whose replacement is itself just another perturbation.
 ///
 /// A cite whose range is NOT intact refuses the whole array (atomicity):
 /// when an earlier op replaced or deleted one of its lines, or inserted
@@ -1520,8 +1696,9 @@ fn translate_cite_range(
     total: usize,
 ) -> Result<(usize, usize)> {
     // The unperturbed case — no op before this cite, or the earlier ops
-    // netted back to the original bytes: the read's coordinates ARE the
-    // running coordinates, so the diff below is skipped entirely.
+    // netted back to the original bytes: the cite's pre-call (arrival)
+    // coordinates ARE the running coordinates, so the diff below is skipped
+    // entirely.
     if read_lines == current_lines {
         return Ok((cite.start, cite.end));
     }
@@ -1703,6 +1880,173 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The receipt id and line span an excerpt header advertises, so a test
+    /// can cite exactly what a miss served.
+    fn excerpt_header(excerpt: &str) -> (String, usize, usize) {
+        let header = excerpt.lines().next().expect("an excerpt has a header");
+        let id = header
+            .split("read receipt ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("the header names a receipt: {header}"))
+            .to_string();
+        let range = header
+            .split("(lines ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_else(|| panic!("the header names a range: {header}"));
+        let (start, end) = range.split_once('-').expect("a start-end span");
+        (id, start.parse().unwrap(), end.parse().unwrap())
+    }
+
+    /// Plan f89fd63d step 3: a literal miss with a near-miss position hands
+    /// back the current text in `read_files`' own numbered format plus a
+    /// receipt minted over exactly those lines — the whole point is that the
+    /// corrected retry cites it and never needs a full re-read.
+    #[test]
+    fn miss_with_near_miss_serves_numbered_excerpt_and_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha line\nbeta line\ngamma line\n";
+        let excerpt = near_miss_excerpt(&path, content, "alpha line\nbeta LINE\ngamma line")
+            .expect("a near miss serves the current text");
+        assert!(excerpt.starts_with(NEAR_MISS_EXCERPT_MARK), "{excerpt}");
+        let (id, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (1, 3));
+        // `read_files`' format: `N: text`, no padding.
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(
+            served,
+            vec!["1: alpha line", "2: beta line", "3: gamma line"]
+        );
+        // The minted receipt names exactly those lines and hash-verifies
+        // against the bytes on disk.
+        let (resolved_start, resolved_end) =
+            crate::tool::agent::read_registry::resolve(&id, &path, start, end, content)
+                .expect("the excerpt's receipt resolves against the file");
+        assert_eq!((resolved_start, resolved_end), (start, end));
+    }
+
+    /// The window is capped: a needle spanning many lines would otherwise
+    /// echo the whole file and re-create the context cost the excerpt is
+    /// meant to avoid.
+    #[test]
+    fn excerpt_capped_at_40_lines_around_the_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content: String = (1..=300).map(|n| format!("line {n}\n")).collect();
+        // 41 needle lines starting at line 100; the first difference is the
+        // first character of line 105.
+        let needle: String = (100..=140)
+            .map(|n| {
+                if n == 105 {
+                    "LINE 105\n".to_string()
+                } else {
+                    format!("line {n}\n")
+                }
+            })
+            .collect();
+        let excerpt = near_miss_excerpt(&path, &content, &needle).expect("a near miss");
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(served.len(), 40, "the window is capped at 40 lines");
+        let (_, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (85, 124), "40 lines centred on the difference");
+        assert_eq!(served[0], "85: line 85", "numbering follows the file");
+        assert_eq!(served[39], "124: line 124");
+    }
+
+    /// No near-miss position, no excerpt (and no receipt).
+    #[test]
+    fn no_excerpt_without_near_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha\nbeta\ngamma\n";
+        assert!(
+            near_miss_excerpt(&path, content, "zzz\nalpha").is_none(),
+            "no 8-char shared prefix means nothing useful to show"
+        );
+        assert!(
+            near_miss_excerpt(&path, content, "alp").is_none(),
+            "a needle shorter than the prefix threshold is never a near miss"
+        );
+        assert!(
+            near_miss_excerpt(&path, "", "alpha\nbeta").is_none(),
+            "an empty file has nothing to serve"
+        );
+    }
+
+    /// Finding f-e05a95ed: CR-only content. `content.lines()` splits on '\n'
+    /// only, while the LF projection also turns a lone '\r' into '\n'. Taking
+    /// line numbers from the projection put the match on line 6 of a
+    /// one-line file, so `end - first + 1` underflowed (panic in debug). The
+    /// window must be computed in the frame the served lines use.
+    #[test]
+    fn excerpt_on_lone_cr_content_maps_to_the_served_line_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "s1\rs2\rs3\rs4\rs5\rs6\rTARGET\rend";
+        let excerpt = near_miss_excerpt(&path, content, "s6\nTARGEY")
+            .expect("a near miss on CR-only content still serves the text");
+        let (id, start, end) = excerpt_header(&excerpt);
+        // The whole file is ONE line in `content.lines()` (no '\n' at all).
+        assert_eq!((start, end), (1, 1));
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(served, vec![format!("1: {content}")]);
+        // ...and the receipt hash-verifies against those same bytes.
+        let (resolved_start, resolved_end) =
+            crate::tool::agent::read_registry::resolve(&id, &path, start, end, content)
+                .expect("the excerpt's receipt resolves on CR-only content");
+        assert_eq!((resolved_start, resolved_end), (start, end));
+    }
+
+    /// A CRLF file serves `read_files`' terminator-stripped lines and the
+    /// receipt still resolves against the CRLF bytes.
+    #[test]
+    fn excerpt_on_crlf_content_serves_stripped_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha line\r\nbeta line\r\ngamma line\r\ndelta line\r\n";
+        let excerpt = near_miss_excerpt(&path, content, "alpha line\r\nbeta LINE\r\ngamma line")
+            .expect("a near miss");
+        let (id, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (1, 4));
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(
+            served,
+            vec![
+                "1: alpha line",
+                "2: beta line",
+                "3: gamma line",
+                "4: delta line"
+            ]
+        );
+        assert!(
+            crate::tool::agent::read_registry::resolve(&id, &path, 2, 3, content).is_ok(),
+            "the receipt hashes terminator-stripped lines"
+        );
+    }
+
+    /// A file with no trailing newline still serves its last line, and the
+    /// window never runs past it.
+    #[test]
+    fn excerpt_without_trailing_newline_serves_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let content = "alpha line\nbeta line\ngamma line";
+        let excerpt = near_miss_excerpt(&path, content, "alpha line\nbeta LINE\ngamma line\nfour")
+            .expect("a near miss");
+        let (id, start, end) = excerpt_header(&excerpt);
+        assert_eq!((start, end), (1, 3), "the window stops at the last line");
+        let served: Vec<&str> = excerpt.lines().skip(1).collect();
+        assert_eq!(
+            served,
+            vec!["1: alpha line", "2: beta line", "3: gamma line"]
+        );
+        assert!(
+            crate::tool::agent::read_registry::resolve(&id, &path, start, end, content).is_ok()
+        );
+    }
+
     /// Parse an ops array literal and apply it to `content`.
     fn apply(
         path: &str,
@@ -1710,7 +2054,7 @@ mod tests {
         values: &[serde_json::Value],
     ) -> Result<(String, Vec<String>)> {
         let ops = parse_ops(values)?;
-        apply_ops(path, content, &ops, false, true)
+        apply_ops(path, content, &ops, false, true, Path::new(path))
     }
 
     fn apply_ok(content: &str, values: &[serde_json::Value]) -> String {
@@ -1735,13 +2079,14 @@ mod tests {
         }
     }
 
-    /// Plan f302cc0e: a cite's range lives in the CITED READ's coordinates,
-    /// so an earlier ANCHOR op that shifts the line count must not move the
-    /// cite's landing lines either — the translation is perturbation-
-    /// agnostic (a line-level diff of the pre-ops content against the
-    /// running result), not compact-op bookkeeping. Engine-level twin of
-    /// the file_edit end-to-end regression; no receipt registry involved —
-    /// the ops are constructed directly.
+    /// Plans f302cc0e, f89fd63d step 2: a cite's range arrives in PRE-CALL
+    /// coordinates, so an earlier ANCHOR op that shifts the line count must
+    /// not move the cite's landing lines either — the translation is
+    /// perturbation-agnostic (a line-level diff of the pre-ops content
+    /// against the running result), not compact-op bookkeeping. Engine-level
+    /// twin of the file_edit end-to-end regression; no receipt registry
+    /// involved — the ops are constructed directly, which is why the cite
+    /// here is written in pre-call coordinates.
     #[test]
     fn read_cite_translates_through_an_earlier_anchor_op() {
         let ops = vec![
@@ -1766,6 +2111,7 @@ mod tests {
             &ops,
             false,
             true,
+            Path::new("a.txt"),
         )
         .expect("the cite lands on the lines it cited");
         assert_eq!(

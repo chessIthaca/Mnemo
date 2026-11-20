@@ -413,13 +413,141 @@ fn json_kind(v: &Value) -> &'static str {
     }
 }
 
+/// Whether a property schema declares `kind` — `"type": "object"` or a
+/// type union listing it.
+fn schema_type_includes(schema: &Value, kind: &str) -> bool {
+    match schema.get("type") {
+        Some(Value::String(t)) => t == kind,
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some(kind)),
+        _ => false,
+    }
+}
+
 /// Whether a property schema declares a sequence type — `"type": "array"`
 /// or a type union listing it.
 fn schema_declares_array(schema: &Value) -> bool {
-    match schema.get("type") {
-        Some(Value::String(t)) => t == "array",
-        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("array")),
-        _ => false,
+    schema_type_includes(schema, "array")
+}
+
+/// Whether the schema's sequence items are integers — the `lines` shape of
+/// a file_edit/multi_edit read cite.
+fn schema_declares_integer_array(schema: &Value) -> bool {
+    match schema.get("items") {
+        Some(Value::Array(schemas)) => {
+            schemas.iter().any(|s| schema_type_includes(s, "integer"))
+        }
+        Some(items) => schema_type_includes(items, "integer"),
+        None => false,
+    }
+}
+
+/// Whether the schema's sequence items are objects — a `files` entry or an
+/// `ops` item. An `anyOf`/`oneOf` items schema with an object branch counts
+/// (that is how both tools declare `ops`). A bare `"type": "array"` with no
+/// `items` does not, so the pinned behaviour for it is unchanged.
+fn schema_declares_object_array(schema: &Value) -> bool {
+    let declares_object = |s: &Value| {
+        schema_type_includes(s, "object")
+            || ["anyOf", "oneOf"].iter().any(|key| {
+                s.get(key)
+                    .and_then(|branches| branches.as_array())
+                    .is_some_and(|branches| branches.iter().any(|b| schema_type_includes(b, "object")))
+            })
+    };
+    match schema.get("items") {
+        Some(Value::Array(schemas)) => schemas.iter().any(declares_object),
+        Some(items) => declares_object(items),
+        None => false,
+    }
+}
+
+/// Plan f89fd63d step 4 (a): a line range delivered as text — `"108, 130"`,
+/// `"108-130"`, `"108..130"`, `"108:130"`, `"[108, 130]"`, spaces optional —
+/// becomes the integer pair `[108, 130]`. Nothing else is interpreted and
+/// the range is NOT validated (order and bounds are the tool's job): a
+/// string that is not exactly two integers is left alone.
+fn coerce_text_integer_range(text: &str) -> Option<Vec<Value>> {
+    let trimmed = text.trim();
+    let inner = match trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(inner) => inner.trim(),
+        None => trimmed,
+    };
+    let (start, end) = two_integer_sides(inner)?;
+    Some(vec![Value::from(start), Value::from(end)])
+}
+
+/// The two integer sides of a text range, split on its separator.
+fn two_integer_sides(text: &str) -> Option<(i64, i64)> {
+    // Comma, dot-dot and colon cannot be confused with a sign.
+    for separator in [",", "..", ":"] {
+        if let Some((start, end)) = text.split_once(separator) {
+            return Some((
+                start.trim().parse::<i64>().ok()?,
+                end.trim().parse::<i64>().ok()?,
+            ));
+        }
+    }
+    // A dash can start a negative number, so try every cut and take the
+    // first that parses on both sides.
+    for (idx, _) in text.match_indices('-').filter(|(idx, _)| *idx > 0) {
+        let (start, end) = (&text[..idx], &text[idx + 1..]);
+        if let (Ok(start), Ok(end)) = (start.trim().parse::<i64>(), end.trim().parse::<i64>()) {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// The narrow shape coercions of plan f89fd63d step 4, applied to one
+/// property value after the clean-array splice ([`repair_stringified_sequences`]):
+///
+/// - an integer-array property (`lines`) given as a text range becomes the
+///   integer pair ([`coerce_text_integer_range`]);
+/// - an object-array property (`multi_edit.files`, `file_edit.ops`) given
+///   as one object — or a string that cleanly parses to one — becomes a
+///   one-element array.
+///
+/// Nothing else is repaired here: a shape that does not match is left for
+/// [`argument_shape_error`] to explain with an example.
+fn coerce_array_shape(prop_schema: &Value, value: &mut Value) {
+    if !schema_declares_array(prop_schema) {
+        return;
+    }
+    if let Some(text) = value.as_str() {
+        if schema_declares_integer_array(prop_schema) {
+            if let Some(pair) = coerce_text_integer_range(text) {
+                *value = Value::Array(pair);
+                return;
+            }
+        }
+        if schema_declares_object_array(prop_schema) {
+            if let Ok(obj @ Value::Object(_)) = serde_json::from_str::<Value>(text) {
+                *value = Value::Array(vec![obj]);
+            }
+        }
+    } else if schema_declares_object_array(prop_schema) && value.is_object() {
+        let obj = std::mem::take(value);
+        *value = Value::Array(vec![obj]);
+    }
+}
+
+/// [`parse_stringified_sequence`] for the seam repair, plus the
+/// DOUBLE-encoded shape: the model stringified an already-stringified
+/// payload, so the delivered string parses to a string (`"\"[{\\\"path
+/// \\\":\\\"a.rs\\\"}]\""`). At most two parse passes — the delivered text,
+/// then the string it parses to. A payload quoted three times is left
+/// alone, and so is one whose inner text is not an array: the seam's
+/// [`argument_shape_error`] names it instead of guessing.
+fn parse_sequence_with_double_encoding(s: &str) -> Option<Vec<Value>> {
+    if let Ok(elements) = parse_stringified_sequence(s) {
+        return Some(elements);
+    }
+    match serde_json::from_str::<Value>(s) {
+        Ok(Value::String(inner)) => parse_stringified_sequence(&inner).ok(),
+        _ => None,
     }
 }
 
@@ -428,9 +556,11 @@ fn schema_declares_array(schema: &Value) -> bool {
 /// every model-generated call flows through as [`drop_stringified_nulls`]
 /// (read_files' `files` was hit 3x in one turn, 2027-01-25, and the
 /// generic "an argument must be a sequence, not a string" taught
-/// nothing). When the string cleanly parses as a JSON array it is spliced
-/// in place; unparseable strings and other kinds are left untouched — the
-/// tool's own decode (or read_files' positional recovery) names them.
+/// nothing). When the string cleanly parses as a JSON array (or as a
+/// string that parses to one — [`parse_sequence_with_double_encoding`])
+/// it is spliced in place; unparseable strings and other kinds are left
+/// untouched — the tool's own decode (or read_files' positional recovery)
+/// names them.
 ///
 /// The walk mirrors [`drop_stringified_nulls`] (`normalize_in_place`,
 /// `src/provider/strict.rs`): it recurses into `anyOf`/`oneOf`/`allOf`
@@ -474,15 +604,163 @@ pub(crate) fn repair_stringified_sequences(schema: &Value, args: &mut Value) {
             continue;
         };
         if schema_declares_array(prop_schema) {
-            if let Some(repaired) = value
-                .as_str()
-                .and_then(|s| parse_stringified_sequence(s).ok())
-            {
+            if let Some(repaired) = value.as_str().and_then(parse_sequence_with_double_encoding) {
                 *value = Value::Array(repaired);
             }
         }
+        coerce_array_shape(prop_schema, value);
         repair_stringified_sequences(prop_schema, value);
     }
+}
+
+/// Plan f89fd63d step 4 (d): after the repair, an array-typed argument that
+/// is STILL a string is refused at the dispatch seam with an example-bearing
+/// error instead of running the tool and letting it fail on its own decode.
+/// Broken JSON is never guessed at — the model's own byte error is named
+/// (line, column, and a bounded snippet around it) so the retry is informed.
+///
+/// The marker `must be a JSON array, but it arrived as a string` is what the
+/// Quality tab's shape classifier keys on; `None` when every array-typed
+/// property holds an array (or no such property is present).
+pub(crate) fn argument_shape_error(tool: &str, schema: &Value, args: &Value) -> Option<String> {
+    if let Some(message) = split_key_shape_error(tool, schema, args) {
+        return Some(message);
+    }
+    let (prop, text) = array_string_property(schema, args, "")?;
+    let why = match serde_json::from_str::<Value>(&text) {
+        Ok(_) => String::new(),
+        Err(e) => format!(
+            " whose text is not valid JSON either ({e}, near `{}`)",
+            near_break(&text, absolute_byte_position(&text, e.line(), e.column()))
+        ),
+    };
+    Some(shape_error_message(tool, &prop, &why))
+}
+
+/// Plan f89fd63d step 4 (e): the arguments were split mid-string, so the
+/// array landed as an object KEY and the property it belonged to is empty or
+/// missing (`{"files":"", "[{…": …}`). Named as the split it is — no repair.
+fn split_key_shape_error(tool: &str, schema: &Value, args: &Value) -> Option<String> {
+    let args_obj = args.as_object()?;
+    args_obj.keys().find(|key| key.starts_with('['))?;
+    let props = schema.get("properties")?.as_object()?;
+    for (name, prop_schema) in props {
+        if !schema_declares_array(prop_schema) {
+            continue;
+        }
+        let orphaned = match args_obj.get(name) {
+            None => true,
+            Some(Value::String(text)) => text.is_empty(),
+            Some(_) => false,
+        };
+        if orphaned {
+            return Some(shape_error_message(
+                tool,
+                name,
+                " (the array was sent as an object key: your arguments were split mid-string)",
+            ));
+        }
+    }
+    None
+}
+
+/// The first array-typed property that still holds a string, named by its
+/// schema path (`lines`, `files[0].ops`). The walk mirrors
+/// [`repair_stringified_sequences`] so it looks exactly where the repair
+/// looked.
+fn array_string_property(schema: &Value, args: &Value, path: &str) -> Option<(String, String)> {
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get(key).and_then(|b| b.as_array()) {
+            for branch in branches {
+                if let Some(found) = array_string_property(branch, args, path) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    if let (Some(items), Value::Array(elements)) = (schema.get("items"), args) {
+        let item_schemas: Vec<&Value> = match items {
+            Value::Array(schemas) => schemas.iter().collect(),
+            single => vec![single; elements.len()],
+        };
+        for (idx, (item_schema, element)) in item_schemas.iter().zip(elements).enumerate() {
+            let item_path = format!("{path}[{idx}]");
+            if let Some(found) = array_string_property(item_schema, element, &item_path) {
+                return Some(found);
+            }
+        }
+    }
+    let props = schema.get("properties")?.as_object()?;
+    let args_obj = args.as_object()?;
+    for (name, value) in args_obj {
+        let Some(prop_schema) = props.get(name) else {
+            continue;
+        };
+        let prop_path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{path}.{name}")
+        };
+        if schema_declares_array(prop_schema) {
+            if let Some(text) = value.as_str() {
+                return Some((prop_path, text.to_string()));
+            }
+        }
+        if let Some(found) = array_string_property(prop_schema, value, &prop_path) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The argument-shape error text (plan f89fd63d step 4). `why` is empty when
+/// the string parses as JSON of the wrong kind; the shape error still names
+/// the property and shows a correct call.
+fn shape_error_message(tool: &str, prop: &str, why: &str) -> String {
+    format!(
+        "Error: The tool '{tool}' failed because '{prop}' must be a JSON array, \
+         but it arrived as a string{why}. Send the array itself, not a quoted \
+         string. A correct call: {}",
+        shape_example(tool, prop)
+    )
+}
+
+/// A correct call for the tool whose argument was refused. `multi_edit` also
+/// points at `file_edit` for the common single-file case.
+fn shape_example(tool: &str, prop: &str) -> &'static str {
+    match (tool, prop) {
+        ("multi_edit", _) => {
+            r#"{"files":[{"path":"src/a.rs","ops":[{"old_string":"let x = 1;","new_string":"let x = 2;"}]}]} For a change to one file, file_edit is simpler: {"path":"src/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}"#
+        }
+        ("file_edit", "lines") => {
+            r#"{"path":"src/a.rs","from_read":"r12","lines":[108,130],"new_string":"..."}"#
+        }
+        ("file_edit", _) => {
+            r#"{"path":"src/a.rs","ops":[{"old_string":"let x = 1;","new_string":"let x = 2;"}]}"#
+        }
+        _ => " (see the tool's schema)",
+    }
+}
+
+/// About 40 characters around `pos`, escaped onto one line — the bounded
+/// "near" diagnostic in the argument-shape error.
+fn near_break(text: &str, pos: usize) -> String {
+    let mut pos = pos.min(text.len());
+    while pos > 0 && !text.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    let start = text[..pos]
+        .char_indices()
+        .rev()
+        .nth(19)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let end = text[pos..]
+        .char_indices()
+        .nth(20)
+        .map(|(idx, _)| pos + idx)
+        .unwrap_or(text.len());
+    text[start..end].chars().flat_map(char::escape_debug).collect()
 }
 
 /// The trait every tool implements.
@@ -1666,6 +1944,107 @@ mod tests {
         let mut args = serde_json::json!({"files": [{"path": "a.rs", "ops": "[\"d2\"]"}]});
         repair_stringified_sequences(&schema, &mut args);
         assert_eq!(args["files"][0]["ops"], serde_json::json!(["d2"]));
+    }
+
+    /// Regression (plan f89fd63d step 4, simFactories01[389]): a
+    /// line-range parameter delivered as TEXT — `"108, 130"`, `"108-130"`,
+    /// `"108..130"`, `"108:130"`, `"[108, 130]"` — becomes the integer
+    /// pair the tool takes. Nothing else about the range is touched: the
+    /// tool validates order and bounds.
+    #[test]
+    fn lines_text_range_is_coerced() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"lines": {"type": "array", "items": {"type": "integer"}}}
+        });
+        for text in ["108, 130", "108-130", "108..130", "108:130", "[108, 130]"] {
+            let mut args = serde_json::json!({"lines": text});
+            repair_stringified_sequences(&schema, &mut args);
+            assert_eq!(args["lines"], serde_json::json!([108, 130]), "form: {text}");
+        }
+    }
+
+    /// Only a text range of exactly two integers is coerced. A lone number,
+    /// junk, a three-part list and a trailing dash stay strings — the
+    /// argument-shape error names them with an example.
+    #[test]
+    fn non_range_string_left_alone() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"lines": {"type": "array", "items": {"type": "integer"}}}
+        });
+        for text in ["108", "abc", "1,2,3", "108-130-5", "1.5-3", ""] {
+            let mut args = serde_json::json!({"lines": text});
+            repair_stringified_sequences(&schema, &mut args);
+            assert_eq!(args["lines"], serde_json::json!(text), "form: {text:?}");
+        }
+        // A sequence of strings is never range-coerced.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"tags": {"type": "array", "items": {"type": "string"}}}
+        });
+        let mut args = serde_json::json!({"tags": "a, b"});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["tags"], serde_json::json!("a, b"));
+    }
+
+    /// One object delivered where an array of objects belongs — as the bare
+    /// object, or as a string that cleanly parses to one — becomes a
+    /// one-element array. The pinned bare `{"type": "array"}` without
+    /// `items` is untouched.
+    #[test]
+    fn single_object_is_wrapped_for_object_array() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "files": {"type": "array", "items": {"type": "object"}},
+                "ops": {"type": "array", "items": {"anyOf": [
+                    {"type": "string"},
+                    {"type": "object"}
+                ]}},
+                "bare": {"type": "array"}
+            }
+        });
+        let mut args = serde_json::json!({"files": {"path": "a.rs", "ops": ["d2"]}});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(
+            args["files"],
+            serde_json::json!([{"path": "a.rs", "ops": ["d2"]}])
+        );
+
+        let mut args = serde_json::json!({"ops": "{\"old_string\":\"a\",\"new_string\":\"b\"}"});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(
+            args["ops"],
+            serde_json::json!([{"old_string": "a", "new_string": "b"}])
+        );
+
+        let mut args = serde_json::json!({"bare": "{\"path\":\"a.rs\"}"});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["bare"], serde_json::json!("{\"path\":\"a.rs\"}"));
+    }
+
+    /// A payload quoted TWICE — the model stringified an already-stringified
+    /// array — is unwrapped at the seam: two parse passes, never more. A
+    /// payload quoted three times stays a string for the shape error.
+    #[test]
+    fn double_encoded_array_string_is_repaired() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"files": {"type": "array", "items": {"type": "object"}}}
+        });
+        // The delivered string is a JSON string LITERAL whose text is the
+        // stringified array.
+        let mut args = serde_json::json!({"files": "\"[{\\\"path\\\":\\\"a.rs\\\"}]\""});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"], serde_json::json!([{"path": "a.rs"}]));
+
+        // Quoted three times: the second pass is not a clean array either,
+        // so nothing is spliced — the shape error names it.
+        let mut args = serde_json::json!({"files": "\"\\\"[{\\\"path\\\":\\\"a.rs\\\"}]\\\"\""});
+        let original = args["files"].clone();
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"], original);
     }
 
     /// Backlog c19ec2ff (c): the parse helper reports the 0-based byte

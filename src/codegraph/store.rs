@@ -29,13 +29,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use serde::Serialize;
 
 use crate::codegraph::extract::{
-    lang_family, EdgeKind, EMBEDDABLE_KINDS, RefKind, Symbol, SymbolKind,
+    body_excerpt, lang_family, EdgeKind, EMBEDDABLE_KINDS, RefKind, Symbol, SymbolKind,
 };
 use crate::codegraph::schema;
+use crate::codegraph::walk::Lang;
 use crate::error::Result;
 
 /// Aggregate counts for the status surface (`codegraph_status`, tools, tests).
@@ -142,7 +143,8 @@ pub struct UpsertEntry {
 pub struct PendingSymbol {
     /// The symbol id (`{relpath}::{name}::{start_line}`).
     pub symbol_id: String,
-    /// The chunk text to embed: `<kind> <name>\n<signature>\n<doc>\n<file>`
+    /// The chunk text to embed:
+    /// `<kind> <name>\n<name words>\n<enclosing type>\n<signature>\n<doc>\n<body excerpt>\n<file>`
     /// — rebuilt from the stored rows exactly the way
     /// [`symbol_chunk_text`] built the stored hash, so the two never
     /// drift.
@@ -150,6 +152,74 @@ pub struct PendingSymbol {
     /// The stored chunk hash — the vector row records it, so a later
     /// text change (hash mismatch) makes the symbol pending again.
     pub text_hash: String,
+}
+
+/// One text row's chunk-rebuild inputs (plan d3336a8a step 15) —
+/// everything [`symbol_chunk_text`] needs, read from the stored rows by
+/// the pending read and the eval's re-hash alike, so the two rebuild
+/// identically.
+#[derive(Debug)]
+struct ChunkRow {
+    /// The symbol id (`{relpath}::{name}::{start_line}`).
+    symbol_id: String,
+    /// The symbol kind (the stored snake_case string).
+    kind: String,
+    /// The symbol name.
+    name: String,
+    /// The stored signature.
+    signature: String,
+    /// The stored doc comment.
+    doc: String,
+    /// The project-relative file path (the DB key form).
+    file: String,
+    /// The stored chunk hash (the upsert built it from this chunk's
+    /// text; the vector row records it).
+    text_hash: String,
+    /// The symbol's 1-based start line.
+    start_line: usize,
+    /// The symbol's 1-based end line.
+    end_line: usize,
+    /// The enclosing non-module symbol's name, if any — the contains
+    /// edge's parent (a top-level symbol's parent is the file's module,
+    /// which contributes no name line; the file path is already in the
+    /// chunk).
+    parent: Option<String>,
+}
+
+impl ChunkRow {
+    /// The chunk text of this row rebuilt with `shape` and the file's
+    /// content lines — the read-side twin of the upsert's chunk build;
+    /// the two must never drift, or a matching vector row would key a
+    /// text it was never built from.
+    fn chunk_text(&self, shape: ChunkShape, lines: &[(usize, &str)]) -> String {
+        let excerpt = match excerpt_lang(&self.file) {
+            Some(lang) => body_excerpt(lines, self.start_line, self.end_line, lang),
+            None => String::new(),
+        };
+        symbol_chunk_text(
+            shape,
+            &ChunkParts {
+                kind: &self.kind,
+                name: &self.name,
+                parent: self.parent.as_deref().unwrap_or(""),
+                signature: &self.signature,
+                doc: &self.doc,
+                file: &self.file,
+                excerpt: &excerpt,
+            },
+        )
+    }
+}
+
+/// The distinct files of `rows`, in first-seen order (plan d3336a8a
+/// step 15): the content fetch's `IN (...)` list — the batch's rows are
+/// symbol-id-ordered, so a file's rows arrive together.
+fn distinct_files(rows: &[ChunkRow]) -> Vec<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    rows.iter()
+        .map(|r| r.file.as_str())
+        .filter(|file| seen.insert(file))
+        .collect()
 }
 
 /// One stored symbol vector — the `cg_symbol_vec` row (plan d3336a8a
@@ -187,6 +257,10 @@ pub struct SymbolText {
 /// `CodeGraph` facade in `mod.rs` does exactly that, mirroring `MemoryStore`).
 pub struct Store {
     conn: Connection,
+    /// The chunk shape every rebuilt chunk text uses (plan d3336a8a step
+    /// 15): [`ChunkShape::production`] outside tests; the eval switches
+    /// it per variant via [`Store::set_chunk_shape_for_test`].
+    chunk_shape: ChunkShape,
 }
 
 impl Store {
@@ -205,14 +279,20 @@ impl Store {
                 path.display()
             );
         }
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            chunk_shape: ChunkShape::production(),
+        })
     }
 
     /// Open a transient in-memory store (tests, scratch indexing).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         schema::apply_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            chunk_shape: ChunkShape::production(),
+        })
     }
 
     /// The content hash recorded for `path` at last index, if indexed. The
@@ -462,17 +542,59 @@ impl Store {
             // synthetic module has no source anchor and carries none.
             // The text hash keys incremental embedding: the background
             // pass embeds a symbol only when no vector row pairs this
-            // hash with the current model.
+            // hash with the current model. Step 15's chunk adds the
+            // name's split words, the enclosing type's name and the
+            // body excerpt; both rebuild from the stored cg_content
+            // rows and contains edges, so the embed-time twin of this
+            // build (`pending_symbols`) needs no extra columns.
             let mut ins_text = tx.prepare_cached(
                 "INSERT OR REPLACE INTO cg_symbol_text (symbol_id, signature, doc, text_hash)
                  VALUES (?1, ?2, ?3, ?4)",
             )?;
+            // The excerpt's inputs, once per file: the file's lines and
+            // the language their body shape follows.
+            let file_lines: Vec<(usize, &str)> = content
+                .lines()
+                .enumerate()
+                .map(|(i, line)| (i + 1, line))
+                .collect();
+            let lang = excerpt_lang(path);
+            // The enclosing symbol's name per child id (contains edges);
+            // a module parent contributes no name line (the file path is
+            // already in the chunk).
+            let by_id: HashMap<&str, &Symbol> =
+                data.symbols.iter().map(|s| (s.id.as_str(), s)).collect();
+            let parent_name: HashMap<&str, &str> = data
+                .contains
+                .iter()
+                .filter_map(|(parent, child)| {
+                    by_id
+                        .get(parent.as_str())
+                        .filter(|p| p.kind != SymbolKind::Module)
+                        .map(|p| (child.as_str(), p.name.as_str()))
+                })
+                .collect();
             for s in &data.symbols {
                 if s.kind == SymbolKind::Module {
                     continue;
                 }
-                let chunk =
-                    symbol_chunk_text(s.kind.as_str(), &s.name, &s.signature, &s.doc, path);
+                let parent = parent_name.get(s.id.as_str()).copied().unwrap_or("");
+                let excerpt = match lang {
+                    Some(lang) => body_excerpt(&file_lines, s.start_line, s.end_line, lang),
+                    None => String::new(),
+                };
+                let chunk = symbol_chunk_text(
+                    ChunkShape::production(),
+                    &ChunkParts {
+                        kind: s.kind.as_str(),
+                        name: &s.name,
+                        parent,
+                        signature: &s.signature,
+                        doc: &s.doc,
+                        file: path,
+                        excerpt: &excerpt,
+                    },
+                );
                 ins_text.execute(params![
                     s.id,
                     s.signature,
@@ -875,29 +997,134 @@ impl Store {
     /// vector for `model` (plan d3336a8a step 9): no vector row, a
     /// different model's row, or a drifted text hash. The background
     /// pass's work queue — embeddable kinds only, in stable symbol-id
-    /// order. One SELECT under one short lock; the caller embeds WITHOUT
-    /// holding the write connection.
+    /// order. One row SELECT plus one content fetch under one short
+    /// lock; the caller embeds WITHOUT holding the write connection.
+    /// The chunk text rebuilds from the stored rows exactly the way the
+    /// upsert built the stored hash (see [`symbol_chunk_text`]): the
+    /// body excerpt from the `cg_content` rows and the enclosing type's
+    /// name from the contains edge (plan d3336a8a step 15).
     pub fn pending_symbols(&self, model: &str, limit: usize) -> Result<Vec<PendingSymbol>> {
-        let mut stmt = self.conn.prepare_cached(pending_symbols_sql())?;
-        let rows = stmt.query_map(params![model, limit as i64], |r| {
-            let kind: String = r.get(1)?;
-            let name: String = r.get(2)?;
-            let signature: String = r.get(3)?;
-            let doc: String = r.get(4)?;
-            let file: String = r.get(5)?;
-            // Rebuilt exactly the way the upsert built the stored hash
-            // (see [`symbol_chunk_text`]), so a matching vector row truly
-            // means "this text is already embedded".
-            let text = symbol_chunk_text(&kind, &name, &signature, &doc, &file);
-            Ok(PendingSymbol {
+        let rows = self.pending_chunk_rows(model, limit as i64)?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let files = distinct_files(&rows);
+        let lines = self.content_lines_for_files(&files)?;
+        let out = rows
+            .iter()
+            .map(|row| {
+                let file_lines: Vec<(usize, &str)> = lines
+                    .get(&row.file)
+                    .map(|rows| rows.iter().map(|(l, t)| (*l, t.as_str())).collect())
+                    .unwrap_or_default();
+                PendingSymbol {
+                    symbol_id: row.symbol_id.clone(),
+                    text: row.chunk_text(self.chunk_shape, &file_lines),
+                    text_hash: row.text_hash.clone(),
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Test seam (plan d3336a8a step 15): the chunk shape every rebuilt
+    /// chunk uses — the eval's per-variant switch. The production shape
+    /// never changes ([`ChunkShape::production`]).
+    #[cfg(test)]
+    pub(crate) fn set_chunk_shape_for_test(&mut self, shape: ChunkShape) {
+        self.chunk_shape = shape;
+    }
+
+    /// Test seam (plan d3336a8a step 15): re-hash every stored text row
+    /// with the CURRENT [`ChunkShape`] — the eval's per-variant reset:
+    /// every symbol turns pending (its vector row's hash no longer
+    /// matches), the pass re-embeds the shape's chunk text, and the
+    /// previous shape's vectors are replaced. Returns the number of
+    /// re-hashed rows.
+    #[cfg(test)]
+    pub(crate) fn retarget_symbol_text_hashes_for_test(&mut self) -> Result<usize> {
+        // `""` never names a real embedder, so no vector row's model
+        // matches and every row comes back pending — the same row shape
+        // as the pending read, one content scan for all files at once.
+        let rows = self.pending_chunk_rows("", i64::MAX)?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let files = distinct_files(&rows);
+        let lines = self.content_lines_for_files(&files)?;
+        let tx = self.conn.transaction()?;
+        let mut upd = tx.prepare_cached("UPDATE cg_symbol_text SET text_hash = ?2 WHERE symbol_id = ?1")?;
+        let mut rehashed = 0usize;
+        for row in &rows {
+            let file_lines: Vec<(usize, &str)> = lines
+                .get(&row.file)
+                .map(|rows| rows.iter().map(|(l, t)| (*l, t.as_str())).collect())
+                .unwrap_or_default();
+            let chunk = row.chunk_text(self.chunk_shape, &file_lines);
+            upd.execute(params![
+                row.symbol_id,
+                crate::codegraph::content_hash(chunk.as_bytes())
+            ])?;
+            rehashed += 1;
+        }
+        drop(upd);
+        tx.commit()?;
+        Ok(rehashed)
+    }
+
+
+    /// The stored rows the chunk rebuild reads (plan d3336a8a step 15):
+    /// the text row's signature/doc/hash plus the symbol's kind, name,
+    /// line range and its enclosing non-module symbol's name (the
+    /// contains edge's parent). The pending queue: rows whose vector row
+    /// is missing, names another model, or hashes a different text.
+    fn pending_chunk_rows(&self, model: &str, limit: i64) -> Result<Vec<ChunkRow>> {
+        let mut stmt = self.conn.prepare_cached(chunk_rows_sql())?;
+        let rows = stmt.query_map(params![model, limit], |r| {
+            Ok(ChunkRow {
                 symbol_id: r.get(0)?,
-                text,
+                kind: r.get(1)?,
+                name: r.get(2)?,
+                signature: r.get(3)?,
+                doc: r.get(4)?,
+                file: r.get(5)?,
                 text_hash: r.get(6)?,
+                start_line: r.get::<_, i64>(7)? as usize,
+                end_line: r.get::<_, i64>(8)? as usize,
+                parent: r.get(9)?,
             })
         })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The content lines of `files` (plan d3336a8a step 15): one scan for
+    /// the whole batch — `cg_content` has no index on `path` (FTS5
+    /// UNINDEXED), so a per-file query would each pay the full scan.
+    /// Returns `path → (1-based line number, text)` with every non-blank
+    /// line of the file; the body excerpt skips blanks anyway, so the
+    /// rebuild agrees with the upsert's build over the raw content.
+    fn content_lines_for_files(
+        &self,
+        files: &[&str],
+    ) -> Result<HashMap<String, Vec<(usize, String)>>> {
+        let mut out: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+        if files.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = vec!["?"; files.len()].join(", ");
+        let sql =
+            format!("SELECT path, line, text FROM cg_content WHERE path IN ({placeholders})");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(params_from_iter(files.iter().copied()))?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let line: i64 = row.get(1)?;
+            let text: String = row.get(2)?;
+            out.entry(path).or_default().push((line as usize, text));
         }
         Ok(out)
     }
@@ -1118,12 +1345,15 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// The pending-symbols query, built once: the embeddable-kind list is
-/// derived from [`crate::codegraph::extract::EMBEDDABLE_KINDS`] — the
-/// single source of truth — so the cached statement's SQL and the kind
-/// list can never drift (a per-call `format!` would defeat the statement
-/// cache).
-fn pending_symbols_sql() -> &'static str {
+/// The chunk-rows query, built once (plan d3336a8a steps 9 and 15): the
+/// embeddable-kind list is derived from
+/// [`crate::codegraph::extract::EMBEDDABLE_KINDS`] — the single source
+/// of truth — so the cached statement's SQL and the kind list can never
+/// drift (a per-call `format!` would defeat the statement cache). The
+/// contains edge joins the enclosing non-module symbol's name in; a
+/// module parent (or a missing edge) yields NULL and contributes no
+/// name line to the chunk.
+fn chunk_rows_sql() -> &'static str {
     static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SQL.get_or_init(|| {
         let kinds = EMBEDDABLE_KINDS
@@ -1132,10 +1362,13 @@ fn pending_symbols_sql() -> &'static str {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "SELECT t.symbol_id, s.kind, s.name, t.signature, t.doc, s.file, t.text_hash
+            "SELECT t.symbol_id, s.kind, s.name, t.signature, t.doc, s.file, t.text_hash,
+                    s.start_line, s.end_line, p.name
              FROM cg_symbol_text t
              JOIN cg_symbols s ON s.id = t.symbol_id
              LEFT JOIN cg_symbol_vec v ON v.symbol_id = t.symbol_id
+             LEFT JOIN cg_edges ce ON ce.to_id = t.symbol_id AND ce.kind = 'contains'
+             LEFT JOIN cg_symbols p ON p.id = ce.from_id AND p.kind <> 'module'
              WHERE s.kind IN ({kinds})
                AND (v.symbol_id IS NULL OR v.model <> ?1 OR v.text_hash <> t.text_hash)
              ORDER BY t.symbol_id
@@ -1144,14 +1377,137 @@ fn pending_symbols_sql() -> &'static str {
     })
 }
 
-/// The embedding chunk text for one symbol (plan d3336a8a step 9):
-/// `<kind> <name>\n<signature>\n<doc>\n<file path>` — the text whose hash
-/// keys incremental embedding and the text the code-search model
-/// embeds. Built identically at upsert time (the stored `text_hash`)
-/// and at embed time (the pending batch's `text`), so the two can never
-/// drift.
-fn symbol_chunk_text(kind: &str, name: &str, signature: &str, doc: &str, file: &str) -> String {
-    format!("{kind} {name}\n{signature}\n{doc}\n{file}")
+/// Which context lines the embedding chunk carries (plan d3336a8a step
+/// 15). Production always embeds [`ChunkShape::Full`]; the eval measures
+/// [`ChunkShape::Today`] (the pre-step-15 chunk) and
+/// [`ChunkShape::SplitNames`] to justify it — variant by variant, so the
+/// shipped chunk's quality is a measurement, not a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkShape {
+    /// The shipped chunk: the name's split words, the enclosing type's
+    /// name, the signature, the doc comment, the body excerpt and the
+    /// file path — a plain-language question gets words to match even
+    /// when the code has no doc comment.
+    Full,
+    /// Eval staging only: the pre-step-15 chunk —
+    /// `<kind> <name>\n<signature>\n<doc>\n<file path>` — byte-identical
+    /// to the chunk step 9 shipped (the baseline the richer chunk must
+    /// beat).
+    #[cfg(test)]
+    Today,
+    /// Eval staging only: [`ChunkShape::Today`] plus the name's split
+    /// words.
+    #[cfg(test)]
+    SplitNames,
+}
+
+impl ChunkShape {
+    /// The chunk the production pipeline embeds (plan d3336a8a step 15).
+    fn production() -> Self {
+        Self::Full
+    }
+}
+
+/// The inputs of [`symbol_chunk_text`] (plan d3336a8a step 15): one
+/// symbol's stored text plus the step-15 context lines — bundled so the
+/// builder takes one argument.
+struct ChunkParts<'a> {
+    /// The symbol kind (the stored snake_case string).
+    kind: &'a str,
+    /// The symbol name.
+    name: &'a str,
+    /// The enclosing non-module symbol's name ("" when there is none).
+    parent: &'a str,
+    /// The stored signature.
+    signature: &'a str,
+    /// The stored doc comment.
+    doc: &'a str,
+    /// The project-relative file path (the DB key form).
+    file: &'a str,
+    /// The body excerpt (plan d3336a8a step 15): the first body lines,
+    /// comment and blank lines skipped — "" for symbols without one.
+    excerpt: &'a str,
+}
+
+/// The embedding chunk text for one symbol (plan d3336a8a steps 9 and 15):
+/// `<kind> <name>\n<name words>\n<enclosing type>\n<signature>\n<doc>\n<body excerpt>\n<file path>`
+/// — the text whose hash keys incremental embedding and the text the
+/// code-search model embeds. Built identically at upsert time (the stored
+/// `text_hash`) and at embed time (the pending batch's `text`), so the
+/// two can never drift; the `shape` selects the eval's staging variants
+/// ([`ChunkShape`]).
+fn symbol_chunk_text(shape: ChunkShape, parts: &ChunkParts) -> String {
+    let ChunkParts {
+        kind,
+        name,
+        parent,
+        signature,
+        doc,
+        file,
+        excerpt,
+    } = parts;
+    match shape {
+        ChunkShape::Full => format!(
+            "{kind} {name}\n{}\n{parent}\n{signature}\n{doc}\n{excerpt}\n{file}",
+            name_words_line(name)
+        ),
+        #[cfg(test)]
+        ChunkShape::Today => format!("{kind} {name}\n{signature}\n{doc}\n{file}"),
+        #[cfg(test)]
+        ChunkShape::SplitNames => format!(
+            "{kind} {name}\n{}\n{signature}\n{doc}\n{file}",
+            name_words_line(name)
+        ),
+    }
+}
+
+/// The name's words line of the chunk (plan d3336a8a step 15): the
+/// identifier split into lower-case words — `parse_retry_after` gives
+/// `parse retry after`, `RunOutcome` gives `run outcome` — so the chunk
+/// carries the name's plain-language form next to the identifier itself.
+fn name_words_line(name: &str) -> String {
+    name_words(name).join(" ")
+}
+
+/// Split an identifier into its lower-case words (plan d3336a8a step 11:
+/// the `find_code` name term; step 15: the chunk's words line — the same
+/// rule for both, in one place): non-alphanumeric characters are
+/// separators, and a camelCase hump (lower/digit → upper) splits too.
+/// `stale_edit_gate`, `StaleEditGate` and `stale edit gate` all split
+/// into `stale edit gate`.
+pub(crate) fn name_words(name: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            previous = None;
+            continue;
+        }
+        if c.is_uppercase() {
+            let hump = previous.is_some_and(|p| p.is_lowercase() || p.is_numeric());
+            if hump && !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+        current.extend(c.to_lowercase());
+        previous = Some(c);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// The excerpt's language for a stored `file` path (plan d3336a8a step
+/// 15): both chunk builders derive it from the same path column, so the
+/// upsert-built hash and the embed-time rebuild agree.
+fn excerpt_lang(file: &str) -> Option<Lang> {
+    let ext = file.rsplit('.').next()?.to_ascii_lowercase();
+    Lang::from_extension(&ext)
 }
 
 /// The [`RefKind`] persisted in a `cg_refs.kind` row (`"call"`,
@@ -1678,6 +2034,185 @@ mod tests {
             .unwrap()
     }
 
+    /// The step-15 chunk (plan d3336a8a): the name's split words, the
+    /// enclosing type's name and the body excerpt join kind, name,
+    /// signature, doc and file — the excerpt skips blank and comment-only
+    /// lines, and the caps hold on multi-byte text. The full round-trip
+    /// (upsert-built hash ↔ pending rebuild) covers the new fields'
+    /// store identity, and the eval's staging shapes stay
+    /// byte-compatible with step 9.
+    #[test]
+    fn chunk_text_includes_split_name_and_body_excerpt() {
+        // A Rust fn with a body: the excerpt begins after the line that
+        // opens the body; blank and comment-only lines never appear.
+        let source = r#"/// Parses a Retry-After header.
+pub fn parse_retry_after(header: &str) -> Option<Duration> {
+    // An interior comment.
+
+    let trimmed = header.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(Duration::from_secs(trimmed.parse().ok()?))
+}
+"#;
+        let lines: Vec<(usize, &str)> =
+            source.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+        let excerpt = body_excerpt(&lines, 2, 10, Lang::Rust);
+        assert_eq!(
+            excerpt,
+            "let trimmed = header.trim();\nif trimmed.is_empty() {\nreturn None;\n}\
+             \nSome(Duration::from_secs(trimmed.parse().ok()?))\n}"
+        );
+
+        // The chunk carries the words line, the enclosing type and the
+        // excerpt between the doc and the file path.
+        let chunk = symbol_chunk_text(
+            ChunkShape::Full,
+            &ChunkParts {
+                kind: "function",
+                name: "parse_retry_after",
+                parent: "RateLimits",
+                signature: "pub fn parse_retry_after(header: &str) -> Option<Duration>",
+                doc: "Parses a Retry-After header.",
+                file: "src/provider/limits.rs",
+                excerpt: &excerpt,
+            },
+        );
+        assert_eq!(
+            chunk,
+            "function parse_retry_after\nparse retry after\nRateLimits\n\
+             pub fn parse_retry_after(header: &str) -> Option<Duration>\n\
+             Parses a Retry-After header.\n\
+             let trimmed = header.trim();\n\
+             if trimmed.is_empty() {
+return None;
+}
+\
+             Some(Duration::from_secs(trimmed.parse().ok()?))
+}\n\
+             src/provider/limits.rs"
+        );
+
+        // The line cap: at most EXCERPT_MAX_LINES body lines.
+        let body_lines: Vec<String> = (0..30).map(|i| format!("    acc += {i};")).collect();
+        let source = format!("fn wide() {{\n{}\n}}\n", body_lines.join("\n"));
+        let lines: Vec<(usize, &str)> =
+            source.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+        let wide = body_excerpt(&lines, 1, 32, Lang::Rust);
+        assert_eq!(wide.lines().count(), crate::codegraph::extract::EXCERPT_MAX_LINES);
+
+        // The char cap, cut on a char boundary even on multi-byte text:
+        // `ä` is two bytes, so a byte-cut would not land at 600 chars.
+        let long_line = "ä".repeat(700);
+        let source = format!("fn wide() {{\n    {long_line}\n}}\n");
+        let lines: Vec<(usize, &str)> =
+            source.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+        let wide = body_excerpt(&lines, 1, 3, Lang::Rust);
+        assert_eq!(wide.chars().count(), crate::codegraph::extract::EXCERPT_MAX_CHARS);
+        assert!(wide.chars().all(|c| c == 'ä'));
+
+        // The store round-trip: a contains edge supplies the parent
+        // name, the content rows supply the excerpt, and the pending
+        // rebuild equals the upsert's chunk (the stored hash's text).
+        let content = "\
+impl RateLimits {
+    pub fn other() -> u32 {
+        0
+    }
+    pub fn parse_retry_after(header: &str) -> Option<Duration> {
+        // An interior comment.
+
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(Duration::from_secs(trimmed.parse().ok()?))
+    }
+}
+";
+        let mut method = sym("t.rs", "parse_retry_after", SymbolKind::Method, 5, 13);
+        method.signature =
+            "pub fn parse_retry_after(header: &str) -> Option<Duration>".to_string();
+        method.doc = "Parses a Retry-After header.".to_string();
+        let parent = sym("t.rs", "RateLimits", SymbolKind::Impl, 1, 15);
+        let module = Symbol {
+            id: "t.rs::module".to_string(),
+            name: "t.rs".to_string(),
+            kind: SymbolKind::Module,
+            file: "t.rs".to_string(),
+            start_line: 1,
+            end_line: 15,
+            signature: String::new(),
+            doc: String::new(),
+        };
+        let data = FileData {
+            symbols: vec![module, parent, method],
+            refs: vec![],
+            contains: vec![(
+                "t.rs::RateLimits::1".to_string(),
+                "t.rs::parse_retry_after::5".to_string(),
+            )],
+        };
+        let mut s = Store::open_in_memory().unwrap();
+        s.upsert_file("t.rs", "h1", 100, &data, content).unwrap();
+        let pending = s
+            .pending_symbols("jina-embeddings-v2-base-code", 100)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].symbol_id, "t.rs::parse_retry_after::5");
+        let expected = symbol_chunk_text(
+            ChunkShape::Full,
+            &ChunkParts {
+                kind: "method",
+                name: "parse_retry_after",
+                parent: "RateLimits",
+                signature: "pub fn parse_retry_after(header: &str) -> Option<Duration>",
+                doc: "Parses a Retry-After header.",
+                file: "t.rs",
+                excerpt: "let trimmed = header.trim();\nif trimmed.is_empty() {\nreturn None;\n}\
+             \nSome(Duration::from_secs(trimmed.parse().ok()?))\n}",
+            },
+        );
+        assert_eq!(pending[0].text, expected);
+        assert_eq!(
+            pending[0].text_hash,
+            crate::codegraph::content_hash(expected.as_bytes())
+        );
+
+        // The eval's staging shapes: Today is byte-identical to the
+        // pre-step-15 chunk, SplitNames adds only the words line.
+        s.set_chunk_shape_for_test(ChunkShape::Today);
+        let today = s
+            .pending_symbols("jina-embeddings-v2-base-code", 100)
+            .unwrap();
+        assert_eq!(
+            today[0].text,
+            "method parse_retry_after\n\
+             pub fn parse_retry_after(header: &str) -> Option<Duration>\n\
+             Parses a Retry-After header.\n\
+             t.rs"
+        );
+        s.set_chunk_shape_for_test(ChunkShape::SplitNames);
+        let split = s
+            .pending_symbols("jina-embeddings-v2-base-code", 100)
+            .unwrap();
+        assert_eq!(
+            split[0].text,
+            "method parse_retry_after\nparse retry after\n\
+             pub fn parse_retry_after(header: &str) -> Option<Duration>\n\
+             Parses a Retry-After header.\n\
+             t.rs"
+        );
+        // The retarget seam re-hashes every row for the current shape.
+        s.set_chunk_shape_for_test(ChunkShape::Full);
+        assert_eq!(s.retarget_symbol_text_hashes_for_test().unwrap(), 1);
+        let full = s
+            .pending_symbols("jina-embeddings-v2-base-code", 100)
+            .unwrap();
+        assert_eq!(full[0].text, expected);
+    }
+
     /// The step-9 text/vector lifecycle at the store level: upserts write
     /// text rows (real symbols only), a stored vector makes the symbol
     /// non-pending, an UNCHANGED re-upsert keeps it non-pending (the
@@ -1696,7 +2231,8 @@ mod tests {
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].symbol_id, "t.rs::helper::3");
-        let expected_chunk = "function helper\npub fn helper(x: u32) -> u32\nAdds one.\nt.rs";
+        let expected_chunk =
+            "function helper\nhelper\n\npub fn helper(x: u32) -> u32\nAdds one.\n\nt.rs";
         assert_eq!(pending[0].text, expected_chunk);
         assert_eq!(
             pending[0].text_hash,

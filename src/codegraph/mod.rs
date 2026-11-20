@@ -395,6 +395,21 @@ impl CodeGraph {
         Ok(self.store().pending_symbols(model, 1)?.len())
     }
 
+    /// Test seam (plan d3336a8a step 15): the eval's per-variant switch —
+    /// set the chunk shape every rebuilt chunk text uses, then re-hash
+    /// every stored text row so every symbol turns pending and the pass
+    /// re-embeds the shape's chunks (replacing the previous shape's
+    /// vectors). Returns the number of re-hashed rows.
+    #[cfg(test)]
+    pub(crate) fn retarget_symbol_chunks_for_test(
+        &self,
+        shape: crate::codegraph::store::ChunkShape,
+    ) -> Result<usize> {
+        let mut store = self.store();
+        store.set_chunk_shape_for_test(shape);
+        store.retarget_symbol_text_hashes_for_test()
+    }
+
     /// Content-index hits for a token set, best bm25 first (plan d3336a8a
     /// step 11): the semantic code search's lexical term. One FTS query.
     pub(crate) fn content_hits_any(
@@ -1729,6 +1744,15 @@ pub fn content_hash(bytes: &[u8]) -> String {
 #[cfg(feature = "embeddings")]
 const SYMBOL_EMBED_BATCH: usize = 64;
 
+/// How many texts one inference call embeds on the pass (plan d3336a8a
+/// step 15): the host splits its /v1/embed requests at 16, and the
+/// in-process path gets the same bound here — fastembed pads every
+/// call to its longest text, so one 64-text call is the largest shape
+/// the ONNX arena ever sees, and the arena's per-shape blocks grew
+/// until an allocation failed mid-pass (the zeros stop the pass).
+#[cfg(feature = "embeddings")]
+const SYMBOL_EMBED_SUB_BATCH: usize = 16;
+
 /// Clears the pass's single-flight flag when the pass thread ends —
 /// normal return or panic (review finding panicStuckRunning: Drop runs
 /// on unwind too, so a panicking embedder must not disable the graph's
@@ -1828,51 +1852,80 @@ fn run_symbol_embed_pass(
                 break;
             }
             let texts: Vec<String> = batch.iter().map(|s| s.text.clone()).collect();
-            let vectors = embedder.embed_batch(&texts).await;
-            // Review finding midPassHashJunk: re-check the status EVERY
-            // batch, after the embed call. A mid-pass degradation — the
-            // shared host died and the in-process load failed — keeps
-            // ANSWERING, as the hash fallback's deterministic, NON-ZERO,
-            // right-dim vectors under the code model's id, so neither
-            // the model check, the dim guard nor the zero guard catches
-            // it; only the status flip to Failed does. Drop the batch,
-            // stop the pass — the next pass retries after the host or
-            // model recovers.
-            if matches!(
-                embedder.status(),
-                Some(crate::memory::embedder::EmbedderStatus::Failed)
-            ) {
-                code_embedder_slot::log_skip_once("embedder degraded mid-pass (status Failed)");
-                break;
-            }
-            if vectors.iter().all(|v| v.iter().all(|f| *f == 0.0)) {
-                // The bundled embedder's own failure contract answers
-                // zeros: persisting them would be junk, and a zero
-                // vector is indistinguishable from no signal in cosine.
-                // Stop — the next pass retries after recovery.
-                code_embedder_slot::log_skip_once("embedder answered zero vectors");
-                break;
-            }
-            match lock_store(&store).store_symbol_vecs(&model, dim, &batch, &vectors) {
-                Ok(0) => {
-                    // Review finding zeroProgressLoop: nothing stored for
-                    // a NON-empty batch (wrong-length vectors, or every
-                    // symbol vanished mid-batch) — re-reading the queue
-                    // would return the very same batch in a hot loop.
-                    // Stop; the next pass retries from a fresh queue.
-                    code_embedder_slot::log_skip_once("a non-empty batch stored nothing");
+            // Step 15's RAM bound applies to the in-process path too
+            // (found by the step-15 eval, whose `1 pending` never
+            // drained): fastembed pads every inference call to its
+            // longest text, one 64-text call is the largest shape the
+            // arena ever sees, and the arena keeps a block per distinct
+            // padded length — it grows until an allocation fails
+            // mid-pass, the embedder answers zeros and the zero guard
+            // stops the pass with the queue half-drained. Sub-batch like
+            // the host does: at most SYMBOL_EMBED_SUB_BATCH texts per
+            // inference call, each sub-batch embedded, checked and
+            // stored on its own — the review guards below keep their
+            // semantics at the finer granularity (the sub-batch
+            // embedded before a degradation is stored; the ones after
+            // it are dropped and the pass stops).
+            let mut stop = false;
+            for (rows, texts) in batch
+                .chunks(SYMBOL_EMBED_SUB_BATCH)
+                .zip(texts.chunks(SYMBOL_EMBED_SUB_BATCH))
+            {
+                let vectors = embedder.embed_batch(texts).await;
+                // Review finding midPassHashJunk: re-check the status
+                // after every embed call. A mid-pass degradation — the
+                // shared host died and the in-process load failed —
+                // keeps ANSWERING, as the hash fallback's
+                // deterministic, NON-ZERO, right-dim vectors under the
+                // code model's id, so neither the model check, the dim
+                // guard nor the zero guard catches it; only the status
+                // flip to Failed does. Drop the sub-batch, stop the
+                // pass — the next pass retries after the host or model
+                // recovers.
+                if matches!(
+                    embedder.status(),
+                    Some(crate::memory::embedder::EmbedderStatus::Failed)
+                ) {
+                    code_embedder_slot::log_skip_once("embedder degraded mid-pass (status Failed)");
+                    stop = true;
                     break;
                 }
-                Ok(n) => {
-                    stored += n;
-                    // Semantic code search (step 11): the new vectors are
-                    // rankable now — the query snapshot reloads.
-                    generation.fetch_add(1, Ordering::AcqRel);
-                }
-                Err(e) => {
-                    eprintln!("codegraph: symbol-embed store failed: {e}");
+                if vectors.iter().all(|v| v.iter().all(|f| *f == 0.0)) {
+                    // The bundled embedder's own failure contract answers
+                    // zeros: persisting them would be junk, and a zero
+                    // vector is indistinguishable from no signal in cosine.
+                    // Stop — the next pass retries after recovery.
+                    code_embedder_slot::log_skip_once("embedder answered zero vectors");
+                    stop = true;
                     break;
                 }
+                match lock_store(&store).store_symbol_vecs(&model, dim, rows, &vectors) {
+                    Ok(0) => {
+                        // Review finding zeroProgressLoop: nothing stored
+                        // for a NON-empty sub-batch (wrong-length vectors,
+                        // or every symbol vanished mid-batch) — re-reading
+                        // the queue would return the very same batch in a
+                        // hot loop. Stop; the next pass retries from a
+                        // fresh queue.
+                        code_embedder_slot::log_skip_once("a non-empty sub-batch stored nothing");
+                        stop = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        stored += n;
+                        // Semantic code search (step 11): the new vectors
+                        // are rankable now — the query snapshot reloads.
+                        generation.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Err(e) => {
+                        eprintln!("codegraph: symbol-embed store failed: {e}");
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                break;
             }
             tokio::task::yield_now().await;
         }
@@ -2953,6 +3006,7 @@ mod tests {
         calls: AtomicUsize,
         batches: AtomicUsize,
         fail_after_batches: usize,
+        max_batch: AtomicUsize,
     }
 
     #[cfg(feature = "embeddings")]
@@ -2969,6 +3023,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 batches: AtomicUsize::new(0),
                 fail_after_batches: 0,
+                max_batch: AtomicUsize::new(0),
             })
         }
 
@@ -2982,11 +3037,22 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 batches: AtomicUsize::new(0),
                 fail_after_batches: after,
+                max_batch: AtomicUsize::new(0),
             })
         }
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        /// The step-15 regression seam: the largest inference call the
+        /// stub served, and how many inference calls it served.
+        fn max_batch_texts(&self) -> usize {
+            self.max_batch.load(Ordering::Relaxed)
+        }
+
+        fn batches_served(&self) -> usize {
+            self.batches.load(Ordering::Relaxed)
         }
 
         /// Deterministic pseudo-embedding: the vector depends only on
@@ -3014,6 +3080,7 @@ mod tests {
         async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
             self.calls.fetch_add(texts.len(), Ordering::Relaxed);
             self.batches.fetch_add(1, Ordering::Relaxed);
+            self.max_batch.fetch_max(texts.len(), Ordering::Relaxed);
             texts.iter().map(|t| self.embed_one(t)).collect()
         }
 
@@ -3434,19 +3501,55 @@ mod tests {
             graph.store().pending_symbols(model, 1000).unwrap().len(),
             100
         );
-        let stub = StubEmbedder::new_degrading(model, 8, 1);
+        let stub = StubEmbedder::new_degrading(model, 8, 4);
         graph.arm_symbol_embedder_stub(Arc::clone(&stub));
         run_armed_pass(&graph);
-        // Batch 1 (64 symbols) stored; batch 2 embedded, then dropped on
-        // its status check; nothing after.
+        // Batch 1 (64 symbols, four step-15 sub-batches) stored; batch 2
+        // embedded its first sub-batch, then dropped it on the status
+        // check; nothing after.
         assert_eq!(graph.store().symbol_vec_count().unwrap(), 64);
-        assert_eq!(stub.calls(), 100);
+        assert_eq!(stub.calls(), 80);
         // The pass stopped: the degraded batch's symbols stay pending
         // for the next pass.
         assert_eq!(
             graph.store().pending_symbols(model, 1000).unwrap().len(),
             36
         );
+    }
+
+    /// Plan d3336a8a step 15: the pass embeds at most
+    /// SYMBOL_EMBED_SUB_BATCH texts per inference call — one 64-symbol
+    /// batch in a single ONNX call is the padded shape that grew the
+    /// arena until an allocation failed mid-pass (the eval's queue
+    /// stuck at `1 pending`, never draining). The stub records the
+    /// largest inference call it served; it must stay within the
+    /// sub-batch bound, and the answers still cover every symbol.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_sub_batches_its_inference_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 embeddable fns: two batches at SYMBOL_EMBED_BATCH = 64,
+        // five inference calls at SYMBOL_EMBED_SUB_BATCH = 16.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let mut src = String::new();
+        for i in 0..100 {
+            src.push_str(&format!("pub fn f{i}() -> u32 {{ {i} }}\n"));
+        }
+        std::fs::write(src_dir.join("big.rs"), src).unwrap();
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let model = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        let stub = StubEmbedder::new(model, 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&stub));
+        run_armed_pass(&graph);
+        assert_eq!(
+            stub.max_batch_texts(),
+            SYMBOL_EMBED_SUB_BATCH,
+            "no inference call exceeds the sub-batch bound"
+        );
+        assert_eq!(stub.batches_served(), 7);
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 100);
     }
 
     /// Step 9's migration path end to end: a pre-step-9 DB (its tables

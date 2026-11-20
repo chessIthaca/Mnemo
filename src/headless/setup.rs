@@ -316,6 +316,15 @@ struct LiveHandles {
     /// file with it before pushing the manager's list, the same wiring the
     /// brain performs at startup, so a reload never strips project servers.
     mcp_project_file: Option<PathBuf>,
+    /// The head of the embedder-rewire chain (review finding
+    /// rewireBlocksRuntime): the still-running embedder build of the
+    /// LAST live apply. apply_live — always under the apply mutex —
+    /// takes and re-stores this head, and each background embedder
+    /// rewire first awaits its predecessor, so consecutive saves swap
+    /// embedders in save order even though every build runs off the
+    /// apply path (never on it — the build can block for tens of
+    /// seconds).
+    embedder_rewire_chain: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl fmt::Debug for LiveHandles {
@@ -700,6 +709,11 @@ impl Setup {
                         .join(".coding")
                         .join("mcp.toml"),
                 ),
+                // Every Setup for one engine shares the SAME chain head:
+                // cloned from the brain, so concurrent Setups (a save
+                // and a watcher reload) serialize their embedder builds
+                // in apply order.
+                embedder_rewire_chain: brain.embedder_rewire_chain.clone(),
             }),
         }
     }
@@ -804,9 +818,17 @@ impl Setup {
             pause.entered.add_permits(1);
             let _ = pause.release.acquire().await;
         }
-        // The rewire core: vision + embedder + the live toggles. The
-        // re-embed future spawns on tokio (the headless engine runs on
-        // tokio by construction).
+        // The rewire core, split by pacing (review finding
+        // rewireBlocksRuntime): the FAST factory leg — vision + the live
+        // toggles — runs inline, order-coherent with the config swap
+        // below; the SLOW embedder leg runs OFF the apply critical path
+        // (the build can block for tens of seconds: the shared models
+        // host's acquire — probe loops, the 30 s spawn-lock wait, the
+        // spawn and its health wait — or the in-process ONNX load, a
+        // first use possibly a download), on a blocking thread chained
+        // after the last apply's build, so consecutive saves swap
+        // embedders in save order. The re-embed future spawns on tokio
+        // once the swap lands.
         let targets = crate::host::rewire::RewireTargets {
             factory: Some(live.factory.clone()),
             memory_store: live.memory_store.clone(),
@@ -816,9 +838,8 @@ impl Setup {
             // dir — install isolation for custom-dir Setups.
             config_dir: Some(self.config_dir.clone()),
         };
-        if let Some(task) = crate::host::rewire::rewire_vision_embedder(&targets, &new_config) {
-            tokio::spawn(task);
-        }
+        crate::host::rewire::rewire_vision_embedder(&targets, &new_config);
+        self.spawn_embedder_rewire(live, targets, new_config.clone());
         // `[models]` overrides on the next request.
         crate::host::rewire::sync_model_resolver(Some(&live.model_resolver), &new_config);
         // The factory's shared tool handles.
@@ -868,6 +889,52 @@ impl Setup {
             *config = new_config;
         }
         pending_mcp_drop
+    }
+
+    /// The embedder half of a live apply, run OFF the apply critical
+    /// path (review finding rewireBlocksRuntime): the embedder build —
+    /// the shared models host's acquire (probe loops, the spawn-lock
+    /// wait, the spawn and its health wait) or the in-process ONNX
+    /// load, a first use possibly a download — runs on a blocking
+    /// thread, so no Settings save or config-watcher reload stalls the
+    /// apply mutex for it. `rewire::rewire_memory_embedder` is the
+    /// work; this method owns its pacing and ordering.
+    ///
+    /// Consecutive saves must still swap embedders in SAVE order: each
+    /// spawned task first awaits the chain head on [`LiveHandles`] —
+    /// the last apply's still-running build — so an older config's
+    /// embedder can never land after a newer save's. The head is taken
+    /// and re-stored here, under the apply lock apply_live's callers
+    /// hold, so the bookkeeping never interleaves.
+    fn spawn_embedder_rewire(
+        &self,
+        live: &LiveHandles,
+        targets: crate::host::rewire::RewireTargets,
+        cfg: Config,
+    ) {
+        let previous = live
+            .embedder_rewire_chain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let head = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let reembed = tokio::task::spawn_blocking(move || {
+                crate::host::rewire::rewire_memory_embedder(&targets, &cfg)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(reembed) = reembed {
+                tokio::spawn(reembed);
+            }
+        });
+        *live
+            .embedder_rewire_chain
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(head);
     }
 
     /// Record a fingerprint as this Setup's applied baseline — after a save
@@ -2611,6 +2678,81 @@ mod tests {
             .expect("save task")
             .expect("the MCP save applies");
         assert!(!message.is_empty());
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Review finding rewireBlocksRuntime: the embedder half of the
+    /// rewire runs OFF the apply critical path — a slow models-host
+    /// acquire must never stall a Settings save behind the apply
+    /// mutex.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_models_host_acquire_does_not_block_apply_live() {
+        let (_root, cfg, engine) = ready_engine().await;
+        // Hold the models-host spawn lock: every acquire now waits for
+        // it (the holder signals once it HAS the lock, so the apply
+        // cannot race ahead of it).
+        let dir = crate::host::shared_service::service_dir(
+            cfg.path(),
+            crate::host::models_host::SERVICE_NAME,
+        );
+        std::fs::create_dir_all(&dir).expect("create the service dir");
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (locked, took) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _ = crate::host::shared_service::with_spawn_lock_wait(
+                &dir,
+                std::time::Duration::from_secs(60),
+                |held| {
+                    if held {
+                        locked.send(()).expect("signal the lock is held");
+                        let _ = gate.recv_timeout(std::time::Duration::from_secs(60));
+                    }
+                    Ok(())
+                },
+            );
+        });
+        took.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the holder took the spawn lock");
+        // A bundled model the catalog does not know: the background leg
+        // waits on the lock above, and its eventual in-process fallback
+        // fails fast in the catalog — this test can neither spawn a
+        // host nor download a model. The apply runs on its own task
+        // with its own Setup (the shape of a real settings IPC), so an
+        // in-line acquire — the old code — parks the TASK and this
+        // timeout still fires on a free worker.
+        let applying = {
+            let setup = Setup::open(Some(cfg.path().to_path_buf()))
+                .expect("a fresh Setup for the apply")
+                .for_engine(&engine);
+            let live = setup.live.clone().expect("live handles");
+            let mut new_config = setup.load_config().expect("the engine's config");
+            new_config.general.general.bundled_embedding_model = Some("no-such-model".into());
+            tokio::spawn(async move { setup.apply_live(&live, new_config, true).await })
+        };
+        let _pending_mcp = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            applying,
+        )
+        .await
+        .expect("apply_live returned while the acquire still waited")
+        .expect("the apply task ran");
+        // Free the lock so the background leg can finish: the swap
+        // lands (the unknown model parks the status on Failed — the
+        // hash fallback the store keeps serving with).
+        release.send(()).expect("release the spawn lock");
+        holder.join().expect("the lock holder ends");
+        let status = engine.brain().embedder_status.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while *status.read().expect("embedder status lock")
+            != crate::memory::embedder::EmbedderStatus::Failed
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the off-path embedder rewire never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         engine.shutdown().await.expect("shutdown");
     }
 

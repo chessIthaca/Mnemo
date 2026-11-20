@@ -600,20 +600,77 @@ fn spawn_host(
 
 /// The lazily loaded models of a serving host.
 struct HostState {
-    /// `<config>/models` — the machine-global model cache (the same dir the
-    /// in-process `BundledEmbedder` uses, so a host's download is shared).
-    cache_dir: PathBuf,
     /// The model ids this host serves (validated against the catalog).
     serving: Vec<String>,
-    /// Loaded models: id → the ONNX session plus its dim. One loader at a
-    /// time; embeds serialize on the session, not this table.
+    /// Loaded models: id → the ONNX session plus its dim. Held only for
+    /// the moment of a lookup or insert — NEVER across a load (review
+    /// finding loadHoldsTableLock).
     loaded: Mutex<HashMap<String, LoadedModel>>,
+    /// One loading slot per model id: the first requester holds its
+    /// slot while it loads; same-model requests queue on it (one load,
+    /// no double download), while every other model keeps serving —
+    /// the code model's slow load never blocks the memory model's
+    /// embeds.
+    loading: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The load seam: production runs the real fastembed ONNX load
+    /// (possibly a first-use download into the shared cache); tests
+    /// inject slow or instant stubs.
+    load: LoadFn,
 }
 
-/// One loaded model: its ONNX session and its dim (recorded at load time).
+/// How a model becomes a [`LoadedModel`] — the load seam (production:
+/// the fastembed ONNX load; tests: deterministic stubs).
+type LoadFn = Box<dyn Fn(&str) -> Result<LoadedModel, String> + Send + Sync>;
+
+/// One loaded model: its inference session and its dim (recorded at
+/// load time).
+#[derive(Clone)]
 struct LoadedModel {
-    session: Arc<Mutex<fastembed::TextEmbedding>>,
+    session: Arc<Mutex<Session>>,
     dim: usize,
+}
+
+/// The inference handle of one loaded model: the real ONNX session, or
+/// — through the test seam only — a deterministic stand-in that needs
+/// no model file. The real session is boxed (clippy
+/// `large_enum_variant`): it dwarfs the stub, and every loaded model
+/// carries the enum in an Arc anyway.
+enum Session {
+    /// The real fastembed session.
+    Real(Box<fastembed::TextEmbedding>),
+    /// Tests: constant vectors of this dim — the host never loads a
+    /// model for it.
+    #[cfg(test)]
+    Stub(usize),
+}
+
+impl Session {
+    /// Embed `texts` through this session: the real ONNX inference, or
+    /// (tests) the deterministic stub.
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        match self {
+            Session::Real(session) => {
+                session.embed(texts, None).map_err(|err| err.to_string())
+            }
+            #[cfg(test)]
+            Session::Stub(dim) => Ok(texts.iter().map(|_| vec![0.5_f32; *dim]).collect()),
+        }
+    }
+}
+
+/// The production load: the catalog lookup, the dim, and the fastembed
+/// ONNX init with the machine-global cache (a first use may download
+/// into it — the request blocks for that, by design).
+fn load_bundled_model(cache_dir: &Path, model_id: &str) -> Result<LoadedModel, String> {
+    let model = model_for_id(model_id)?;
+    let dim = dim_for_model(&model);
+    let init = fastembed::TextInitOptions::new(model).with_cache_dir(cache_dir.to_path_buf());
+    let session = fastembed::TextEmbedding::try_new(init)
+        .map_err(|err| format!("failed to load embedding model '{model_id}': {err}"))?;
+    Ok(LoadedModel {
+        session: Arc::new(Mutex::new(Session::Real(Box::new(session)))),
+        dim,
+    })
 }
 
 impl HostState {
@@ -625,46 +682,68 @@ impl HostState {
         if !self.serving.iter().any(|served| served == model_id) {
             return Err(format!("model '{model_id}' is not served by this host"));
         }
-        let loaded_model = {
-            let mut table = self
-                .loaded
-                .lock()
-                .map_err(|_| String::from("the model table is poisoned"))?;
-            if let Some(existing) = table.get(model_id) {
-                LoadedModel {
-                    session: Arc::clone(&existing.session),
-                    dim: existing.dim,
-                }
-            } else {
-                let model = model_for_id(model_id)?;
-                let dim = dim_for_model(&model);
-                let init =
-                    fastembed::TextInitOptions::new(model).with_cache_dir(self.cache_dir.clone());
-                let session = fastembed::TextEmbedding::try_new(init).map_err(|err| {
-                    format!("failed to load embedding model '{model_id}': {err}")
-                })?;
-                let entry = LoadedModel {
-                    session: Arc::new(std::sync::Mutex::new(session)),
-                    dim,
-                };
-                table.insert(
-                    model_id.to_string(),
-                    LoadedModel {
-                        session: Arc::clone(&entry.session),
-                        dim: entry.dim,
-                    },
-                );
-                entry
-            }
-        };
+        let loaded_model = self.loaded_model(model_id)?;
         let mut session = loaded_model
             .session
             .lock()
             .map_err(|_| String::from("the model session is poisoned"))?;
         let vectors = session
-            .embed(texts, None)
+            .embed(texts)
             .map_err(|err| format!("inference for '{model_id}' failed: {err}"))?;
         Ok((vectors, loaded_model.dim))
+    }
+
+    /// The loaded model for `model_id`: a fast table hit, or a load
+    /// under THIS model's slot. The table lock is held for a lookup or
+    /// insert only — never across the load itself — so already-loaded
+    /// models keep serving while another model loads, and the slot
+    /// makes same-model requests queue instead of starting a second
+    /// download (review finding loadHoldsTableLock).
+    fn loaded_model(&self, model_id: &str) -> Result<LoadedModel, String> {
+        if let Some(existing) = self
+            .loaded
+            .lock()
+            .map_err(|_| String::from("the model table is poisoned"))?
+            .get(model_id)
+        {
+            return Ok(existing.clone());
+        }
+        let slot = {
+            let mut slots = self
+                .loading
+                .lock()
+                .map_err(|_| String::from("the loading table is poisoned"))?;
+            Arc::clone(slots.entry(model_id.to_string()).or_default())
+        };
+        let _one_load = slot
+            .lock()
+            .map_err(|_| String::from("the loading slot is poisoned"))?;
+        if let Some(existing) = self
+            .loaded
+            .lock()
+            .map_err(|_| String::from("the model table is poisoned"))?
+            .get(model_id)
+        {
+            return Ok(existing.clone());
+        }
+        let entry = (self.load)(model_id)?;
+        self.loaded
+            .lock()
+            .map_err(|_| String::from("the model table is poisoned"))?
+            .insert(model_id.to_string(), entry.clone());
+        Ok(entry)
+    }
+
+    /// Tests only: a host state whose loads go through `load` — the
+    /// load seam — instead of the real ONNX loader.
+    #[cfg(test)]
+    fn for_tests(load: LoadFn, models: &[&str]) -> Self {
+        Self {
+            serving: models.iter().map(|model| model.to_string()).collect(),
+            loaded: Mutex::new(HashMap::new()),
+            loading: Mutex::new(HashMap::new()),
+            load,
+        }
     }
 }
 
@@ -697,10 +776,12 @@ pub fn serve(
             serving.push(model.clone());
         }
     }
+    let cache_dir = crate::config::embedder_cache_dir(config_dir);
     let state = Arc::new(HostState {
-        cache_dir: crate::config::embedder_cache_dir(config_dir),
         serving,
         loaded: Mutex::new(HashMap::new()),
+        loading: Mutex::new(HashMap::new()),
+        load: Box::new(move |model_id| load_bundled_model(&cache_dir, model_id)),
     });
     let listener = TcpListener::bind(SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port))?;
     listener.set_nonblocking(true)?;
@@ -745,26 +826,29 @@ pub fn serve(
 fn handle_connection(mut stream: TcpStream, token: &str, state: Arc<HostState>) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    let Some(incoming) = read_request(&mut stream) else {
+    // The head first: an unauthenticated client must never make the
+    // host buffer more than the head cap (review finding authAfterBody —
+    // the bearer check runs BEFORE the body is read).
+    let Some(head) = read_request_head(&mut stream) else {
         let _ = respond(&mut stream, 400, "Bad Request", "{\"error\":\"malformed request\"}");
         return;
     };
-    let ParsedRequest {
-        method,
-        path,
-        headers,
-        body,
-    } = incoming;
-    // Bearer check first — nothing runs without it.
+    // Bearer check before the body is read: an unauthenticated request
+    // is never buffered past the head (review finding authAfterBody).
     let expected = format!("Bearer {token}");
-    let authorized = headers
+    let authorized = head
+        .headers
         .iter()
         .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && value == &expected);
     if !authorized {
         let _ = respond(&mut stream, 401, "Unauthorized", &error_body("missing or invalid bearer token"));
         return;
     }
-    if method == "GET" && path == "/health" {
+    let Some(body) = read_request_body(&mut stream, &head) else {
+        let _ = respond(&mut stream, 400, "Bad Request", "{\"error\":\"malformed request\"}");
+        return;
+    };
+    if head.method == "GET" && head.path == "/health" {
         let answer = HealthResponse {
             models: state.serving.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -773,7 +857,7 @@ fn handle_connection(mut stream: TcpStream, token: &str, state: Arc<HostState>) 
         let _ = respond(&mut stream, 200, "OK", &body);
         return;
     }
-    if method == "POST" && path == "/v1/embed" {
+    if head.method == "POST" && head.path == "/v1/embed" {
         match serde_json::from_slice::<EmbedRequest>(&body) {
             Ok(request) => match state.embed(&request.model, &request.texts) {
                 Ok((vectors, dim)) => {
@@ -791,7 +875,7 @@ fn handle_connection(mut stream: TcpStream, token: &str, state: Arc<HostState>) 
         }
         return;
     }
-    let code = if method == "GET" || method == "POST" { 404 } else { 405 };
+    let code = if head.method == "GET" || head.method == "POST" { 404 } else { 405 };
     let _ = respond(&mut stream, code, "Not Found", &error_body("unknown method or path"));
 }
 
@@ -803,22 +887,28 @@ fn error_body(message: &str) -> String {
     .unwrap_or_default()
 }
 
-/// One parsed HTTP request.
-struct ParsedRequest {
+/// One parsed HTTP request head. The body is read separately — AFTER
+/// the bearer check — so an unauthenticated client can never make the
+/// host buffer more than `HEAD_CAP` (review finding authAfterBody).
+struct ParsedHead {
     /// The request method (`GET` or `POST`).
     method: String,
     /// The request path (`/health` or `/v1/embed`).
     path: String,
     /// The headers, (name, value) pairs, names matched case-insensitively.
     headers: Vec<(String, String)>,
-    /// The `Content-Length` body (empty when the request carries none).
-    body: Vec<u8>,
+    /// The declared `Content-Length` (0 when the request carries none).
+    content_length: usize,
+    /// Body bytes that already arrived with the head.
+    buffered: Vec<u8>,
 }
 
-/// Read one HTTP/1.1 request: the request line, the headers and the
-/// Content-Length body (chunked bodies are refused — the client is ours and
-/// always sends a length).
-fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
+/// Read one HTTP/1.1 request head: the request line and the headers
+/// up to the `\r\n\r\n` separator (chunked bodies are refused — the
+/// client is ours and always sends a length). Body bytes that arrived
+/// with the head ride along; the body itself is read only after the
+/// bearer check passed ([`read_request_body`]).
+fn read_request_head(stream: &mut TcpStream) -> Option<ParsedHead> {
     let mut buffer = Vec::new();
     let header_end = loop {
         let mut chunk = [0u8; 8192];
@@ -854,11 +944,25 @@ fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.parse().ok())
         .unwrap_or(0);
-    if content_length > BODY_CAP {
+    Some(ParsedHead {
+        method,
+        path,
+        headers,
+        content_length,
+        buffered: buffer[header_end + 4..].to_vec(),
+    })
+}
+
+/// Read the body of an authenticated request whose head
+/// [`read_request_head`] parsed: the declared `Content-Length` bytes,
+/// capped at `BODY_CAP`. `None` on an oversized body or a truncated
+/// read.
+fn read_request_body(stream: &mut TcpStream, head: &ParsedHead) -> Option<Vec<u8>> {
+    if head.content_length > BODY_CAP {
         return None;
     }
-    let mut body = buffer[header_end + 4..].to_vec();
-    while body.len() < content_length {
+    let mut body = head.buffered.clone();
+    while body.len() < head.content_length {
         let mut chunk = [0u8; 8192];
         let read = stream.read(&mut chunk).ok()?;
         if read == 0 {
@@ -866,13 +970,8 @@ fn read_request(stream: &mut TcpStream) -> Option<ParsedRequest> {
         }
         body.extend_from_slice(&chunk[..read]);
     }
-    body.truncate(content_length);
-    Some(ParsedRequest {
-        method,
-        path,
-        headers,
-        body,
-    })
+    body.truncate(head.content_length);
+    Some(body)
 }
 
 /// The offset of the `\r\n\r\n` header/body separator, if fully buffered.
@@ -1143,6 +1242,112 @@ mod tests {
         assert!(
             response.contains("not served"),
             "the answer says why: {response}"
+        );
+    }
+
+    /// Review finding authAfterBody: the bearer check runs once the head
+    /// is parsed — BEFORE the body is read. A client with a bad token
+    /// that promises a huge body but sends only the head gets its 401
+    /// at once; the old code buffered up to BODY_CAP waiting for the
+    /// body first, and this read never answered.
+    #[test]
+    fn a_bad_token_is_rejected_before_the_body_is_read() {
+        let home = tempfile::tempdir().unwrap();
+        let (port, token) = spawn_test_host(home.path(), &["all-MiniLM-L6-v2"], HOST_IDLE);
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).expect("connect to the test host");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a client read timeout");
+        // Only the head: a bad token and a 16 MiB Content-Length, no
+        // body bytes.
+        let head = format!(
+            "POST /v1/embed HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Authorization: Bearer definitely-not-{token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            16 * 1024 * 1024,
+        );
+        stream.write_all(head.as_bytes()).expect("send the head");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("the 401 answers before any body byte was read");
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "the bad token is rejected without reading the body: {response}"
+        );
+    }
+
+    /// Review finding loadHoldsTableLock: a model load holds only ITS
+    /// loading slot — never the loaded table — so an embed of a model
+    /// with its own instant load is not blocked by another model's slow
+    /// load. The load seam makes "slow-model" park mid-load; while it
+    /// waits, "fast-model" must answer at once (the old code held the
+    /// table across the load and this recv timed out).
+    #[test]
+    fn a_loaded_model_keeps_serving_while_another_model_loads() {
+        let (slow_load_started, entered) = mpsc::channel::<()>();
+        // mpsc ends are !Sync and the load seam is `Send + Sync` (the
+        // host state is Arc-shared across serve threads) — both ends
+        // ride behind a Mutex.
+        let slow_load_started = Mutex::new(slow_load_started);
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let state = Arc::new(HostState::for_tests(
+            Box::new(move |model_id| {
+                if model_id == "slow-model" {
+                    slow_load_started
+                        .lock()
+                        .expect("the started-sender lock")
+                        .send(())
+                        .expect("signal the load started");
+                    let _ = gate
+                        .lock()
+                        .expect("the gate lock")
+                        .recv_timeout(Duration::from_secs(10));
+                }
+                Ok(LoadedModel {
+                    session: Arc::new(std::sync::Mutex::new(Session::Stub(4))),
+                    dim: 4,
+                })
+            }),
+            &["fast-model", "slow-model"],
+        ));
+        // The first embed of "slow-model" parks inside its load.
+        let slow = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || state.embed("slow-model", &["slow".to_string()]))
+        };
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the slow load started");
+        // While it still loads, "fast-model" loads instantly through
+        // the same seam and embeds.
+        let (fast_done, fast_answer) = mpsc::channel();
+        thread::spawn({
+            let state = Arc::clone(&state);
+            move || {
+                fast_done
+                    .send(state.embed("fast-model", &["fast".to_string()]))
+                    .expect("send the fast result");
+            }
+        });
+        let fast_result = fast_answer
+            .recv_timeout(Duration::from_secs(3))
+            .expect("a loaded model keeps serving while another model loads");
+        assert!(fast_result.is_ok(), "the fast model embeds: {fast_result:?}");
+        // Release the slow load: its embed completes, and a second
+        // "slow-model" embed hits the loaded table.
+        release.send(()).expect("release the slow load");
+        let slow_result = slow
+            .join()
+            .expect("the slow embed thread ends")
+            .expect("the slow model loads and embeds");
+        assert_eq!(slow_result.1, 4, "the stub records its dim");
+        assert!(
+            state.embed("slow-model", &["slow again".to_string()]).is_ok(),
+            "the second slow-model embed hits the loaded table"
         );
     }
 

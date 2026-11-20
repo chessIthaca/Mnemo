@@ -750,13 +750,18 @@ fn build_workflow_tauri_cli_is_declared_and_locked() {
     );
 }
 
-/// The release installers must carry the Claude Code helper: the `mnemo`
-/// plugin runs `bin/mnemo2-mcp`, which only a source build used to create
-/// (`scripts/install-mnemo2-mcp.mjs`), so an installed Mnemo2 could not lead
-/// with Claude Code. Tauri's bundler ships every `[[bin]]` of the app package
-/// on its own (`src-tauri/mnemo2-app` declares `mnemo2-mcp`), so each
-/// platform job bundles normally and then checks that the produced installer
-/// really carries the helper — no `bundle.externalBin` sidecar anywhere.
+/// The release installers must carry the Claude Code helper AND the shared
+/// models host: the `mnemo` plugin runs `bin/mnemo2-mcp`, which only a
+/// source build used to create (`scripts/install-mnemo2-mcp.mjs`), so an
+/// installed Mnemo2 could not lead with Claude Code; `mnemo-models` is the
+/// machine-wide embedding host every instance embeds through (plan
+/// d3336a8a step 2 — review finding ciMissesModelsBin: an installer that
+/// silently drops it disables the shared host and no instance notices).
+/// Tauri's bundler ships every `[[bin]]` of the app package on its own
+/// (`src-tauri/mnemo2-app` declares `mnemo2-mcp` and `mnemo-models`), so
+/// each platform job bundles normally and then checks that the produced
+/// installer really carries BOTH binaries — no `bundle.externalBin`
+/// sidecar anywhere.
 ///
 /// Regression: the released installers shipped without `mnemo2-mcp`, so the
 /// bundled plugin's MCP server could not start on a user's machine. A second
@@ -777,13 +782,23 @@ fn build_workflow_bundles_the_mnemo2_mcp_helper() {
     let checks = [
         (
             "windows",
-            "Check the installers carry mnemo2-mcp",
-            ["installer.nsi", "main.wxs", "mnemo2-mcp.exe"].as_slice(),
+            "Check the installers carry mnemo2-mcp and mnemo-models",
+            [
+                "installer.nsi",
+                "main.wxs",
+                "mnemo2-mcp.exe",
+                "mnemo-models.exe",
+            ]
+            .as_slice(),
         ),
         (
             "macos",
-            "Check the app bundle carries mnemo2-mcp",
-            ["Contents/MacOS/mnemo2-mcp"].as_slice(),
+            "Check the app bundle carries mnemo2-mcp and mnemo-models",
+            [
+                "Contents/MacOS/mnemo2-mcp",
+                "Contents/MacOS/mnemo-models",
+            ]
+            .as_slice(),
         ),
     ];
     for (job, check, needles) in checks {
@@ -791,7 +806,7 @@ fn build_workflow_bundles_the_mnemo2_mcp_helper() {
         assert!(
             block.contains(&format!("- name: {check}")),
             "the {job} job has no `{check}` step — nothing then proves the \
-             built installers carry the helper"
+             built installers carry both binaries"
         );
         let step = step_named(&block, check);
         for needle in needles {
@@ -799,7 +814,7 @@ fn build_workflow_bundles_the_mnemo2_mcp_helper() {
                 step.contains(needle),
                 "the {job} job's `{check}` step no longer looks for {needle:?} \
                  — nothing then proves the built installers carry the \
-                 mnemo2-mcp helper: {step}"
+                 mnemo2-mcp and mnemo-models binaries: {step}"
             );
         }
 

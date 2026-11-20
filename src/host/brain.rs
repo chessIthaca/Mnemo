@@ -106,6 +106,15 @@ pub struct Brain {
     /// swap it into the live store (mirror of the download swap).
     /// `pub(crate)` so console mode starts the same background load.
     pub pending_model_load: Option<String>,
+    /// The head of the embedder-rewire chain (review finding
+    /// rewireBlocksRuntime): the still-running embedder build of the
+    /// LAST live apply. Every `Setup` for this engine shares the SAME
+    /// Arc — cloned through `for_engine`'s live handles — so
+    /// consecutive Settings saves or config-watcher reloads swap
+    /// embedders in SAVE order even though each build runs off the
+    /// apply critical path on a blocking thread.
+    pub embedder_rewire_chain:
+        Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// The CodeGraph OS file watcher — held only to keep the watch alive for
     /// the app's lifetime (dropping it stops watching). `None` when codegraph
     /// is disabled, failed to open, or the watcher failed to start. The field
@@ -1261,6 +1270,7 @@ pub(crate) fn wire_brain(
         classifier_slot,
         pending_model_download: pending_download,
         pending_model_load: pending_load,
+        embedder_rewire_chain: Arc::new(std::sync::Mutex::new(None)),
         _graph_watcher: graph_watcher,
         _memory_watcher: memory_watcher,
     })

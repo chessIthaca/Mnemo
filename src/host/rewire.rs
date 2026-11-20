@@ -10,11 +10,18 @@
 //! and Mnemo2's settings save path
 //! (src-tauri/src/mnemo2/model_settings.rs) share this ONE implementation.
 //!
-//! The caller owns the spawn policy: [`rewire_vision_embedder`] returns
-//! the re-embed future when the bundled model changed and the new
-//! embedder is Ready (a host app spawns it on its async runtime, the
-//! headless engine on tokio). The MANAGED-CLASSIFIER leg is host-agnostic
-//! — the classifier slot/status Arcs live in the brain.
+//! Two functions, two pacing contracts (review finding
+//! rewireBlocksRuntime): [`rewire_vision_embedder`] is FAST — the
+//! vision client + the factory's live toggles — and runs inline on the
+//! apply path; [`rewire_memory_embedder`] is SLOW — the embedder build
+//! can block for tens of seconds (the shared models host's acquire:
+//! probe loops, the spawn-lock wait, a spawn with its health wait; or
+//! the in-process ONNX load, a first use possibly a download) — so the
+//! CALLER runs it on a blocking thread, never under the apply lock, and
+//! owns the spawn policy for the re-embed future it returns when the
+//! bundled model changed and the new embedder is Ready. The
+//! MANAGED-CLASSIFIER leg is host-agnostic — the classifier slot/status
+//! Arcs live in the brain.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -47,30 +54,27 @@ pub struct RewireTargets {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// The background re-embed task [`rewire_vision_embedder`] returns —
-/// spawned by the CALLER (the app on `tauri::async_runtime`, the
-/// headless Setup on tokio): a full re-embed is long, so it never
-/// blocks the save call.
+/// The background re-embed task [`rewire_memory_embedder`] returns —
+/// spawned by the CALLER (the headless Setup's off-path embedder chain
+/// on tokio): a full re-embed is long, so it never blocks the save call.
 pub type ReembedFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// Rebuild the live vision client + memory embedder from `cfg` and
-/// install them (the factory's vision slot + the store's embedder +
-/// `[memory]` knobs) + push the factory's live toggles (the classifier
-/// flags, the optimizer/verify/budget configs — every consumer reads
-/// them at call time, so a save lands on the next request with no
-/// registry rebuild). Absent handles no-op (startup-error fallback).
+/// Rebuild the live vision client from `cfg` and install it (the
+/// factory's vision slot) + push the factory's live toggles (the
+/// classifier flags, the optimizer/verify/budget configs — every
+/// consumer reads them at call time, so a save lands on the next
+/// request with no registry rebuild). Absent handles no-op
+/// (startup-error fallback).
 ///
-/// Returns the re-embed future when the bundled model changed and the
-/// new embedder is Ready — a Failed/hash-fallback embedder has nothing
-/// useful to re-embed with (it would corrupt the fingerprint
-/// semantics), and the explicit `"hash"` opt-out never re-embeds
-/// (it would destroy stored semantic vectors). The caller spawns it.
+/// FAST by construction — synchronous by design, safe inline on the
+/// apply critical path. The slow memory half (the embedder swap) lives
+/// in [`rewire_memory_embedder`], which the caller runs on a blocking
+/// thread.
 ///
 /// The managed-classifier leg is NOT here (it stays app-side until job
 /// 4 D5 moves the Laya core); the factory toggles that mirror the
 /// `[general.laya]` FLAGS are — they read config, never the runtime.
-pub fn rewire_vision_embedder(targets: &RewireTargets, cfg: &Config) -> Option<ReembedFuture> {
-    let mut reembed: Option<ReembedFuture> = None;
+pub fn rewire_vision_embedder(targets: &RewireTargets, cfg: &Config) {
     if let Some(factory) = &targets.factory {
         let vision = build_vision_client(cfg);
         factory.set_vision(vision);
@@ -116,6 +120,25 @@ pub fn rewire_vision_embedder(targets: &RewireTargets, cfg: &Config) -> Option<R
         // a Settings save lands on the next heavy command.
         factory.set_machine_config(cfg.general.general.machine.clone());
     }
+}
+
+/// Rebuild the memory embedder from `cfg` and install it (the store's
+/// embedder + `[memory]` knobs) — the SLOW half of a rewire (review
+/// finding rewireBlocksRuntime): the build can block for tens of
+/// seconds (the shared models host's acquire — probe loops, the
+/// spawn-lock wait, a spawn and its health wait — or the in-process
+/// ONNX load, a first use possibly a download), so the CALLER runs this
+/// on a blocking thread, never on the apply critical path (the same
+/// discipline as brain.rs's deferred startup load). Absent handles
+/// no-op (startup-error fallback).
+///
+/// Returns the re-embed future when the bundled model changed and the
+/// new embedder is Ready — a Failed/hash-fallback embedder has nothing
+/// useful to re-embed with (it would corrupt the fingerprint
+/// semantics), and the explicit `"hash"` opt-out never re-embeds
+/// (it would destroy stored semantic vectors). The caller spawns it.
+pub fn rewire_memory_embedder(targets: &RewireTargets, cfg: &Config) -> Option<ReembedFuture> {
+    let mut reembed: Option<ReembedFuture> = None;
     if let Some(store) = &targets.memory_store {
         // The bundled model cache lives under the config dir (NOT
         // .coding/, which is committed to git — model binaries are

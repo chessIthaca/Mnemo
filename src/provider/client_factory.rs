@@ -550,8 +550,11 @@ pub fn build_remote_embedder(
 
 /// Attach-or-spawn a machine-wide models host and return a `RemoteEmbedder`
 /// for `model_id` — the background paths only (the deferred startup load,
-/// rewire, reembed, the post-download swap, the code embedder): spawn
-/// budgets are fine there, never on the startup path. A host THIS instance
+/// the settings rewire's off-path embedder leg, reembed, the code
+/// embedder): spawn budgets are fine there, never on the startup path.
+/// The post-download swap is NOT one of them — embed_download.rs builds
+/// its `BundledEmbedder` in-process once a download finishes (review
+/// finding postDownloadDoc). A host THIS instance
 /// spawns serves `model_id` plus the code-search model (the exact-set
 /// rule: an instance attaches only when its requested model is in the
 /// descriptor's list). `None` on any failure (the caller falls back

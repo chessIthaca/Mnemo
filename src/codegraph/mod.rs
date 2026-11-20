@@ -2058,6 +2058,17 @@ mod code_embedder_slot {
         let embedder = build(cache_dir, memory_model);
         let good = embedder.model_id() == crate::memory::embedder::CODE_EMBEDDING_MODEL
             && !matches!(embedder.status(), Some(EmbedderStatus::Failed));
+        // Why a failure parks the gate (finding parkedNoteEdges (a)),
+        // computed BEFORE the slot lock (finding serveableUnderSlotLock):
+        // the serveable probe stats the filesystem and pokes a pid, and
+        // cached()/state() readers must never wait behind that I/O.
+        let park_reason = (!good).then(|| {
+            if crate::provider::client_factory::host_is_serveable(cache_dir) {
+                super::ParkReason::HostNotAnswering
+            } else {
+                super::ParkReason::NotLoaded
+            }
+        });
         let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
         if good {
             slot.embedder = Some(Arc::clone(&embedder));
@@ -2065,16 +2076,7 @@ mod code_embedder_slot {
             slot.park_reason = None;
         } else {
             slot.retry_at = Some(Instant::now() + retry_window());
-            // Why the gate parked (finding parkedNoteEdges (a)): a
-            // serveable host that answered nothing, or an offline load
-            // that failed — the fallback note blames the right thing.
-            slot.park_reason = Some(
-                if crate::provider::client_factory::host_is_serveable(cache_dir) {
-                    super::ParkReason::HostNotAnswering
-                } else {
-                    super::ParkReason::NotLoaded
-                },
-            );
+            slot.park_reason = park_reason;
         }
         good.then_some(embedder)
     }
@@ -3479,6 +3481,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         code_embedder_slot::test::reset();
+        // A stub builder makes an accidentally expired gate harmless
+        // (finding tailTestRealBuild): the default builder's in-process
+        // ONNX load could download a model in CI.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path());
         let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
@@ -3627,6 +3635,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         code_embedder_slot::test::reset();
+        // A stub builder makes an accidentally expired gate harmless
+        // (finding tailTestRealBuild): the default builder's in-process
+        // ONNX load could download a model in CI.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path());
         let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
@@ -3667,6 +3681,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         code_embedder_slot::test::reset();
+        // A stub builder before the note loop (finding tailTestRealBuild):
+        // if a thread stall lets the sub-second "shortly" gate expire, the
+        // query's ensure_build must build the harmless stub — never the
+        // DEFAULT builder, whose in-process ONNX load could download a
+        // model in CI.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path());
         let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
@@ -3740,15 +3762,23 @@ mod tests {
         // The next query really retries: ensure_build claims the
         // expired gate and builds.
         code_embedder_slot::ensure_build(Path::new("does-not-matter"), None);
+        // Poll for the STORED result, not just the builder's counter
+        // (finding tailTestRealBuild): the counter moves when build()
+        // starts, while build_and_store stores after it returns — so a
+        // counter-only wait races the store under load.
         let start = std::time::Instant::now();
-        while builds.load(Ordering::Relaxed) == 0 {
+        while code_embedder_slot::cached().is_none() {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(10),
-                "the query-started retry never ran"
+                "the query-started retry never stored its result"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(code_embedder_slot::cached().is_some());
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "the query-started retry ran exactly once"
+        );
         code_embedder_slot::test::reset();
     }
 

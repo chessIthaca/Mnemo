@@ -1,14 +1,19 @@
-// Install the freshly built `mnemo2-mcp` helper for the "mnemo" Claude Code
-// plugin.
+// Install the freshly built `mnemo2-mcp` helper and the `mnemo-models`
+// shared-models host.
 //
 // - `mnemo2/plugin/bin/` is what the plugin's MCP server and hooks run
 //   (`${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp`). `claude plugin install` copies
 //   the plugin into Claude Code's plugin cache, so an installed plugin keeps
 //   the helper it was installed with.
-// - `<config>/bin/` ($MNEMO_HOME or ~/.mnemo) holds the current helper. Any
-//   older copy (e.g. the cached plugin's) hands its arguments to this one, so
-//   a rebuild takes effect without reinstalling the plugin.
-// - A running Claude session keeps the old helper open, and Windows refuses to
+// - `<config>/bin/` ($MNEMO_HOME or ~/.mnemo) holds the current helper — and
+//   `mnemo-models` (plan d3336a8a step 2), the machine-wide shared
+//   embedding-model host the instances spawn from this dir when it is not a
+//   sibling of their own executable. The plugin never runs the models host,
+//   so it is not copied into the plugin bin. Any older helper copy (e.g. the
+//   cached plugin's) hands its arguments to this one, so a rebuild takes
+//   effect without reinstalling the plugin.
+// - A running Claude session keeps the old helper open, a running models
+//   host keeps serving from the old host binary, and Windows refuses to
 //   overwrite a running executable. The old file is renamed aside first;
 //   leftovers from earlier runs are removed once they are no longer locked.
 // - The helper starts Mnemo2 itself when no instance serves the project, so
@@ -27,12 +32,39 @@ const exe = process.platform === "win32" ? ".exe" : "";
 // src-tauri is a workspace member, so cargo builds into the workspace target.
 const targetDir = join(process.env.CARGO_TARGET_DIR || join(root, "target"), profile);
 const helper = join(targetDir, `mnemo2-mcp${exe}`);
+const host = join(targetDir, `mnemo-models${exe}`);
 const app = join(targetDir, `mnemo2${exe}`);
 const configDir = process.env.MNEMO_HOME || join(homedir(), ".mnemo");
 
-if (!existsSync(helper)) {
-  console.error(`install-mnemo2-mcp: ${helper} is missing; build it with cargo build -p mnemo2-app --bin mnemo2-mcp first.`);
-  process.exit(1);
+for (const [binary, hint] of [
+  [helper, "cargo build -p mnemo2-app --bin mnemo2-mcp"],
+  [host, "cargo build -p mnemo2-app --bin mnemo-models"],
+]) {
+  if (!existsSync(binary)) {
+    console.error(`install-mnemo2-mcp: ${binary} is missing; build it with ${hint} first.`);
+    process.exit(1);
+  }
+}
+
+// Copy `src` to `dest` with the rename-aside rollover: Windows refuses to
+// overwrite a running executable, so the old file is moved out of the way
+// (a running session or host keeps using it) and copied over fresh.
+function copyWithRollover(src, dest) {
+  try {
+    if (existsSync(dest)) {
+      try {
+        rmSync(dest);
+      } catch {
+        renameSync(dest, `${dest}.old-${Date.now()}`);
+      }
+    }
+    copyFileSync(src, dest);
+    console.log(`install-mnemo2-mcp: ${dest}`);
+    return true;
+  } catch (error) {
+    console.error(`install-mnemo2-mcp: could not install ${dest}: ${error.message}`);
+    return false;
+  }
 }
 
 function install(binDir) {
@@ -46,26 +78,23 @@ function install(binDir) {
       }
     }
   }
-  const dest = join(binDir, `mnemo2-mcp${exe}`);
+  if (!copyWithRollover(helper, join(binDir, `mnemo2-mcp${exe}`))) return false;
   try {
-    if (existsSync(dest)) {
-      try {
-        rmSync(dest);
-      } catch {
-        renameSync(dest, `${dest}.old-${Date.now()}`);
-      }
-    }
-    copyFileSync(helper, dest);
     writeFileSync(join(binDir, "mnemo2-path.txt"), `${app}\n`);
-    console.log(`install-mnemo2-mcp: ${dest}`);
     return true;
   } catch (error) {
-    console.error(`install-mnemo2-mcp: could not install ${dest}: ${error.message}`);
+    console.error(`install-mnemo2-mcp: could not write ${join(binDir, "mnemo2-path.txt")}: ${error.message}`);
     return false;
   }
 }
 
 // Install both before failing, so one locked folder does not skip the other.
-const results = [install(join(root, "mnemo2", "plugin", "bin")), install(join(configDir, "bin"))];
+// The models host goes only into <config>/bin — the plugin never runs it
+// (the .old- sweep in install() above already cleaned that directory).
+const results = [
+  install(join(root, "mnemo2", "plugin", "bin")),
+  install(join(configDir, "bin")),
+  copyWithRollover(host, join(configDir, "bin", `mnemo-models${exe}`)),
+];
 console.log(`  starts ${app}`);
 if (results.includes(false)) process.exit(1);

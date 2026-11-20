@@ -346,23 +346,42 @@ pub(crate) fn wire_brain(
             )
         }
         EmbedderStartupPlan::UseHashThenLocalLoad(model) => {
-            eprintln!(
-                "info: bundled embedding model '{model}' is installed; starting with the \
-                 built-in hash embedder and loading the model in the background \
-                 (keeps the ONNX load off the main thread)"
+            // d3336a8a step 2: the machine-wide shared models host comes
+            // first — but ATTACH-ONLY here: a healthy published host is
+            // used immediately with Ready (the health probe is bounded by
+            // 1 s, and `wire_brain` is already a blocking builder); the
+            // startup path never spawns and never waits for a spawn. No
+            // host → today's shape below (hash + the deferred load, which
+            // is allowed to spawn).
+            #[cfg(feature = "embeddings")]
+            let remote = crate::provider::client_factory::build_remote_embedder(
+                &model,
+                &embedder_cache_dir,
+                embedder_status.clone(),
             );
-            // Hash now, status stays `Checking` — the load task flips it to
-            // Ready on success (Failed on error), same honesty contract as
-            // the download path.
-            *embedder_status
-                .write()
-                .expect("embedder status lock poisoned") =
-                crate::memory::embedder::EmbedderStatus::Checking;
-            (
-                Arc::new(HashEmbedder::new()) as Arc<dyn crate::memory::embedder::Embedder>,
-                None,
-                Some(model),
-            )
+            #[cfg(not(feature = "embeddings"))]
+            let remote: Option<Arc<dyn crate::memory::embedder::Embedder>> = None;
+            if let Some(embedder) = remote {
+                (embedder, None, None)
+            } else {
+                eprintln!(
+                    "info: bundled embedding model '{model}' is installed; starting with the \
+                     built-in hash embedder and loading the model in the background \
+                     (keeps the ONNX load off the main thread)"
+                );
+                // Hash now, status stays `Checking` — the load task flips it to
+                // Ready on success (Failed on error), same honesty contract as
+                // the download path.
+                *embedder_status
+                    .write()
+                    .expect("embedder status lock poisoned") =
+                    crate::memory::embedder::EmbedderStatus::Checking;
+                (
+                    Arc::new(HashEmbedder::new()) as Arc<dyn crate::memory::embedder::Embedder>,
+                    None,
+                    Some(model),
+                )
+            }
         }
         // HashOptOut / HashDefault go through build_embedder (sentinel +
         // fallback respectively — nothing to load or download).
@@ -1267,8 +1286,14 @@ impl Brain {
     /// Must be called inside a tokio runtime context (the engine's
     /// `start` / the console's startup). `cache_dir` is the engine's
     /// config dir (D6: the model cache derives from it —
-    /// `<config_dir>/models` ��� never the machine-global one; the
+    /// `<config_dir>/models` — never the machine-global one; the
     /// brain's startup build already used this derivation).
+    ///
+    /// d3336a8a step 2: the deferred load is remote-first — before any
+    /// in-process load it tries the machine-wide shared models host
+    /// (attach-or-spawn, a background budget; the startup arm above
+    /// stayed attach-only). Only when no host can be had does the
+    /// in-process ONNX load run, exactly as before.
     #[cfg(feature = "embeddings")]
     pub fn spawn_startup_embedder_load(
         &self,
@@ -1285,6 +1310,37 @@ impl Brain {
         let status = self.embedder_status.clone();
         let cache_dir = cache_dir.to_path_buf();
         tokio::spawn(async move {
+            // d3336a8a step 2: try the shared models host first. One
+            // process per machine holds the models; when a host serves
+            // this model, the instance embeds over loopback and never
+            // loads ONNX in-process at all.
+            let remote_status = status.clone();
+            let remote_model = model.clone();
+            let remote_cache = cache_dir.join("models");
+            let remote = tokio::task::spawn_blocking(move || {
+                crate::provider::client_factory::acquire_remote_embedder(
+                    &remote_model,
+                    &remote_cache,
+                    remote_status,
+                )
+            })
+            .await;
+            match remote {
+                Ok(Some(embedder)) => {
+                    let s = EmbedderStatus::Ready;
+                    *status.write().expect("embedder status lock poisoned") = s.clone();
+                    emit(s);
+                    let for_reembed = embedder.clone();
+                    crate::memory::reembed_if_needed(&store, &for_reembed).await;
+                    store.set_embedder(embedder);
+                    return;
+                }
+                // No host → today's in-process path, unchanged below.
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("error: the models-host acquire task panicked: {e}");
+                }
+            }
             // ONNX init is blocking → the blocking pool (the app's twin
             // does the same). The model cache is machine-global
             // (~/.mnemo/models or MNEMO_HOME/models) — the same dir the

@@ -95,6 +95,12 @@ pub use crate::host::machine_slots;
 // The shared Rust build cache (plan d3336a8a step 7): the Mnemo2 proofs and
 // the Machine page read it on the same bare crate-root path.
 pub use crate::host::sccache;
+// The machine-wide shared models host (plan d3336a8a step 2): the detached
+// mnemo-models binary in mnemo2-app runs the serve loop and reads its
+// constants on the same bare crate-root path (embeddings-gated like the
+// module it re-exports).
+#[cfg(feature = "embeddings")]
+pub use crate::host::models_host;
 pub use crate::runtime::turn_resolve;
 
 #[cfg(test)]

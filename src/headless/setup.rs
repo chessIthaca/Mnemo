@@ -1118,41 +1118,45 @@ impl Setup {
     ///
     /// The gate re-reads the LIVE config (the brain's shared Arc — the
     /// same live view [`Setup::live_laya_enabled`] serves) and requires
-    /// `[general.laya] enabled` AND `is_checkpoint_installed` for the
-    /// port, park the shared status on `Starting`, build the managed
-    /// classifier client (constructing it does no I/O — startup is
-    /// never blocked, brain.rs:543-546), write it into the brain's live
-    /// slot, then fire-and-forget `start_managed_server` on the
-    /// pre-allocated port through this Setup's own manager
-    /// (main.rs:816-830's discipline: the caller never waits — the
-    /// spawned task drives the status to `Ready`/`Failed`). Returns
-    /// the allocated port.
+    /// `[general.laya] enabled` AND `is_checkpoint_installed`
+    /// ([`Setup::attach_decision`], the offline check below).
     ///
-    /// Otherwise a NO-OP: the slot stays `None`, the status stays
-    /// `Disabled`, the return is `None` — a disabled or
-    /// not-yet-installed Laya changes nothing (every consumer
-    /// short-circuits on the empty slot; the enabled-but-not-installed
-    /// case logs the same install hint the app's startup attach logs).
-    /// A STANDALONE Setup (no engine attached) no-ops too — nothing
-    /// consumes a sidecar until an engine starts (the install-only
-    /// philosophy of [`Setup::classifier_setup`]'s standalone arm). The
-    /// gate leg (marker/venv file stats) is offline and instant.
+    /// With the gate open, three legs follow, in order:
     ///
+    /// - Fast attach: a shared `laya-serve` another instance already
+    ///   runs answers its health probe (`LayaManager::attach_shared` —
+    ///   one probe, at most two seconds, and only when a descriptor
+    ///   exists). A server that answers is ready by definition: the
+    ///   no-I/O client fills the live slot, the shared status goes
+    ///   `Ready`, the monitor is armed, and the port is returned.
+    /// - Cold-start attach: the shared server is live but still loading
+    ///   (another instance's cold start, loading its model). The lease
+    ///   is taken anyway, the client points at its port, the status
+    ///   parks on `Starting`, and ONE background readiness task
+    ///   (`crate::host::laya::await_shared_ready`) promotes it to
+    ///   `Ready` when it answers — and arms the monitor — falling back
+    ///   to a spawn only if that server dies.
+    /// - Otherwise today's own-server path, unchanged: allocate a free
+    ///   loopback port, fill the no-I/O client
+    ///   (`crate::host::laya::build_managed_classifier`) into the live
+    ///   slot, park the shared status on `Starting`, then fire-and-forget
+    ///   `crate::host::laya::finish_start` through this Setup's own
+    ///   manager (the caller never waits — the spawned task drives the
+    ///   status to `Ready`/`Failed`; it re-runs the shared decision under
+    ///   the spawn lock, so two instances starting at the same moment
+    ///   still end up with one server and one attach, and it re-points
+    ///   this slot when the other instance won).
     ///
-    /// The server itself can come from the machine-wide share: this instance
-    /// first probes the shared `laya-serve` another instance may already run
-    /// (`LayaManager::attach_shared` — one health probe, at most two seconds,
-    /// and only when a descriptor exists). A server that answers is filled
-    /// `Ready` immediately; a LIVE one that does not answer yet (another
-    /// instance's cold start, loading its model) is leased too — the client
-    /// points at its port, the status parks on `Starting`, and a background
-    /// task runs the ordinary readiness wait, falling back to a spawn only if
-    /// that server dies. With no shared server it takes today's path
-    /// unchanged: allocate a loopback port, fill the no-I/O client, then
-    /// fire-and-forget the spawn; that task (`LayaManager::finish_start`)
-    /// re-runs the shared decision under the spawn lock, so two instances
-    /// starting at the same moment still end up with one server and one
-    /// attach — and it re-points this slot when the other instance won.
+    /// Returns the allocated port on every leg. Otherwise a NO-OP: the
+    /// slot stays `None`, the status stays `Disabled`, the return is
+    /// `None` — a disabled or not-yet-installed Laya changes nothing
+    /// (every consumer short-circuits on the empty slot; the
+    /// enabled-but-not-installed case logs the same install hint the
+    /// app's startup attach logs). A STANDALONE Setup (no engine
+    /// attached) no-ops too — nothing consumes a sidecar until an
+    /// engine starts (the install-only philosophy of
+    /// [`Setup::classifier_setup`]'s standalone arm). The gate leg
+    /// (marker/venv file stats) is offline and instant.
     pub async fn attach_laya(&self) -> Option<u16> {
         let live = self.live.as_ref()?;
         let checkpoint = crate::host::laya::english_checkpoint();

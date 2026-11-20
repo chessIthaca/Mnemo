@@ -3008,6 +3008,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Version strings, lockfile versions and the CHANGELOG only; no behaviour changes."
+    },
+    {
+      "id": "c7ad776e",
+      "status": "open",
+      "created_at_ms": 1795132770235,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Dependency placement only; no behaviour change."
     }
   ]
 }

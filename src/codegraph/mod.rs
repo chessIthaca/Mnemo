@@ -352,6 +352,22 @@ impl SymbolSearchIndex {
     }
 }
 
+/// Why the code-embedder slot's retry gate was parked (plan d3336a8a step
+/// 17, finding parkedNoteEdges): the fallback note must blame the right
+/// thing — a serveable host that is not answering, or a model that could
+/// not be loaded offline.
+#[cfg(feature = "embeddings")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ParkReason {
+    /// A host is serveable (a binary resolves or a live descriptor is
+    /// published) but did not answer — the note says the shared model
+    /// host is not answering.
+    HostNotAnswering,
+    /// No host can serve at all and the in-process load failed — the
+    /// note says the model could not be loaded.
+    NotLoaded,
+}
+
 /// The process-global code-embedder slot's availability, read by
 /// find_code's text fallback (plan d3336a8a step 17, finding
 /// notReadyNoteMisleads): a parked retry gate must not be described as
@@ -365,8 +381,11 @@ pub(crate) enum CodeEmbedderState {
     /// A build is running on another thread.
     Building,
     /// A failed build parked the gate; `retry_in` is how long until the
-    /// next round may retry.
-    Parked { retry_in: std::time::Duration },
+    /// next round may retry, and `reason` is why it parked.
+    Parked {
+        retry_in: std::time::Duration,
+        reason: ParkReason,
+    },
     /// No build has run in this process yet (the graph was never armed,
     /// or the first pass has not reached the embedder).
     Unarmed,
@@ -1941,15 +1960,18 @@ mod code_embedder_slot {
     pub(super) type Build = Box<dyn Fn(&Path, Option<&str>) -> Arc<dyn Embedder> + Send + Sync>;
 
     /// The parked slot: a good embedder, or the retry gate a failed
-    /// build left behind.
+    /// build left behind (with why it parked — finding
+    /// parkedNoteEdges).
     struct Slot {
         embedder: Option<Arc<dyn Embedder>>,
         retry_at: Option<Instant>,
+        park_reason: Option<super::ParkReason>,
     }
 
     static SLOT: Mutex<Slot> = Mutex::new(Slot {
         embedder: None,
         retry_at: None,
+        park_reason: None,
     });
     static BUILDER: Mutex<Option<Build>> = Mutex::new(None);
     static SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -1971,51 +1993,100 @@ mod code_embedder_slot {
 
     /// Acquire the process-global code embedder: a cached good one
     /// clones out instantly; a fresh build runs on THIS thread when no
-    /// retry gate parks it and none is already running. The build runs
-    /// OUTSIDE the slot lock (finding slotLockAcrossRetry, plan d3336a8a
-    /// step 17): with the acquire retries it can take up to about a
-    /// minute, and `cached`/`state` readers must never wait behind it —
-    /// they see `BUILDING` and answer at once. `None` (gate parked, or a
-    /// build already running — its result lands for the next round) when
-    /// the build is not the code model or reports `Failed` — junk vectors
-    /// are never stored, and a failed build is never cached.
+    /// live retry gate parks it and none is already running. The build
+    /// runs OUTSIDE the slot lock (finding slotLockAcrossRetry, plan
+    /// d3336a8a step 17): with the acquire retries it can take up to
+    /// about a minute, and `cached`/`state` readers must never wait
+    /// behind it — they see `BUILDING` and answer at once. A build
+    /// already in flight (the query-started shared build, or another
+    /// round) is WAITED FOR, bounded by [`PASS_BUILD_WAIT`] (finding
+    /// skippedPassNotRescheduled): on a quiet project nothing else
+    /// would re-run the pass when that build lands, so its result must
+    /// reach this round. `None` (a live gate parked, or the wait
+    /// expired) when the build is not the code model or reports
+    /// `Failed` — junk vectors are never stored, and a failed build is
+    /// never cached.
     pub(super) fn acquire(
         cache_dir: &Path,
         memory_model: Option<&str>,
     ) -> Option<Arc<dyn Embedder>> {
-        {
-            let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(embedder) = &slot.embedder {
-                return Some(Arc::clone(embedder));
+        let deadline = Instant::now() + PASS_BUILD_WAIT;
+        loop {
+            let claimed = {
+                let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(embedder) = &slot.embedder {
+                    return Some(Arc::clone(embedder));
+                }
+                if slot.retry_at.is_some_and(|at| Instant::now() < at) {
+                    return None;
+                }
+                // Claim the build under the same lock hold that checked the
+                // cache and gate; the early returns above are fine — only
+                // build_and_store re-takes the (non-reentrant) lock, so it
+                // must run OUTSIDE this block (finding slotLockAcrossRetry).
+                !BUILDING.swap(true, Ordering::AcqRel)
+            };
+            if claimed {
+                return build_and_store(cache_dir, memory_model);
             }
-            if slot.retry_at.is_some_and(|at| Instant::now() < at) {
+            if Instant::now() >= deadline {
                 return None;
             }
-            // A build is already running (the query-started shared build
-            // or another pass round): this round is skipped — the running
-            // build stores its result, the next round picks it up.
-            if BUILDING.swap(true, Ordering::AcqRel) {
-                return None;
-            }
+            std::thread::sleep(BUILD_POLL);
         }
-        build_and_store(cache_dir, memory_model)
     }
 
+    /// How long a pass round waits for an in-flight query-started build
+    /// before skipping the round (finding skippedPassNotRescheduled):
+    /// about the build's own worst-case budget, so the result reaches
+    /// this round instead of a someday index event.
+    const PASS_BUILD_WAIT: Duration = Duration::from_secs(120);
+
+    /// The wait loop's poll cadence.
+    const BUILD_POLL: Duration = Duration::from_millis(100);
+
     /// The build + store half of [`acquire`], run OUTSIDE the slot lock.
-    /// The caller has claimed `BUILDING` (the flag is cleared here once
-    /// the result is stored or the gate parked).
+    /// The caller has claimed `BUILDING`; the [`BuildingGuard`] clears
+    /// it on ANY exit — return or panic unwind (finding
+    /// buildingFlagPanicWedge, the same discipline as the pass's
+    /// `RunningFlagGuard`): a panic inside the build must not wedge the
+    /// slot into "always building" — every later acquire would answer
+    /// `None` and every note would say "still being built" for the rest
+    /// of the process.
     fn build_and_store(cache_dir: &Path, memory_model: Option<&str>) -> Option<Arc<dyn Embedder>> {
+        let _building = BuildingGuard;
         let embedder = build(cache_dir, memory_model);
         let good = embedder.model_id() == crate::memory::embedder::CODE_EMBEDDING_MODEL
             && !matches!(embedder.status(), Some(EmbedderStatus::Failed));
         let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
         if good {
             slot.embedder = Some(Arc::clone(&embedder));
+            slot.retry_at = None;
+            slot.park_reason = None;
         } else {
             slot.retry_at = Some(Instant::now() + retry_window());
+            // Why the gate parked (finding parkedNoteEdges (a)): a
+            // serveable host that answered nothing, or an offline load
+            // that failed — the fallback note blames the right thing.
+            slot.park_reason = Some(
+                if crate::provider::client_factory::host_is_serveable(cache_dir) {
+                    super::ParkReason::HostNotAnswering
+                } else {
+                    super::ParkReason::NotLoaded
+                },
+            );
         }
-        BUILDING.store(false, Ordering::Release);
         good.then_some(embedder)
+    }
+
+    /// Clears the shared `BUILDING` flag on scope exit — unwind or return
+    /// (finding buildingFlagPanicWedge).
+    struct BuildingGuard;
+
+    impl Drop for BuildingGuard {
+        fn drop(&mut self) {
+            BUILDING.store(false, Ordering::Release);
+        }
     }
 
     /// The cached good build, WITHOUT building one (plan d3336a8a step 11)
@@ -2032,7 +2103,11 @@ mod code_embedder_slot {
     /// d3336a8a step 17, finding notReadyNoteMisleads): a parked retry
     /// gate must not read as "still being built" — nothing is building,
     /// and the note says the model is unavailable and when the next
-    /// round retries. Like [`cached`], never waits on a build.
+    /// round retries. An EXPIRED gate is not `Parked` either (finding
+    /// parkedNoteEdges (c)): the window has lapsed, a query's
+    /// `ensure_build` starts the retry, and the note must not promise a
+    /// retry that already happened. Like [`cached`], never waits on a
+    /// build.
     pub(super) fn state() -> CodeEmbedderState {
         let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
         if slot.embedder.is_some() {
@@ -2042,28 +2117,41 @@ mod code_embedder_slot {
             return CodeEmbedderState::Building;
         }
         match slot.retry_at {
-            Some(at) => CodeEmbedderState::Parked {
+            Some(at) if Instant::now() < at => CodeEmbedderState::Parked {
                 retry_in: at.saturating_duration_since(Instant::now()),
+                reason: slot
+                    .park_reason
+                    .unwrap_or(super::ParkReason::HostNotAnswering),
             },
-            None => CodeEmbedderState::Unarmed,
+            _ => CodeEmbedderState::Unarmed,
         }
     }
 
     /// Start the shared build on its own thread and return at once (plan
     /// d3336a8a step 11): a query that finds no cached embedder must never
-    /// wait for the tens-of-seconds build. One build at a time; a parked
+    /// wait for the tens-of-seconds build. One build at a time; a LIVE
     /// retry gate is left alone (the pass retries it once the window
-    /// expires, a query does not). The thread builds outside the slot
-    /// lock like [`acquire`] does (finding slotLockAcrossRetry).
+    /// expires, a query does not), but an EXPIRED gate is retried NOW
+    /// (finding parkedNoteEdges (c)): the fallback note promises "it
+    /// retries in about N minutes", so a query after the window must
+    /// really start the retry. The `BUILDING` claim happens inside the
+    /// SAME lock hold as the cache/gate check (finding
+    /// ensureBuildSwapRace): a build that lands between a separate check
+    /// and a separate swap would otherwise be rebuilt redundantly. The
+    /// thread builds outside the slot lock like [`acquire`] does (finding
+    /// slotLockAcrossRetry).
     pub(super) fn ensure_build(cache_dir: &Path, memory_model: Option<&str>) {
         {
             let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
-            if slot.embedder.is_some() || slot.retry_at.is_some() {
+            if slot.embedder.is_some() {
                 return;
             }
-        }
-        if BUILDING.swap(true, Ordering::AcqRel) {
-            return;
+            if slot.retry_at.is_some_and(|at| Instant::now() < at) {
+                return;
+            }
+            if BUILDING.swap(true, Ordering::AcqRel) {
+                return;
+            }
         }
         let cache_dir = cache_dir.to_path_buf();
         let memory_model = memory_model.map(str::to_string);
@@ -2071,8 +2159,8 @@ mod code_embedder_slot {
             .name("codegraph-code-embedder".to_string())
             .spawn(move || {
                 // BUILDING is already ours (the swap above) — the build
-                // runs outside the slot lock, and build_and_store clears
-                // the flag when the result lands.
+                // runs outside the slot lock, and build_and_store's guard
+                // clears the flag when the result lands, panic or return.
                 let _ = build_and_store(&cache_dir, memory_model.as_deref());
             });
         if spawned.is_err() {
@@ -2110,6 +2198,7 @@ mod code_embedder_slot {
             *SLOT.lock().unwrap_or_else(|p| p.into_inner()) = Slot {
                 embedder: None,
                 retry_at: None,
+                park_reason: None,
             };
             *BUILDER.lock().unwrap_or_else(|p| p.into_inner()) = None;
             SKIP_LOGGED.store(false, Ordering::Relaxed);
@@ -2125,12 +2214,18 @@ mod code_embedder_slot {
             RETRY_WINDOW_SECS.store(secs, Ordering::Relaxed);
         }
 
-        /// Park the retry gate NOW (finding notReadyNoteMisleads tests):
-        /// the state a failed build leaves behind, without running a
-        /// build.
-        pub(crate) fn park_gate_for_test() {
-            SLOT.lock().unwrap_or_else(|p| p.into_inner()).retry_at =
-                Some(Instant::now() + retry_window());
+        /// Park the retry gate NOW (the note tests): the state a failed
+        /// build leaves behind, without running a build. `window` is how
+        /// long the gate stays live — `Duration::ZERO` is an instantly
+        /// expired gate (finding parkedNoteEdges (c)); `reason` is what
+        /// the note blames (finding parkedNoteEdges (a)).
+        pub(crate) fn park_gate_for_test(
+            reason: crate::codegraph::ParkReason,
+            window: std::time::Duration,
+        ) {
+            let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+            slot.retry_at = Some(Instant::now() + window);
+            slot.park_reason = Some(reason);
         }
 
         /// Fake a build in flight (the slotLockAcrossRetry and note tests).
@@ -3389,7 +3484,10 @@ mod tests {
         let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
         graph.index(None).unwrap();
         graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
-        code_embedder_slot::test::park_gate_for_test();
+        code_embedder_slot::test::park_gate_for_test(
+            crate::codegraph::ParkReason::HostNotAnswering,
+            std::time::Duration::from_secs(600),
+        );
         let tool = crate::tool::agent::find_code::FindCodeTool::new(Some(Arc::new(graph)));
         // Sync test + block_on: the slot guard is a std Mutex and must not
         // be held across an await.
@@ -3445,6 +3543,212 @@ mod tests {
             result.output.starts_with("code embeddings are still being built (0 of"),
             "the building note reads: {result:?}"
         );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding buildingFlagPanicWedge (plan d3336a8a step 17): a panic
+    /// inside the build must not wedge `BUILDING` — the Drop guard
+    /// clears it on unwind, and a later acquire builds again.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_panicking_build_leaves_the_slot_buildable() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            panic!("the injected build panics");
+        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            code_embedder_slot::acquire(Path::new("does-not-matter"), None)
+        }));
+        assert!(result.is_err(), "the panicking build panics");
+        assert!(
+            !code_embedder_slot::test::building(),
+            "the panic unwound with BUILDING cleared — the slot is not wedged"
+        );
+        // A later acquire builds again and stores the good result.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let built = code_embedder_slot::acquire(Path::new("does-not-matter"), None);
+        assert!(built.is_some(), "the slot builds again after the panic");
+        assert!(code_embedder_slot::cached().is_some());
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding skippedPassNotRescheduled (plan d3336a8a step 17): a pass
+    /// round that races a query-started build WAITS for it (bounded)
+    /// instead of skipping — the build's result reaches THIS round, so
+    /// pending symbols are embedded without any new index event, and no
+    /// redundant second build runs.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_pass_round_waits_for_the_query_started_build() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        code_embedder_slot::test::install_builder(Box::new(move |_cache_dir, _memory_model| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        // The query-started shared build: owns BUILDING at once, builds
+        // in the background.
+        code_embedder_slot::ensure_build(Path::new("does-not-matter"), None);
+        assert!(
+            code_embedder_slot::test::building(),
+            "ensure_build claimed the build at once"
+        );
+        // The pass round, racing the in-flight build: it waits for the
+        // good result instead of skipping — and does NOT build again.
+        let got = code_embedder_slot::acquire(Path::new("does-not-matter"), None);
+        assert!(got.is_some(), "the round waited for the build to land");
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "no second build — the round reused the query-started one"
+        );
+        assert!(code_embedder_slot::cached().is_some());
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding parkedNoteEdges (a): an OFFLINE park (no host could
+    /// serve, the in-process load failed) must not blame the shared
+    /// model host — the note says the model could not be loaded.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn find_code_note_blames_the_load_when_no_host_could_serve() {
+        use crate::tool::Tool;
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        code_embedder_slot::test::park_gate_for_test(
+            crate::codegraph::ParkReason::NotLoaded,
+            std::time::Duration::from_secs(600),
+        );
+        let tool = crate::tool::agent::find_code::FindCodeTool::new(Some(Arc::new(graph)));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(tool.execute(serde_json::json!({
+            "query": "parse the fixture files",
+            "limit": 4,
+        })));
+        assert!(result.success, "the text fallback answers: {result:?}");
+        assert!(
+            result.output.starts_with(
+                "the code search model could not be loaded; showing text \
+                 matches; it retries in about 10 minutes"
+            ),
+            "the offline note reads: {result:?}"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding parkedNoteEdges (b): the retry tail is grammatical — one
+    /// minute singular, and "shortly" for a gate that has all but
+    /// expired.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn find_code_note_retry_tail_is_worded_correctly() {
+        use crate::tool::Tool;
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        let tool = crate::tool::agent::find_code::FindCodeTool::new(Some(Arc::new(graph)));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let note = |window: std::time::Duration| -> String {
+            code_embedder_slot::test::park_gate_for_test(
+                crate::codegraph::ParkReason::HostNotAnswering,
+                window,
+            );
+            let result = rt.block_on(tool.execute(serde_json::json!({
+                "query": "parse the fixture files",
+                "limit": 4,
+            })));
+            result.output.lines().next().unwrap().to_string()
+        };
+        let minute = note(std::time::Duration::from_secs(60));
+        assert!(
+            minute.ends_with("it retries in about 1 minute"),
+            "the singular tail reads: {minute}"
+        );
+        let shortly = note(std::time::Duration::from_millis(900));
+        assert!(
+            shortly.ends_with("it retries shortly"),
+            "the expiring tail reads: {shortly}"
+        );
+        let minutes = note(std::time::Duration::from_secs(600));
+        assert!(
+            minutes.ends_with("it retries in about 10 minutes"),
+            "the plural tail reads: {minutes}"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding parkedNoteEdges (c): an EXPIRED gate is not reported
+    /// Parked, and a query really retries it — ensure_build starts the
+    /// retry the note promised.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn an_expired_gate_is_retried_by_the_next_query() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        code_embedder_slot::test::install_builder(Box::new(move |_cache_dir, _memory_model| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        // An instantly-expired gate: the state must not report Parked.
+        code_embedder_slot::test::park_gate_for_test(
+            crate::codegraph::ParkReason::HostNotAnswering,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            graph.code_embedder_state(),
+            CodeEmbedderState::Unarmed,
+            "an expired gate is not Parked"
+        );
+        // The next query really retries: ensure_build claims the
+        // expired gate and builds.
+        code_embedder_slot::ensure_build(Path::new("does-not-matter"), None);
+        let start = std::time::Instant::now();
+        while builds.load(Ordering::Relaxed) == 0 {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the query-started retry never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(code_embedder_slot::cached().is_some());
         code_embedder_slot::test::reset();
     }
 

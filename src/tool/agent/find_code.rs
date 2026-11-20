@@ -546,22 +546,39 @@ fn fallback_note(graph: &CodeGraph, embedded: usize, total: usize) -> String {
 }
 
 /// The parked-retry-gate wording of the fallback note (plan d3336a8a
-/// step 17, finding notReadyNoteMisleads): the model is unavailable, not
-/// being built, and the note says when the next round retries. `None`
-/// for every other state (the progress line answers those).
+/// step 17, findings notReadyNoteMisleads + parkedNoteEdges): the model
+/// is unavailable, not being built, and the note says WHY — a serveable
+/// host that is not answering, or a model that could not be loaded
+/// offline — and WHEN the next round retries (the singular for one
+/// minute, "shortly" for a gate that has all but expired). `None` for
+/// every other state (the progress line answers those).
 #[cfg(feature = "embeddings")]
 fn parked_note(graph: &CodeGraph) -> Option<String> {
-    match graph.code_embedder_state() {
-        crate::codegraph::CodeEmbedderState::Parked { retry_in } => {
-            let minutes = retry_in.as_secs().div_ceil(60).max(1);
-            Some(format!(
-                "the code search model is not available right now (the shared \
-                 model host is not answering); showing text matches; it retries \
-                 in about {minutes} minutes"
-            ))
+    let crate::codegraph::CodeEmbedderState::Parked { retry_in, reason } =
+        graph.code_embedder_state()
+    else {
+        return None;
+    };
+    let head = match reason {
+        crate::codegraph::ParkReason::HostNotAnswering => {
+            "the code search model is not available right now (the shared model \
+             host is not answering)"
         }
-        _ => None,
-    }
+        crate::codegraph::ParkReason::NotLoaded => {
+            "the code search model could not be loaded"
+        }
+    };
+    let retry = if retry_in.as_secs() == 0 {
+        "shortly".to_string()
+    } else {
+        let minutes = retry_in.as_secs().div_ceil(60);
+        if minutes == 1 {
+            "in about 1 minute".to_string()
+        } else {
+            format!("in about {minutes} minutes")
+        }
+    };
+    Some(format!("{head}; showing text matches; it retries {retry}"))
 }
 
 /// The text-only answer (plan d3336a8a step 11): a progress note, then the

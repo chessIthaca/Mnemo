@@ -180,7 +180,11 @@ pub fn detached_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::C
 /// On Windows a hard-stopped process can leave its handle open somewhere, so
 /// the pid counts as live only when `GetExitCodeProcess` yields `STILL_ACTIVE`
 /// (a process that really exits with code 259 is indistinguishable — accepted:
-/// every caller uses this as a hint, never as a lock). On Unix it is `ps -p`.
+/// every caller uses this as a hint, never as a lock). On Unix it is
+/// `ps -o stat=`: the pid is alive only when ps prints a state for it, and a
+/// ZOMBIE — a killed child its parent has not reaped yet — counts as dead,
+/// although a bare `ps -p` would still list it (the v2.7.0 macOS build: a
+/// stub the watchdog had killed kept passing its own liveness poll).
 ///
 /// The one implementation every caller shares (the app's instance markers, the
 /// shared-service leases and their watchdog), so liveness can never differ
@@ -209,13 +213,19 @@ pub fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
+        // `stat=` prints the process state instead of a bare yes: a ZOMBIE —
+        // a killed child its parent has not reaped yet — still makes a plain
+        // `ps -p` exit zero, so a server an instance spawned and never
+        // reaps would stay "alive" to its own liveness poll after a crash
+        // (the v2.7.0 macOS build). Alive only when ps succeeds and prints
+        // a state that is not a zombie's (`Z…`).
         std::process::Command::new("ps")
-            .arg("-p")
-            .arg(pid.to_string())
+            .args(["-p", &pid.to_string(), "-o", "stat="])
             .output()
             .ok()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .is_some_and(|state| !state.is_empty() && !state.starts_with('Z'))
     }
 }
 
@@ -414,5 +424,57 @@ mod tests {
     #[test]
     fn assign_failure_returns_none() {
         assert!(KillOnCloseJob::assign_raw(std::ptr::null_mut()).is_none());
+    }
+}
+
+/// Unix-only liveness tests: the killed-but-unreaped child — a ZOMBIE that
+/// a bare `ps -p` still lists.
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use super::pid_alive;
+
+    /// Regression (the v2.7.0 macOS release build): a child that has exited
+    /// but that its parent has not reaped yet is a ZOMBIE, and `ps -p` still
+    /// lists it — so the shared services' liveness polls reported a killed
+    /// server (the watchdog test's stub, a crashed shared laya-serve) as
+    /// alive forever. pid_alive must treat a zombie as dead.
+    #[test]
+    fn pid_alive_treats_a_zombie_as_dead() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the short-lived child");
+        let pid = child.id();
+        // Wait until it has exited WITHOUT reaping it: an exited child its
+        // parent never reaps is a zombie, and ps reports its state as `Z…`.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "stat="])
+                .output()
+                .expect("read the child's state");
+            let state = String::from_utf8_lossy(&state.stdout).trim().to_string();
+            if state.starts_with('Z') {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the short-lived child never became a zombie: state {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !pid_alive(pid),
+            "a zombie (a killed child this parent never reaped) must count as dead"
+        );
+        // Reap so the test leaves no zombie behind.
+        let _ = child.wait();
     }
 }

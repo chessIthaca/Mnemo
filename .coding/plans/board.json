@@ -3019,6 +3019,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Dependency placement only; no behaviour change."
+    },
+    {
+      "id": "e90e3047",
+      "status": "closed",
+      "created_at_ms": 1795136432440,
+      "closed_at_ms": 1795160034545,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e90e3047-20261120-073354.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Unix process liveness and a test fix; no spec requirement changes."
     }
   ]
 }

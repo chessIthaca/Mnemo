@@ -859,7 +859,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = service_dir(dir.path(), "laya");
         write_service(&service, &test_service(4242, 8123, &["english"])).unwrap();
-        take_lease(&service, 4242).unwrap();
+        // The guard must stay bound until after the mode checks below: its
+        // Drop removes lease-4242.json, and the metadata read inside `mode`
+        // would hit NotFound (the v2.7.0 macOS build's failure).
+        let _lease = take_lease(&service, 4242).unwrap();
         let mode = |path: std::path::PathBuf| {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777
         };

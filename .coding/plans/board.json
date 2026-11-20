@@ -3033,10 +3033,10 @@
     },
     {
       "id": "f296f8f9",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795176941396,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795180565194,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-f296f8f9-20261120-131605.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},

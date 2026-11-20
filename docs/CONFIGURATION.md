@@ -15,7 +15,9 @@ How to configure Mnemo2: the global files in `~/.mnemo/` (or `$MNEMO_HOME`), end
 | `state-owner-id` | this machine's id, which stamps each project's `.coding/mnemo2/` |
 | `bin/mnemo2-mcp` | the Claude Code plugin's helper; Mnemo2 installs it at every start (a source build installs it too) |
 | `claude-plugin/` | the Claude Code plugin as a local marketplace (`.claude-plugin/marketplace.json` plus `plugin/` with the helper in `plugin/bin/`), rewritten at every start; Settings → Claude Code connects it |
-| `run/` | one `mnemo2-<pid>.json` per running Mnemo2 (port, token, open project), read by the helper |
+| `run/` | one `mnemo2-<pid>.json` per running Mnemo2 (port, token, open project), read by the helper and by every instance's Mission Control; the shared-service lease dirs `laya/` and `models/` (a `service.json` plus one `lease-<pid>.json` per attached instance); `heavy/` and `endpoint-<hash>/` hold the machine-wide file-lock slots and the shared 429 cooldown |
+| `models/` | the embedding models every instance shares, downloaded once (`mnemo-models` and the in-process fallback load them from here) |
+| `knowledge/` | the machine knowledge tier: `how/` and `decision/` records every project indexes read-only and shows as `[machine]`, written with `memory_write` `scope: "machine"` |
 | `index-staleness.jsonl` | the index-repair log (last section) |
 | `laya/training/` | Laya training logs |
 

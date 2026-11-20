@@ -77,6 +77,17 @@ pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str {
         "hash"
     }
+
+    /// The live status of this embedder, when it tracks one (the bundled
+    /// and remote embedders do; the hash embedder has nothing to
+    /// report). `None` means "no tracked status" — callers treat it as
+    /// healthy and rely on [`Embedder::model_id`]. The code-graph
+    /// symbol-embed pass (plan d3336a8a step 9) uses it to refuse
+    /// storing vectors from a degraded embedder: a `Failed` status
+    /// answers zero vectors, which would be junk in the vec table.
+    fn status(&self) -> Option<EmbedderStatus> {
+        None
+    }
 }
 
 /// A deterministic embedder. Produces a stable hash-based vector so the memory
@@ -309,6 +320,18 @@ impl Embedder for BundledEmbedder {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// The live status (the shared field this embedder keeps updated).
+    /// A poisoned lock reads as Failed — the conservative answer for a
+    /// caller deciding whether to store this embedder's vectors.
+    fn status(&self) -> Option<EmbedderStatus> {
+        Some(
+            self.status
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or(EmbedderStatus::Failed),
+        )
     }
 }
 
@@ -610,6 +633,18 @@ impl Embedder for RemoteEmbedder {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    /// The live status (the shared field this embedder keeps updated).
+    /// A poisoned lock reads as Failed — the conservative answer for a
+    /// caller deciding whether to store this embedder's vectors.
+    fn status(&self) -> Option<EmbedderStatus> {
+        Some(
+            self.status
+                .read()
+                .map(|s| s.clone())
+                .unwrap_or(EmbedderStatus::Failed),
+        )
     }
 }
 

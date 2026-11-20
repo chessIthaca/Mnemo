@@ -482,6 +482,8 @@ mod tests {
             file: file.to_string(),
             start_line: line,
             end_line: line,
+            signature: String::new(),
+            doc: String::new(),
         }
     }
 

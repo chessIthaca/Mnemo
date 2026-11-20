@@ -625,6 +625,8 @@ mod tests {
             file: file.to_string(),
             start_line: line,
             end_line: line + 2,
+            signature: String::new(),
+            doc: String::new(),
         }
     }
 

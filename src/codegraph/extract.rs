@@ -89,7 +89,31 @@ impl SymbolKind {
             _ => return None,
         })
     }
+
+    /// Whether this kind is embedded for semantic code search (see
+    /// [`EMBEDDABLE_KINDS`] — the single source of truth, plan d3336a8a
+    /// step 9).
+    pub fn is_embeddable(&self) -> bool {
+        EMBEDDABLE_KINDS.contains(self)
+    }
 }
+
+/// The symbol kinds eligible for semantic embedding (plan d3336a8a
+/// step 9): one chunk per symbol of these kinds goes through the
+/// code-search model. Containers without their own signature (impl
+/// blocks, the per-file synthetic modules) are excluded — an impl
+/// block adds nothing searchable the methods do not carry better.
+pub const EMBEDDABLE_KINDS: &[SymbolKind] = &[
+    SymbolKind::Function,
+    SymbolKind::Method,
+    SymbolKind::Struct,
+    SymbolKind::Enum,
+    SymbolKind::Trait,
+    SymbolKind::Class,
+    SymbolKind::Interface,
+    SymbolKind::TypeAlias,
+    SymbolKind::TsEnum,
+];
 
 /// The kind of an edge between two symbols. Serializes snake_case
 /// (`"calls"`, `"imports"`, `"contains"`), matching [`EdgeKind::as_str`].
@@ -143,6 +167,20 @@ pub struct Symbol {
     pub start_line: usize,
     /// 1-based line where the definition ends.
     pub end_line: usize,
+    /// The definition's signature: source text from the definition's
+    /// start to the first `{` or `;`, whitespace-collapsed to one line,
+    /// capped at [`SIGNATURE_MAX_CHARS`] characters (plan d3336a8a
+    /// step 9). Semantic code search embeds it with the doc comment;
+    /// the chunk's hash keys incremental embedding.
+    #[serde(default)]
+    pub signature: String,
+    /// The definition's doc comment — the contiguous doc-comment block
+    /// directly above the definition, per language (see
+    /// [`Ctx::doc_of`]), capped at [`DOC_MAX_CHARS`] characters. Empty
+    /// when there is none, and always empty for the per-file synthetic
+    /// module symbol (no source anchor).
+    #[serde(default)]
+    pub doc: String,
 }
 
 /// An unresolved reference found while parsing one file. Resolution to a
@@ -289,6 +327,10 @@ pub fn extract_file_with(
             file: rel.to_string(),
             start_line: 1,
             end_line: source.lines().count().max(1),
+            // The synthetic module has no source anchor — no signature,
+            // no doc, and never a text row (plan d3336a8a step 9).
+            signature: String::new(),
+            doc: String::new(),
         }],
         refs: Vec::new(),
         contains: Vec::new(),
@@ -296,6 +338,8 @@ pub fn extract_file_with(
     let mut ctx = Ctx {
         rel,
         src: source,
+        lines: source.lines().collect(),
+        lang,
         out: &mut out,
         scope: vec![module_id(rel)],
         in_impl: 0,
@@ -328,6 +372,13 @@ pub fn extract_file_with(
 struct Ctx<'a> {
     rel: &'a str,
     src: &'a str,
+    /// `src` split once per parse — the doc-comment scan reads arbitrary
+    /// lines above a definition without re-splitting the source per
+    /// symbol (plan d3336a8a step 9).
+    lines: Vec<&'a str>,
+    /// The language being walked — decides which doc-comment syntaxes
+    /// the doc scan accepts ([`DocStyle`]).
+    lang: Lang,
     out: &'a mut FileExtract,
     /// Enclosing definition ids (module → … → innermost function).
     scope: Vec<String>,
@@ -353,6 +404,13 @@ impl Ctx<'_> {
     fn def(&mut self, name: &str, kind: SymbolKind, node: tree_sitter::Node) -> String {
         let start = node.start_position().row + 1 + self.line_offset;
         let id = format!("{}::{}::{}", self.rel, name, start);
+        // Module symbols never carry text (no source anchor of their own,
+        // no text row, never embedded — plan d3336a8a step 9).
+        let (signature, doc) = if kind == SymbolKind::Module {
+            (String::new(), String::new())
+        } else {
+            self.symbol_text(node)
+        };
         self.out.symbols.push(Symbol {
             id: id.clone(),
             name: name.to_string(),
@@ -360,9 +418,118 @@ impl Ctx<'_> {
             file: self.rel.to_string(),
             start_line: start,
             end_line: node.end_position().row + 1 + self.line_offset,
+            signature,
+            doc,
         });
         self.scope.push(id.clone());
         id
+    }
+
+    /// The symbol's embedded text pair (plan d3336a8a step 9): its
+    /// signature and its doc comment.
+    fn symbol_text(&self, node: tree_sitter::Node) -> (String, String) {
+        (self.signature_of(node), self.doc_of(node))
+    }
+
+    /// The definition's signature: source text from the node's start up
+    /// to the first `{` or `;` (whichever comes first), or up to the end
+    /// of its first line — newlines collapsed to single spaces, capped
+    /// at [`SIGNATURE_MAX_CHARS`] characters. The brace-less languages
+    /// (Python and Ruby delimit bodies by indentation, not braces) cut
+    /// at the end of the definition's FIRST line unconditionally: their
+    /// bodies routinely CONTAIN braces or semicolons (`config = {}`
+    /// inside a Python function), so searching the whole node for `{`
+    /// or `;` would swallow body text into the signature.
+    fn signature_of(&self, node: tree_sitter::Node) -> String {
+        let start = node.start_byte();
+        // The node came from this Ctx's source (the HTML script
+        // sub-parses use their own slice), so the byte range lines up.
+        let Some(text) = self.src.get(start..node.end_byte()) else {
+            return String::new();
+        };
+        let cut = match doc_style(self.lang) {
+            DocStyle::BodyString => text.find('\n').unwrap_or(text.len()),
+            _ => text
+                .find(['{', ';'])
+                .or_else(|| text.find('\n'))
+                .unwrap_or(text.len()),
+        };
+        let collapsed: String = text[..cut].split_whitespace().collect::<Vec<_>>().join(" ");
+        collapsed.chars().take(SIGNATURE_MAX_CHARS).collect()
+    }
+
+    /// The definition's doc comment, per language family (see
+    /// [`DocStyle`]). Capped at [`DOC_MAX_CHARS`] characters.
+    fn doc_of(&self, node: tree_sitter::Node) -> String {
+        match doc_style(self.lang) {
+            DocStyle::AboveRust => self.doc_above(node, is_rust_doc_line, strip_rust_doc_line),
+            DocStyle::AboveC => self.doc_above(node, is_c_doc_line, strip_c_doc_line),
+            DocStyle::AboveGo => self.doc_above(node, is_go_doc_line, strip_go_doc_line),
+            DocStyle::BodyString => self.body_docstring(node),
+        }
+    }
+
+    /// Walk the lines directly above the definition upward, collecting
+    /// the contiguous doc-comment block. A blank line ends the block; a
+    /// non-doc, non-meta line ends the walk; single-line attributes and
+    /// decorators (`#[derive(..)]`, `@Injectable()`) are stepped over so
+    /// they do not hide the doc (plan d3336a8a step 9). `is_doc`
+    /// classifies one trimmed line as a doc line of the language family;
+    /// `strip` removes its comment markup.
+    fn doc_above(
+        &self,
+        node: tree_sitter::Node,
+        is_doc: fn(&str) -> bool,
+        strip: fn(&str) -> String,
+    ) -> String {
+        let mut row = node.start_position().row;
+        let mut block: Vec<String> = Vec::new();
+        while row > 0 {
+            row -= 1;
+            let Some(line) = self.lines.get(row) else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if is_meta_line(trimmed) {
+                continue;
+            }
+            if !is_doc(trimmed) {
+                break;
+            }
+            block.push(strip(trimmed));
+        }
+        block.reverse();
+        let joined = block.join("\n");
+        joined.trim().chars().take(DOC_MAX_CHARS).collect()
+    }
+
+    /// Python/Ruby: the docstring is the body's leading string
+    /// statement, not a comment above (plan d3336a8a step 9 — "per
+    /// language as tree-sitter allows"). Reads the `body` field's first
+    /// statement, unwraps Python's `expression_statement` wrapper, and
+    /// takes a string node's text minus its quote marks; any other shape
+    /// answers empty.
+    fn body_docstring(&self, node: tree_sitter::Node) -> String {
+        let Some(body) = node.child_by_field_name("body") else {
+            return String::new();
+        };
+        let Some(mut first) = body.named_child(0) else {
+            return String::new();
+        };
+        if first.kind() == "expression_statement" {
+            let Some(inner) = first.named_child(0) else {
+                return String::new();
+            };
+            first = inner;
+        }
+        if !first.kind().contains("string") {
+            return String::new();
+        }
+        let unquoted = strip_string_quotes(self.text(first));
+        unquoted.chars().take(DOC_MAX_CHARS).collect()
     }
 
     /// Record a call/import reference from the innermost enclosing scope.
@@ -381,6 +548,136 @@ impl Ctx<'_> {
 
 /// Names that are never interesting reference targets (`self::x` tails).
 const SELF_NAMES: &[&str] = &["self", "super", "crate"];
+
+// ===================== Signature + doc extraction ========================
+// Plan d3336a8a step 9: the chunk text embedded per symbol is
+// `<kind> <name>\n<signature>\n<doc>\n<file path>` — the extraction
+// below fills the two middle lines.
+
+/// The signature cap: [`Symbol::signature`] keeps at most this many
+/// characters (the step-9 rule).
+const SIGNATURE_MAX_CHARS: usize = 300;
+
+/// The doc cap: [`Symbol::doc`] keeps at most this many characters.
+const DOC_MAX_CHARS: usize = 1500;
+
+/// How a language writes doc comments (plan d3336a8a step 9) — decides
+/// what the doc scan accepts.
+enum DocStyle {
+    /// `///` and `//!` lines above the definition (Rust).
+    AboveRust,
+    /// `/** … */` blocks with `*`-continuation lines, and `///` lines
+    /// (TS/JS — including the HTML script sub-parses — Java, C/C++,
+    /// C#, PHP).
+    AboveC,
+    /// The C-family forms, PLUS Go's plain `//` lines: Go's documented
+    /// convention is that the contiguous `//` block immediately above
+    /// a declaration IS its doc (review finding goDocComments — Go
+    /// only; everywhere else plain `//` and `#` are not docs).
+    AboveGo,
+    /// The docstring is the body's leading string statement (Python,
+    /// Ruby).
+    BodyString,
+}
+
+/// The doc-comment family of a language.
+fn doc_style(lang: Lang) -> DocStyle {
+    match lang {
+        Lang::Rust => DocStyle::AboveRust,
+        Lang::Python | Lang::Ruby => DocStyle::BodyString,
+        Lang::Go => DocStyle::AboveGo,
+        Lang::Ts | Lang::Tsx | Lang::Js | Lang::Java | Lang::C
+        | Lang::Cpp | Lang::CSharp | Lang::Php | Lang::Html => DocStyle::AboveC,
+    }
+}
+
+/// Whether a trimmed line is a Rust doc line (`///` or `//!`).
+fn is_rust_doc_line(trimmed: &str) -> bool {
+    trimmed.starts_with("///") || trimmed.starts_with("//!")
+}
+
+/// Strip one Rust doc line's markup, leaving its text.
+fn strip_rust_doc_line(trimmed: &str) -> String {
+    trimmed
+        .strip_prefix("///")
+        .or_else(|| trimmed.strip_prefix("//!"))
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
+/// Whether a trimmed line is a C-family doc line: a `/** … */` block
+/// opener, continuation or terminator (both `/**` and a bare `*/` start
+/// with the marker) or a `///` line. Plain `//` lines are NOT docs —
+/// they end the block scan.
+fn is_c_doc_line(trimmed: &str) -> bool {
+    trimmed.starts_with("///") || trimmed.starts_with("/**") || trimmed.starts_with('*')
+}
+
+/// Strip one C-family doc line's markup, leaving its text. Handles block
+/// openers (`/** …`), continuations (`* …`), and terminators (`… */` —
+/// including the bare `*/` line, which must answer empty, not `/`).
+fn strip_c_doc_line(trimmed: &str) -> String {
+    let body = trimmed
+        .strip_suffix("*/")
+        .map(|b| {
+            b.trim_start_matches('/')
+                .trim_start_matches('*')
+                .trim()
+        })
+        .unwrap_or_else(|| {
+            trimmed
+                .strip_prefix("/**")
+                .or_else(|| trimmed.strip_prefix("///"))
+                .or_else(|| trimmed.strip_prefix('*'))
+                .unwrap_or(trimmed)
+                .trim()
+        });
+    body.to_string()
+}
+
+/// Whether a trimmed line is a Go doc line: the C-family forms, or a
+/// plain `//` line — Go's documented convention is that the contiguous
+/// `//` block immediately above a declaration IS its doc (review
+/// finding goDocComments; Go only — other languages keep excluding
+/// plain `//`).
+fn is_go_doc_line(trimmed: &str) -> bool {
+    is_c_doc_line(trimmed) || trimmed.starts_with("//")
+}
+
+/// Strip one Go doc line's markup: the `//` prefix for plain lines,
+/// the C-family strip otherwise.
+fn strip_go_doc_line(trimmed: &str) -> String {
+    if let Some(body) = trimmed.strip_prefix("//") {
+        return body.trim().to_string();
+    }
+    strip_c_doc_line(trimmed)
+}
+
+/// A single-line attribute (Rust `#[..]`) or decorator line
+/// (`@Name(..)`, `@Name`) — metadata sitting between a doc block and
+/// its definition. The doc scan steps over these so `#[derive(Debug)]`
+/// or `@Injectable()` does not hide the doc. Multi-line attributes stop
+/// the scan at their first line matching neither shape — harmless.
+fn is_meta_line(trimmed: &str) -> bool {
+    (trimmed.starts_with("#[") && trimmed.ends_with(']'))
+        || (trimmed.starts_with('@') && trimmed.len() > 1)
+}
+
+/// Strip a string literal's quote marks — `"""x"""`, `'x'`, `"x"`, and
+/// prefixed forms (`r"x"`) — leaving the string body. Ruby heredoc
+/// bodies (`<<~DOC`) carry no quotes and answer empty, which is
+/// acceptable ("per language as tree-sitter allows").
+fn strip_string_quotes(text: &str) -> &str {
+    let t = text.trim();
+    let Some(open) = t.find(['"', '\'']) else {
+        return "";
+    };
+    let Some(quote) = t[open..].chars().next() else {
+        return "";
+    };
+    t[open + quote.len_utf8()..].trim_matches(quote).trim()
+}
 
 // =============================== Rust walk ===============================
 
@@ -1187,6 +1484,10 @@ fn visit_html(node: tree_sitter::Node, ctx: &mut Ctx) {
         let mut sub = Ctx {
             rel,
             src: js,
+            // The sub-parse reads doc comments from the script slice —
+            // its own lines, with its own language family (JS).
+            lines: js.lines().collect(),
+            lang: Lang::Js,
             out: &mut *ctx.out,
             scope: vec![module_id(rel)],
             in_impl: 0,
@@ -2390,6 +2691,174 @@ namespace App {
             .refs
             .iter()
             .any(|r| r.kind == RefKind::Call && r.name == "helper" && r.from == main_id));
+    }
+
+    // ===== Signature + doc extraction (plan d3336a8a step 9) =====
+
+    const RUST_DOC_SRC: &str = r#"
+/// Draws the widget.
+///
+/// Second doc line.
+#[derive(Debug)]
+pub fn draw_widget(count: u32,
+                   scale: f32) -> Option<u32> {
+    Some(count)
+}
+
+// A plain comment is NOT a doc comment.
+fn bare() {}
+"#;
+
+    #[test]
+    fn extracts_signature_and_doc_for_rust_fn() {
+        let f = extract_file("w.rs", RUST_DOC_SRC, Lang::Rust);
+        let draw = sym(&f, "draw_widget");
+        // The signature runs from the definition's start to the first
+        // `{`, newlines collapsed.
+        assert_eq!(
+            draw.signature,
+            "pub fn draw_widget(count: u32, scale: f32) -> Option<u32>"
+        );
+        // The contiguous doc block directly above; the attribute line
+        // is stepped over; blank doc lines keep the paragraph break.
+        assert_eq!(draw.doc, "Draws the widget.\n\nSecond doc line.");
+        // A plain `//` comment is not a doc comment.
+        let bare = sym(&f, "bare");
+        assert_eq!(bare.signature, "fn bare()");
+        assert_eq!(bare.doc, "");
+    }
+
+    const TS_DOC_SRC: &str = r#"
+/** A Shape with area. */
+export interface Shape {
+  area(): number;
+}
+
+/**
+ * Builds a shape.
+ * Multi-line block.
+ */
+export function build(): Shape {
+  return null as unknown as Shape;
+}
+
+/// Triple-slash doc.
+export const alpha = () => 1;
+"#;
+
+    #[test]
+    fn extracts_signature_and_doc_for_ts_symbols() {
+        let f = extract_file("s.ts", TS_DOC_SRC, Lang::Ts);
+        let shape = sym(&f, "Shape");
+        // tree-sitter's declaration node starts after the `export`
+        // modifier (the export_statement wraps it), so the signature is
+        // the declaration itself.
+        assert_eq!(shape.signature, "interface Shape");
+        assert_eq!(shape.doc, "A Shape with area.");
+        // Interface members (method_signature `area(): number;`) are not
+        // definition symbols in the graph — no extraction for them.
+        assert!(!f.symbols.iter().any(|s| s.name == "area"));
+        let build = sym(&f, "build");
+        assert_eq!(build.signature, "function build(): Shape");
+        assert_eq!(build.doc, "Builds a shape.\nMulti-line block.");
+        // The arrow-fn const extracts from its declarator.
+        let alpha = sym(&f, "alpha");
+        assert_eq!(alpha.signature, "alpha = () => 1");
+        assert_eq!(alpha.doc, "Triple-slash doc.");
+    }
+
+    const SVELTE_SRC: &str = r#"
+<script>
+  /** Greets the user. */
+  export function greet(name) {
+    return `Hello ${name}`;
+  }
+</script>
+
+<main>{greet("world")}</main>
+"#;
+
+    #[test]
+    fn extracts_signature_and_doc_for_svelte_script() {
+        // Svelte components are HTML files with script blocks (see
+        // `extracts_html_script_blocks`) — the step-9 text must come
+        // from the script slice with the file's true line numbers.
+        let f = extract_file("App.svelte", SVELTE_SRC, Lang::Html);
+        let greet = sym(&f, "greet");
+        assert_eq!(greet.kind, SymbolKind::Function);
+        // tree-sitter's function_declaration starts after `export` (the
+        // export_statement wraps it), so the signature is the
+        // declaration itself.
+        assert_eq!(greet.signature, "function greet(name)");
+        assert_eq!(greet.doc, "Greets the user.");
+        assert_eq!(
+            greet.start_line,
+            SVELTE_SRC
+                .lines()
+                .position(|l| l.contains("export function greet"))
+                .unwrap()
+                + 1,
+            "the script sub-parse keeps the HTML file's line numbers"
+        );
+    }
+
+    #[test]
+    fn extracts_python_docstring_from_body() {
+        // Python (and Ruby) carry the doc as the body's leading string
+        // statement, not as a comment above; braces never delimit the
+        // definition, so the signature ends at its first line.
+        let src = r#"
+def run():
+    """Runs the pipeline.
+
+    With detail."""
+    return 1
+"#;
+        let f = extract_file("m.py", src, Lang::Python);
+        let run = sym(&f, "run");
+        assert_eq!(run.signature, "def run():");
+        assert_eq!(run.doc, "Runs the pipeline.\n\n    With detail.");
+    }
+
+    /// Review finding goDocComments: Go's plain `//` block directly above
+    /// a declaration IS its doc — extracted for Go only.
+    #[test]
+    fn extracts_go_plain_slash_doc_block() {
+        let src = r#"
+package main
+
+// Add returns a + b.
+// Second line.
+func Add(a int, b int) int {
+    return a + b
+}
+"#;
+        let f = extract_file("m.go", src, Lang::Go);
+        let add = sym(&f, "Add");
+        assert_eq!(add.signature, "func Add(a int, b int) int");
+        assert_eq!(add.doc, "Add returns a + b.\nSecond line.");
+    }
+
+    /// Review finding pyRubySigBody: brace-less languages cut the
+    /// signature at the definition's first line — body text containing
+    /// `{` or `;` never leaks into the signature.
+    #[test]
+    fn brace_less_signatures_stop_at_the_first_line() {
+        let python = "def run():\n    config = {}\n    return config\n";
+        let f = extract_file("m.py", python, Lang::Python);
+        assert_eq!(
+            sym(&f, "run").signature,
+            "def run():",
+            "a brace in the Python body must not leak into the signature"
+        );
+
+        let ruby = "def run\n  x = a; b\n  1\nend\n";
+        let f = extract_file("m.rb", ruby, Lang::Ruby);
+        assert_eq!(
+            sym(&f, "run").signature,
+            "def run",
+            "a semicolon in the Ruby body must not leak into the signature"
+        );
     }
 
     #[test]

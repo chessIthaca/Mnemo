@@ -103,17 +103,12 @@ struct Lease {
     token: String,
 }
 
-/// Lease token source: process-unique even for two `take_lease` calls in the
-/// same nanosecond (a process-local sequence number), and cross-process
-/// unique because the pid is in it.
+/// Lease token source: one UUID v4 in simple form — a uniqueness TAG, not a
+/// secret. It only lets a [`LeaseGuard`] tell its own `lease-<pid>.json`
+/// from a newer lease of the same pid (the same source as the models host's
+/// bearer token, so the crate draws from the OS CSPRNG in one place).
 fn lease_token() -> String {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{nanos:x}-{}-{seq:x}", std::process::id())
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// `<config_dir>/run/<name>` — the lease directory of one shared service.

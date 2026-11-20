@@ -871,7 +871,7 @@ impl Shared {
         let waiting = snapshot
             .workers
             .iter()
-            .filter(|worker| worker.status.waiting_on_user())
+            .filter(|worker| worker.waiting_on_user())
             .count();
         let workers: Vec<Value> = snapshot
             .workers
@@ -890,7 +890,7 @@ impl Shared {
                     "model_short": model_short,
                     "tier": worker.tier,
                     "status": worker.status,
-                    "needs_you": worker.status.waiting_on_user(),
+                    "needs_you": worker.waiting_on_user(),
                     "elapsed_ms": worker.elapsed_ms,
                     "last_activity_ms": worker.created_at_ms + worker.elapsed_ms,
                 })

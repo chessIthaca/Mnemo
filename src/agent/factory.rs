@@ -56,7 +56,7 @@ use crate::tool::agent::{
     file_write::FileWriteTool,
     git::GitTool,
     git_read_tool::GitReadTool,
-    jobs::{JobKillTool, JobRegistry, JobStartTool, JobTailTool, JobWaitTool},
+    jobs::{JobKillTool, JobRegistry, JobTailTool, JobTool, JobWaitTool},
     image_tools::tools::{
         ImageAnalysisTool, ImageAnalyzeChartTool, ImageDiagnoseErrorTool, ImageExtractTextTool,
         ImageUiDiffTool, ImageUiToArtifactTool, ImageUnderstandDiagramTool,
@@ -1686,10 +1686,10 @@ impl AgentLoopFactory {
                 ));
             }
         }
-        // Long commands without polling (plan 5b85ab61 step 2): ONE registry per
-        // agent session's tool set, so every job's tree dies with the session
-        // (stop, merge, app exit) instead of outliving its call.
-        let wants_jobs = ["job_start", "job_wait", "job_tail", "job_kill"]
+        // Long commands without polling (plans 5b85ab61 step 2, 5b498359): ONE
+        // registry per agent session's tool set, so every job's tree dies with
+        // the session (stop, merge, app exit) instead of outliving its call.
+        let wants_jobs = ["job", "job_wait", "job_tail", "job_kill"]
             .iter()
             .any(|name| want(ToolGroup::Shell, name));
         if wants_jobs {
@@ -1705,9 +1705,9 @@ impl AgentLoopFactory {
                     job_registry.with_machine(Arc::clone(&self.machine), dir.clone());
             }
             let jobs = Arc::new(job_registry);
-            if want(ToolGroup::Shell, "job_start") {
+            if want(ToolGroup::Shell, "job") {
                 registry.register(Box::new(
-                    JobStartTool::new(Arc::clone(&jobs), Arc::clone(&self.core_operations))
+                    JobTool::new(Arc::clone(&jobs), Arc::clone(&self.core_operations))
                         .with_check_commands(
                             root.map(|spec| spec.check_commands.clone())
                                 .unwrap_or_default(),
@@ -3005,7 +3005,13 @@ mod tests {
             // ride the shell surface — Executing carries all four schemas;
             // measures Executing at 32_906 chars. Ceiling = measured + headroom,
             // deliberate raise.
-            (ToolFilter::Executing, 33_400),
+            // 33_400 → 34_000 (2026-11-21): `job_start` became `job` (plan
+            // 5b498359 step 1) — it starts AND waits in one call, so its
+            // description is the plan's verbatim text and the schema gains
+            // `wait_s` and `pattern` (~+370), on top of schema drift since the
+            // 32_906 figure pinned at the 2026-11-19 pass; measures Executing at
+            // 33_739 chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Executing, 34_000),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -3249,7 +3255,12 @@ mod tests {
             // share the advertised array (Reviewing carries every Agent tool's
             // schema); measures Reviewing at 26_923 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Reviewing, 27_400),
+            // 27_400 → 28_000 (2026-11-21): same cause as the Executing raise
+            // above (`job` replaces `job_start`, ~+370 of description and
+            // schema), on top of drift since the 26_923 figure pinned at the
+            // 2026-11-19 pass; workspace-unified measures Reviewing at 27_756
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 28_000),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -3730,9 +3741,9 @@ mod tests {
             "file_write",
             "convert_line_endings",
             "shell",
-            // long commands without polling (plan 5b85ab61 step 2): one job
-            // registry per session, four tools on the shell surface.
-            "job_start",
+            // long commands without polling (plans 5b85ab61 step 2, 5b498359):
+            // one job registry per session, four tools on the shell surface.
+            "job",
             "job_wait",
             "job_tail",
             "job_kill",
@@ -3911,8 +3922,8 @@ mod tests {
             "file_write",
             "shell",
             // The job tools ride the shell surface, so the free agent gets
-            // them too (plan 5b85ab61 step 2).
-            "job_start",
+            // them too (plans 5b85ab61 step 2, 5b498359).
+            "job",
             "job_wait",
             "job_tail",
             "job_kill",
@@ -3938,6 +3949,24 @@ mod tests {
             count,
             expected,
             "the free surface = the kernel tools minus the review tool and the app tools and the (unrequired) git pair"
+        );
+    }
+
+    /// Plan 5b498359 step 1: `job_start` was RENAMED to `job`, never aliased —
+    /// the tool list stays short, so the old name must not resolve while `job`
+    /// does.
+    #[test]
+    fn job_start_is_not_a_registered_tool() {
+        let dir = tempdir().unwrap();
+        let factory = make_free_factory(dir.path());
+        factory.set_spawner(Arc::new(MockSpawner));
+        assert!(
+            registry_contains(&factory, &dir, "job"),
+            "the `job` tool must be registered on the shell surface"
+        );
+        assert!(
+            !registry_contains(&factory, &dir, "job_start"),
+            "`job_start` was renamed, not aliased — it must not be registered"
         );
     }
 
@@ -4180,7 +4209,7 @@ mod tests {
                 "git_read",
                 // The three job readers/watchdogs are Agent+AutoRun on purpose
                 // (plan 5b85ab61 step 2): they only read or stop THIS session's
-                // own jobs and start no process — `job_start` is the
+                // own jobs and start no process — `job` is the
                 // NeedsApproval half and stays behind the allow-list.
                 "job_kill",
                 "job_tail",

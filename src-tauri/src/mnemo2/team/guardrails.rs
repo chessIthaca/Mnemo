@@ -120,8 +120,8 @@ pub(super) fn audit_guardrails() -> Guardrails {
         "shell".to_string(),
         // A job runs commands too, so the whole job surface is a mutation
         // path: an audit worker must not be able to start, wait on, tail or
-        // kill a job (plan 5b85ab61 step 2).
-        "job_start".to_string(),
+        // kill a job (plans 5b85ab61 step 2, 5b498359).
+        "job".to_string(),
         "job_wait".to_string(),
         "job_tail".to_string(),
         "job_kill".to_string(),
@@ -273,12 +273,12 @@ fn executor_gate_rules() -> Vec<GateRule> {
         "git",
         r#"(?i)"action":"(?:push|merge|checkout)""#.to_string(),
     ));
-    // The `shell` tool and `job_start` — a job runs the same commands, so it
+    // The `shell` tool and `job` — a job runs the same commands, so it
     // must not become a way around the gate: any git invocation, however
     // chained or qualified.
     let pre = SHELL_CMD_PREFIX;
     let git = SHELL_GIT;
-    for tool in ["shell", "job_start"] {
+    for tool in ["shell", "job"] {
         for sub in [
             r"(?:push|merge|rebase|switch|worktree)\b",
             // Branch deletion: `-d`, `-D`, a combined short flag, or `--delete`.

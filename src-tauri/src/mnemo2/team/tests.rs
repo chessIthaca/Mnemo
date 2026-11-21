@@ -358,10 +358,10 @@ async fn executor_gate_denies_integration_through_the_shell() {
 }
 
 /// A job runs the same commands as `shell`, so the gate that keeps workers out
-/// of integration must cover `job_start` too (plan 5b85ab61 step 2) — otherwise
-/// a worker could push or merge by wrapping the command in a job.
+/// of integration must cover `job` too (plans 5b85ab61 step 2, 5b498359) —
+/// otherwise a worker could push or merge by wrapping the command in a job.
 #[tokio::test]
-async fn executor_gate_denies_integration_through_job_start() {
+async fn executor_gate_denies_integration_through_job() {
     for command in [
         "git push",
         "git -C ../repo push",
@@ -372,7 +372,7 @@ async fn executor_gate_denies_integration_through_job_start() {
     ] {
         assert!(
             executor_denies(
-                "job_start",
+                "job",
                 json!({"command": command, "purpose": "building"})
             )
             .await,
@@ -386,7 +386,7 @@ async fn executor_gate_denies_integration_through_job_start() {
     ] {
         assert!(
             !executor_denies(
-                "job_start",
+                "job",
                 json!({"command": command, "purpose": "building"})
             )
             .await,
@@ -401,7 +401,7 @@ async fn executor_gate_denies_integration_through_job_start() {
 /// applied hostToken01's stash in the wrong checkout) or a months-old stash
 /// from the lead checkout. The executor gate must refuse every push, pop and
 /// drop on that shared stack — through the structured git tool, `shell` and
-/// `job_start` alike — while the read-only forms and `git stash apply <sha>`
+/// `job` alike — while the read-only forms and `git stash apply <sha>`
 /// (recovering a known dangling commit) still run.
 #[tokio::test]
 async fn executor_gate_refuses_the_shared_stash_stack() {
@@ -455,7 +455,7 @@ async fn executor_gate_refuses_the_shared_stash_stack() {
         "git stash apply stash@{1}",
         "git stash apply -q",
     ] {
-        for tool in ["shell", "job_start"] {
+        for tool in ["shell", "job"] {
             assert!(
                 executor_denies_stash(tool, json!({"command": command, "purpose": "p"})).await,
                 "{tool}: {command}"
@@ -472,7 +472,7 @@ async fn executor_gate_refuses_the_shared_stash_stack() {
         "git stash apply 78b29bbd",
         "git stash apply 78b29bbd1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
     ] {
-        for tool in ["shell", "job_start"] {
+        for tool in ["shell", "job"] {
             assert!(
                 !executor_denies_stash(tool, json!({"command": command, "purpose": "p"}))
                     .await,
@@ -496,12 +496,12 @@ async fn executor_gate_refuses_the_shared_stash_stack() {
 
 /// The audit worker is read-only by construction: the job tools ride
 /// `ToolGroup::Shell`, so they must be excluded from its surface by name
-/// (plan 5b85ab61 step 2).
+/// (plans 5b85ab61 step 2, 5b498359).
 #[test]
 fn audit_surface_excludes_the_job_tools() {
     let audit = audit_guardrails().tools.exclude;
     let executor = executor_guardrails().tools.exclude;
-    for tool in ["job_start", "job_wait", "job_tail", "job_kill"] {
+    for tool in ["job", "job_wait", "job_tail", "job_kill"] {
         assert!(
             audit.iter().any(|excluded| excluded == tool),
             "the audit surface still allows {tool}"

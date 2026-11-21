@@ -12,6 +12,7 @@
   } from "../lib/toolCardPaths";
   import { parseAnsi, stripAnsi, terminalTail } from "../lib/ansi";
   import { formatElapsed } from "../lib/elapsed";
+  import { jobCallFrom, jobHeadline } from "../lib/jobCards";
   import { app } from "../lib/store";
   import { prettyArguments } from "../lib/toolArguments";
   import { editDiffSections, writeDiffSections } from "../lib/toolDiff";
@@ -46,9 +47,10 @@
     status === "running" ? "Running" : status === "completed" ? "Completed" : "Failed",
   );
   const headline = $derived(
-    toolHeadline(entry.toolName, entry.arguments, (workerId) =>
-      $app.workers.find((worker) => worker.id === workerId)?.name ?? workerId,
-    ),
+    jobHeadline(entry.toolName, entry.arguments, entry.result) ??
+      toolHeadline(entry.toolName, entry.arguments, (workerId) =>
+        $app.workers.find((worker) => worker.id === workerId)?.name ?? workerId,
+      ),
   );
   /** The time's tooltip: the turn's clock, then this call's own slice of it. */
   const timeTitle = $derived.by(() => {
@@ -92,6 +94,22 @@
   const shellOut = $derived(
     entry.result !== null && entry.toolName === "shell" ? parseShellOutput(entry.result.output) : null,
   );
+  /** A job call rendered like a shell one: the purpose/command it starts, or the
+   *  id a follow-up call acts on, plus the state its result reports. */
+  const jobCall = $derived(jobCallFrom(entry.toolName, entry.arguments, entry.result));
+  /** True when the job call names something to show — its purpose, command or
+   *  job id — so the generic body yields to the job body. */
+  const jobNamed = $derived(
+    jobCall !== null &&
+      (jobCall.command !== null || jobCall.purpose !== null || jobCall.jobId !== null),
+  );
+  /** A completed job's output, split like a shell's. A job's report and filtered
+   *  tail carry no shell trailer, so the split lands it in stdout. */
+  const jobOut = $derived(
+    entry.result !== null && jobCall !== null ? parseShellOutput(entry.result.output) : null,
+  );
+  /** The exit code a job result reports, shown on the output section's heading. */
+  const jobExit = $derived(jobCall?.outcome?.exitCode ?? null);
   /** An edit's diff: the result's structured payload, or — a replayed call
    *  carries none — one rebuilt from the call's own old/new strings. */
   const editDiff = $derived(
@@ -133,6 +151,7 @@
   const rich = $derived(
     shellCall !== null ||
       shellOut !== null ||
+      jobNamed ||
       editDiff !== null ||
       writeDiff !== null ||
       readList.length > 0,
@@ -210,6 +229,23 @@
           </section>
         {/if}
 
+        {#if jobNamed && jobCall !== null}
+          {#if jobCall.start}
+            <section class="tool-detail-section">
+              <h4>Command</h4>
+              {#if jobCall.purpose}<p class="tool-label">purpose: {jobCall.purpose}</p>{/if}
+              {#if jobCall.cwd}<p class="tool-label">cwd: {jobCall.cwd}</p>{/if}
+              {#if jobCall.command}<pre class="tool-command">{jobCall.command}</pre>{/if}
+            </section>
+          {:else}
+            <section class="tool-detail-section">
+              <h4>Job</h4>
+              {#if jobCall.purpose}<p class="tool-label">purpose: {jobCall.purpose}</p>{/if}
+              {#if jobCall.jobId}<p class="tool-label">job: {jobCall.jobId}</p>{/if}
+            </section>
+          {/if}
+        {/if}
+
         {#if editDiff !== null}
           <section class="tool-detail-section">
             <h4>Diff</h4>
@@ -253,6 +289,15 @@
               {/if}
             </h4>
             <ToolShellOutput stdout={shellOut.stdout} stderr={shellOut.stderr} />
+          </section>
+        {:else if jobOut !== null}
+          <section class="tool-detail-section">
+            <h4>
+              {entry.result?.success ? "Result" : "Error"}{#if jobExit !== null}
+                · <span class="tool-exit" data-ok={jobExit === 0}>exit code {jobExit}</span>
+              {/if}
+            </h4>
+            <ToolShellOutput stdout={jobOut.stdout} stderr={jobOut.stderr} />
           </section>
         {:else if !rich}
           {@render resultSection()}

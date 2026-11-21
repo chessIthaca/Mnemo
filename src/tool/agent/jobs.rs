@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! `job_start` / `job_wait` / `job_tail` / `job_kill` — long commands without
-//! polling (plan 5b85ab61 step 2).
+//! `job` (start and wait in one call) / `job_wait` / `job_tail` / `job_kill` —
+//! long commands without polling (plans 5b85ab61 step 2, 5b498359).
 //!
 //! A worker used to detach a long build into a background process and poll it
 //! with `sleep` and log reads: one model round trip per poll, and the sleep
-//! always either too short or too long. The four job tools replace that loop:
+//! always either too short or too long. The job tools replace that loop:
 //!
-//! - `job_start` runs a command as a session-owned JOB and returns its id at
-//!   once. A job has NO silence limit and a three-hour hard cap, so a cold
-//!   `cargo test --workspace` can run to completion in the background.
+//! - `job` runs a command as a session-owned JOB and WAITS for its result in
+//!   the same call — one call instead of `job_start` plus `job_wait`. A job has
+//!   NO silence limit and a three-hour hard cap, so a cold `cargo test
+//!   --workspace` can run to completion. `wait_s` 0 returns its id at once
+//!   instead, for work in parallel or a dev server.
 //! - `job_wait` blocks SERVER-SIDE until the job exits, until a NEW output line
 //!   matches a pattern, or until its own timeout — one call, no polling.
 //! - `job_tail` shows the last lines of the run so far.
@@ -43,8 +45,8 @@
 //! # Never a recorded check
 //!
 //! A job run is never recorded as a check: it is not measured against the
-//! worktree and does not go through the recorded-check path. `job_start` says
-//! so when the command is one of the session's check commands.
+//! worktree and does not go through the recorded-check path. `job` says so
+//! when the command is one of the session's check commands.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -117,7 +119,7 @@ const TAIL_EARLIER_OMITTED: &str = "[... earlier output omitted ...]\n";
 const STDOUT_TAG: &str = "[out] ";
 const STDERR_TAG: &str = "[err] ";
 
-/// The note `job_start` appends when the command is one of the session's check
+/// The note `job` appends when the command is one of the session's check
 /// commands: such a run cannot certify the tip, so the model is pointed at the
 /// path that does record one.
 const CHECK_NOT_RECORDED_NOTE: &str =
@@ -157,6 +159,17 @@ impl JobStatus {
             Self::SpawnFailed(message) => format!("failed to start ({message})"),
         }
     }
+
+    /// The state WORD a tool result's `data` carries (the window's contract,
+    /// plan 5b498359): `running`, `exited`, `killed` or `failed`.
+    fn word(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited(_) => "exited",
+            Self::Killed(_) => "killed",
+            Self::SpawnFailed(_) => "failed",
+        }
+    }
 }
 
 /// One job's shared state: the registry, the run task and the tools all hold a
@@ -166,6 +179,9 @@ impl JobStatus {
 /// only read it, so a query never blocks a run for longer than a lock scope.
 struct JobState {
     id: String,
+    /// The label the caller gave the job ("build game"). Carried by every later
+    /// job tool's result and shown by the window.
+    purpose: String,
     /// The command as the model wrote it — the filter classifies on it, so it
     /// must be the ORIGINAL string (not the PowerShell translation).
     command: String,
@@ -188,9 +204,10 @@ struct JobProgress {
 
 impl JobState {
     /// A job that has not started producing anything yet.
-    fn new(id: String, command: String, log_path: PathBuf) -> Self {
+    fn new(id: String, purpose: String, command: String, log_path: PathBuf) -> Self {
         Self {
             id,
+            purpose,
             command,
             started: Instant::now(),
             log_path,
@@ -299,7 +316,7 @@ pub struct JobRegistry {
 struct RegistryState {
     /// Job ids are `j1`, `j2`, ... per session.
     next_id: u64,
-    /// Created on the first `job_start`, so a session that never starts a job
+    /// Created on the first `job`, so a session that never starts a job
     /// leaves no folder behind.
     dir: Option<PathBuf>,
     jobs: BTreeMap<String, JobEntry>,
@@ -362,9 +379,15 @@ impl JobRegistry {
         resolve_cwd(&self.sandbox, cwd)
     }
 
-    /// Start a job for `command` in `cwd` and return its state. The command
-    /// begins running immediately; the caller never waits for it.
-    async fn start(&self, command: &str, cwd: PathBuf) -> Result<Arc<JobState>, String> {
+    /// Start a job for `command`, labelled `purpose`, in `cwd` and return its
+    /// state. The command begins running immediately; whether to wait for it is
+    /// the caller's decision.
+    async fn start(
+        &self,
+        command: &str,
+        purpose: &str,
+        cwd: PathBuf,
+    ) -> Result<Arc<JobState>, String> {
         let (id, log_path) = {
             let mut inner = self.inner.lock().expect("job registry lock poisoned");
             let running: Vec<String> = inner
@@ -402,7 +425,12 @@ impl JobRegistry {
             (id, log_path)
         };
 
-        let state = Arc::new(JobState::new(id.clone(), command.to_string(), log_path.clone()));
+        let state = Arc::new(JobState::new(
+            id.clone(),
+            purpose.to_string(),
+            command.to_string(),
+            log_path.clone(),
+        ));
         // ONE writer owns the log file: records are appended in arrival order,
         // and the file closes when every sender is gone.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -680,6 +708,24 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
+/// The `data` object every job tool returns: the id, the label, the command and
+/// the normalised state word (`running` / `exited` / `killed` / `failed`), plus
+/// `exit_code` once the job exited (plan 5b498359's contract; the window reads
+/// it, and falls back to the call's own arguments for old transcripts).
+fn job_data(state: &JobState) -> serde_json::Value {
+    let status = state.status();
+    let mut data = json!({
+        "job_id": state.id,
+        "purpose": state.purpose,
+        "command": state.command,
+        "state": status.word(),
+    });
+    if let JobStatus::Exited(code) = status {
+        data["exit_code"] = json!(code);
+    }
+    data
+}
+
 /// The shared shape of every job report: the state line, the run time, then a
 /// headed tail. `state` is the caller's label, so `job_wait` can report
 /// `matched: <line>` instead of the job's running state.
@@ -792,25 +838,77 @@ async fn wait_for_job(state: &JobState, pattern: Option<&Regex>, timeout: Durati
     }
 }
 
-/// Arguments for `job_start`.
+/// What a blocked wait produced: the report text and result `data` `job_wait`
+/// returns, whether the call succeeded, and how the wait ended.
+struct WaitReport {
+    /// The state line, the run time and the filtered tail.
+    text: String,
+    /// `job_data`'s contract plus `elapsed_ms` and (on a match) `matched`.
+    data: serde_json::Value,
+    /// A killed or never-started job is a failure; an exit code is data.
+    success: bool,
+    /// Why the wait returned.
+    outcome: WaitOutcome,
+}
+
+/// Block on `state` exactly as `job_wait` does and build its whole answer —
+/// `job` and `job_wait` share this ONE formatter, so the waiting `job` call and
+/// a later `job_wait` on the same id answer alike.
+async fn wait_report(
+    jobs: &JobRegistry,
+    state: &JobState,
+    pattern: Option<&Regex>,
+    timeout: Duration,
+) -> WaitReport {
+    let outcome = wait_for_job(state, pattern, timeout).await;
+    let matched = match &outcome {
+        WaitOutcome::Matched(line) => Some(line.clone()),
+        WaitOutcome::Finished | WaitOutcome::TimedOut => None,
+    };
+    let label = match &matched {
+        Some(line) => format!("matched: {line}"),
+        None => state.state_text(),
+    };
+    let tail = jobs.filtered_tail(state);
+    let mut data = job_data(state);
+    data["elapsed_ms"] = json!(state.elapsed().as_millis() as u64);
+    if let Some(line) = &matched {
+        data["matched"] = json!(line);
+    }
+    WaitReport {
+        text: job_report(state, &label, "tail (filtered):", &tail),
+        data,
+        success: !matches!(
+            state.status(),
+            JobStatus::Killed(_) | JobStatus::SpawnFailed(_)
+        ),
+        outcome,
+    }
+}
+
+/// Arguments for `job`.
 #[derive(Debug, Deserialize)]
-struct JobStartArgs {
+struct JobArgs {
     command: String,
     /// Optional working directory (relative to project root, sandboxed).
     #[serde(default)]
     cwd: Option<String>,
     /// A short human-readable label of what this job does (e.g. "building the
     /// workspace"). Required like `shell`'s: it was the first field dropped when
-    /// a call went malformed.
-    ///
-    /// Consumed by the frontend from the raw tool-call args (Mnemo2's
-    /// `argLabel` helper), so it is kept only so serde parses/validates it.
-    #[expect(dead_code, reason = "consumed by the frontend from raw tool-call args")]
+    /// a call went malformed. Every job tool carries it back in its `data`, and
+    /// the window titles the call with it.
     purpose: String,
+    /// Seconds to wait for the result in this call; 0 returns the id at once.
+    /// Default [`DEFAULT_WAIT_S`], capped at [`MAX_WAIT_S`].
+    #[serde(default)]
+    wait_s: Option<u64>,
+    /// Stop the wait early when a NEW output line matches this regex.
+    #[serde(default)]
+    pattern: Option<String>,
 }
 
-/// `job_start` — begin a background job and return its id at once.
-pub struct JobStartTool {
+/// `job` — run a background job and wait for its result in the same call.
+pub struct JobTool {
     jobs: Arc<JobRegistry>,
     /// The same shared core-operation list `ShellTool` holds, so a job-invoked
     /// `git push` raises the always-on prompt too.
@@ -819,8 +917,8 @@ pub struct JobStartTool {
     check_commands: Vec<String>,
 }
 
-impl JobStartTool {
-    /// A starter bound to the session's registry and core-operation list.
+impl JobTool {
+    /// A job runner bound to the session's registry and core-operation list.
     pub fn new(jobs: Arc<JobRegistry>, core_operations: Arc<RwLock<Vec<String>>>) -> Self {
         Self {
             jobs,
@@ -848,9 +946,9 @@ impl JobStartTool {
 }
 
 #[async_trait]
-impl Tool for JobStartTool {
+impl Tool for JobTool {
     fn name(&self) -> &str {
-        "job_start"
+        "job"
     }
 
     fn category(&self) -> ToolCategory {
@@ -877,27 +975,33 @@ impl Tool for JobStartTool {
 
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
-            "job_start",
-            format!(
-                "Start a command as a background JOB; returns its id at once. Then block on it \
-                 with job_wait — never with sleep. No silence limit, a {} hour cap, same \
-                 command/cwd/approval rules as shell. Not recorded as a check.",
-                JOB_TOTAL.as_secs() / 3600
-            ),
+            "job",
+            "Run a long build or test as a background job with no silence limit (3-hour cap) and \
+             wait for its result in this call. If it is still running when wait_s ends, you get \
+             its id for job_wait; wait_s 0 returns the id at once so you can work while it runs. \
+             purpose is a short label shown in the window, for example 'build game'.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The command to run in the background (same rules as shell)."
+                        "description": "The command to run as a job (same rules as shell)."
                     },
                     "purpose": {
                         "type": "string",
-                        "description": "Short label of what the job does, for the UI."
+                        "description": "Short label of what the job does, shown in the window, for example 'build game'."
                     },
                     "cwd": {
                         "type": ["string", "null"],
                         "description": "Working directory relative to the project root (sandboxed). Default: the root."
+                    },
+                    "wait_s": {
+                        "type": ["integer", "null"],
+                        "description": "Seconds to wait for the result in this call; 0 returns the id at once. Default 600, max 1800."
+                    },
+                    "pattern": {
+                        "type": ["string", "null"],
+                        "description": "Regex: stop waiting as soon as a NEW output line matches it."
                     }
                 },
                 "required": ["command", "purpose"]
@@ -906,31 +1010,83 @@ impl Tool for JobStartTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: JobStartArgs = match serde_json::from_value(args.clone()) {
+        let args: JobArgs = match serde_json::from_value(args.clone()) {
             Ok(args) => args,
             Err(error) => {
                 return ToolResult::error(invalid_args_error(
-                    "job_start",
+                    "job",
                     &error,
                     &args,
                     &tool_contract::recovery_hint("command + purpose"),
                 ))
             }
         };
+        // The pattern is parsed BEFORE the job starts: a malformed regex must
+        // not leave a running job nobody is waiting for.
+        let pattern = match args
+            .pattern
+            .as_deref()
+            .map(str::trim)
+            .filter(|pattern| !pattern.is_empty())
+            .map(Regex::new)
+            .transpose()
+        {
+            Ok(pattern) => pattern,
+            Err(error) => return ToolResult::error(format!("invalid pattern regex: {error}")),
+        };
         let cwd = match self.jobs.cwd(args.cwd.as_deref()) {
             Ok(path) => path,
             Err(message) => return ToolResult::error(message),
         };
-        let state = match self.jobs.start(&args.command, cwd).await {
+        let state = match self.jobs.start(&args.command, &args.purpose, cwd).await {
             Ok(state) => state,
             Err(message) => return ToolResult::error(message),
         };
-        let mut output = format!("job {} started: {}\n", state.id, state.command);
-        if self.is_check_command(&state.command) {
-            output.push_str(CHECK_NOT_RECORDED_NOTE);
-            output.push('\n');
+        // The check note rides BOTH paths: a job never becomes a recorded check,
+        // whether or not this call waits for it.
+        let note = if self.is_check_command(&state.command) {
+            format!("{CHECK_NOT_RECORDED_NOTE}\n")
+        } else {
+            String::new()
+        };
+        let wait_s = args.wait_s.unwrap_or(DEFAULT_WAIT_S).min(MAX_WAIT_S);
+        if wait_s == 0 {
+            // `wait_s` 0 IS the old `job_start`: hand the id back at once so the
+            // caller can work in parallel (or tend a dev server).
+            let mut data = job_data(&state);
+            data["waited_s"] = json!(0);
+            return ToolResult::success(format!(
+                "job {} started: {}\n{note}",
+                state.id, state.command
+            ))
+            .with_data(data);
         }
-        ToolResult::success(output).with_data(json!({ "job_id": state.id }))
+        let began = Instant::now();
+        let report = wait_report(
+            &self.jobs,
+            &state,
+            pattern.as_ref(),
+            Duration::from_secs(wait_s),
+        )
+        .await;
+        let waited_s = began.elapsed().as_secs();
+        // The body IS `job_wait`'s answer; the header names the job, which is
+        // what the caller needs when the wait ended while it still runs.
+        let mut output = format!("job {}: {}\n{note}{}", state.id, state.command, report.text);
+        if matches!(report.outcome, WaitOutcome::TimedOut) {
+            output.push_str(&format!(
+                "still running: continue it with job_wait (job_id \"{}\"), or work in \
+                 parallel and collect it later.\n",
+                state.id
+            ));
+        }
+        let mut data = report.data;
+        data["waited_s"] = json!(waited_s);
+        ToolResult {
+            success: report.success,
+            output,
+            data: Some(data),
+        }
     }
 }
 
@@ -987,7 +1143,7 @@ impl Tool for JobWaitTool {
                 "properties": {
                     "job_id": {
                         "type": "string",
-                        "description": "The id job_start returned (j1, j2, ...)."
+                        "description": "The id job returned (j1, j2, ...)."
                     },
                     "pattern": {
                         "type": ["string", "null"],
@@ -1031,37 +1187,11 @@ impl Tool for JobWaitTool {
             Err(error) => return ToolResult::error(format!("invalid pattern regex: {error}")),
         };
         let timeout = Duration::from_secs(args.timeout_s.unwrap_or(DEFAULT_WAIT_S).clamp(1, MAX_WAIT_S));
-        let outcome = wait_for_job(&state, pattern.as_ref(), timeout).await;
-        let matched = match &outcome {
-            WaitOutcome::Matched(line) => Some(line.clone()),
-            WaitOutcome::Finished | WaitOutcome::TimedOut => None,
-        };
-        let tail = self.jobs.filtered_tail(&state);
-        let label = match &matched {
-            Some(line) => format!("matched: {line}"),
-            None => state.state_text(),
-        };
-        let text = job_report(&state, &label, "tail (filtered):", &tail);
-        let mut result_data = json!({
-            "job_id": state.id,
-            "state": state.state_text(),
-            "elapsed_ms": state.elapsed().as_millis() as u64,
-        });
-        if let Some(line) = matched {
-            result_data["matched"] = json!(line);
-        }
-        if let JobStatus::Exited(code) = state.status() {
-            result_data["exit_code"] = json!(code);
-        }
-        // A killed or never-started job is a failure; an exit code is data.
-        let success = !matches!(
-            state.status(),
-            JobStatus::Killed(_) | JobStatus::SpawnFailed(_)
-        );
+        let report = wait_report(&self.jobs, &state, pattern.as_ref(), timeout).await;
         ToolResult {
-            success,
-            output: text,
-            data: Some(result_data),
+            success: report.success,
+            output: report.text,
+            data: Some(report.data),
         }
     }
 }
@@ -1113,7 +1243,7 @@ impl Tool for JobTailTool {
                 "properties": {
                     "job_id": {
                         "type": "string",
-                        "description": "The id job_start returned."
+                        "description": "The id job returned."
                     },
                     "lines": {
                         "type": ["integer", "null"],
@@ -1160,11 +1290,11 @@ impl Tool for JobTailTool {
             text.push_str(&tail);
             text.push('\n');
         }
-        ToolResult::success(text).with_data(json!({
-            "job_id": state.id,
-            "state": state.state_text(),
-            "elapsed_ms": state.elapsed().as_millis() as u64,
-        }))
+        ToolResult::success(text).with_data({
+            let mut data = job_data(&state);
+            data["elapsed_ms"] = json!(state.elapsed().as_millis() as u64);
+            data
+        })
     }
 }
 
@@ -1210,7 +1340,7 @@ impl Tool for JobKillTool {
                 "properties": {
                     "job_id": {
                         "type": "string",
-                        "description": "The id job_start returned."
+                        "description": "The id job returned."
                     }
                 },
                 "required": ["job_id"]
@@ -1236,11 +1366,11 @@ impl Tool for JobKillTool {
         };
         let tail = self.jobs.filtered_tail(&state);
         let text = job_report(&state, &state.state_text(), "tail (filtered):", &tail);
-        ToolResult::success(text).with_data(json!({
-            "job_id": state.id,
-            "state": state.state_text(),
-            "elapsed_ms": state.elapsed().as_millis() as u64,
-        }))
+        ToolResult::success(text).with_data({
+            let mut data = job_data(&state);
+            data["elapsed_ms"] = json!(state.elapsed().as_millis() as u64);
+            data
+        })
     }
 }
 
@@ -1259,8 +1389,8 @@ mod tests {
         ))
     }
 
-    fn starter(jobs: &Arc<JobRegistry>) -> JobStartTool {
-        JobStartTool::new(Arc::clone(jobs), Arc::new(RwLock::new(Vec::new())))
+    fn starter(jobs: &Arc<JobRegistry>) -> JobTool {
+        JobTool::new(Arc::clone(jobs), Arc::new(RwLock::new(Vec::new())))
     }
 
     /// A sleep in the platform shell's own syntax — `shell.rs` owns that split
@@ -1275,16 +1405,17 @@ mod tests {
             .as_ref()
             .and_then(|data| data.get("job_id"))
             .and_then(Value::as_str)
-            .expect("job_start returns a job id")
+            .expect("a job tool returns a job id")
             .to_string()
     }
 
-    /// Start `command` and return its id, asserting the start succeeded.
-    async fn start(tool: &JobStartTool, command: &str) -> String {
+    /// Start `command` with `wait_s` 0 — the id comes back at once — and return
+    /// it, asserting the start succeeded.
+    async fn start(tool: &JobTool, command: &str) -> String {
         let result = tool
-            .execute(json!({ "command": command, "purpose": "test job" }))
+            .execute(json!({ "command": command, "purpose": "test job", "wait_s": 0 }))
             .await;
-        assert!(result.success, "job_start failed: {}", result.output);
+        assert!(result.success, "job failed: {}", result.output);
         job_id(&result)
     }
 
@@ -1394,7 +1525,10 @@ mod tests {
         let root = dir.path().to_path_buf();
         let jobs = registry(&dir);
         let command = crate::tool::agent::shell::test_heartbeat("beat.txt");
-        let state = jobs.start(&command, root.clone()).await.expect("job start");
+        let state = jobs
+            .start(&command, "heartbeat", root.clone())
+            .await
+            .expect("job start");
         let log_dir = state
             .log_path
             .parent()
@@ -1440,13 +1574,21 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..MAX_RUNNING_JOBS {
             let state = jobs
-                .start(&sleep_command(Duration::from_secs(30)), root.clone())
+                .start(
+                    &sleep_command(Duration::from_secs(30)),
+                    "limit test",
+                    root.clone(),
+                )
                 .await
                 .expect("a job within the limit");
             ids.push(state.id.clone());
         }
         let message = jobs
-            .start(&sleep_command(Duration::from_secs(30)), root.clone())
+            .start(
+                &sleep_command(Duration::from_secs(30)),
+                "limit test",
+                root.clone(),
+            )
             .await
             .err()
             .expect("the fifth job must be refused");
@@ -1462,8 +1604,217 @@ mod tests {
         }
     }
 
+    /// Plan 5b498359: ONE call starts a job AND waits for its result — the
+    /// build's exit status and output tail come back without a second call.
     #[tokio::test]
-    async fn job_start_validates_cwd_like_shell() {
+    async fn job_waits_for_a_short_command_and_returns_its_result() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let jobs = registry(&dir);
+        let result = starter(&jobs)
+            .execute(json!({
+                "command": "echo one; echo error: boom; exit 2",
+                "purpose": "build game"
+            }))
+            .await;
+        assert!(result.success, "job failed: {}", result.output);
+        assert!(
+            result.output.contains("state: exited 2"),
+            "the one call did not return the exit status: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("boom"),
+            "the one call did not return the output tail: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("still running"),
+            "a command that ends inside the wait must not report still running: {}",
+            result.output
+        );
+        let data = result.data.as_ref().expect("data");
+        assert_eq!(data.get("state"), Some(&json!("exited")));
+        assert_eq!(data.get("exit_code"), Some(&json!(2)));
+        assert_eq!(data.get("purpose"), Some(&json!("build game")));
+        assert_eq!(
+            data.get("command"),
+            Some(&json!("echo one; echo error: boom; exit 2"))
+        );
+        assert!(
+            data.get("waited_s").is_some(),
+            "the job result must carry waited_s: {data}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_with_wait_s_0_returns_the_id_at_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let jobs = registry(&dir);
+        let began = Instant::now();
+        let result = starter(&jobs)
+            .execute(json!({
+                "command": sleep_command(Duration::from_secs(30)),
+                "purpose": "dev server",
+                "wait_s": 0
+            }))
+            .await;
+        assert!(result.success, "job failed: {}", result.output);
+        // Waiting for the 30-second sleep would blow this bound wide open.
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "wait_s 0 waited for the command: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            result.output.contains("started"),
+            "wait_s 0 must hand back the started id: {}",
+            result.output
+        );
+        let data = result.data.as_ref().expect("data");
+        assert_eq!(data.get("state"), Some(&json!("running")));
+        assert_eq!(data.get("waited_s"), Some(&json!(0)));
+        assert_eq!(data.get("purpose"), Some(&json!("dev server")));
+        let id = job_id(&result);
+        JobKillTool::new(Arc::clone(&jobs))
+            .execute(json!({ "job_id": id }))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn job_still_running_returns_the_id_for_job_wait() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let jobs = registry(&dir);
+        let result = starter(&jobs)
+            .execute(json!({
+                "command": format!("{}; echo done", sleep_command(Duration::from_secs(3))),
+                "purpose": "slow test",
+                "wait_s": 1
+            }))
+            .await;
+        assert!(result.success, "job failed: {}", result.output);
+        assert!(
+            result.output.contains("state: still running"),
+            "a short wait_s must report the job as still running: {}",
+            result.output
+        );
+        assert_eq!(
+            result.data.as_ref().expect("data").get("state"),
+            Some(&json!("running"))
+        );
+        // The model reads the TEXT, so the id it needs for job_wait must be in it.
+        let id = job_id(&result);
+        assert!(
+            result.output.contains(&id),
+            "the still-running answer must name the id for job_wait: {}",
+            result.output
+        );
+        let wait = JobWaitTool::new(Arc::clone(&jobs))
+            .execute(json!({ "job_id": id, "timeout_s": 60 }))
+            .await;
+        assert!(
+            wait.output.contains("state: exited 0"),
+            "job_wait after job did not collect the result: {}",
+            wait.output
+        );
+    }
+
+    #[tokio::test]
+    async fn job_pattern_returns_on_a_matching_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let jobs = registry(&dir);
+        let command = format!(
+            "{}; echo ready; {}",
+            sleep_command(Duration::from_millis(500)),
+            sleep_command(Duration::from_secs(30))
+        );
+        let began = Instant::now();
+        let result = starter(&jobs)
+            .execute(json!({
+                "command": command,
+                "purpose": "dev server",
+                "wait_s": 20,
+                "pattern": "ready"
+            }))
+            .await;
+        assert!(result.success, "job failed: {}", result.output);
+        assert!(
+            result.output.contains("state: matched: ready"),
+            "the matched line is missing: {}",
+            result.output
+        );
+        // Well under the job's 30-second sleep: the wait ended on the pattern.
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "the pattern wait did not return early: {:?}",
+            began.elapsed()
+        );
+        let id = job_id(&result);
+        JobKillTool::new(Arc::clone(&jobs))
+            .execute(json!({ "job_id": id }))
+            .await;
+    }
+
+    /// Plan 5b498359's data contract: EVERY job tool reports the id, the label,
+    /// the command and the state — plus the exit code once the job exited.
+    #[tokio::test]
+    async fn every_job_tool_data_carries_purpose_and_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let jobs = registry(&dir);
+        let started = starter(&jobs)
+            .execute(json!({ "command": "echo hi", "purpose": "build game", "wait_s": 0 }))
+            .await;
+        let id = job_id(&started);
+        let tail = JobTailTool::new(Arc::clone(&jobs))
+            .execute(json!({ "job_id": id }))
+            .await;
+        let wait = JobWaitTool::new(Arc::clone(&jobs))
+            .execute(json!({ "job_id": id, "timeout_s": 60 }))
+            .await;
+        let kill = JobKillTool::new(Arc::clone(&jobs))
+            .execute(json!({ "job_id": id }))
+            .await;
+        for (tool, result) in [
+            ("job", &started),
+            ("job_tail", &tail),
+            ("job_wait", &wait),
+            ("job_kill", &kill),
+        ] {
+            let data = result
+                .data
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tool} returned no data"));
+            assert_eq!(data.get("job_id"), Some(&json!(id)), "{tool} lost the id");
+            assert_eq!(
+                data.get("purpose"),
+                Some(&json!("build game")),
+                "{tool} lost the purpose"
+            );
+            assert_eq!(
+                data.get("command"),
+                Some(&json!("echo hi")),
+                "{tool} lost the command"
+            );
+            let state = data
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{tool} lost the state"));
+            assert!(
+                ["running", "exited", "killed", "failed"].contains(&state),
+                "{tool} reported an off-contract state: {state}"
+            );
+        }
+        // The job ended by the time job_wait returned: the exit code is data.
+        for (tool, result) in [("job_wait", &wait), ("job_kill", &kill)] {
+            assert_eq!(
+                result.data.as_ref().expect("data").get("exit_code"),
+                Some(&json!(0)),
+                "{tool} lost the exit code of an exited job"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_validates_cwd_like_shell() {
         let dir = tempfile::tempdir().expect("temp dir");
         let jobs = registry(&dir);
         let tool = starter(&jobs);
@@ -1499,14 +1850,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_start_notes_a_check_command_run_is_not_recorded() {
+    async fn job_notes_a_check_command_run_is_not_recorded() {
         let dir = tempfile::tempdir().expect("temp dir");
         let jobs = registry(&dir);
         let tool = starter(&jobs).with_check_commands(vec!["echo recorded".to_string()]);
         let noted = tool
             .execute(json!({ "command": "echo recorded", "purpose": "test" }))
             .await;
-        assert!(noted.success, "job_start failed: {}", noted.output);
+        assert!(noted.success, "job failed: {}", noted.output);
         assert!(
             noted.output.contains(CHECK_NOT_RECORDED_NOTE),
             "the check note is missing: {}",
@@ -1515,7 +1866,7 @@ mod tests {
         let other = tool
             .execute(json!({ "command": "echo not-a-check", "purpose": "test" }))
             .await;
-        assert!(other.success, "job_start failed: {}", other.output);
+        assert!(other.success, "job failed: {}", other.output);
         assert!(
             !other.output.contains(CHECK_NOT_RECORDED_NOTE),
             "a non-check command got the check note: {}",

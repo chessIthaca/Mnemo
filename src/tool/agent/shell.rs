@@ -591,7 +591,7 @@ impl ShellTool {
 
 /// Resolve and sandbox-validate a working directory — the shared contract of
 /// `shell` and the job tools (plan 5b85ab61 step 2 reuses it instead of
-/// copying the rules, so `job_start`'s `cwd` is validated exactly like
+/// copying the rules, so `job`'s `cwd` is validated exactly like
 /// `shell`'s).
 ///
 /// - `None` / empty → the sandbox root.
@@ -746,7 +746,7 @@ impl Tool for ShellTool {
                     format!(
                         "command printed nothing for {label} and was killed (silence \
                          timeout); a command that works silently for long should print \
-                         progress, or run it with job_start"
+                         progress, or run it with job"
                     ),
                     "silence",
                     stdout,

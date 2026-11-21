@@ -79,7 +79,7 @@ struct RunChecksArgs {
     ///
     /// Consumed by the frontend from the raw tool-call args (Mnemo2's
     /// `argLabel` helper), so it is never read in Rust — it is kept here so
-    /// serde parses and validates it, like `shell`'s and `job_start`'s.
+    /// serde parses and validates it, like `shell`'s and `job`'s.
     #[expect(dead_code, reason = "consumed by the frontend from raw tool-call args")]
     purpose: String,
 }

@@ -3041,6 +3041,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "It tightens the existing executor git gate (an internal guardrail) with an extra refusal; no specified behaviour in external-lead, worker-brief, tier-ladder or other governed capabilities changes."
+    },
+    {
+      "id": "5b498359",
+      "status": "open",
+      "created_at_ms": 1795301607351,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "It renames and extends an internal worker tool and changes how the window renders tool calls; no governed capability's specified behaviour changes (the worker-brief and external-lead specs don't name the job tools)."
     }
   ]
 }

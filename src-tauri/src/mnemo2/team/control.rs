@@ -33,7 +33,8 @@ use super::pump::{pump_worker, snapshot_model};
 use super::spawn::load_check_commands;
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
-    audit_finished, audit_finished_error, kickoff_message, note_model, session_model_spec,
+    agent_worker_refusal, audit_finished, audit_finished_error, kickoff_message, note_model,
+    session_model_spec,
 };
 use super::routing::{
     NUDGE_LADDER, final_tier, logs_label, logs_routing, next_tier_above, outcome_row,
@@ -51,6 +52,11 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
+        // A Claude Code agent worker has no session to message: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+            return Err(refusal);
+        }
         self.message_inner(worker_id, text, sender).await
     }
 
@@ -427,6 +433,11 @@ impl TeamRuntime {
     pub async fn resume(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
+        // A Claude Code agent worker has no session to reattach: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+            return Err(refusal);
+        }
         self.resume_inner(worker_id).await
     }
 
@@ -465,7 +476,7 @@ impl TeamRuntime {
                 "worker '{worker_id}' is already running; team_message it to continue"
             ));
         }
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
@@ -593,6 +604,11 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
+        // A Claude Code agent worker has no session to reroute: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+            return Err(refusal);
+        }
         self.change_model_locked(worker_id, model, reasoning_effort, source)
             .await
     }
@@ -737,6 +753,11 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         let mut record = self.worker(worker_id).await?;
+        // A Claude Code agent worker has no session to compact: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_worker_refusal(&record) {
+            return Err(refusal);
+        }
         if record.compacting {
             return Err(format!("worker '{worker_id}' is already compacting"));
         }

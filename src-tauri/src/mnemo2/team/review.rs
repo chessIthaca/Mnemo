@@ -30,7 +30,8 @@ use super::nudge::{claim_nudge, deliver_nudge, pending_fix_downshift, route_fix_
 use super::persistence::TeamPersistence;
 use super::pump::save_workers;
 use super::record::{
-    ChangeSource, InboxKind, MessageSender, WorkerCheck, WorkerRecord, WorkerStatus,
+    agent_worker_refusal, unfinished_agent_error, ChangeSource, InboxKind, MessageSender,
+    WorkerCheck, WorkerRecord, WorkerStatus,
 };
 use super::routing::NUDGE_LADDER;
 
@@ -194,6 +195,9 @@ impl TeamRuntime {
             return Err("the review summary is empty".to_string());
         }
         let worker = self.worker(worker_id).await?;
+        if let Some(error) = unfinished_agent_error(&worker) {
+            return Err(error);
+        }
         if worker.kind == "audit" {
             return Err(
                 "an audit worker is a read-only reviewer and is not reviewed; adjudicate it by recording team_review on its implementation worker with independent_reviewer_id".to_string(),
@@ -388,6 +392,9 @@ impl TeamRuntime {
             return Err("a check needs a name and a passed/failed outcome".to_string());
         }
         let worker = self.worker(worker_id).await?;
+        if let Some(error) = unfinished_agent_error(&worker) {
+            return Err(error);
+        }
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("checks cannot be added during or after merge".to_string());
         }
@@ -812,6 +819,12 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         let worker = self.worker(worker_id).await?;
+        // A Claude Code agent worker has no session to route a fix into:
+        // the lead continues it with its own agent and closes it with
+        // team_agent_done.
+        if let Some(refusal) = agent_worker_refusal(&worker) {
+            return Err(refusal);
+        }
         // Audits only ever produce findings; they never receive them.
         debug_assert_ne!(
             worker.kind,

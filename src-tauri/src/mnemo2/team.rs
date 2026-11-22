@@ -717,6 +717,22 @@ impl TeamRuntime {
         ledger::live_turns(&self.records.lock().await)
     }
 
+    /// Active workers for every slot gate: live Mnemo sessions plus
+    /// session-free Claude Code agents in Working or Interrupted.
+    pub(super) async fn active_workers_for_slots(&self) -> usize {
+        let active_agents = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| {
+                worker.claude_agent.is_some()
+                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Interrupted)
+            })
+            .count();
+        self.live.lock().await.len() + active_agents
+    }
+
     /// Persist a new live-session cap without dropping active workers.
     pub async fn set_slots(&self, slots: usize) -> Result<TeamSnapshot, String> {
         if !(1..=MAX_WORKER_SLOTS).contains(&slots) {
@@ -725,7 +741,7 @@ impl TeamRuntime {
             ));
         }
         let _operation = self.merge_lock.lock().await;
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         if slots < active {
             return Err(format!(
                 "stop {} worker(s) before reducing slots to {slots}",
@@ -937,9 +953,26 @@ impl TeamRuntime {
     }
 
     async fn persist(&self) -> Result<(), String> {
+        self.persist_with_snapshot(None).await
+    }
+
+    /// Persist the ledger, optionally substituting one worker in the saved
+    /// snapshot. The override is a regression seam for transcript write
+    /// failures; normal lifecycle writes always pass `None`.
+    async fn persist_with_snapshot(
+        &self,
+        snapshot_override: Option<WorkerRecord>,
+    ) -> Result<(), String> {
         // The final write of a closing runtime, so it bypasses the shutdown
         // check that voids detached saves.
-        save_workers_now(&self.records, &self.usage, &self.save_lock, &self.persistence).await
+        save_workers_now(
+            &self.records,
+            &self.usage,
+            &self.save_lock,
+            &self.persistence,
+            snapshot_override,
+        )
+        .await
     }
 
     /// Stop every live worker while preserving merged audit records.

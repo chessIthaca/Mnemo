@@ -1047,6 +1047,18 @@ impl Shared {
         if !attached {
             return json!({ "decision": "allow", "reason": "" });
         }
+        // While a Claude Code agent worker runs the step the lead dispatched
+        // to it, the lead's own Agent is doing Mnemo's work: let it run.
+        if let Some(target) = target.as_ref() {
+            if let Some((worker_id, tier)) = target.team.claude_agent_working().await {
+                return json!({
+                    "decision": "allow",
+                    "reason": format!(
+                        "runs Mnemo worker {worker_id} ({tier} tier) as a Claude Code agent"
+                    ),
+                });
+            }
+        }
         let allowed = agents_without_prompt(&self.host.config_dir());
         if allowed
             .iter()
@@ -3854,6 +3866,108 @@ mod tests {
             .lead_post("/lead/gate-agent", json!({ "root": "/elsewhere", "subagent_type": "x" }))
             .await;
         assert_eq!(reply["decision"], "allow");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_allows_agents_while_an_agent_worker_runs() {
+        use crate::mnemo2::runtime::LeadModel;
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        let ask = |subagent_type: &str| json!({ "root": root, "subagent_type": subagent_type });
+        fixture.attach().await;
+        fixture.rpc(initialize()).await;
+
+        // The high tier runs as a Claude Code agent when this lead leads.
+        let mut dto = mnemo::headless::TiersDto::default();
+        dto.tiers[0].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].claude_agent = Some("opus".to_string());
+        team.set_catalog(
+            vec![LeadModel {
+                endpoint: "test".to_string(),
+                model: "scripted-a".to_string(),
+                spec: "test/scripted-a".to_string(),
+                is_default: true,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            dto,
+            Vec::new(),
+        );
+        // A plan to dispatch on the agent tier.
+        let searched = fixture
+            .call("memory_search", json!({"query": "external lead planning"}))
+            .await;
+        ok_text(&searched);
+        let (_, reply) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": "plan_create", "arguments": {
+                    "title": "Agent tier plan",
+                    "goal": "Prove the agent gate and team_agent_done",
+                    "context": "The lead's own agent runs this step; src/lib.rs is the anchor file for the change.",
+                    "steps": ["**One** - edit src/lib.rs"]
+                } }
+            }))
+            .await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let plan_id = reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .strip_prefix("Created plan ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("a plan id")
+            .to_string();
+
+        // No agent worker yet: the gate asks.
+        let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
+        assert_eq!(gate["decision"], "ask", "{gate}");
+
+        // The dispatch hands the step to the lead's agent: the answer carries
+        // the claude_agent block.
+        let dispatched = fixture
+            .call("team_dispatch", json!({
+                "worker_id": "extagnt0001",
+                "plan_id": plan_id,
+                "step": 1,
+                "tier": "high",
+                "brief": "write src/lib.rs"
+            }))
+            .await;
+        assert_eq!(dispatched["result"]["isError"], false, "{dispatched}");
+        let answer: Value = serde_json::from_str(&ok_text(&dispatched)).expect("dispatch JSON");
+        let block = &answer["result"]["claude_agent"];
+        assert_eq!(block["model"].as_str(), Some("opus"), "{answer}");
+        assert!(
+            block["prompt"]
+                .as_str()
+                .is_some_and(|prompt| !prompt.is_empty()),
+            "{answer}"
+        );
+
+        // While the agent worker is Working, the gate allows, naming it.
+        let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
+        assert_eq!(gate["decision"], "allow", "{gate}");
+        assert_eq!(
+            gate["reason"],
+            "runs Mnemo worker extagnt0001 (high tier) as a Claude Code agent"
+        );
+
+        // team_agent_done closes the worker and the finished notice rides the
+        // tool answer; the gate asks again.
+        let done = fixture
+            .call("team_agent_done", json!({
+                "worker_id": "extagnt0001",
+                "report": "The agent committed its work in the worktree."
+            }))
+            .await;
+        assert_eq!(done["result"]["isError"], false, "{done}");
+        let done_text = ok_text(&done);
+        assert!(done_text.contains("finished its turn"), "{done_text}");
+        let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
+        assert_eq!(gate["decision"], "ask", "{gate}");
         fixture.shutdown().await;
     }
 

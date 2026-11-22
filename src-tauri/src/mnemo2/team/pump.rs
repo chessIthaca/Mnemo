@@ -1599,19 +1599,40 @@ pub(super) async fn save_workers(
     if persistence.closed.load(Ordering::SeqCst) {
         return Ok(());
     }
-    save_workers_now(records, usage, save_lock, persistence).await
+    save_workers_now(records, usage, save_lock, persistence, None).await
 }
 
 /// [`save_workers`] without the shutdown check: the closing runtime's final
-/// persist.
+/// persist. `snapshot_override` replaces one worker in the saved snapshot,
+/// which lets a persistence regression force a transcript write without
+/// changing the runtime's in-memory record.
 pub(super) async fn save_workers_now(
     records: &Arc<Mutex<Vec<WorkerRecord>>>,
     usage: &Arc<Mutex<ProjectUsage>>,
     save_lock: &Arc<Mutex<()>>,
     persistence: &TeamPersistence,
+    snapshot_override: Option<WorkerRecord>,
 ) -> Result<(), String> {
-    let _serialized = save_lock.lock().await;
-    let workers = records.lock().await.clone();
+    let save_guard = save_lock.lock().await;
+    save_workers_now_locked(records, usage, persistence, snapshot_override, &save_guard).await
+}
+
+/// Persist with the save serialization guard already held. Holding that
+/// guard across a record mutation and this write prevents every other saver
+/// from cloning a transient in-memory state.
+pub(super) async fn save_workers_now_locked(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: &Arc<Mutex<ProjectUsage>>,
+    persistence: &TeamPersistence,
+    snapshot_override: Option<WorkerRecord>,
+    _save_guard: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<(), String> {
+    let mut workers = records.lock().await.clone();
+    if let Some(snapshot) = snapshot_override {
+        if let Some(worker) = workers.iter_mut().find(|worker| worker.id == snapshot.id) {
+            *worker = snapshot;
+        }
+    }
     let usage = usage.lock().await.clone();
     let persistence = persistence.clone();
     let team = PersistedTeam {

@@ -919,3 +919,19 @@ fn worktree_remove_removes_plain_worktrees_and_leaves_pools_alone() {
     assert!(!std::path::Path::new(&plain).exists(), "the plain worktree is gone");
     assert_eq!(git(&repo, &["branch", "--list", "worktree-agent-plain2"]), "");
 }
+
+#[test]
+fn gate_agent_passes_the_isolation_on() {
+    let sandbox = Sandbox::new();
+    let server = server_with(&sandbox, "/lead/gate-agent", json!({ "decision": "allow", "reason": "" }));
+    let env = sandbox.env();
+    assert!(gate_agent(
+        &env,
+        &gate_input(&sandbox, "Agent", json!({ "subagent_type": "general-purpose", "isolation": "worktree" })),
+    )
+    .is_none());
+    assert!(gate_agent(&env, &gate_input(&sandbox, "Agent", json!({ "subagent_type": "Explore" }))).is_none());
+    let sent = server.requests_to("/lead/gate-agent");
+    assert_eq!(sent[0].json()["isolation"], "worktree");
+    assert!(sent[1].json().get("isolation").is_none(), "no isolation, no field");
+}

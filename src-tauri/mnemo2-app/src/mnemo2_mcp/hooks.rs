@@ -253,12 +253,12 @@ pub fn gate_agent(env: &Env, stdin_text: &str) -> Option<String> {
             other => other.to_string(),
         });
     let instance = find_instance_for_hook(env, &hook_cwd(env, &input))?;
-    let reply = call(
-        &instance,
-        "/lead/gate-agent",
-        &json!({ "root": instance.root, "subagent_type": subagent_type }),
-        HOOK_TIMEOUT,
-    )?;
+    let mut body = json!({ "root": instance.root, "subagent_type": subagent_type });
+    // The gate wants agent workers launched with worktree isolation.
+    if let Some(isolation) = input.pointer("/tool_input/isolation").and_then(Value::as_str) {
+        body["isolation"] = json!(isolation);
+    }
+    let reply = call(&instance, "/lead/gate-agent", &body, HOOK_TIMEOUT)?;
     if reply.get("decision").and_then(Value::as_str) != Some("ask") {
         return None;
     }

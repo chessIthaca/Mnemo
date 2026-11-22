@@ -707,6 +707,17 @@ pub(super) fn waits_for_agent(worker: &WorkerRecord) -> bool {
 pub(super) const AGENT_WORKER_CAP: usize = 3;
 
 impl TeamRuntime {
+    /// The agent worker that waits for its agent to be launched, if one does:
+    /// the agent gate wants that launch made with isolation "worktree".
+    pub async fn agent_worker_waiting(&self) -> Option<String> {
+        self.records
+            .lock()
+            .await
+            .iter()
+            .find(|worker| waits_for_agent(worker))
+            .map(|worker| worker.id.clone())
+    }
+
     /// Why another agent worker may not start now, if it may not (plan
     /// 4d920eec decisions 4-5): one already waits for its agent, so the next
     /// isolated launch could be handed the wrong checkout, or

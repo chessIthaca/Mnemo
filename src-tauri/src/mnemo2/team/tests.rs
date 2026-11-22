@@ -18217,10 +18217,9 @@ async fn team_message_on_an_agent_worker_returns_the_sendmessage_instruction() {
     let worker = team.worker("agentMsg01").await.expect("worker");
     assert_eq!(worker.status, WorkerStatus::Working);
     assert!(
-        answer.output.contains(&format!(
-            "No agent is registered for agentMsg01: start a new Agent in {} with this message, then call team_agent_started.",
-            worker.worktree.display()
-        )),
+        answer.output.contains(
+            "No agent is registered for agentMsg01: start a new Agent with isolation \"worktree\" and this message; Mnemo hands it this worker's checkout and registers it."
+        ),
         "{}",
         answer.output
     );

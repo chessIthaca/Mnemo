@@ -1217,9 +1217,8 @@ fn continue_agent_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
             worker.id
         ),
         None => format!(
-            "No agent is registered for {}: start a new Agent in {} with this message, then call team_agent_started.",
-            worker.id,
-            worker.worktree.display()
+            "No agent is registered for {}: start a new Agent with isolation \"worktree\" and this message; Mnemo hands it this worker's checkout and registers it.",
+            worker.id
         ),
     };
     let data = serde_json::to_value(worker).unwrap_or(Value::Null);

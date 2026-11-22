@@ -21,7 +21,7 @@
 //
 // Usage: node scripts/install-mnemo2-mcp.mjs [release|debug]   (default release)
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -97,4 +97,40 @@ const results = [
   copyWithRollover(host, join(configDir, "bin", `mnemo-models${exe}`)),
 ];
 console.log(`  starts ${app}`);
+
+// The command-line `claude` runs the Mnemo plugin from the copy
+// `claude plugin install` made in its plugin cache, so refresh that copy's
+// hooks, skills and manifest too (plan 4d920eec decision 9); the Claude
+// desktop app reads the plugin straight from this repository. Best effort:
+// a missing cache or file is skipped silently.
+function refreshInstalledPlugin() {
+  const registry = join(homedir(), ".claude", "plugins", "installed_plugins.json");
+  if (!existsSync(registry)) return;
+  let installs;
+  try {
+    installs = JSON.parse(readFileSync(registry, "utf8")).plugins ?? {};
+  } catch {
+    return;
+  }
+  const source = join(root, "mnemo2", "plugin");
+  for (const [key, entries] of Object.entries(installs)) {
+    if (!key.startsWith("mnemo@")) continue;
+    for (const entry of Array.isArray(entries) ? entries : [entries]) {
+      const target = entry?.installPath;
+      if (!target || !existsSync(target) || resolve(target) === resolve(source)) continue;
+      for (const name of ["hooks", "skills", ".claude-plugin", ".mcp.json", "README.md"]) {
+        const from = join(source, name);
+        if (!existsSync(from)) continue;
+        try {
+          cpSync(from, join(target, name), { recursive: true, force: true });
+        } catch (error) {
+          console.error(`install-mnemo2-mcp: could not refresh ${join(target, name)}: ${error.message}`);
+        }
+      }
+      console.log(`install-mnemo2-mcp: refreshed the installed plugin copy ${target}`);
+    }
+  }
+}
+refreshInstalledPlugin();
+
 if (results.includes(false)) process.exit(1);

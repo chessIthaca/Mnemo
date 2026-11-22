@@ -110,6 +110,11 @@ pub const DEFAULT_AGENTS_WITHOUT_PROMPT: [&str; 2] = ["Explore", "claude-code-gu
 const GATE_REASON: &str =
     "This bypasses Mnemo's workers and runs on your Claude subscription. Allow?";
 
+/// The reason the agent gate asks while an agent worker waits for its launch
+/// and the Agent call lacks worktree isolation (plan 4d920eec decision 7).
+const WORKTREE_GATE_REASON: &str =
+    "Launch Mnemo agent workers with isolation \"worktree\" so they get their warm checkout.";
+
 /// The tool that brings the Mnemo2 window to the front.
 const OPEN_MISSION_CONTROL: &str = "open_mission_control";
 
@@ -1100,8 +1105,15 @@ impl Shared {
             return json!({ "decision": "allow", "reason": "" });
         }
         // While a Claude Code agent worker runs the step the lead dispatched
-        // to it, the lead's own Agent is doing Mnemo's work: let it run.
+        // to it, the lead's own Agent is doing Mnemo's work: let it run. The
+        // launch for a worker that waits for its agent must use worktree
+        // isolation, or the agent would miss its warm checkout (plan
+        // 4d920eec decision 7).
         if let Some(target) = target.as_ref() {
+            let isolated = body.get("isolation").and_then(Value::as_str) == Some("worktree");
+            if !isolated && target.team.agent_worker_waiting().await.is_some() {
+                return json!({ "decision": "ask", "reason": WORKTREE_GATE_REASON });
+            }
             if let Some((worker_id, tier)) = target.team.claude_agent_working().await {
                 return json!({
                     "decision": "allow",
@@ -4058,13 +4070,24 @@ mod tests {
             "{answer}"
         );
 
-        // While the agent worker is Working, the gate allows, naming it.
+        // The worker waits for its agent: a launch without worktree isolation
+        // is asked about, because the agent would miss its warm checkout.
         let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
+        assert_eq!(gate["decision"], "ask", "{gate}");
+        assert_eq!(gate["reason"], WORKTREE_GATE_REASON);
+        // With worktree isolation the gate allows, naming the worker.
+        let mut isolated = ask("general-purpose");
+        isolated["isolation"] = json!("worktree");
+        let gate = fixture.lead_post("/lead/gate-agent", isolated).await;
         assert_eq!(gate["decision"], "allow", "{gate}");
         assert_eq!(
             gate["reason"],
             "runs Mnemo worker extagnt0001 (high tier) as a Claude Code agent"
         );
+        // Once the agent is launched (registered), any Agent call is allowed.
+        team.claim_agent_checkout("agent-a1b2c3", None).await.expect("the claim");
+        let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
+        assert_eq!(gate["decision"], "allow", "{gate}");
 
         // team_agent_done closes the worker and the finished notice rides the
         // tool answer; the gate asks again.

@@ -3066,10 +3066,10 @@
     },
     {
       "id": "e21c4820",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795339166391,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795356670246,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e21c4820-20261122-141110.md",
       "abandon_reason": null,
       "spec_deltas": [
         {

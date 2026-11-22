@@ -610,6 +610,9 @@ impl TeamRuntime {
         let Some((agent, effort)) = self.agent_handoff_target(&record, tier) else {
             return Ok(None);
         };
+        if let Some(refusal) = self.agent_launch_refusal(Some(worker_id)).await {
+            return Err(refusal);
+        }
         let previous = session_model_spec(&record).to_string();
         let row = DispatchRoutingRow::LeadReroute {
             ts: unix_ms(),

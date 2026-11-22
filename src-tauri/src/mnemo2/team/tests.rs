@@ -15102,7 +15102,7 @@ async fn agent_tier_dispatch_prepares_the_checkout_without_a_session() {
         block["branch"].as_str().map(str::to_string),
         Some(record.branch.clone())
     );
-    assert!(prompt.contains(record.worktree.to_str().expect("a utf-8 worktree path")), "the prompt names the worktree: {prompt}");
+    assert!(!prompt.contains(record.worktree.to_str().expect("a utf-8 worktree path")), "the prompt names no folder: {prompt}");
     assert!(prompt.contains(&record.branch), "the prompt names the branch: {prompt}");
     assert!(prompt.contains("Never push"), "{prompt}");
     assert!(prompt.contains("git stash"), "{prompt}");
@@ -15972,6 +15972,11 @@ async fn agent_workers_count_when_reducing_slots() {
             .dispatch_request(agent_dispatch_request(&fixture.plan_id, brief, id))
             .await
             .expect("an agent dispatch within the original slot cap");
+        // Its agent is launched, so the next agent dispatch may go ahead.
+        fixture
+            .team
+            .update_worker(id, |worker| worker.claude_agent_id = Some(format!("agent-{id}")))
+            .await;
     }
 
     let error = fixture
@@ -16135,6 +16140,11 @@ async fn dispatch_after_a_lead_commit_gets_the_new_tip() {
         .await
         .expect("first dispatch");
     assert_eq!(first.base_commit.as_deref(), Some(first_tip.as_str()));
+    // The first agent is launched before the next agent dispatch.
+    fixture
+        .team
+        .update_worker("alphabase1", |worker| worker.claude_agent_id = Some("a1".into()))
+        .await;
     let second_tip = lead_commit(root, "lead.txt", "lead moves on");
     let (second, _, _) = fixture
         .team
@@ -16559,13 +16569,18 @@ async fn agent_prompt_names_only_tools_a_claude_agent_has() {
     assert!(!prompt.contains("message_parent"), "{prompt}");
     assert!(!prompt.contains("plan_read"), "{prompt}");
     assert!(!prompt.contains("(pinned)"), "{prompt}");
-    assert!(prompt.contains("plan_show"), "{prompt}");
+    assert!(!prompt.contains("plan_show"), "agents use no Mnemo tools: {prompt}");
     assert!(prompt.contains("end your turn"), "{prompt}");
     assert!(
-        prompt.contains(record.worktree.to_str().expect("a utf-8 worktree")),
-        "{prompt}"
+        !prompt.contains(record.worktree.to_str().expect("a utf-8 worktree")),
+        "the agent runs in its own checkout, so the prompt names no folder: {prompt}"
     );
 
+    // The first agent is launched before the next agent dispatch.
+    fixture
+        .team
+        .update_worker("promptNorm1", |worker| worker.claude_agent_id = Some("a1".into()))
+        .await;
     let mut read_back = agent_dispatch_request(
         &fixture.plan_id,
         "read the task back without Mnemo worker tools",
@@ -17435,18 +17450,25 @@ async fn team_progress_lands_in_the_log_and_notifies() {
 }
 
 #[test]
-fn agent_prompt_carries_the_cd_foreground_and_progress_rules() {
+fn the_agent_prompt_uses_no_mnemo_tools_and_no_cd_rule() {
     let mut record = worker(std::path::Path::new("D:/proj"), "agentWatch06");
     record.claude_agent = Some("opus".into());
     let prompt = super::record::agent_prompt(&record);
-    let worktree = record.worktree.display();
+    let worktree = record.worktree.display().to_string();
     assert!(
-        prompt.contains(&format!("- Work only inside {worktree}. Claude Code doesn't keep your working directory between shell calls, so start every shell command with cd \"{worktree}\" && (in PowerShell: Set-Location \"{worktree}\"; ), and read and edit files only by absolute paths under it. Never touch the project's main checkout or any other checkout.")),
+        prompt.contains(&format!(
+            "- You run in your own checkout of this project on branch {}; commit your work there.",
+            record.branch
+        )),
         "{prompt}"
     );
-    assert!(prompt.contains("- Run shell commands in the foreground. Start one in the background only when it will run longer than about two minutes (a full build or test suite)."), "{prompt}");
-    assert!(prompt.contains("- After each milestone (you have read the code, the change is in, the tests pass, you committed), post a one-line note with the Mnemo tool team_progress (worker_id agentWatch06)."), "{prompt}");
-    assert!(prompt.contains("- Leave Mnemo's team_* and plan_* tools to the lead; plan_show and team_progress are the only ones you may use."), "{prompt}");
+    assert!(prompt.contains("- Do not use Mnemo's team_* or plan_* tools."), "{prompt}");
+    assert!(prompt.contains("- Run shell commands in the foreground."), "{prompt}");
+    assert!(prompt.contains("Mnemo runs the full checks in .coding/checks.toml on your final commit."), "{prompt}");
+    for gone in ["cd \"", "Set-Location", "team_progress", "plan_show", "Work only inside"] {
+        assert!(!prompt.contains(gone), "{gone} is gone from the prompt: {prompt}");
+    }
+    assert!(!prompt.contains(&worktree), "the prompt names no folder: {prompt}");
 }
 
 // --- Audit fixes for the agent watch (plan ca7f2177, step 1) ----------------
@@ -18598,5 +18620,119 @@ async fn worktree_claim_without_a_waiting_worker_falls_back() {
         fixture.team.claim_agent_checkout("../escape", None).await.expect("claim"),
         None
     );
+    fixture.team.shutdown().await;
+}
+
+// --- plan 4d920eec step 3: dispatch rules and the agent block ---
+
+#[tokio::test]
+async fn a_second_waiting_agent_dispatch_is_refused() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    let (first, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "the first agent step", "waitOne01"))
+        .await
+        .expect("the first agent dispatch");
+    assert!(first.claude_agent.is_some());
+    let refused = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "the second agent step", "waitTwo01"))
+        .await
+        .expect_err("a second waiting agent is refused");
+    assert_eq!(
+        refused,
+        "waitOne01 is waiting for its agent: launch it (Agent with isolation \"worktree\") before dispatching another agent step."
+    );
+    // Once the first agent is launched (registered), the next dispatch goes through.
+    fixture
+        .team
+        .update_worker("waitOne01", |worker| worker.claude_agent_id = Some("a1".into()))
+        .await;
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "the second agent step", "waitTwo01"))
+        .await
+        .expect("the second agent dispatch after the first launch");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_workers_are_capped_at_three() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    fixture.team.persistence.slots.store(8, std::sync::atomic::Ordering::SeqCst);
+    for (index, id) in ["capOne01", "capTwo01", "capThree1"].iter().enumerate() {
+        fixture
+            .team
+            .dispatch_request(agent_dispatch_request(&fixture.plan_id, &format!("agent step {index}"), id))
+            .await
+            .expect("an agent dispatch under the cap");
+        fixture
+            .team
+            .update_worker(id, |worker| worker.claude_agent_id = Some(format!("agent{index}")))
+            .await;
+    }
+    let refused = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "agent step 3", "capFour01"))
+        .await
+        .expect_err("a fourth running agent worker is refused");
+    assert_eq!(
+        refused,
+        "3 Claude Code agent workers are already running (capOne01, capTwo01, capThree1); wait for one to finish (team_agent_done) before starting another."
+    );
+    fixture
+        .team
+        .agent_done("capOne01", "done".into(), false)
+        .await
+        .expect("one finishes");
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "agent step 3", "capFour01"))
+        .await
+        .expect("room again after one finished");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_block_asks_for_worktree_isolation() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "an agent step", "isoBlock01"))
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    assert_eq!(block["isolation"], "worktree", "{block}");
+    assert_eq!(block["model"], "opus");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hand_off_counts_toward_the_waiting_rule() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "an agent step", "handWait01"))
+        .await
+        .expect("an agent worker waiting for its launch");
+    let started = external_dispatch(&fixture, "handMove01", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handMove01").await.expect("stop");
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "handMove01", "tier": "high"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!answer.success, "{}", answer.output);
+    assert!(answer.output.contains("handWait01 is waiting for its agent"), "{}", answer.output);
+    let worker = fixture.team.worker("handMove01").await.expect("worker");
+    assert!(worker.claude_agent.is_none(), "the refused hand-off changed nothing");
     fixture.team.shutdown().await;
 }

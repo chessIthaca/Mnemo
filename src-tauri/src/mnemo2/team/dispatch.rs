@@ -176,6 +176,9 @@ pub(super) fn dispatch_lead_override_row(
 pub(super) fn claude_agent_block(worker: &WorkerRecord) -> Option<Value> {
     worker.claude_agent.as_ref()?;
     Some(json!({
+        // Claude Code's own isolation: Mnemo's WorktreeCreate hook hands the
+        // agent this worker's warm checkout (plan 4d920eec).
+        "isolation": "worktree",
         "model": worker.claude_agent,
         "worktree": worker.worktree,
         "branch": worker.branch,
@@ -763,6 +766,11 @@ impl TeamRuntime {
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
+        }
+        if claude_agent.is_some() {
+            if let Some(refusal) = self.agent_launch_refusal(None).await {
+                return Err(refusal);
+            }
         }
         let placed = plan.as_ref().map(|plan| (plan.plan_id.clone(), plan.step));
         let provisioned = self

@@ -702,6 +702,45 @@ pub(super) fn waits_for_agent(worker: &WorkerRecord) -> bool {
         && !worker.worktree.as_os_str().is_empty()
 }
 
+/// The most agent workers that run (Working or Fixing) at once (plan
+/// 4d920eec decision 5). A constant: there is no setting.
+pub(super) const AGENT_WORKER_CAP: usize = 3;
+
+impl TeamRuntime {
+    /// Why another agent worker may not start now, if it may not (plan
+    /// 4d920eec decisions 4-5): one already waits for its agent, so the next
+    /// isolated launch could be handed the wrong checkout, or
+    /// [`AGENT_WORKER_CAP`] agent workers already run. `except` is the worker
+    /// being started or moved, which never counts against itself.
+    pub(super) async fn agent_launch_refusal(&self, except: Option<&str>) -> Option<String> {
+        let records = self.records.lock().await;
+        let others = || {
+            records
+                .iter()
+                .filter(move |worker| Some(worker.id.as_str()) != except)
+        };
+        if let Some(waiting) = others().find(|worker| waits_for_agent(worker)) {
+            return Some(format!(
+                "{} is waiting for its agent: launch it (Agent with isolation \"worktree\") before dispatching another agent step.",
+                waiting.id
+            ));
+        }
+        let running: Vec<&str> = others()
+            .filter(|worker| {
+                worker.claude_agent.is_some()
+                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+            })
+            .map(|worker| worker.id.as_str())
+            .collect();
+        (running.len() >= AGENT_WORKER_CAP).then(|| {
+            format!(
+                "{AGENT_WORKER_CAP} Claude Code agent workers are already running ({}); wait for one to finish (team_agent_done) before starting another.",
+                running.join(", ")
+            )
+        })
+    }
+}
+
 /// The agent workers `team_agent_started` and `team_progress` accept.
 fn agent_worker_in_work(worker: &WorkerRecord, tool: &str) -> Result<(), String> {
     if worker.claude_agent.is_none() {

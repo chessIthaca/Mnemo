@@ -469,27 +469,19 @@ pub(super) fn agent_prompt(record: &WorkerRecord) -> String {
         .opening_prompt
         .clone()
         .unwrap_or_else(|| record.brief.clone());
-    let pinned = match &record.plan_id {
-        Some(plan_id) => pinned.replace(
-            PLAN_READ_TOOL_GUIDANCE,
-            &format!(
-                "Re-read this plan at any time with the Mnemo plan_show tool (plan_id {plan_id}), if you have it: the lead may record decisions or interfaces after you start."
-            ),
-        ),
-        None => pinned.replace(PLAN_READ_TOOL_GUIDANCE, ""),
-    };
+    // An agent uses no Mnemo tools (plan 4d920eec decision 6): the plan in
+    // its prompt is what it works from, and the lead passes on any change.
+    let pinned = pinned.replace(PLAN_READ_TOOL_GUIDANCE, "");
     let kickoff = if record.read_back {
         AGENT_READ_BACK_KICKOFF
     } else {
         AGENT_KICKOFF
     };
     format!(
-        "{kickoff}\n\nYour task:\n\n{pinned}\n\nThis step runs as a Claude Code agent, outside Mnemo's worker sessions:\n- Work only inside {worktree}. Claude Code doesn't keep your working directory between shell calls, so start every shell command with cd \"{worktree}\" && (in PowerShell: Set-Location \"{worktree}\"; ), and read and edit files only by absolute paths under it. Never touch the project's main checkout or any other checkout.\n- Run shell commands in the foreground. Start one in the background only when it will run longer than about two minutes (a full build or test suite).\n- Commit your work on the branch {branch}.\n- Never push, never use git stash, never merge.\n- Where the task tells you to message the lead, end your turn with that message instead; the lead answers and continues you.\n- After each milestone (you have read the code, the change is in, the tests pass, you committed), post a one-line note with the Mnemo tool team_progress (worker_id {id}).\n- Leave Mnemo's team_* and plan_* tools to the lead; plan_show and team_progress are the only ones you may use.\n- Run the commands in .coding/checks.toml exactly as written before your last commit.\n- End with a report of the commit hash, the checks you ran and their results, and anything left open.",
+        "{kickoff}\n\nYour task:\n\n{pinned}\n\nThis step runs as a Claude Code agent:\n- You run in your own checkout of this project on branch {branch}; commit your work there.\n- Run shell commands in the foreground. Start one in the background only when it will run longer than about two minutes.\n- Never push, never use git stash, never merge, never switch branches.\n- Where the task tells you to message the lead, end your turn with that message instead; the lead answers and continues you.\n- Do not use Mnemo's team_* or plan_* tools.\n- Verify with the narrowest tests that cover your change (the touched crate's tests, or the tests the task names). Mnemo runs the full checks in .coding/checks.toml on your final commit.\n- End with a report of the commit hash, the tests you ran and their results, and anything left open.",
         kickoff = kickoff,
         pinned = pinned,
-        worktree = record.worktree.display(),
         branch = record.branch,
-        id = record.id,
     )
 }
 

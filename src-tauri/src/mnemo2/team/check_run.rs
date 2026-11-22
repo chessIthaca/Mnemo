@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use mnemo::app::worktrees::current_branch;
 use mnemo::tool::agent::run_checks::RunChecksTool;
 use mnemo::tool::agent::sandbox::Sandbox;
-use mnemo::tool::Tool;
+use mnemo::tool::{Tool, ToolResult};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 
@@ -53,6 +53,9 @@ const NO_CHECKS: &str = "no checks configured: add commands to .coding/checks.to
 #[derive(Clone, Debug, Default)]
 pub(super) struct CheckRuns {
     ids: Arc<StdMutex<HashSet<String>>>,
+    /// Tests only: the next spawned worker run panics at its start.
+    #[cfg(test)]
+    pub(super) panic_next: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CheckRuns {
@@ -288,6 +291,17 @@ async fn run_all(
     if !result.success {
         return Err(result.output);
     }
+    build_report(checkout, commands, &args, &result)
+}
+
+/// Turn the `run_checks` result into one outcome per `data.checks` entry. Split
+/// out of [`run_all`] so a result of any shape can be tested.
+fn build_report(
+    checkout: &Path,
+    commands: &[String],
+    args: &Value,
+    result: &ToolResult,
+) -> Result<RunReport, String> {
     let Some(entries) = result
         .data
         .as_ref()
@@ -298,7 +312,7 @@ async fn run_all(
     };
     // The pump's own counting rule decides what passed: exit 0, an allowed
     // command, run from the checkout, files unchanged.
-    let counted = counted_checks("run_checks", &args, &result, checkout, commands);
+    let counted = counted_checks("run_checks", args, result, checkout, commands);
     let run: Vec<String> = entries
         .iter()
         .filter_map(|entry| entry.get("command").and_then(Value::as_str))
@@ -372,6 +386,9 @@ struct CheckCtx {
     save_lock: Arc<Mutex<()>>,
     persistence: TeamPersistence,
     signals: broadcast::Sender<BoardSignal>,
+    /// Tests only: this run panics at its start.
+    #[cfg(test)]
+    inject_panic: bool,
 }
 
 impl CheckCtx {
@@ -416,6 +433,10 @@ impl CheckCtx {
         commands: Vec<String>,
         guard: CheckRunGuard,
     ) {
+        #[cfg(test)]
+        if self.inject_panic {
+            panic!("injected check run panic");
+        }
         let header = format!("worker_id={worker_id}");
         let outcomes = run_all(&worktree, &commands, &self.config_dir).await;
         let text = match outcomes {
@@ -521,6 +542,11 @@ impl TeamRuntime {
             save_lock: self.save_lock.clone(),
             persistence: self.persistence.clone(),
             signals: self.signals.clone(),
+            #[cfg(test)]
+            inject_panic: self
+                .check_runs
+                .panic_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst),
         }
     }
 
@@ -648,5 +674,66 @@ impl TeamRuntime {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(command: &str, checkout: &Path) -> Value {
+        json!({
+            "command": command,
+            "exit_code": 0,
+            "tree_before": "tree",
+            "tree_after": "tree",
+            "cwd": checkout.display().to_string(),
+        })
+    }
+
+    /// An outcome per data entry, a cut-off block never reads as a clean run,
+    /// a command with no entry is named, and neither (nor an empty list) is
+    /// ever all-passed, so the notice never says to merge.
+    #[test]
+    fn cut_off_and_missing_results_never_say_merge() {
+        let dir = tempfile::tempdir().expect("checkout");
+        let commands: Vec<String> = ["git --version", "git status", "git log"]
+            .iter()
+            .map(|command| command.to_string())
+            .collect();
+        // The text carries the first command's block only; the data carries
+        // the first two commands; the third has no entry at all.
+        let result = ToolResult {
+            success: true,
+            output: "PASS git --version (exit 0, 0.1s)\n\n1 passed, 0 failed".to_string(),
+            data: Some(json!({"checks": [
+                entry("git --version", dir.path()),
+                entry("git status", dir.path()),
+            ]})),
+        };
+        let report = build_report(dir.path(), &commands, &json!({}), &result).expect("a report");
+        assert_eq!(report.outcomes.len(), 2, "{:?}", report.outcomes);
+        assert!(report.outcomes[0].passed);
+        let cut = &report.outcomes[1];
+        assert_eq!(cut.command, "git status");
+        assert_eq!(cut.detail(), "run by Mnemo: exit 0; its output was cut off");
+        assert_eq!(report.missing, vec!["git log".to_string()]);
+        assert!(!report.all_passed(), "a missing command is never a pass");
+        let notice = CheckCtx::notice_text(None, "subject", &report, "NEXT");
+        assert!(
+            notice.contains("NO RESULT git log (the tool returned no entry)"),
+            "{notice}"
+        );
+        // All three entries present and counted: only then does it pass.
+        let complete = RunReport {
+            outcomes: report.outcomes.clone(),
+            missing: Vec::new(),
+        };
+        assert!(complete.all_passed());
+        let empty = RunReport {
+            outcomes: Vec::new(),
+            missing: Vec::new(),
+        };
+        assert!(!empty.all_passed(), "an empty list is never a pass");
     }
 }

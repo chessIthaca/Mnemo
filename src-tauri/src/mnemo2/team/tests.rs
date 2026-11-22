@@ -16453,3 +16453,58 @@ async fn team_run_checks_refuses_a_dirty_checkout() {
     assert!(!answer.output.contains("Mnemo is running the missing checks"), "{}", answer.output);
     team.shutdown().await;
 }
+
+/// A lead branch that moves while the lead-checkout run waits for a slot gets
+/// the moved-tip notice, with no pass claim.
+#[tokio::test]
+async fn the_lead_check_run_reports_a_moved_tip() {
+    let (root, _state, config, team, _worker_id) =
+        check_run_fixture("runChecks09", &["git --version"]).await;
+    let slots = hold_all_slots(config.path());
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(None).await.expect("the run starts");
+    run_git(
+        root.path(),
+        &["commit", "--allow-empty", "-m", "the lead moves under the run"],
+    );
+    drop(slots);
+    let notice = drain_notice(&mut notices, "while the checks ran")
+        .await
+        .expect("the run says the lead branch moved");
+    assert!(notice.contains("the lead branch moved from "), "{notice}");
+    assert!(notice.contains("run team_run_checks again"), "{notice}");
+    assert!(!notice.contains("passed"), "{notice}");
+    assert!(!notice.contains("PASS"), "{notice}");
+    team.shutdown().await;
+}
+
+/// A check run that panics still tells the lead, records nothing, and gives
+/// the claim back, so the next request is accepted.
+#[tokio::test]
+async fn a_panicking_check_run_still_notifies() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks10", &["git --version"]).await;
+    team.check_runs
+        .panic_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    let notice = drain_notice(&mut notices, "stopped unexpectedly")
+        .await
+        .expect("the stopped run still sends a notice");
+    assert!(
+        notice.contains(&format!(
+            "Mnemo's check run for {worker_id} stopped unexpectedly; nothing was recorded. Run team_run_checks again."
+        )),
+        "{notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(worker.checks.is_empty(), "{:?}", worker.checks);
+    eventually(|| async { (!team.check_runs.is_active(&worker_id)).then_some(()) }).await;
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the claim was released, so a new run is accepted");
+    team.shutdown().await;
+}

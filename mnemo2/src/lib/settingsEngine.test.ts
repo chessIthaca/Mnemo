@@ -61,11 +61,11 @@ describe("settingsEngine", () => {
     const { invoke, transport: t } = transport();
     const tiers = {
       tiers: [
-        { id: "trivial", name: "Trivial", definition: "Lookups", models: ["a/m2"], effort: null, role: null, resolves_to: "trivial", claude_agent: null },
-        { id: "routine", name: "Routine", definition: "Steps", models: [], effort: null, role: null, resolves_to: "trivial", claude_agent: null },
-        { id: "medium", name: "Medium", definition: "Features", models: ["a/m1"], effort: null, role: null, resolves_to: "routine", claude_agent: null },
-        { id: "high", name: "High", definition: "Design", models: [], effort: null, role: null, resolves_to: "medium", claude_agent: null },
-        { id: "escalate", name: "Escalate", definition: "After a failure", models: [], effort: null, role: "escalate", resolves_to: "high", claude_agent: null },
+        { id: "trivial", name: "Trivial", definition: "Lookups", models: ["a/m2"], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+        { id: "routine", name: "Routine", definition: "Steps", models: [], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+        { id: "medium", name: "Medium", definition: "Features", models: ["a/m1"], effort: null, role: null, resolves_to: "routine", claude_agent: null, claude_agent_effort: null },
+        { id: "high", name: "High", definition: "Design", models: [], effort: null, role: null, resolves_to: "medium", claude_agent: null, claude_agent_effort: null },
+        { id: "escalate", name: "Escalate", definition: "After a failure", models: [], effort: null, role: "escalate", resolves_to: "high", claude_agent: null, claude_agent_effort: null },
       ],
     };
     await t.endpointUsage("a");

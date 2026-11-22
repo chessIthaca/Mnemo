@@ -321,6 +321,10 @@ pub struct WorkerRecord {
     /// An audit worker delivered its read-only report; its job is over.
     #[serde(default)]
     pub report_delivered: bool,
+    /// The final report of a Claude Code agent worker, recorded by
+    /// `team_agent_done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
     /// Durable lead findings.
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -372,6 +376,12 @@ pub struct WorkerRecord {
     /// `escalate`) the worker ran on, including later model switches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// The Claude Code model this worker runs as (`opus`, `sonnet`, `haiku`,
+    /// `fable`), when the step was handed to the lead's own Claude Code
+    /// agent instead of a Mnemo worker session. Such a worker has no live
+    /// session; `team_agent_done` closes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_agent: Option<String>,
     /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<WorkerRouting>,
@@ -400,6 +410,39 @@ pub(super) fn kickoff_message(record: &WorkerRecord) -> &'static str {
     } else {
         KICKOFF
     }
+}
+
+/// The full self-contained task text for a Claude Code agent: the same
+/// kickoff and the same pinned plan/step/brief a Mnemo worker receives,
+/// plus the rules that matter outside Mnemo — the prepared worktree and
+/// branch to work in, and what never to do. A Mnemo worker gets the kickoff
+/// as its first message and the task pinned in its system head; the agent
+/// gets both inlined, because it has no Mnemo session.
+pub(super) fn agent_prompt(record: &WorkerRecord) -> String {
+    let pinned = record
+        .opening_prompt
+        .clone()
+        .unwrap_or_else(|| record.brief.clone());
+    format!(
+        "{}\n\nYour pinned task:\n\n{}\n\nThis step runs as a Claude Code agent, outside Mnemo's worker sessions:\n- Work only inside {} (cd there first; never touch the project's main checkout or any other checkout).\n- Commit your work on the branch {}.\n- Never push, never use git stash, never merge.\n- Run the commands in .coding/checks.toml exactly as written before your last commit.\n- End with a report of the commit hash, the checks you ran and their results, and anything left open.",
+        kickoff_message(record),
+        pinned,
+        record.worktree.display(),
+        record.branch,
+    )
+}
+
+/// The refusal the tools that drive a Mnemo session give for a worker that
+/// runs as a Claude Code agent: its step lives on the lead's own agent, so
+/// Mnemo cannot message, resume, compact or route-fix it. `None` for an
+/// ordinary worker.
+pub(super) fn agent_worker_refusal(worker: &WorkerRecord) -> Option<String> {
+    worker.claude_agent.as_ref().map(|_| {
+        format!(
+            "{} runs as a Claude Code agent: continue it with your own Agent (SendMessage to it, or a new Agent with the fix), then call team_agent_done.",
+            worker.id
+        )
+    })
 }
 
 /// The model a worker's session actually runs on: the lead's chosen spec, else

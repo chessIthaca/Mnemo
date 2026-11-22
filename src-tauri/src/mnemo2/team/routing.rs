@@ -18,12 +18,24 @@ use crate::mnemo2::dispatch_routing::{
 use crate::mnemo2::runtime::LeadModel;
 
 use super::nudge::append_reroute_metadata;
-use super::record::{ChangeSource, WorkerRecord, WorkerRouting};
+use super::record::{ChangeSource, MessageSender, WorkerRecord, WorkerRouting};
 use super::dispatch::{
     dispatch_lead_override_row, dispatch_route_row, DispatchRequest, DispatchSource,
 };
 use super::pump::save_workers;
 use super::{status_name, unix_ms, TeamRuntime};
+
+/// A dispatch handed to the lead's own Claude Code agent instead of a Mnemo
+/// worker session: the Claude model to run (`opus`, `sonnet`, `haiku`,
+/// `fable`) and the tier routing settled on before fold-down, which the
+/// agent worker's record and the agent gate's reason name.
+#[derive(Clone, Debug)]
+pub(super) struct ClaudeAgentDispatch {
+    /// The Claude Code model the lead's agent runs on.
+    pub(super) model: String,
+    /// The settled tier that carries `claude_agent`.
+    pub(super) tier: String,
+}
 
 pub(super) struct RoutedDispatch {
     pub(super) model: Option<String>,
@@ -37,6 +49,12 @@ pub(super) struct RoutedDispatch {
     /// returns with a null Laya label; the spawned task writes the corpus
     /// rows and attaches the label to the worker's routing record.
     pub(super) pending: Option<PendingClassification>,
+    /// The Claude Code agent this dispatch hands the step to: `Some` when
+    /// the tier routing settled on (before fold-down) carries `claude_agent`
+    /// and the attached external lead dispatched by tier with no explicit
+    /// model. Provisioning runs as today, but no Mnemo session starts; the
+    /// lead runs its own agent on the prompt in the dispatch answer.
+    pub(super) claude_agent: Option<ClaudeAgentDispatch>,
     pub(super) error: Option<String>,
 }
 
@@ -186,6 +204,7 @@ pub(super) fn tier_ladder_from_dto(tiers: &mnemo::headless::TiersDto) -> TierLad
                 models: tier.models.clone(),
                 effort: tier.effort.clone(),
                 role: tier.role.clone(),
+                claude_agent: tier.claude_agent.clone(),
             })
             .collect(),
     }
@@ -450,6 +469,32 @@ impl TeamRuntime {
         Ok((model, ran_tier))
     }
 
+    /// The Claude Code agent a dispatch hands its step to: `Some` when the
+    /// tier routing settled on (before fold-down — the lead's explicit tier,
+    /// Laya's cleared tier, or Auto's fallback tier) carries `claude_agent`,
+    /// the dispatch comes from the attached external lead by tier, and the
+    /// lead did not name an explicit model (an explicit model always runs a
+    /// Mnemo worker). Everything else resolves exactly as today.
+    pub(super) fn claude_agent_dispatch(
+        &self,
+        request: &DispatchRequest,
+        settled_tier: Option<&str>,
+    ) -> Option<ClaudeAgentDispatch> {
+        let tier = settled_tier?;
+        if request.sender != MessageSender::ExternalLead
+            || request.source != DispatchSource::LeadTool
+            || request.model.is_some()
+            || !self.external_lead_attached()
+        {
+            return None;
+        }
+        let model = self.tier_ladder().get(tier)?.claude_agent.clone()?;
+        Some(ClaudeAgentDispatch {
+            model,
+            tier: tier.to_string(),
+        })
+    }
+
     pub(super) async fn route_implementation_dispatch(
         &self,
         request: &DispatchRequest,
@@ -502,6 +547,7 @@ impl TeamRuntime {
                 routing: None,
                 rows: Vec::new(),
                 pending: None,
+                claude_agent: self.claude_agent_dispatch(request, requested_tier),
                 error: None,
             });
         }
@@ -556,6 +602,7 @@ impl TeamRuntime {
                     reasoning_effort,
                     routing: Some(routing),
                     rows: Vec::new(),
+                    claude_agent: self.claude_agent_dispatch(request, explicit_tier),
                     pending: Some(PendingClassification {
                         classifier,
                         knn: self.route_knn.clone(),
@@ -643,6 +690,25 @@ impl TeamRuntime {
             }
         } else {
             (self.lead_model_choice(None, None)?, None)
+        };
+        // The tier routing settled on, before fold-down: the explicit tier,
+        // Laya's cleared tier, or Auto's fallback tier when one resolved.
+        // This is the tier a claude_agent rung is decided from, never the
+        // fold-down destination `chosen_tier` may have moved to.
+        let settled_tier = if has_explicit_choice {
+            explicit_tier
+        } else if cleared_tier
+            .filter(|_| {
+                settings.mode == RoutingMode::Auto
+                    || (settings.mode == RoutingMode::Suggest && requested_tier == Some("auto"))
+            })
+            .is_some()
+        {
+            cleared_tier
+        } else if settings.mode == RoutingMode::Auto && !self.tiered_models().is_empty() {
+            Some(settings.fallback_tier.as_str())
+        } else {
+            None
         };
         let auto_fallback_tier = (!has_explicit_choice
             && settings.mode == RoutingMode::Auto
@@ -742,6 +808,7 @@ impl TeamRuntime {
             routing: Some(routing),
             rows,
             pending: None,
+            claude_agent: self.claude_agent_dispatch(request, settled_tier),
             error: refusal,
         })
     }
@@ -992,8 +1059,13 @@ impl TeamRuntime {
             } else {
                 ""
             };
+            let agent = rung
+                .claude_agent
+                .as_deref()
+                .map(|model| format!("; runs as a Claude Code agent ({model}) when Claude Code leads"))
+                .unwrap_or_default();
             lines.push(format!(
-                "{tier} ({}) - {}: {list}{effort}{escalation}",
+                "{tier} ({}) - {}: {list}{effort}{escalation}{agent}",
                 rung.name, rung.definition
             ));
         }

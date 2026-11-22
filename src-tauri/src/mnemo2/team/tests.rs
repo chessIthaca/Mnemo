@@ -20,7 +20,8 @@ use super::deletion::{
     validated_checkout, worktree_list_paths,
 };
 use super::dispatch::{
-    dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
+    claude_agent_block, dispatch_result, dispatch_routing_line,
+    require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
 };
 use super::guardrails::{audit_guardrails, executor_guardrails};
 use super::lead_tools::worker_status_view;
@@ -34,7 +35,7 @@ use super::pump::{
     pump_worker,
 };
 use super::review::CheckRecorder;
-use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
+use super::record::{append_inbox, audit_finished, MessageSender, WORKER_INBOX_LIMIT};
 use super::review::clear_review_for_a_newer_tip;
 use super::routing::final_tier;
 
@@ -1762,6 +1763,8 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         model: None,
         model_id: None,
         reasoning_effort: None,
+        claude_agent: None,
+        report: None,
         branch,
         worktree: root
             .join(".worktrees")
@@ -4732,6 +4735,7 @@ async fn team_dispatch_refuses_unmet_openspec_apply_requirements() {
             tier: None,
             dispatch_routing: false,
             source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model: None,
             reasoning_effort: None,
             worker_id: None,
@@ -4769,6 +4773,7 @@ async fn redispatch_with_a_different_read_back_is_refused() {
             tier: None,
             dispatch_routing: false,
         source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model: None,
             reasoning_effort: None,
             worker_id: Some(existing.id.clone()),
@@ -4787,6 +4792,7 @@ async fn redispatch_with_a_different_read_back_is_refused() {
             tier: None,
             dispatch_routing: false,
         source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model: None,
             reasoning_effort: None,
             worker_id: Some(existing.id.clone()),
@@ -9662,6 +9668,7 @@ async fn permit_wait_counts_toward_laya_timeout() {
         tier: None,
         dispatch_routing: true,
         source: DispatchSource::Ipc,
+            sender: MessageSender::User,
         model: None,
         reasoning_effort: None,
         worker_id: Some("permitwait".into()),
@@ -14427,4 +14434,689 @@ async fn completed_audits_do_not_count_as_waiting() {
         "an unreported failed audit waits for its resume"
     );
     team.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code agent tiers (plan e21c4820): a tier may run as the lead's own
+// Claude Code agent, with team_agent_done closing the worker.
+// ---------------------------------------------------------------------------
+
+/// The routing fixture with the high tier set to run as a Claude Code agent
+/// (`claude_model`): a dispatch that settles on high from the external lead
+/// hands the step to the lead's agent instead of a Mnemo session.
+async fn agent_fixture(
+    mode: RoutingMode,
+    answer: Option<mnemo::memory::Answer>,
+    install_classifier: bool,
+    claude_model: &str,
+    high_models: Vec<String>,
+) -> RoutingFixture {
+    agent_fixture_with_settings(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        answer,
+        install_classifier,
+        claude_model,
+        high_models,
+    )
+    .await
+}
+
+/// The agent fixture with explicit routing settings, for the Auto fallback.
+async fn agent_fixture_with_settings(
+    settings: crate::mnemo2::dispatch_routing::RoutingSettings,
+    answer: Option<mnemo::memory::Answer>,
+    install_classifier: bool,
+    claude_model: &str,
+    high_models: Vec<String>,
+) -> RoutingFixture {
+    let fixture = routing_fixture_with(
+        settings,
+        answer,
+        install_classifier,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let mut dto = tiers_dto! {
+        difficult: high_models,
+        average: vec!["test/scripted-average".into()],
+        simple: vec!["test/scripted-simple".into()],
+    };
+    dto.tiers[3].claude_agent = Some(claude_model.into());
+    fixture.team.set_catalog(
+        vec![
+            lead_model("scripted-difficult"),
+            lead_model("scripted-average"),
+            lead_model("scripted-simple"),
+        ],
+        dto,
+        Vec::new(),
+    );
+    fixture
+}
+
+/// An explicit dispatch on the high tier from the external lead, the way
+/// Claude Code's `team_dispatch` lands.
+fn agent_dispatch_request(plan_id: &str, brief: &str, worker_id: &str) -> DispatchRequest {
+    DispatchRequest {
+        brief: brief.into(),
+        tier: Some("high".into()),
+        model: None,
+        reasoning_effort: None,
+        worker_id: Some(worker_id.into()),
+        review_risk: Some("standard".into()),
+        source: DispatchSource::LeadTool,
+        sender: MessageSender::ExternalLead,
+        dispatch_routing: true,
+        plan: Some(PlanRef {
+            plan_id: plan_id.into(),
+            step: 0,
+        }),
+        read_back: false,
+    }
+}
+
+#[tokio::test]
+async fn agent_tier_dispatch_prepares_the_checkout_without_a_session() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let brief = "Add the per-tier claude_agent handling";
+    let (record, reused, _pending) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, brief, "agenttier01"))
+        .await
+        .expect("the agent dispatch prepares the step");
+
+    // Provisioning ran as today: a real worktree on the agent branch.
+    assert!(!reused);
+    assert!(std::path::Path::new(&record.worktree).is_dir());
+    assert_eq!(record.branch, agent_branch("agenttier01"));
+    // The record claims the agent model and the settled pre-fold tier.
+    assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert_eq!(record.status, WorkerStatus::Working);
+    // No Mnemo session was started for the agent worker.
+    assert!(
+        fixture.team.live.lock().await.get("agenttier01").is_none(),
+        "an agent worker has no Mnemo session"
+    );
+
+    // The block the lead hands its own Agent: the model, the prepared
+    // checkout, and the full self-contained prompt.
+    let block = claude_agent_block(&record).expect("the dispatch answer's claude_agent block");
+    let prompt = block["prompt"].as_str().expect("the prompt text");
+    assert_eq!(block["model"].as_str(), Some("opus"));
+    assert_eq!(
+        block["worktree"].as_str().map(str::to_string),
+        Some(record.worktree.display().to_string())
+    );
+    assert_eq!(
+        block["branch"].as_str().map(str::to_string),
+        Some(record.branch.clone())
+    );
+    assert!(prompt.contains(record.worktree.to_str().expect("a utf-8 worktree path")), "the prompt names the worktree: {prompt}");
+    assert!(prompt.contains(&record.branch), "the prompt names the branch: {prompt}");
+    assert!(prompt.contains("Never push"), "{prompt}");
+    assert!(prompt.contains("git stash"), "{prompt}");
+    assert!(prompt.contains(".coding/checks.toml"), "{prompt}");
+    assert!(
+        prompt.contains(
+            "Implement the requested routing behavior in src-tauri/src/mnemo2/team.rs"
+        ),
+        "the prompt carries the step text: {prompt}"
+    );
+    assert!(prompt.contains(brief), "the prompt carries the brief: {prompt}");
+
+    // The block rides both halves of the dispatch answer, and team_status
+    // shows the worker as a Claude Code agent.
+    let answer = dispatch_result(
+        Ok((record.clone(), false, false)),
+        "team_dispatch",
+        RoutingMode::Off,
+        None,
+        false,
+    );
+    let result: Value =
+        serde_json::from_str(&answer.output).expect("the dispatch answer JSON");
+    assert_eq!(
+        result["result"]["claude_agent"]["model"].as_str(),
+        Some("opus"),
+        "{result}"
+    );
+    assert_eq!(
+        answer.data.as_ref().unwrap()["claude_agent"]["prompt"].as_str(),
+        block["prompt"].as_str(),
+        "data carries the same block"
+    );
+    let view = worker_status_view(&record, false);
+    assert_eq!(view["model"].as_str(), Some("claude-code/opus"), "{view}");
+
+    // An idempotent re-dispatch returns the same agent block.
+    let (again, reused, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, brief, "agenttier01"))
+        .await
+        .expect("the re-dispatch reuses the worker");
+    assert!(reused);
+    assert_eq!(again.claude_agent.as_deref(), Some("opus"));
+    let again_block = claude_agent_block(&again).expect("the reused agent block");
+    assert_eq!(
+        again_block["prompt"].as_str(),
+        block["prompt"].as_str(),
+        "the reuse returns the same prompt"
+    );
+}
+
+#[tokio::test]
+async fn agent_tier_without_models_is_still_an_agent_tier() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "sonnet", vec![]).await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "hand the empty tier to the agent",
+            "agenttier02",
+        ))
+        .await
+        .expect("the empty agent tier still goes to the agent");
+    // The pre-fold settled tier claims the agent before fold-down moves the
+    // dispatch onto a lower tier's model.
+    assert_eq!(record.claude_agent.as_deref(), Some("sonnet"));
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert!(fixture.team.live.lock().await.get("agenttier02").is_none());
+    // The routed model still names the fold target; the status view shows
+    // the Claude Code agent.
+    assert_eq!(record.model.as_deref(), Some("test/scripted-average"));
+    assert_eq!(
+        worker_status_view(&record, false)["model"].as_str(),
+        Some("claude-code/sonnet")
+    );
+}
+
+#[tokio::test]
+async fn agent_tier_with_an_explicit_model_still_starts_a_mnemo_worker() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request = agent_dispatch_request(
+        &fixture.plan_id,
+        "the lead explicitly chose this Mnemo model",
+        "agenttier11",
+    );
+    request.model = Some("test/scripted-difficult".into());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the explicit-model dispatch");
+    assert!(record.claude_agent.is_none());
+    assert_eq!(record.model.as_deref(), Some("test/scripted-difficult"));
+    assert!(fixture.team.live.lock().await.get("agenttier11").is_some());
+}
+
+#[tokio::test]
+async fn agent_tier_is_ignored_without_an_external_lead() {
+    // No external lead attached: the in-app lead's dispatch on the agent
+    // tier starts a normal Mnemo worker on the tier's models.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let mut request = agent_dispatch_request(&fixture.plan_id, "in-app brief", "agenttier03");
+    request.sender = MessageSender::Lead;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the in-app dispatch starts a normal worker");
+    assert!(
+        record.claude_agent.is_none(),
+        "without an external lead the tier resolves exactly as today"
+    );
+    assert_eq!(record.model.as_deref(), Some("test/scripted-difficult"));
+    assert!(
+        fixture.team.live.lock().await.get("agenttier03").is_some(),
+        "a normal Mnemo session started"
+    );
+
+    // An attached external lead does not claim the in-app lead's dispatch:
+    // the sender, not the attach state alone, decides.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request =
+        agent_dispatch_request(&fixture.plan_id, "in-app brief with the lead attached", "agenttier04");
+    request.sender = MessageSender::Lead;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the in-app dispatch with the lead attached");
+    assert!(record.claude_agent.is_none());
+    assert!(fixture.team.live.lock().await.get("agenttier04").is_some());
+
+    // IPC dispatches (the Control Room form) never take the agent path,
+    // even when Laya clears the agent tier while a lead is attached.
+    let fixture = agent_fixture(
+        RoutingMode::Auto,
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.93),
+        true,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _) = fixture
+        .team
+        .dispatch_on_plan(
+            "the control-room brief with enough implementation detail for Laya to classify this step".into(),
+            None,
+            None,
+            Some("agenttier05".into()),
+            None,
+            false,
+            &fixture.plan_id,
+            1,
+        )
+        .await
+        .expect("the IPC dispatch");
+    assert!(
+        record.claude_agent.is_none(),
+        "IPC dispatches never take the agent path"
+    );
+    assert_eq!(
+        record.model.as_deref(),
+        Some("test/scripted-difficult"),
+        "Laya cleared high and the worker runs on its model"
+    );
+    assert!(fixture.team.live.lock().await.get("agenttier05").is_some());
+}
+
+#[tokio::test]
+async fn laya_auto_into_an_agent_tier_hands_it_to_the_lead() {
+    let fixture = agent_fixture(
+        RoutingMode::Auto,
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.93),
+        true,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let request = DispatchRequest {
+        brief: "auto-routed brief with enough implementation detail for Laya to classify this step".into(),
+        tier: None,
+        model: None,
+        reasoning_effort: None,
+        worker_id: Some("layaagnt01".into()),
+        review_risk: Some("standard".into()),
+        source: DispatchSource::LeadTool,
+        sender: MessageSender::ExternalLead,
+        dispatch_routing: true,
+        plan: Some(PlanRef {
+            plan_id: fixture.plan_id.clone(),
+            step: 0,
+        }),
+        read_back: false,
+    };
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the auto dispatch");
+    assert_eq!(
+        record.claude_agent.as_deref(),
+        Some("opus"),
+        "Laya's cleared tier hands the step to the lead's agent: {record:?}"
+    );
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert!(fixture.team.live.lock().await.get("layaagnt01").is_none());
+}
+
+#[tokio::test]
+async fn auto_fallback_into_an_agent_tier_hands_it_to_the_lead() {
+    let fixture = agent_fixture_with_settings(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: RoutingMode::Auto,
+            fallback_tier: "high".into(),
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        None,
+        false,
+        "fable",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request = agent_dispatch_request(
+        &fixture.plan_id,
+        "Auto has no cleared Laya decision, so its fallback tier settles the dispatch",
+        "agenttier12",
+    );
+    request.tier = None;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the Auto fallback dispatch");
+    assert_eq!(record.claude_agent.as_deref(), Some("fable"));
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert!(fixture.team.live.lock().await.get("agenttier12").is_none());
+}
+
+#[tokio::test]
+async fn team_agent_done_finishes_the_worker_and_notifies_the_lead() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    // The merge lands on the lead branch, not main.
+    run_git(fixture._root.path(), &["checkout", "-b", "wt/mnemo"]);
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier06",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let worktree = std::path::PathBuf::from(&record.worktree);
+
+    // The lead's own agent commits in the prepared worktree.
+    std::fs::write(worktree.join("agent-work.txt"), "done\n").expect("write in the worktree");
+    run_git(&worktree, &["add", "."]);
+    run_git(&worktree, &["commit", "-m", "the agent's work"]);
+
+    // team_agent_done records the report, completes the worker and bumps
+    // the turn as the pump's Finished handling does.
+    let report = "Committed the change; cargo test --workspace and clippy pass.";
+    let done = fixture
+        .team
+        .agent_done("agenttier06", report.to_string(), false)
+        .await
+        .expect("finish the agent worker");
+    assert_eq!(done.status, WorkerStatus::Completed);
+    assert_eq!(done.turns, 1);
+    assert_eq!(done.report.as_deref(), Some(report));
+
+    // The finished notice reaches the external lead's queue, and survives
+    // current_notices exactly as a session's tagged notice does.
+    let notices = fixture
+        .team
+        .current_notices(fixture.team.drain_external_notices())
+        .await;
+    let notice = notices
+        .iter()
+        .find(|notice| notice.contains("agenttier06"))
+        .expect("the finished notice reached the external lead");
+    assert!(notice.contains("finished its turn"), "{notice}");
+    assert!(notice.contains("Review it now"), "{notice}");
+
+    // team_check, team_review and team_merge then work as for any worker.
+    fixture
+        .team
+        .record_check(
+            "agenttier06",
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect("record the check");
+    fixture
+        .team
+        .review("agenttier06", "the agent's work is good".into(), Vec::new(), evidence())
+        .await
+        .expect("review the agent's work");
+    let merged = fixture
+        .team
+        .merge("agenttier06")
+        .await
+        .expect("merge the agent worker");
+    assert_eq!(merged.status, WorkerStatus::Merged);
+}
+
+#[tokio::test]
+async fn team_agent_done_failed_marks_failed() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier07",
+        ))
+        .await
+        .expect("the agent dispatch");
+    // Reopen recovery can leave an agent worker Interrupted; the lead can
+    // still close it with team_agent_done.
+    fixture
+        .team
+        .update_worker("agenttier07", |worker| {
+            worker.status = WorkerStatus::Interrupted;
+        })
+        .await;
+    let report = "the agent hit a failing build it could not fix";
+    let failed = fixture
+        .team
+        .agent_done("agenttier07", report.to_string(), true)
+        .await
+        .expect("mark the agent worker failed");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert_eq!(failed.turns, 1);
+    assert_eq!(failed.report.as_deref(), Some(report));
+
+    // The failure notice is failure-shaped: it names the failure, quotes the
+    // report, and never tells the lead to review now.
+    let notices = fixture
+        .team
+        .current_notices(fixture.team.drain_external_notices())
+        .await;
+    let notice = notices
+        .iter()
+        .find(|notice| notice.contains("agenttier07"))
+        .expect("the failed notice reached the external lead");
+    assert!(notice.contains("could not finish its turn"), "{notice}");
+    assert!(notice.contains(report), "{notice}");
+    assert!(!notice.contains("Review it now"), "{notice}");
+}
+
+#[tokio::test]
+async fn team_agent_done_refuses_a_mnemo_worker() {
+    // A worker with a Mnemo session is never an agent worker.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let mut request = agent_dispatch_request(&fixture.plan_id, "a normal Mnemo worker", "agenttier08");
+    request.sender = MessageSender::Lead;
+    fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("a normal worker dispatch");
+    let error = fixture
+        .team
+        .agent_done("agenttier08", "report".to_string(), false)
+        .await
+        .expect_err("a Mnemo worker is not an agent worker");
+    assert!(
+        error.contains("does not run as a Claude Code agent"),
+        "{error}"
+    );
+
+    // And an agent worker outside Working/Interrupted is refused with its state.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier09",
+        ))
+        .await
+        .expect("the agent dispatch");
+    fixture
+        .team
+        .agent_done("agenttier09", "done".to_string(), false)
+        .await
+        .expect("finish the agent worker");
+    let error = fixture
+        .team
+        .agent_done("agenttier09", "again".to_string(), false)
+        .await
+        .expect_err("an already-completed worker is refused");
+    assert!(error.contains("completed"), "{error}");
+}
+
+#[tokio::test]
+async fn session_tools_refuse_an_agent_worker() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier10",
+        ))
+        .await
+        .expect("the agent dispatch");
+
+    // Every tool that would drive a Mnemo session refuses, pointing at the
+    // lead's own agent instead.
+    for refusal in [
+        fixture
+            .team
+            .message("agenttier10", "status?".into(), MessageSender::ExternalLead)
+            .await
+            .expect_err("team_message refuses"),
+        fixture
+            .team
+            .resume("agenttier10")
+            .await
+            .expect_err("team_resume refuses"),
+        fixture
+            .team
+            .change_model("agenttier10", Some("test/scripted-average".into()), None, ChangeSource::Lead)
+            .await
+            .expect_err("team_resume with a model refuses"),
+        fixture
+            .team
+            .compact("agenttier10")
+            .await
+            .expect_err("team_compact refuses"),
+        fixture
+            .team
+            .route_fix_with_tier("agenttier10", "finding1", None)
+            .await
+            .expect_err("team_route_fix refuses"),
+    ] {
+        assert_eq!(
+            refusal,
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it, or a new Agent with the fix), then call team_agent_done."
+        );
+    }
+
+    // team_stop still works: the lead cancels the record itself.
+    let stopped = fixture
+        .team
+        .stop("agenttier10")
+        .await
+        .expect("team_stop still works on an agent worker");
+    assert_eq!(stopped.status, WorkerStatus::Stopped);
+}
+
+#[tokio::test]
+async fn tier_guidance_names_the_claude_agent() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (opus) when Claude Code leads"),
+        "{line}"
+    );
+
+    // An agent tier with no models still appears, naming the fold target as
+    // today, followed by the same suffix.
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "haiku", vec![]).await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(line.contains("no model; folds down to routine"), "{line}");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (haiku) when Claude Code leads"),
+        "{line}"
+    );
 }

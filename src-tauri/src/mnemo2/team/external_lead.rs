@@ -12,9 +12,11 @@ use mnemo::app::plan_board::BoardStatus;
 use mnemo::headless::SessionId;
 
 use crate::mnemo2::ledger;
+use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
+use crate::mnemo2::runtime::{finished_notice, TEAM_NOTICE_PREFIX};
 
 use super::lead_tools::TeamLeadStatus;
-use super::record::{audit_finished, WorkerStatus};
+use super::record::{audit_finished, WorkerRecord, WorkerStatus};
 use super::{unix_ms, TeamRuntime};
 
 /// How long an attached external lead may go without calling in before it is
@@ -458,6 +460,112 @@ impl TeamRuntime {
         }
         while state.undelivered.len() > EXTERNAL_QUEUE_CAP {
             state.undelivered.pop_front();
+        }
+    }
+
+    /// A working Claude Code agent worker, for the agent gate: its id and
+    /// the settled tier it runs on, so the gate names what runs while the
+    /// lead's own Agent does the step.
+    pub async fn claude_agent_working(&self) -> Option<(String, String)> {
+        let records = self.records.lock().await;
+        records
+            .iter()
+            .find(|worker| worker.claude_agent.is_some() && worker.status == WorkerStatus::Working)
+            .map(|worker| (worker.id.clone(), worker.tier.clone().unwrap_or_default()))
+    }
+
+    /// Finish a Claude Code agent worker (`team_agent_done`): record its
+    /// final report, mark it completed or failed, and bump the turn as the
+    /// pump's Finished handling does. Only a worker that runs as a Claude
+    /// Code agent, in status Working or Interrupted, can be closed this
+    /// way; anything else is refused with the reason. The finished (or
+    /// failed) notice then reaches the lead through
+    /// [`TeamRuntime::push_agent_done_notice`].
+    pub async fn agent_done(
+        &self,
+        worker_id: &str,
+        report: String,
+        failed: bool,
+    ) -> Result<WorkerRecord, String> {
+        let _guard = self.merge_lock.lock().await;
+        let record = self.worker(worker_id).await?;
+        if record.claude_agent.is_none() {
+            return Err(format!(
+                "{worker_id} does not run as a Claude Code agent: team_agent_done only finishes agent workers"
+            ));
+        }
+        if !matches!(record.status, WorkerStatus::Working | WorkerStatus::Interrupted) {
+            let status = serde_json::to_value(record.status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "not working".to_string());
+            return Err(format!(
+                "{worker_id} is {status}: team_agent_done needs a Working or Interrupted agent worker"
+            ));
+        }
+        self.update_worker(worker_id, |worker| {
+            worker.status = if failed {
+                WorkerStatus::Failed
+            } else {
+                WorkerStatus::Completed
+            };
+            worker.turns = worker.turns.saturating_add(1);
+            worker.pending = None;
+            worker.compacting = false;
+            worker.report = Some(report);
+        })
+        .await;
+        self.persist().await?;
+        let worker = self.worker(worker_id).await?;
+        self.push_agent_done_notice(&worker, failed);
+        Ok(worker)
+    }
+
+    /// Deliver the finished (or failed) notice for a Claude Code agent
+    /// worker `team_agent_done` closed: the pump's exact notice shape, so
+    /// the review skill applies to it unchanged. The tag is built from the
+    /// completed record — an agent worker's generation is 0 (it never had
+    /// a session) and its turn was just bumped, so `current_notices` keeps
+    /// the notice. It rides the external-lead queue when one is attached
+    /// (the tool answer drains it); otherwise it parks on the undelivered
+    /// list for whoever leads next.
+    fn push_agent_done_notice(&self, worker: &WorkerRecord, failed: bool) {
+        let step = match (&worker.plan_id, worker.plan_step) {
+            (Some(plan), Some(step)) => format!(" on plan {plan} step {}", step + 1),
+            _ => String::new(),
+        };
+        let detail = if failed {
+            // A failed agent worker is never reviewed: name the failure,
+            // quote the agent's report, and offer the ways forward.
+            let report = worker
+                .report
+                .as_deref()
+                .map(|report| format!("\n\nIts report: {report}"))
+                .unwrap_or_default();
+            format!(
+                "{} could not finish its turn{step}: the Claude Code agent failed.{report}\nTo try again, dispatch the step again (a fresh worker id), or team_stop this worker to clear it.",
+                worker.name
+            )
+        } else {
+            finished_notice(worker)
+        };
+        let tag = TurnTag::of(
+            worker,
+            worker.generation,
+            if failed {
+                NoticeState::Failed
+            } else {
+                NoticeState::Finished
+            },
+        )
+        .suffix();
+        let text = format!(
+            "{TEAM_NOTICE_PREFIX} worker_id={}{}\n{detail}\nUse team_status with this exact worker_id. Reply with team_message, or use team_stop/team_compact as appropriate. Never infer lifecycle from Git, files, timestamps, or team.json.",
+            worker.id,
+            tag,
+        );
+        if !self.push_external_notice(text.clone()) {
+            self.restore_undelivered_notices(vec![text]);
         }
     }
 

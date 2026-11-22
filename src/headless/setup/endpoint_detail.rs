@@ -128,6 +128,10 @@ pub struct TierDto {
     /// `"escalate"` on the escalation-only rung, otherwise `null`.
     #[serde(default)]
     pub role: Option<String>,
+    /// The Claude Code model this tier runs as when Claude Code leads
+    /// (`opus`, `sonnet`, `haiku`, or `fable`), otherwise `null`.
+    #[serde(default)]
+    pub claude_agent: Option<String>,
     /// The rung this tier currently folds down to (output-only).
     #[serde(default)]
     pub resolves_to: String,
@@ -158,6 +162,7 @@ impl From<TierLadder> for TiersDto {
                 models: tier.models.clone(),
                 effort: tier.effort.clone(),
                 role: tier.role.clone(),
+                claude_agent: tier.claude_agent.clone(),
                 resolves_to: ladder
                     .resolve(&tier.id)
                     .map(|(ran_tier, _)| ran_tier)
@@ -183,6 +188,7 @@ impl TryFrom<TiersDto> for TierLadder {
                     models: tier.models,
                     effort: tier.effort,
                     role: tier.role,
+                    claude_agent: tier.claude_agent,
                 })
                 .collect(),
         };

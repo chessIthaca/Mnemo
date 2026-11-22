@@ -21,7 +21,9 @@ use crate::mnemo2::ledger;
 use serde_json::{json, Value};
 
 use super::lead_tools::{team_tool_error, worker_status_view};
-use super::record::{validate_worker_id, WorkerRecord, WorkerRouting, WorkerStatus};
+use super::record::{
+    agent_prompt, validate_worker_id, MessageSender, WorkerRecord, WorkerRouting, WorkerStatus,
+};
 use super::routing::RoutedDispatch;
 use super::TeamRuntime;
 
@@ -49,6 +51,10 @@ pub(super) struct DispatchRequest {
     pub(super) dispatch_routing: bool,
     /// Which public entry point supplied the dispatch.
     pub(super) source: DispatchSource,
+    /// Who supplied the dispatch. Only the attached external lead's
+    /// dispatches may be handed to a Claude Code agent tier; the in-app
+    /// lead and the IPC form always start a Mnemo worker.
+    pub(super) sender: MessageSender,
     /// The exact model spec, when the lead chose one.
     pub(super) model: Option<String>,
     /// The chosen reasoning effort, when the lead chose one.
@@ -155,6 +161,20 @@ pub(super) fn dispatch_lead_override_row(
     }
 }
 
+/// The `claude_agent` block of a dispatch answer: everything the lead's own
+/// Claude Code agent needs to run the step — the model, the prepared
+/// worktree and branch, and the full self-contained prompt
+/// ([`record::agent_prompt`]). `None` for an ordinary Mnemo worker.
+pub(super) fn claude_agent_block(worker: &WorkerRecord) -> Option<Value> {
+    worker.claude_agent.as_ref()?;
+    Some(json!({
+        "model": worker.claude_agent,
+        "worktree": worker.worktree,
+        "branch": worker.branch,
+        "prompt": agent_prompt(worker),
+    }))
+}
+
 /// A dispatch answer: the compact worker entry next to the idempotent-reuse
 /// flag. `data` keeps the whole record, as the single-worker answers do.
 pub(super) fn dispatch_result(
@@ -192,12 +212,14 @@ pub(super) fn dispatch_result(
                 }
                 _ => None,
             };
+            let claude_agent = claude_agent_block(&worker);
             let output = serde_json::to_string(&json!({
                 "action": action,
                 "result": {
                     "worker": worker_status_view(&worker, false),
                     "reused": reused,
                     "routing_note": routing_note,
+                    "claude_agent": claude_agent.clone(),
                 },
             }))
             .unwrap_or_else(|_| action.to_string());
@@ -214,9 +236,12 @@ pub(super) fn dispatch_result(
                 format!("{output}\n{}", lines.join("\n"))
             };
             let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
-            ToolResult::success(output).with_data(
-                json!({"worker": data, "reused": reused, "routing_note": routing_note}),
-            )
+            ToolResult::success(output).with_data(json!({
+                "worker": data,
+                "reused": reused,
+                "routing_note": routing_note,
+                "claude_agent": claude_agent,
+            }))
         }
         Err(err) => team_tool_error(err),
     }
@@ -428,6 +453,7 @@ impl TeamRuntime {
             tier: None,
             dispatch_routing: true,
             source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model,
             reasoning_effort,
             worker_id,
@@ -462,6 +488,7 @@ impl TeamRuntime {
             tier: None,
             dispatch_routing: false,
             source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model,
             reasoning_effort: None,
             worker_id,
@@ -486,6 +513,7 @@ impl TeamRuntime {
             tier: None,
             dispatch_routing: false,
             source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model,
             reasoning_effort,
             worker_id,
@@ -555,6 +583,7 @@ impl TeamRuntime {
             tier,
             dispatch_routing,
             source: _,
+            sender: _,
             model,
             reasoning_effort,
             worker_id,
@@ -673,22 +702,30 @@ impl TeamRuntime {
             }
             None => None,
         };
-        let (model, reasoning_effort, tier, routing, routing_rows, routing_error, routing_pending) =
-            if dispatch_routing {
-                let routed = routed
-                    .ok_or_else(|| "dispatch routing was not prepared".to_string())?;
-                (
-                    routed.model,
-                    routed.reasoning_effort,
-                    routed.tier,
-                    routed.routing,
-                    routed.rows,
-                    routed.error,
-                    routed.pending,
-                )
-            } else {
-                (model, reasoning_effort, tier, None, Vec::new(), None, None)
-            };
+        let (
+            model,
+            reasoning_effort,
+            tier,
+            routing,
+            routing_rows,
+            routing_error,
+            routing_pending,
+            claude_agent,
+        ) = if dispatch_routing {
+            let routed = routed.ok_or_else(|| "dispatch routing was not prepared".to_string())?;
+            (
+                routed.model,
+                routed.reasoning_effort,
+                routed.tier,
+                routed.routing,
+                routed.rows,
+                routed.error,
+                routed.pending,
+                routed.claude_agent,
+            )
+        } else {
+            (model, reasoning_effort, tier, None, Vec::new(), None, None, None)
+        };
         if let Some(error) = routing_error {
             for row in &routing_rows {
                 self.append_dispatch_routing_row(row);
@@ -751,12 +788,16 @@ impl TeamRuntime {
                     self.spawn_pending_classification(pending, record.id.clone());
                     pending_spawned = true;
                 }
-                self.start_worker(WorkerRecord {
-                    read_back,
-                    routing,
-                    ..record
-                })
-                .await
+                if let Some(agent) = claude_agent {
+                    self.start_agent_worker(record, agent).await
+                } else {
+                    self.start_worker(WorkerRecord {
+                        read_back,
+                        routing,
+                        ..record
+                    })
+                    .await
+                }
             }
             Err(err) => Err(err),
         };

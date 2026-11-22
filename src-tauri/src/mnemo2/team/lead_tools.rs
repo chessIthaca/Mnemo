@@ -248,6 +248,17 @@ impl TeamRuntime {
                 timeout_ms: Some(120_000),
             },
             HostToolSpec {
+                name: "team_agent_done".to_string(),
+                description: "Finish a worker that runs as a Claude Code agent: record its final report and mark it completed (or failed, with failed=true). Call it after your Claude Code agent for that worker finished its step; then team_check, team_review and team_merge work as for any worker.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The agent worker to close."},
+                    "report":{"type":"string","description":"The agent's final report: the commit hash, the checks it ran and their results, and anything left open."},
+                    "failed":{"type":"boolean","description":"True when the agent could not finish the step."}
+                },"required":["worker_id","report"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_quality".to_string(),
                 description: "Whether merged work holds up, per tier and per model: merges, first-pass share, average fix rounds and findings, high findings, reverts, merges a later bug-fix plan changed the same files for, and cost per merge. Read-only; use it when deciding a tier or model on evidence rather than on impressions.".to_string(),
                 parameters: json!({"type":"object","properties":{
@@ -358,6 +369,7 @@ impl TeamRuntime {
                     tier,
                     dispatch_routing: true,
                     source: DispatchSource::LeadTool,
+                    sender,
                     model,
                     reasoning_effort,
                     worker_id: Some(worker_id.to_string()),
@@ -498,6 +510,17 @@ impl TeamRuntime {
                 None => Err("team_message requires a 'text' string".to_string()),
             },
             "team_stop" => self.stop(worker_id).await,
+            "team_agent_done" => {
+                let report = args.get("report").and_then(Value::as_str);
+                let failed = args.get("failed").and_then(Value::as_bool).unwrap_or(false);
+                match report {
+                    Some(report) if !report.trim().is_empty() => {
+                        self.agent_done(worker_id, report.to_string(), failed)
+                            .await
+                    }
+                    _ => Err("team_agent_done requires a non-empty 'report' string".to_string()),
+                }
+            }
             "team_resume" => {
                 let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
                 let model = args.get("model").and_then(Value::as_str).map(str::to_string);
@@ -853,7 +876,19 @@ pub(super) fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
         })
         .collect::<Vec<_>>();
     // The observed model id beats the selected spec: it is what actually ran.
-    let model = worker.model_id.as_ref().or(worker.model.as_ref());
+    // A Claude Code agent worker shows the agent it runs as: it has no
+    // session, so its selected spec never ran.
+    let model = worker
+        .claude_agent
+        .as_ref()
+        .map(|agent| format!("claude-code/{agent}"))
+        .or_else(|| {
+            worker
+                .model_id
+                .as_ref()
+                .or(worker.model.as_ref())
+                .cloned()
+        });
     let mut view = json!({
         "id": worker.id,
         "name": worker.name,

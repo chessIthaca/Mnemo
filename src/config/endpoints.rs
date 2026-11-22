@@ -53,6 +53,11 @@ pub struct Tier {
     /// `"escalate"` marks the escalation-only rung; ordinary tiers omit this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// The Claude Code model this tier runs as when Claude Code leads
+    /// (`opus`, `sonnet`, `haiku`, or `fable`); absent when the tier runs on
+    /// Mnemo models only. Never set on the escalate rung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_agent: Option<String>,
 }
 
 impl Tier {
@@ -64,6 +69,7 @@ impl Tier {
             models: Vec::new(),
             effort: None,
             role: (id == "escalate").then(|| "escalate".to_string()),
+            claude_agent: None,
         }
     }
 }
@@ -173,7 +179,9 @@ impl TierLadder {
     }
 
     /// Refuse unknown, duplicate, missing, or out-of-order ids, a malformed
-    /// escalation role, and an empty lowest tier (the default-model rung).
+    /// escalation role, an empty lowest tier (the default-model rung), a
+    /// `claude_agent` other than the four Claude models, and `claude_agent`
+    /// on the escalate rung.
     pub fn validate(&self) -> std::result::Result<(), String> {
         for expected in TIER_IDS {
             let matches = self.tiers.iter().filter(|tier| tier.id == expected).count();
@@ -201,6 +209,23 @@ impl TierLadder {
         }
         if self.tiers[..4].iter().any(|tier| tier.role.is_some()) {
             return Err("only the 'escalate' tier may have a role".to_string());
+        }
+        for tier in &self.tiers {
+            if let Some(model) = &tier.claude_agent {
+                if !matches!(model.as_str(), "opus" | "sonnet" | "haiku" | "fable") {
+                    return Err(format!(
+                        "tier '{}': claude_agent '{}' is not a Claude Code model; it must be one of opus, sonnet, haiku, fable",
+                        tier.id, model
+                    ));
+                }
+            }
+        }
+        if self
+            .escalation()
+            .and_then(|tier| tier.claude_agent.as_ref())
+            .is_some()
+        {
+            return Err("the escalate tier cannot run as a Claude Code agent".to_string());
         }
         if self.first_model("trivial").is_none() {
             return Err("the lowest tier 'trivial' must have a model".to_string());
@@ -2550,6 +2575,63 @@ difficult = ["ep/hard"]
         let (loaded_endpoints, loaded_pricing) = load_or_default(&path).unwrap();
         assert_eq!(loaded_endpoints.len(), 1);
         assert_eq!(loaded_pricing.len(), 1);
+    }
+
+    #[test]
+    fn claude_agent_tier_round_trips_and_validates() {
+        // A tier may run as the lead's Claude Code agent: the setting saves
+        // and loads with the ladder, stays absent byte-for-byte when unset,
+        // and only ever carries one of the four Claude models — never on
+        // the escalate rung.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+
+        // A ladder without the setting round-trips identical bytes, so
+        // existing endpoints.toml files keep their shape.
+        let ladder = ladder_with_models();
+        save_tier_ladder(&path, &ladder).unwrap();
+        let baseline = std::fs::read(&path).unwrap();
+        let reloaded = load_tier_ladder(&path, None).unwrap();
+        assert!(reloaded.get("high").unwrap().claude_agent.is_none());
+        save_tier_ladder(&path, &reloaded).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), baseline);
+
+        // The setting saves, loads and validates.
+        let mut ladder = reloaded;
+        ladder.tiers[3].claude_agent = Some("opus".into());
+        save_tier_ladder(&path, &ladder).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("claude_agent = \"opus\"")
+        );
+        let loaded = load_tier_ladder(&path, None).unwrap();
+        assert_eq!(
+            loaded.get("high").unwrap().claude_agent.as_deref(),
+            Some("opus")
+        );
+        loaded.validate().unwrap();
+
+        // Any other value is refused, with the allowed values in the error.
+        ladder.tiers[3].claude_agent = Some("gpt".into());
+        let error = ladder.validate().unwrap_err();
+        assert!(
+            error.contains("opus, sonnet, haiku, fable"),
+            "the error names the allowed values: {error}"
+        );
+
+        // The escalate rung never runs as an agent.
+        ladder.tiers[3].claude_agent = None;
+        ladder.tiers[4].claude_agent = Some("opus".into());
+        assert_eq!(
+            ladder.validate().unwrap_err(),
+            "the escalate tier cannot run as a Claude Code agent"
+        );
+
+        // Removing the setting again keeps the file byte-identical.
+        ladder.tiers[4].claude_agent = None;
+        save_tier_ladder(&path, &ladder).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), baseline);
     }
 }
 

@@ -91,6 +91,8 @@ Strict tool schemas are capability-gated per endpoint: `supports_strict_schema` 
 
 `endpoints.toml` holds five `[[tier]]` entries in fixed order: `trivial`, `routine`, `medium`, `high`, `escalate`. Each has an id, a name, a definition and an ordered list of models. A worker runs on its tier's first available model; an empty tier falls back to the nearest cheaper tier that has one; `escalate` is only for moving a worker that keeps failing, never a first pick. Edit them in Settings → Tiers.
 
+A tier except `escalate` may also carry `claude_agent = "opus" | "sonnet" | "haiku" | "fable"` (omitted by default, set in Settings → Tiers with the "Run as" choice). While an external Claude Code lead leads the team, a dispatch that settles on such a tier is handed to the lead's own Claude Code agent on that model instead of a Mnemo worker session: Mnemo still prepares the worktree and branch, gates and routes the step, and the agent gate allows the lead's Agent calls without asking, but no Mnemo session starts — the lead finishes the step with `team_agent_done`, and review and merge stay the normal Mnemo flow. Without an external lead attached the tier resolves to its models exactly as before; `escalate` rejects the key at validation ("the escalate tier cannot run as a Claude Code agent").
+
 ## mnemo2.toml
 
 Mnemo2's own settings, kept apart from the shared `config.toml`.

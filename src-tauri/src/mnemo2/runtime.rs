@@ -1623,8 +1623,10 @@ async fn pump_team_notifications(
 }
 
 /// The lead notice for a worker turn that ended Completed: its plan step and
-/// the next move toward a merge (review, close findings, or merge).
-fn finished_notice(worker: &crate::mnemo2::team::WorkerRecord) -> String {
+/// the next move toward a merge (review, close findings, or merge). Shared
+/// with `team_agent_done`, which closes a Claude Code agent worker with the
+/// same notice shape.
+pub(crate) fn finished_notice(worker: &crate::mnemo2::team::WorkerRecord) -> String {
     let step = match (&worker.plan_id, worker.plan_step) {
         (Some(plan), Some(step)) => format!(" on plan {plan} step {}", step + 1),
         _ => String::new(),

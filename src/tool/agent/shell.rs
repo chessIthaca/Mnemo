@@ -1911,25 +1911,31 @@ mod tests {
         }
     }
 
-    /// The silence clock starts AFTER the slot is acquired: a command queued for
-    /// longer than its silence window is not killed as "silent" (plan d3336a8a).
+    /// The slot wait is outside the silence clock: a command queued for longer
+    /// than its silence window is not killed as "silent" (plan d3336a8a).
     #[tokio::test]
     async fn slot_wait_is_not_counted_as_silence() {
         let dir = tempdir().unwrap();
         let slots = tempdir().unwrap();
+        // `run_command` starts the clock just before it SPAWNS the child, so a
+        // shell's own start-up counts against the silence window: the window
+        // must clear a boot on THIS host (measured from ~1 s idle to more than
+        // 8 s under load), which a fixed 4 s never does. Both the window and
+        // the wait are sized from the measured boot instead, so the wait still
+        // exceeds the window by construction.
+        let boot = measured_shell_boot(dir.path()).await;
+        let silence = silence_window(boot);
+        let hold = silence + Duration::from_secs(2);
         let held = HeavySlots::new(slots.path().to_path_buf(), 1)
             .try_take()
             .guard()
             .expect("the only slot is free");
         let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(8000));
+            std::thread::sleep(hold);
             drop(held);
         });
-        // A 4 s silence window is generous for PowerShell's own startup on a
-        // loaded machine, and the wait below is longer still: counting the wait
-        // as silence would kill the command before it ever spawned.
         let limits = RunLimits {
-            silence: Some(Duration::from_millis(4000)),
+            silence: Some(silence),
             total: Duration::from_secs(60),
         };
         let slots_for_call = HeavySlots::new(slots.path().to_path_buf(), 1);
@@ -1943,9 +1949,11 @@ mod tests {
         )
         .await;
         release.join().expect("release thread");
+        // The wait outlasted the whole silence window, so a clock that counted
+        // it would have killed the command before it ever spawned.
         assert!(
-            waited >= Duration::from_millis(2500),
-            "the call waited for the slot: {waited:?}"
+            waited > silence,
+            "the call waited out the silence window: {waited:?} vs {silence:?}"
         );
         match outcome {
             RunOutcome::Exited { code, .. } => {

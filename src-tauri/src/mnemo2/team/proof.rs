@@ -240,8 +240,8 @@ fn plain_path(raw: &str) -> String {
 }
 
 /// The one-based line of the `#[cfg(test)]` that opens a file's inline test
-/// module: the first `#[cfg(test)]` whose next non-blank line starts with
-/// `mod `. Other `#[cfg(test)]` items above it (a test seam in production
+/// module: the first `#[cfg(test)]` whose next line, past blank lines and
+/// other attributes (`#[...]`), starts with `mod `. Other `#[cfg(test)]` items above it (a test seam in production
 /// code) do not start the test code. Without such a line the first
 /// `#[cfg(test)]` of any kind is used.
 fn cfg_test_line(text: &str) -> Option<u32> {
@@ -251,7 +251,7 @@ fn cfg_test_line(text: &str) -> Option<u32> {
         is_cfg(line)
             && lines[index + 1..]
                 .iter()
-                .find(|next| !next.trim().is_empty())
+                .find(|next| !next.trim().is_empty() && !next.trim().starts_with("#["))
                 .is_some_and(|next| next.trim().starts_with("mod "))
     });
     module
@@ -592,6 +592,36 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Kill the child in `slot` and wait for it to exit; `true` when there is no
+/// child or it was reaped.
+///
+/// Best effort by necessity: [`Drop`] cannot wait forever, so after about
+/// 5 s a child that will not die is reported on stderr and given up on
+/// (`false`), and the caller restores anyway. A failed kill or a failed
+/// poll is reported and never counted as an exit. It blocks: async callers
+/// run it through `spawn_blocking`.
+fn reap_slot(slot: &std::sync::Mutex<Option<tokio::process::Child>>) -> bool {
+    let child = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(mut child) = child else {
+        return true;
+    };
+    if let Err(error) = child.start_kill() {
+        eprintln!("Mnemo2: could not kill the proof's git child: {error}");
+    }
+    for _ in 0..500 {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("Mnemo2: could not poll the proof's git child: {error}");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    eprintln!("Mnemo2: the proof's git child could not be reaped; restoring anyway");
+    false
+}
+
 /// Puts the checkout back when the proof future is dropped before its own
 /// restore ran.
 ///
@@ -691,8 +721,10 @@ impl<'a> RestoreGuard<'a> {
                 Ok(status) => break status,
                 Err(Some(error)) => {
                     // A child we cannot poll is killed and reaped, not left
-                    // running behind the error.
-                    self.reap_inflight();
+                    // running behind the error. The wait blocks, so it runs
+                    // off the async runtime.
+                    let slot = self.inflight.clone();
+                    let _ = tokio::task::spawn_blocking(move || reap_slot(&slot)).await;
                     return Err(fail(error));
                 }
                 Err(None) => tokio::time::sleep(Duration::from_millis(10)).await,
@@ -705,37 +737,9 @@ impl<'a> RestoreGuard<'a> {
         })
     }
 
-    /// Kill the in-flight child and wait for it to exit; `true` when there is
-    /// no child or it was reaped.
-    ///
-    /// Best effort by necessity: [`Drop`] cannot wait forever, so after about
-    /// 5 s a child that will not die is reported on stderr and given up on
-    /// (`false`), and the caller restores anyway. A failed kill or a failed
-    /// poll is reported and never counted as an exit.
+    /// Kill the in-flight child and wait for it to exit (see [`reap_slot`]).
     fn reap_inflight(&self) -> bool {
-        let child = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let Some(mut child) = child else {
-            return true;
-        };
-        if let Err(error) = child.start_kill() {
-            eprintln!("Mnemo2: could not kill the proof's git child: {error}");
-        }
-        for _ in 0..500 {
-            match child.try_wait() {
-                Ok(Some(_)) => return true,
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("Mnemo2: could not poll the proof's git child: {error}");
-                }
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        eprintln!("Mnemo2: the proof's git child could not be reaped; restoring anyway");
-        false
+        reap_slot(&self.inflight)
     }
 
     /// [`restore_checkout`] through [`Self::run_git`]: every child is
@@ -750,7 +754,11 @@ impl<'a> RestoreGuard<'a> {
                 return Err(git_error(args, &output));
             }
         }
-        let head = self.run_git(&["rev-parse", "HEAD"]).await?;
+        let head_args = ["rev-parse", "HEAD"];
+        let head = self.run_git(&head_args).await?;
+        if !head.status.success() {
+            return Err(git_error(&head_args, &head));
+        }
         let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
         if head != self.tip {
             return Err(format!(
@@ -807,7 +815,7 @@ impl Drop for RestoreGuard<'_> {
 /// The checkout must sit at `tip` with a clean status when the proof starts;
 /// anything else is [`RedOutcome::Inconclusive`] and the checkout is untouched.
 /// From the reverse-apply on, every path restores the checkout and verifies it
-/// — the normal paths through [`restore_checkout`], a dropped future through
+/// — the normal paths through [`RestoreGuard::restore`], a dropped future through
 /// the armed [`RestoreGuard`] — and a restore that cannot be verified is an
 /// `Err` the caller must surface.
 pub async fn prove_regression(
@@ -1370,7 +1378,8 @@ mod tests {
                 5 => "#[cfg(test)]".to_string(),
                 6 => "const SEAM: u32 = 1;".to_string(),
                 20 => "#[cfg(test)]".to_string(),
-                21 => "mod tests {".to_string(),
+                21 => "#[rustfmt::skip]".to_string(),
+                22 => "mod tests {".to_string(),
                 _ => format!("// line {line}"),
             })
             .collect::<Vec<_>>()

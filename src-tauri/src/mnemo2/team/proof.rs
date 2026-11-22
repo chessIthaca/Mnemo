@@ -1639,12 +1639,30 @@ Start-Sleep -Seconds 3
             "demo".to_string(),
             None,
         );
-        let waited = tokio::time::timeout(Duration::from_secs(1), proof).await;
-        APPLY_SEAM.with(|cell| *cell.borrow_mut() = None);
-        assert!(
-            waited.is_err(),
-            "the proof must still be applying when dropped"
-        );
+        // Drive the proof until the wrapper's first action (the patch copy)
+        // is visible, i.e. the apply is really running, then drop the proof.
+        {
+            tokio::pin!(proof);
+            let marker = async {
+                for _ in 0..3000 {
+                    if copy.exists() {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                false
+            };
+            tokio::select! {
+                finished = &mut proof => {
+                    APPLY_SEAM.with(|cell| *cell.borrow_mut() = None);
+                    panic!("the proof finished before the apply started: {finished:?}");
+                }
+                seen = marker => {
+                    APPLY_SEAM.with(|cell| *cell.borrow_mut() = None);
+                    assert!(seen, "the apply wrapper never started within 60 s");
+                }
+            }
+        }
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
         assert_eq!(git_in(&root, &["status", "--porcelain", "-uall"]), "");

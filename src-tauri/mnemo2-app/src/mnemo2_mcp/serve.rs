@@ -52,6 +52,8 @@ const SERVER_ERROR: i64 = -32000;
 const METHOD_NOT_FOUND: i64 = -32601;
 const PARSE_ERROR: i64 = -32700;
 /// Tells Claude Code to fetch the tool list again.
+/// The reply field naming the revision of Mnemo2's tool list; stripped here.
+const REVISION_FIELD: &str = "_mnemo_tools_revision";
 const LIST_CHANGED: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 
 #[derive(Clone)]
@@ -98,6 +100,9 @@ struct Bridge {
     stale_list: AtomicBool,
     /// A thread is looking for an instance after a failed start.
     watching: AtomicBool,
+    /// The `_mnemo_tools_revision` of the last `tools/list` answered: the tool
+    /// list Claude Code holds. None until the client has listed tools once.
+    listed_revision: Mutex<Option<String>>,
 }
 
 /// How a bounded wait for the instance ended.
@@ -209,6 +214,28 @@ impl Bridge {
             local_initialize,
             stale_list: AtomicBool::new(false),
             watching: AtomicBool::new(false),
+            listed_revision: Mutex::new(None),
+        }
+    }
+
+    /// Track the tool-list revision a reply carries. A `tools/list` answer
+    /// records it; any other reply with a different one means the client's
+    /// list is out of date (the tiers changed, or Mnemo2 was rebuilt and
+    /// restarted), so the change is announced once, right after that reply.
+    /// A reply without a revision (an older app) never announces anything.
+    fn note_revision(&self, method: &str, revision: Option<String>) {
+        let Some(revision) = revision else {
+            return;
+        };
+        let mut listed = self
+            .listed_revision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if method == "tools/list" {
+            *listed = Some(revision);
+        } else if listed.as_ref().is_some_and(|known| *known != revision) {
+            *listed = Some(revision);
+            self.stale_list.store(true, Ordering::SeqCst);
         }
     }
 
@@ -309,7 +336,9 @@ impl Bridge {
             }
             match self.forward(&instance, line) {
                 Forward::Reply(response) => {
-                    return match reply_from(id.as_ref(), response) {
+                    let (line, revision) = reply_from(id.as_ref(), response);
+                    self.note_revision(method, revision);
+                    return match line {
                         Some(line) if method == "tools/call" => {
                             Some(self.offer.apply(line, Path::new(&instance.root)))
                         }
@@ -594,7 +623,16 @@ fn watch(bridge: Weak<Bridge>) {
 }
 
 /// Turn Mnemo2's HTTP answer into the line to write, if any.
-fn reply_from(id: Option<&Value>, response: Response) -> Option<String> {
+///
+/// Also returns the tool-list revision the reply carried; the field is removed
+/// from the line, so it never reaches the client.
+fn reply_from(id: Option<&Value>, response: Response) -> (Option<String>, Option<String>) {
+    let mut revision = None;
+    let line = reply_line(id, response, &mut revision);
+    (line, revision)
+}
+
+fn reply_line(id: Option<&Value>, response: Response, revision: &mut Option<String>) -> Option<String> {
     if response.status == 202 {
         return None;
     }
@@ -610,7 +648,15 @@ fn reply_from(id: Option<&Value>, response: Response) -> Option<String> {
     }
     match serde_json::from_str::<Value>(body) {
         // Re-serialising keeps the reply on one line whatever the server sent.
-        Ok(value) if ok || value.get("jsonrpc").is_some() => Some(value.to_string()),
+        Ok(mut value) if ok || value.get("jsonrpc").is_some() => {
+            if let Some(object) = value.as_object_mut() {
+                *revision = match object.remove(REVISION_FIELD) {
+                    Some(Value::String(text)) => Some(text),
+                    _ => None,
+                };
+            }
+            Some(value.to_string())
+        }
         _ => {
             let excerpt: String = body.chars().take(200).collect();
             id.map(|id| {

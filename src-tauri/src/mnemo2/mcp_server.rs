@@ -558,8 +558,12 @@ const CODE_METHOD_NOT_FOUND: i64 = -32601;
 const CODE_INVALID_PARAMS: i64 = -32602;
 const CODE_PROJECT: i64 = -32000;
 
-fn rpc_result(id: &Value, result: Value) -> Response {
-    Response::json(200, &json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+fn rpc_result(id: &Value, result: Value, revision: Option<&str>) -> Response {
+    let mut body = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    if let Some(revision) = revision {
+        body[TOOLS_REVISION_FIELD] = json!(revision);
+    }
+    Response::json(200, &body)
 }
 
 fn rpc_error(id: &Value, (code, message): RpcError) -> Response {
@@ -573,6 +577,9 @@ fn rpc_error(id: &Value, (code, message): RpcError) -> Response {
 struct Reply {
     result: Value,
     drained: Option<Drained>,
+    /// `tools_revision` of the connection's tool list, set once the target
+    /// resolved; it rides in `_mnemo_tools_revision` for the helper.
+    revision: Option<String>,
 }
 
 impl Reply {
@@ -580,8 +587,25 @@ impl Reply {
         Self {
             result,
             drained: None,
+            revision: None,
         }
     }
+}
+
+/// The reply field the helper reads and strips: the revision of the tool list.
+pub const TOOLS_REVISION_FIELD: &str = "_mnemo_tools_revision";
+
+/// A stable hash (FNV-1a, so it holds across builds) of exactly the JSON
+/// `tools/list` returns, as a decimal string. A change to any tool or
+/// description, tier guidance included, changes it.
+fn tools_revision(tools: &[Value]) -> String {
+    let text = Value::Array(tools.to_vec()).to_string();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash.to_string()
 }
 
 /// `/lead/wait` reports this when the root names no open project.
@@ -1169,7 +1193,14 @@ impl Shared {
                             }
                         }
                         target.team.touch_external_lead();
-                        self.dispatch(method, params, request, &target).await
+                        self.dispatch(method, params, request, &target)
+                            .await
+                            .map(|mut reply| {
+                                if reply.revision.is_none() {
+                                    reply.revision = Some(tools_revision(&tool_list(&target)));
+                                }
+                                reply
+                            })
                     }
                     Err(message) => Err((CODE_PROJECT, message)),
                 }
@@ -1178,7 +1209,7 @@ impl Shared {
         };
         match outcome {
             Ok(reply) => {
-                let mut response = rpc_result(id, reply.result);
+                let mut response = rpc_result(id, reply.result, reply.revision.as_deref());
                 response.drained = reply.drained;
                 response
             }
@@ -1202,12 +1233,17 @@ impl Shared {
                 let helper = request.header("x-mnemo-helper").unwrap_or_default();
                 Ok(Reply::plain(json!({
                     "protocolVersion": version,
-                    "capabilities": { "tools": {} },
+                    "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": { "name": "mnemo", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": lead_instructions(helper),
                 })))
             }
-            "tools/list" => Ok(Reply::plain(json!({ "tools": tool_list(target) }))),
+            "tools/list" => {
+                let tools = tool_list(target);
+                let mut reply = Reply::plain(json!({ "tools": tools }));
+                reply.revision = Some(tools_revision(&tools));
+                Ok(reply)
+            }
             _ => self.call_tool(params, target).await,
         }
     }
@@ -3865,6 +3901,53 @@ mod tests {
             .lead_post("/lead/gate-agent", json!({ "root": "/elsewhere", "subagent_type": "x" }))
             .await;
         assert_eq!(reply["decision"], "allow");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn initialize_declares_list_changed() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let (_, reply) = fixture.rpc(initialize()).await;
+        assert_eq!(reply["result"]["capabilities"]["tools"]["listChanged"], true);
+        assert!(reply[TOOLS_REVISION_FIELD].is_string(), "{reply}");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tools_revision_changes_with_the_tier_guidance() {
+        use crate::mnemo2::runtime::LeadModel;
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let list = || json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+        let (_, first) = fixture.rpc(list()).await;
+        let (_, again) = fixture.rpc(list()).await;
+        let before = first[TOOLS_REVISION_FIELD].as_str().expect("revision").to_string();
+        assert_eq!(again[TOOLS_REVISION_FIELD], before.as_str(), "stable while nothing changes");
+        let tools = first["result"]["tools"].as_array().expect("tools").clone();
+        assert_eq!(tools_revision(&tools), before);
+
+        let mut dto = mnemo::headless::TiersDto::default();
+        dto.tiers[0].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].models = vec!["test/scripted-a".to_string()];
+        team.set_catalog(
+            vec![LeadModel {
+                endpoint: "test".to_string(),
+                model: "scripted-a".to_string(),
+                spec: "test/scripted-a".to_string(),
+                is_default: true,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            dto,
+            Vec::new(),
+        );
+        let (_, after) = fixture.rpc(list()).await;
+        assert_ne!(after[TOOLS_REVISION_FIELD], before.as_str(), "{after}");
+        // Any other reply carries the new revision too.
+        let (_, pong) = fixture
+            .rpc(json!({ "jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {} }))
+            .await;
+        assert_eq!(pong[TOOLS_REVISION_FIELD], after[TOOLS_REVISION_FIELD]);
         fixture.shutdown().await;
     }
 

@@ -95,7 +95,12 @@ impl TeamRuntime {
             );
         }
         let previous_inbox = record.inbox.clone();
-        let delivered_text = format!("{}\n{text}", sender.header());
+        let mut delivered_text = format!("{}\n{text}", sender.header());
+        // A prompt to an idle implementation worker first brings a checkout
+        // that has no commits of its own up to the lead tip.
+        if let Some(note) = self.fast_forward_note(worker_id, kind).await {
+            delivered_text = format!("{note}\n{delivered_text}");
+        }
         let (busy, idle, steer_pending, sent) = {
             let live = self.live.lock().await;
             let live = live

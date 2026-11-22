@@ -383,6 +383,11 @@ pub struct WorkerRecord {
     /// session; `team_agent_done` closes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_agent: Option<String>,
+    /// The full sha of the lead commit this worker's checkout started from
+    /// (advanced when an idle worker without commits is fast-forwarded).
+    /// `None` for workers recorded before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
     /// The dispatch-time Laya decision, absent for legacy and unrouted workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<WorkerRouting>,

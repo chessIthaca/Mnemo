@@ -22,7 +22,9 @@ use crate::mnemo2::phase3::{self, ReviewEvidence};
 use super::findings_ledger;
 use super::record::{ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
-use super::dispatch::{dispatch_result, DispatchRequest, DispatchSource, PlanRef};
+use super::dispatch::{
+    BoxFuture, DispatchRequest, DispatchSource, PlanRef, dispatch_result, stale_base_line,
+};
 use super::TeamRuntime;
 
 impl TeamRuntime {
@@ -304,8 +306,9 @@ impl TeamRuntime {
 
     /// Execute a built-in lead host-tool call.
     pub async fn handle_lead_host_tool(&self, name: &str, args: Value) -> ToolResult {
-        self.handle_lead_host_tool_from(name, args, MessageSender::Lead)
-            .await
+        // Boxed: the future of the whole tool table is large, and callers
+        // (the in-app lead, tests) hold it on their own stack.
+        Box::pin(self.handle_lead_host_tool_from(name, args, MessageSender::Lead)).await
     }
 
     /// Execute a lead host-tool call with its caller's identity attached.
@@ -363,6 +366,9 @@ impl TeamRuntime {
                 .mode;
             let explicit_model = model.is_some();
             let fold_request = if model.is_none() { tier.clone() } else { None };
+            // Read before the dispatch: a deferred classification may already
+            // be waiting on its timer once the worker exists.
+            let warnings = self.lead_checkout_warnings().await;
             let result = self
                 .dispatch_request(DispatchRequest {
                     brief: brief.to_string(),
@@ -387,6 +393,7 @@ impl TeamRuntime {
                 mode,
                 fold_request,
                 explicit_model,
+                warnings,
             );
         }
         if name == "team_audit_dispatch" {
@@ -426,6 +433,7 @@ impl TeamRuntime {
                 RoutingMode::Off,
                 fold_request,
                 explicit_model,
+                Vec::new(),
             );
         }
         if name == "team_prove_regression" || name == "team_mutation_check" {
@@ -490,12 +498,10 @@ impl TeamRuntime {
             // The compact entry is the default because the answer lands in the
             // lead's own context; `detail` asks for the whole record.
             let detail = args.get("detail").and_then(Value::as_bool).unwrap_or(false);
-            let result = result.map(|workers| {
-                workers
-                    .iter()
-                    .map(|worker| worker_status_view(worker, detail))
-                    .collect::<Vec<_>>()
-            });
+            let result = match result {
+                Ok(workers) => Ok(self.status_views(&workers, detail).await),
+                Err(err) => Err(err),
+            };
             return team_status_result(result, self.lead_status());
         }
         if name == "session_search" {
@@ -503,6 +509,13 @@ impl TeamRuntime {
         }
         let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
             return ToolResult::error(format!("{name} requires a 'worker_id' string"));
+        };
+        // The stale base is read before a merge, which would add the merge
+        // commit to what the branch lacks.
+        let stale = if matches!(name, "team_check" | "team_merge") {
+            self.stale_base_of(worker_id).await
+        } else {
+            None
         };
         let result = match name {
             "team_message" => match args.get("text").and_then(Value::as_str) {
@@ -636,6 +649,9 @@ impl TeamRuntime {
         };
         let reviewed = result.as_ref().ok().cloned();
         let mut answer = worker_result(result, name);
+        if let (true, Some(missing)) = (answer.success, stale) {
+            answer.output = format!("{}\n{}", answer.output, stale_base_line(missing));
+        }
         if name == "team_review" && answer.success {
             if let Some(line) = finding_categories_line(&self.workspace_root) {
                 answer.output = format!("{}\n{line}", answer.output);
@@ -653,6 +669,36 @@ impl TeamRuntime {
             }
         }
         answer
+    }
+
+    /// The status views `team_status` answers, each with its `stale_base`
+    /// when the branch lacks lead commits.
+    fn status_views<'a>(
+        &'a self,
+        workers: &'a [WorkerRecord],
+        detail: bool,
+    ) -> BoxFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            let mut views = Vec::with_capacity(workers.len());
+            for worker in workers {
+                let mut view = worker_status_view(worker, detail);
+                if let (Some(missing), Some(object)) =
+                    (self.stale_base(worker).await, view.as_object_mut())
+                {
+                    object.insert("stale_base".to_string(), json!(missing));
+                }
+                views.push(view);
+            }
+            views
+        })
+    }
+
+    /// The stale base of one worker, `None` when unknown or not worth reporting.
+    fn stale_base_of<'a>(&'a self, worker_id: &'a str) -> BoxFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            let worker = self.worker(worker_id).await.ok()?;
+            self.stale_base(&worker).await
+        })
     }
 
     /// `session_search`: search the past worker and lead transcripts, or read

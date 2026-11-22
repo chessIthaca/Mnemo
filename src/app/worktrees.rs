@@ -753,6 +753,63 @@ pub async fn ensure_pool_checkout_registered(
     .map_err(|error| format!("pool checkout guard task failed: {error}"))?
 }
 
+/// Fast-forward a worker's pool `checkout` to `lead_ref` (the lead branch).
+///
+/// Returns `Ok(true)` after `git merge --ff-only <lead_ref>` ran in the
+/// checkout. Returns `Ok(false)` without touching anything when the checkout
+/// has uncommitted or untracked changes, when `lead_ref` is HEAD itself, or
+/// when `lead_ref` does not descend from HEAD. It never rebases, resets or
+/// merges non-fast-forward. The pool registration guard runs first; a git
+/// failure is an `Err` and leaves the checkout as git left it.
+pub async fn fast_forward_checkout(
+    main_root: PathBuf,
+    checkout: PathBuf,
+    lead_ref: String,
+) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || {
+        ensure_registered_pool_checkout(&main_root, &checkout)?;
+        if !git_raw(&checkout, &["status", "--porcelain"])?.trim().is_empty() {
+            return Ok(false);
+        }
+        let behind = git_raw(
+            &checkout,
+            &["rev-list", "--count", &format!("HEAD..{lead_ref}")],
+        )?;
+        let ahead = git_raw(
+            &checkout,
+            &["rev-list", "--count", &format!("{lead_ref}..HEAD")],
+        )?;
+        if behind.trim() == "0" || ahead.trim() != "0" {
+            return Ok(false);
+        }
+        git_raw(&checkout, &["merge", "--ff-only", &lead_ref])?;
+        Ok(true)
+    })
+    .await
+    .map_err(|error| format!("fast-forward task failed: {error}"))?
+}
+
+/// How many commits of `lead_ref` the worker `branch` does not contain
+/// (`git rev-list --count <branch>..<lead_ref>`, run in `main_root`).
+pub async fn commits_missing(
+    main_root: PathBuf,
+    branch: String,
+    lead_ref: String,
+) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || {
+        let count = git_raw(
+            &main_root,
+            &["rev-list", "--count", &format!("{branch}..{lead_ref}")],
+        )?;
+        count
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("unreadable commit count '{}': {error}", count.trim()))
+    })
+    .await
+    .map_err(|error| format!("commit count task failed: {error}"))?
+}
+
 /// Release a finished worker's pool checkout back to the pool WITHOUT
 /// deleting it: the folder's `target/`, `node_modules/` and code graph are
 /// the warm cache the next worker builds on. The checkout must be on the

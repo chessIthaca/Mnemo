@@ -6,9 +6,10 @@
 //! session - the board-step check, dispatch-time routing, provisioning
 //! and idempotent reuse.
 
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use mnemo::app::worktrees::agent_branch;
+use mnemo::app::worktrees::{agent_branch, commits_missing, current_branch, fast_forward_checkout};
 use mnemo::config::endpoints::TierLadder;
 use mnemo::tool::ToolResult;
 
@@ -17,15 +18,22 @@ use crate::mnemo2::dispatch_routing::{
     RoutingSettings,
 };
 use crate::mnemo2::ledger;
+use crate::mnemo2::phase3;
 
 use serde_json::{json, Value};
 
 use super::lead_tools::{team_tool_error, worker_status_view};
 use super::record::{
-    agent_prompt, validate_worker_id, MessageSender, WorkerRecord, WorkerRouting, WorkerStatus,
+    agent_prompt, validate_worker_id, InboxKind, MessageSender, WorkerRecord, WorkerRouting,
+    WorkerStatus,
 };
 use super::routing::RoutedDispatch;
 use super::TeamRuntime;
+
+/// A boxed future: helpers that big async callers await return one so the
+/// callers' state machines (and, in debug builds, their stack frames) stay small.
+pub(super) type BoxFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// A plan and step a task is dispatched under (`step` is 0-based).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,6 +191,7 @@ pub(super) fn dispatch_result(
     mode: RoutingMode,
     fold_request: Option<String>,
     explicit_model: bool,
+    warnings: Vec<String>,
 ) -> ToolResult {
     match result {
         Ok((worker, reused, laya_pending)) => {
@@ -220,6 +229,7 @@ pub(super) fn dispatch_result(
                     "reused": reused,
                     "routing_note": routing_note,
                     "claude_agent": claude_agent.clone(),
+                    "warnings": warnings.clone(),
                 },
             }))
             .unwrap_or_else(|_| action.to_string());
@@ -241,6 +251,7 @@ pub(super) fn dispatch_result(
                 "reused": reused,
                 "routing_note": routing_note,
                 "claude_agent": claude_agent,
+                "warnings": warnings,
             }))
         }
         Err(err) => team_tool_error(err),
@@ -671,8 +682,8 @@ impl TeamRuntime {
                     if !existing.worktree.is_dir() {
                         return Err(format!("worker '{id}' has no recoverable worktree"));
                     }
-                    return self
-                        .start_worker(existing)
+                    let existing = self.refresh_before_redispatch(existing).await;
+                    return Box::pin(self.start_worker(existing))
                         .await
                         .map(|worker| (worker, true, false));
                 }
@@ -776,9 +787,14 @@ impl TeamRuntime {
                     self.append_dispatch_routing_row(&row);
                 }
                 let routing_for_record = routing.clone();
+                // The opening prompt ends by naming the lead commit the
+                // checkout starts from.
+                let opening_prompt = self.opening_with_base(&record).await;
+                let prompt_for_record = opening_prompt.clone();
                 self.update_worker(&record.id, |worker| {
                     worker.read_back = read_back;
                     worker.routing = routing_for_record;
+                    worker.opening_prompt = prompt_for_record;
                 })
                 .await;
                 // The classification an explicit-choice dispatch deferred:
@@ -791,12 +807,13 @@ impl TeamRuntime {
                 let record = WorkerRecord {
                     read_back,
                     routing,
+                    opening_prompt,
                     ..record
                 };
                 if let Some(agent) = claude_agent {
-                    self.start_agent_worker(record, agent).await
+                    Box::pin(self.start_agent_worker(record, agent)).await
                 } else {
-                    self.start_worker(record).await
+                    Box::pin(self.start_worker(record)).await
                 }
             }
             Err(err) => Err(err),
@@ -835,4 +852,236 @@ impl TeamRuntime {
         steps.dedup();
         steps
     }
+
+    /// The closing line of a worker's opening prompt: the lead commit its
+    /// checkout starts from. `None` (logged) when git cannot name it; a
+    /// dispatch never fails over it.
+    pub(super) fn base_line<'a>(
+        &'a self,
+        worktree: &'a Path,
+        sha: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let lead = match current_branch(&self.workspace_root) {
+                Ok(lead) => lead,
+                Err(err) => {
+                    eprintln!("team: base line skipped, no lead branch: {err}");
+                    return None;
+                }
+            };
+            let subject = match phase3::git_value(worktree, &["log", "-1", "--format=%s", sha]).await {
+                Ok(subject) => subject,
+                Err(err) => {
+                    eprintln!("team: base line skipped, no subject for {sha}: {err}");
+                    return None;
+                }
+            };
+            Some(format!(
+                "You start at {} ({subject}), the tip of {lead} when you were dispatched.",
+                short_sha(sha)
+            ))
+        })
+    }
+
+    /// Bring an idle implementation worker that has no commits of its own and
+    /// a clean checkout up to the lead branch tip, when the lead moved on.
+    /// Returns the new tip and its subject after a fast-forward and persists
+    /// the new `base_commit`; `None` in every other case, including a git
+    /// error, which leaves the worktree as it is and is logged. Never rebases
+    /// or resets. The caller holds the merge lock.
+    pub(super) fn refresh_worker_base<'a>(
+        &'a self,
+        worker_id: &'a str,
+    ) -> BoxFuture<'a, Option<(String, String)>> {
+        Box::pin(async move {
+            let worker = self.worker(worker_id).await.ok()?;
+            let base = worker.base_commit.clone()?;
+            if worker.kind != "implementation"
+                || worker.claude_agent.is_some()
+                || worker.branch.is_empty()
+                || matches!(
+                    worker.status,
+                    WorkerStatus::Merged | WorkerStatus::Merging | WorkerStatus::Cancelled
+                )
+            {
+                return None;
+            }
+            let outcome: Result<Option<(String, String)>, String> = async {
+                let lead = current_branch(&self.workspace_root)?;
+                if phase3::tip(&worker.worktree).await? != base {
+                    return Ok(None);
+                }
+                if phase3::git_value(&self.workspace_root, &["rev-parse", &lead]).await? == base {
+                    return Ok(None);
+                }
+                let moved = fast_forward_checkout(
+                    self.workspace_root.clone(),
+                    worker.worktree.clone(),
+                    lead,
+                )
+                .await?;
+                if !moved {
+                    return Ok(None);
+                }
+                let tip = phase3::tip(&worker.worktree).await?;
+                let subject =
+                    phase3::git_value(&worker.worktree, &["log", "-1", "--format=%s", &tip]).await?;
+                Ok(Some((tip, subject)))
+            }
+            .await;
+            match outcome {
+                Ok(Some((tip, subject))) => {
+                    let stored = tip.clone();
+                    self.update_worker(worker_id, |worker| worker.base_commit = Some(stored))
+                        .await;
+                    if let Err(err) = self.persist().await {
+                        eprintln!("team: could not persist the fast-forwarded base of {worker_id}: {err}");
+                    }
+                    Some((tip, subject))
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    eprintln!("team: base refresh of {worker_id} skipped: {err}");
+                    None
+                }
+            }
+        })
+    }
+
+    /// The re-dispatch half of the refresh guard: fast-forward a worker that
+    /// never started, and swap the base line of its stored opening prompt for
+    /// the new tip. Returns the record to start.
+    fn refresh_before_redispatch(&self, existing: WorkerRecord) -> BoxFuture<'_, WorkerRecord> {
+        Box::pin(async move {
+            let Some((tip, _)) = self.refresh_worker_base(&existing.id).await else {
+                return existing;
+            };
+            if let Some(line) = self.base_line(&existing.worktree, &tip).await {
+                let prompt = with_base_line(
+                    existing.opening_prompt.as_deref().unwrap_or(&existing.brief),
+                    &line,
+                );
+                self.update_worker(&existing.id, |worker| worker.opening_prompt = Some(prompt))
+                    .await;
+                if let Err(err) = self.persist().await {
+                    eprintln!("team: could not persist the new base line of {}: {err}", existing.id);
+                }
+            }
+            self.worker(&existing.id).await.unwrap_or(existing)
+        })
+    }
+
+    /// How many lead-branch commits the worker's branch lacks, when that is
+    /// worth reporting: an implementation worker with a branch that is not
+    /// Merged, Merging or Cancelled, and more than 0 missing. One git call;
+    /// a git error is logged and reports nothing.
+    pub(super) async fn stale_base(&self, worker: &WorkerRecord) -> Option<u64> {
+        if worker.kind != "implementation"
+            || worker.branch.is_empty()
+            || matches!(
+                worker.status,
+                WorkerStatus::Merged | WorkerStatus::Merging | WorkerStatus::Cancelled
+            )
+        {
+            return None;
+        }
+        let lead = current_branch(&self.workspace_root).ok()?;
+        match commits_missing(self.workspace_root.clone(), worker.branch.clone(), lead).await {
+            Ok(0) => None,
+            Ok(missing) => Some(missing),
+            Err(err) => {
+                eprintln!("team: stale base of {} not counted: {err}", worker.id);
+                None
+            }
+        }
+    }
+
+    /// The record's opening prompt ending with the base line, or the stored
+    /// prompt unchanged when the record has no base or git cannot name it.
+    fn opening_with_base<'a>(&'a self, record: &'a WorkerRecord) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let base = record.base_commit.as_deref()?;
+            match self.base_line(&record.worktree, base).await {
+                Some(line) => Some(with_base_line(
+                    record.opening_prompt.as_deref().unwrap_or(&record.brief),
+                    &line,
+                )),
+                None => record.opening_prompt.clone(),
+            }
+        })
+    }
+
+    /// The note a prompt to an idle implementation worker starts with when
+    /// its checkout was just fast-forwarded to the lead tip. A steer, a busy
+    /// session and every refusal give `None`; the git work runs outside the
+    /// live lock.
+    pub(super) fn fast_forward_note<'a>(
+        &'a self,
+        worker_id: &'a str,
+        kind: Option<InboxKind>,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            if kind.unwrap_or(InboxKind::Prompt) != InboxKind::Prompt {
+                return None;
+            }
+            let idle = match self.live.lock().await.get(worker_id) {
+                Some(live) => !live.busy.load(Ordering::SeqCst),
+                None => false,
+            };
+            if !idle {
+                return None;
+            }
+            let (tip, subject) = self.refresh_worker_base(worker_id).await?;
+            Some(format!(
+                "[From Mnemo2] The lead branch moved: your checkout was fast-forwarded to {} ({subject}).",
+                short_sha(&tip)
+            ))
+        })
+    }
+
+    /// Warnings a dispatch answer carries about the lead checkout: uncommitted
+    /// `.coding/` files (outside the bookkeeping folders Mnemo serves from the
+    /// lead's own store) that the worker's checkout will not contain.
+    pub(super) fn lead_checkout_warnings(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            match phase3::uncommitted_lead_files(&self.workspace_root).await {
+                Ok(files) if !files.is_empty() => {
+                    let listed = files.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                    let more = if files.len() > 5 { ", ..." } else { "" };
+                    vec![format!(
+                        "The lead checkout has {} uncommitted file(s) under .coding/ that this worker's checkout will not contain: {listed}{more}. Commit them first if the worker needs them.",
+                        files.len()
+                    )]
+                }
+                Ok(_) => Vec::new(),
+                Err(err) => {
+                    eprintln!("team: lead checkout warning skipped: {err}");
+                    Vec::new()
+                }
+            }
+        })
+    }
+}
+
+/// The first 8 hex digits of a commit sha.
+pub(super) fn short_sha(sha: &str) -> &str {
+    sha.get(..8).unwrap_or(sha)
+}
+
+/// `prompt` ending in `line` as its own paragraph, replacing a base line the
+/// prompt already ends with.
+fn with_base_line(prompt: &str, line: &str) -> String {
+    let trimmed = prompt.trim_end();
+    let body = match trimmed.rfind('\n') {
+        Some(at) if trimmed[at + 1..].starts_with("You start at ") => trimmed[..at].trim_end(),
+        _ => trimmed,
+    };
+    format!("{body}\n\n{line}")
+}
+
+/// The line `team_check` and `team_merge` append for a stale worker branch.
+pub(super) fn stale_base_line(missing: u64) -> String {
+    format!(
+        "stale base: the lead branch has {missing} commit(s) this branch does not; the checks ran without them. Rebase or merge deliberately if they matter."
+    )
 }

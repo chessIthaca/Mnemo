@@ -170,9 +170,9 @@ pub(super) fn dispatch_lead_override_row(
 }
 
 /// The `claude_agent` block of a dispatch answer: everything the lead's own
-/// Claude Code agent needs to run the step — the model, the prepared
-/// worktree and branch, and the full self-contained prompt
-/// ([`record::agent_prompt`]). `None` for an ordinary Mnemo worker.
+/// Claude Code agent needs to run the step — the model, the agent effort (or
+/// `null`), the prepared worktree and branch, and the full self-contained
+/// prompt ([`record::agent_prompt`]). `None` for an ordinary Mnemo worker.
 pub(super) fn claude_agent_block(worker: &WorkerRecord) -> Option<Value> {
     worker.claude_agent.as_ref()?;
     Some(json!({
@@ -180,6 +180,7 @@ pub(super) fn claude_agent_block(worker: &WorkerRecord) -> Option<Value> {
         "worktree": worker.worktree,
         "branch": worker.branch,
         "prompt": agent_prompt(worker),
+        "effort": worker.claude_agent_effort,
     }))
 }
 

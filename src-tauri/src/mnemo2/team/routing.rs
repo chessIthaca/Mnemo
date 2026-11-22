@@ -27,12 +27,15 @@ use super::{status_name, unix_ms, TeamRuntime};
 
 /// A dispatch handed to the lead's own Claude Code agent instead of a Mnemo
 /// worker session: the Claude model to run (`opus`, `sonnet`, `haiku`,
-/// `fable`) and the tier routing settled on before fold-down, which the
-/// agent worker's record and the agent gate's reason name.
+/// `fable`), the agent effort the tier sets (if any), and the tier routing
+/// settled on before fold-down, which the agent worker's record and the
+/// agent gate's reason name.
 #[derive(Clone, Debug)]
 pub(super) struct ClaudeAgentDispatch {
     /// The Claude Code model the lead's agent runs on.
     pub(super) model: String,
+    /// The Claude Code effort the tier sets, when it sets one.
+    pub(super) effort: Option<String>,
     /// The settled tier that carries `claude_agent`.
     pub(super) tier: String,
 }
@@ -205,6 +208,7 @@ pub(super) fn tier_ladder_from_dto(tiers: &mnemo::headless::TiersDto) -> TierLad
                 effort: tier.effort.clone(),
                 role: tier.role.clone(),
                 claude_agent: tier.claude_agent.clone(),
+                claude_agent_effort: tier.claude_agent_effort.clone(),
             })
             .collect(),
     }
@@ -488,9 +492,12 @@ impl TeamRuntime {
         {
             return None;
         }
-        let model = self.tier_ladder().get(tier)?.claude_agent.clone()?;
+        let ladder = self.tier_ladder();
+        let rung = ladder.get(tier)?;
+        let model = rung.claude_agent.clone()?;
         Some(ClaudeAgentDispatch {
             model,
+            effort: rung.claude_agent_effort.clone(),
             tier: tier.to_string(),
         })
     }
@@ -1059,11 +1066,17 @@ impl TeamRuntime {
             } else {
                 ""
             };
-            let agent = rung
-                .claude_agent
-                .as_deref()
-                .map(|model| format!("; runs as a Claude Code agent ({model}) when Claude Code leads"))
-                .unwrap_or_default();
+            let agent = match rung.claude_agent.as_deref() {
+                Some(model) => match rung.claude_agent_effort.as_deref() {
+                    Some(effort) => format!(
+                        "; runs as a Claude Code agent ({model}, {effort} effort) when Claude Code leads"
+                    ),
+                    None => {
+                        format!("; runs as a Claude Code agent ({model}) when Claude Code leads")
+                    }
+                },
+                None => String::new(),
+            };
             lines.push(format!(
                 "{tier} ({}) - {}: {list}{effort}{escalation}{agent}",
                 rung.name, rung.definition

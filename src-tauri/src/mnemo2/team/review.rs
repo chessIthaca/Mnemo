@@ -30,8 +30,8 @@ use super::nudge::{claim_nudge, deliver_nudge, pending_fix_downshift, route_fix_
 use super::persistence::TeamPersistence;
 use super::pump::save_workers;
 use super::record::{
-    agent_worker_refusal, ChangeSource, InboxKind, MessageSender, WorkerCheck, WorkerRecord,
-    WorkerStatus,
+    agent_worker_refusal, unfinished_agent_error, ChangeSource, InboxKind, MessageSender,
+    WorkerCheck, WorkerRecord, WorkerStatus,
 };
 use super::routing::NUDGE_LADDER;
 
@@ -195,6 +195,9 @@ impl TeamRuntime {
             return Err("the review summary is empty".to_string());
         }
         let worker = self.worker(worker_id).await?;
+        if let Some(error) = unfinished_agent_error(&worker) {
+            return Err(error);
+        }
         if worker.kind == "audit" {
             return Err(
                 "an audit worker is a read-only reviewer and is not reviewed; adjudicate it by recording team_review on its implementation worker with independent_reviewer_id".to_string(),
@@ -389,6 +392,9 @@ impl TeamRuntime {
             return Err("a check needs a name and a passed/failed outcome".to_string());
         }
         let worker = self.worker(worker_id).await?;
+        if let Some(error) = unfinished_agent_error(&worker) {
+            return Err(error);
+        }
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("checks cannot be added during or after merge".to_string());
         }

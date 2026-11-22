@@ -445,6 +445,20 @@ pub(super) fn agent_worker_refusal(worker: &WorkerRecord) -> Option<String> {
     })
 }
 
+/// The refusal checks, review and merge give while a Claude Code agent
+/// worker is still Working or Interrupted. Unlike session-driving tools,
+/// these operations become valid as soon as `team_agent_done` closes it.
+pub(super) fn unfinished_agent_error(worker: &WorkerRecord) -> Option<String> {
+    (worker.claude_agent.is_some()
+        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Interrupted))
+    .then(|| {
+        format!(
+            "{} runs as a Claude Code agent: call team_agent_done when it has finished",
+            worker.id
+        )
+    })
+}
+
 /// The model a worker's session actually runs on: the lead's chosen spec, else
 /// the id the live session resolved, else the routing default.
 pub(super) fn session_model_spec(worker: &WorkerRecord) -> &str {

@@ -27,7 +27,7 @@ use super::deletion::{
 };
 use super::external_lead::EXTERNAL_LEAD_MEMORY_REMINDER;
 use super::nudge::nudge_ignored_row;
-use super::record::{validate_worker_id, WorkerRecord, WorkerStatus};
+use super::record::{unfinished_agent_error, validate_worker_id, WorkerRecord, WorkerStatus};
 use super::routing::{logs_label, logs_routing, outcome_row};
 use super::{now_key, project_relative, unix_ms, TeamRuntime};
 
@@ -148,6 +148,17 @@ pub(super) async fn delete_merged_branch(root: &Path, worker: &WorkerRecord) -> 
         .map(|_| true)
 }
 
+/// The model to attribute a worker's merge to. A session-free Claude Code
+/// agent has no observed session model, so its agent model is the honest one.
+fn merge_worker_model(worker: &WorkerRecord) -> Option<String> {
+    worker
+        .claude_agent
+        .as_ref()
+        .map(|model| format!("claude-code/{model}"))
+        .or_else(|| worker.model_id.clone())
+        .or_else(|| worker.model.clone())
+}
+
 pub(super) async fn merge_record_from_git(
     root: &std::path::Path,
     worker: &WorkerRecord,
@@ -175,7 +186,7 @@ pub(super) async fn merge_record_from_git(
         files,
         additions,
         deletions,
-        worker_model: worker.model_id.clone().or_else(|| worker.model.clone()),
+        worker_model: merge_worker_model(worker),
         worker_tokens: worker.total_tokens,
         cost_micros: worker.cost_micros,
         merged_at_ms: phase3::now_ms(),
@@ -196,13 +207,13 @@ pub(super) async fn merge_conflicts_only(root: &Path) -> Result<bool, String> {
 }
 
 /// One `## Progress` line for a merged task: step, worker, model, merge
-/// commit, and the review summary when one was recorded.
-fn merge_outcome_line(number: usize, worker: &WorkerRecord) -> String {
+/// commit, and the review summary when one was recorded. The model is the
+/// observed session model or, for a Claude Code agent worker, its agent model.
+pub(super) fn merge_outcome_line(number: usize, worker: &WorkerRecord) -> String {
     let merge = worker.merge.as_ref();
     let model = merge
         .and_then(|m| m.worker_model.clone())
-        .or_else(|| worker.model_id.clone())
-        .or_else(|| worker.model.clone())
+        .or_else(|| merge_worker_model(worker))
         .unwrap_or_else(|| "default model".to_string());
     let commit = merge.map_or("", |m| m.commit.as_str());
     let short: String = commit.chars().take(8).collect();
@@ -323,6 +334,9 @@ impl TeamRuntime {
         // state, so this refusal comes before every other gate. A still-running
         // audit (or a differently-named lead branch) must not mask the reason.
         let worker = self.worker(worker_id).await?;
+        if let Some(error) = unfinished_agent_error(&worker) {
+            return Err(error);
+        }
         if worker.kind == "audit" {
             return Err(
                 "an audit worker is a read-only reviewer and is never merged; adjudicate it on its implementation worker's review".to_string(),

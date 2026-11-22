@@ -487,8 +487,22 @@ impl TeamRuntime {
         report: String,
         failed: bool,
     ) -> Result<WorkerRecord, String> {
+        self.agent_done_with_snapshot(worker_id, report, failed, None)
+            .await
+    }
+
+    /// `agent_done` with an optional saved-worker override for the
+    /// persistence regression seam.
+    pub(super) async fn agent_done_with_snapshot(
+        &self,
+        worker_id: &str,
+        report: String,
+        failed: bool,
+        snapshot_override: Option<WorkerRecord>,
+    ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let record = self.worker(worker_id).await?;
+        let previous = record.clone();
         if record.claude_agent.is_none() {
             return Err(format!(
                 "{worker_id} does not run as a Claude Code agent: team_agent_done only finishes agent workers"
@@ -515,7 +529,15 @@ impl TeamRuntime {
             worker.report = Some(report);
         })
         .await;
-        self.persist().await?;
+        if let Err(error) = self.persist_with_snapshot(snapshot_override).await {
+            // No notice has been queued yet. Restore the exact pre-done
+            // record so memory and the durable ledger both stay retryable.
+            let mut records = self.records.lock().await;
+            if let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) {
+                *worker = previous;
+            }
+            return Err(error);
+        }
         let worker = self.worker(worker_id).await?;
         self.push_agent_done_notice(&worker, failed);
         Ok(worker)

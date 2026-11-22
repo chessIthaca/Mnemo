@@ -747,7 +747,17 @@ impl TeamRuntime {
                 ));
             }
         }
-        let active = self.live.lock().await.len();
+        let active_agents = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| {
+                worker.claude_agent.is_some()
+                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Interrupted)
+            })
+            .count();
+        let active = self.live.lock().await.len() + active_agents;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
@@ -788,15 +798,15 @@ impl TeamRuntime {
                     self.spawn_pending_classification(pending, record.id.clone());
                     pending_spawned = true;
                 }
+                let record = WorkerRecord {
+                    read_back,
+                    routing,
+                    ..record
+                };
                 if let Some(agent) = claude_agent {
                     self.start_agent_worker(record, agent).await
                 } else {
-                    self.start_worker(WorkerRecord {
-                        read_back,
-                        routing,
-                        ..record
-                    })
-                    .await
+                    self.start_worker(record).await
                 }
             }
             Err(err) => Err(err),

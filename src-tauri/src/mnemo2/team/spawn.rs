@@ -286,17 +286,20 @@ impl TeamRuntime {
         mut record: WorkerRecord,
         agent: ClaudeAgentDispatch,
     ) -> Result<WorkerRecord, String> {
+        let model = format!("claude-code/{}", agent.model);
         record.claude_agent = Some(agent.model);
         record.tier = Some(agent.tier);
         record.status = WorkerStatus::Working;
         record.brief_sent = true;
         record.compacting = false;
+        note_model(&mut record, &model);
         self.update_worker(&record.id, |worker| {
             worker.claude_agent = record.claude_agent.clone();
             worker.tier = record.tier.clone();
             worker.status = WorkerStatus::Working;
             worker.brief_sent = true;
             worker.compacting = false;
+            note_model(worker, &model);
         })
         .await;
         self.persist().await?;

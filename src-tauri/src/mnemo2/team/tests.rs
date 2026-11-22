@@ -25,7 +25,9 @@ use super::dispatch::{
 };
 use super::guardrails::{audit_guardrails, executor_guardrails};
 use super::lead_tools::worker_status_view;
-use super::merge::{delete_merged_branch, merge_tip, validate_merge, WORKTREE_CLEANUP_ERROR};
+use super::merge::{
+    delete_merged_branch, merge_outcome_line, merge_tip, validate_merge, WORKTREE_CLEANUP_ERROR,
+};
 use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
@@ -14859,6 +14861,39 @@ async fn team_agent_done_finishes_the_worker_and_notifies_the_lead() {
     run_git(&worktree, &["add", "."]);
     run_git(&worktree, &["commit", "-m", "the agent's work"]);
 
+    // With no live entry, the session-free agent must still be closed by
+    // team_agent_done before checks, review or merge can start.
+    let unfinished =
+        "agenttier06 runs as a Claude Code agent: call team_agent_done when it has finished";
+    let error = fixture
+        .team
+        .record_check(
+            "agenttier06",
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect_err("an unfinished agent worker cannot be checked");
+    assert_eq!(error, unfinished);
+    let error = fixture
+        .team
+        .review(
+            "agenttier06",
+            "this review is premature".into(),
+            Vec::new(),
+            evidence(),
+        )
+        .await
+        .expect_err("an unfinished agent worker cannot be reviewed");
+    assert_eq!(error, unfinished);
+    let error = fixture
+        .team
+        .merge("agenttier06")
+        .await
+        .expect_err("an unfinished agent worker cannot be merged");
+    assert_eq!(error, unfinished);
+
     // team_agent_done records the report, completes the worker and bumps
     // the turn as the pump's Finished handling does.
     let report = "Committed the change; cargo test --workspace and clippy pass.";
@@ -15119,4 +15154,305 @@ async fn tier_guidance_names_the_claude_agent() {
         line.ends_with("; runs as a Claude Code agent (haiku) when Claude Code leads"),
         "{line}"
     );
+}
+
+
+#[tokio::test]
+async fn agent_dispatch_read_back_uses_the_updated_record_and_reuses_the_same_block() {
+    let fixture = agent_fixture(
+        RoutingMode::Auto,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request = agent_dispatch_request(
+        &fixture.plan_id,
+        "read the step back before implementing it",
+        "agenttier13",
+    );
+    request.read_back = true;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the read-back agent dispatch");
+    let first = claude_agent_block(&record).expect("the first agent block");
+    assert!(record.read_back, "the returned record keeps read_back: {record:?}");
+    assert!(record.routing.is_some(), "the returned record keeps routing");
+    assert!(
+        first["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.starts_with(super::record::READ_BACK_KICKOFF)),
+        "the prompt uses the READ_BACK kickoff"
+    );
+
+    let mut retry_request = agent_dispatch_request(
+        &fixture.plan_id,
+        "read the step back before implementing it",
+        "agenttier13",
+    );
+    retry_request.read_back = true;
+    let (retry, reused, _) = fixture
+        .team
+        .dispatch_request(retry_request)
+        .await
+        .expect("the same-id retry");
+    assert!(reused);
+    assert_eq!(first, claude_agent_block(&retry).expect("the retry block"));
+
+    let answer = dispatch_result(
+        Ok((record, false, false)),
+        "team_dispatch",
+        RoutingMode::Auto,
+        None,
+        false,
+    );
+    let data = answer.data.expect("dispatch data");
+    assert_eq!(data["worker"]["read_back"], true);
+    assert!(data["worker"]["routing"].is_object());
+}
+
+#[tokio::test]
+async fn agent_workers_count_against_dispatch_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    fixture.team.set_slots(1).await.expect("one worker slot");
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the first session-free agent occupies the only slot",
+            "slotOne0001",
+        ))
+        .await
+        .expect("the first agent dispatch");
+
+    let error = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the second agent must wait for a free slot",
+            "slotTwo0001",
+        ))
+        .await
+        .expect_err("the working agent occupies the only slot");
+    assert_eq!(error, "all 1 worker slots are busy");
+
+    fixture
+        .team
+        .agent_done("slotOne0001", "finished".into(), false)
+        .await
+        .expect("free the agent slot");
+    let (second, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the second agent runs after team_agent_done",
+            "slotTwo0001",
+        ))
+        .await
+        .expect("the slot is available after team_agent_done");
+    assert_eq!(second.status, WorkerStatus::Working);
+}
+
+
+#[tokio::test]
+async fn agent_workers_count_when_reducing_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    for (id, brief) in [
+        ("slotThree01", "the first agent counts as an active worker"),
+        ("slotFour001", "the second agent also counts as an active worker"),
+    ] {
+        fixture
+            .team
+            .dispatch_request(agent_dispatch_request(&fixture.plan_id, brief, id))
+            .await
+            .expect("an agent dispatch within the original slot cap");
+    }
+
+    let error = fixture
+        .team
+        .set_slots(1)
+        .await
+        .expect_err("two active agents prevent reducing the cap to one");
+    assert_eq!(error, "stop 1 worker(s) before reducing slots to 1");
+    fixture
+        .team
+        .agent_done("slotThree01", "finished".into(), false)
+        .await
+        .expect("finish one agent");
+    fixture
+        .team
+        .set_slots(1)
+        .await
+        .expect("one active agent fits the reduced cap");
+}
+
+#[tokio::test]
+async fn agent_merge_and_outcome_use_the_claude_code_model() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    run_git(fixture._root.path(), &["checkout", "-b", "wt/mnemo"]);
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "attribute the merged work to the Claude Code agent model",
+            "agenttier14",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let worktree = std::path::PathBuf::from(&record.worktree);
+    std::fs::write(worktree.join("attribution.txt"), "done\n").expect("agent work");
+    run_git(&worktree, &["add", "."]);
+    run_git(&worktree, &["commit", "-m", "agent attribution"]);
+    fixture
+        .team
+        .agent_done("agenttier14", "finished".into(), false)
+        .await
+        .expect("finish the agent");
+    fixture
+        .team
+        .record_check(
+            "agenttier14",
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect("record the check");
+    fixture
+        .team
+        .review("agenttier14", "reviewed".into(), Vec::new(), evidence())
+        .await
+        .expect("review the agent");
+    let merged = fixture.team.merge("agenttier14").await.expect("merge the agent");
+
+    assert_eq!(merged.models_used, vec!["claude-code/opus".to_string()]);
+    let merge = merged.merge.as_ref().expect("the merge record");
+    assert_eq!(merge.worker_model.as_deref(), Some("claude-code/opus"));
+    let progress = merge_outcome_line(1, &merged);
+    assert!(progress.contains("claude-code/opus"), "{progress}");
+    let mut without_merge = merged.clone();
+    without_merge.merge = None;
+    let progress = merge_outcome_line(1, &without_merge);
+    assert!(progress.contains("claude-code/opus"), "{progress}");
+}
+
+
+#[tokio::test]
+async fn agent_done_persist_failure_rolls_back_and_can_retry() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "a failed completion write must leave the agent retryable",
+            "agenttier15",
+        ))
+        .await
+        .expect("the agent dispatch");
+
+    // A fresh transcript Arc makes the persistence seam attempt the write;
+    // the directory where that transcript belongs makes the rename fail.
+    let transcript = fixture
+        .state
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join("agenttier15.json");
+    std::fs::create_dir(&transcript).expect("inject the transcript rename failure");
+    let mut snapshot = fixture
+        .team
+        .worker("agenttier15")
+        .await
+        .expect("the working snapshot");
+    snapshot.transcript = std::sync::Arc::new(Transcript::default());
+    let error = fixture
+        .team
+        .agent_done_with_snapshot(
+            "agenttier15",
+            "this completion must not become durable".into(),
+            false,
+            Some(snapshot),
+        )
+        .await
+        .expect_err("the injected transcript write fails");
+    assert!(error.contains("could not replace the transcript"), "{error}");
+
+    let current = fixture
+        .team
+        .worker("agenttier15")
+        .await
+        .expect("the in-memory record after the failed write");
+    assert_eq!(current.status, WorkerStatus::Working);
+    assert_eq!(current.turns, 0);
+    assert!(current.report.is_none());
+    assert!(fixture.team.drain_external_notices().is_empty());
+    std::fs::remove_dir(&transcript).expect("clear the injected failure");
+    let saved = TeamPersistence::new(fixture.state.path())
+        .load()
+        .expect("reload the durable ledger")
+        .expect("a saved team");
+    let saved_worker = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == "agenttier15")
+        .expect("the durable agent record");
+    assert_eq!(saved_worker.status, WorkerStatus::Working);
+
+    let done = fixture
+        .team
+        .agent_done("agenttier15", "the clean retry completes".into(), false)
+        .await
+        .expect("the clean retry");
+    assert_eq!(done.status, WorkerStatus::Completed);
+    assert!(fixture
+        .team
+        .drain_external_notices()
+        .iter()
+        .any(|notice| notice.contains("agenttier15") && notice.contains("finished its turn")));
+    let saved = TeamPersistence::new(fixture.state.path())
+        .load()
+        .expect("reload after the retry")
+        .expect("a saved team");
+    let saved_worker = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == "agenttier15")
+        .expect("the persisted completed agent");
+    assert_eq!(saved_worker.status, WorkerStatus::Completed);
+    assert_eq!(saved_worker.report.as_deref(), Some("the clean retry completes"));
 }

@@ -279,6 +279,140 @@ pub fn gate_agent(env: &Env, stdin_text: &str) -> Option<String> {
     )
 }
 
+// ---- worktree-create / worktree-remove ---------------------------------------
+
+/// How long the worktree claim may take: Mnemo2 registers the agent and
+/// saves its ledger before it answers.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A worktree name Claude Code hands the hook: letters, digits, '.', '-'
+/// and '_', and never a path.
+fn valid_worktree_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// `git <args>` in `dir`, its trimmed stdout on success.
+fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// The folder of the repository `cwd` belongs to (its main checkout, also
+/// when `cwd` is inside a linked worktree).
+fn repo_root(cwd: &std::path::Path) -> Result<PathBuf, String> {
+    let common = git_in(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = PathBuf::from(common);
+    common
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| format!("{} has no parent folder", common.display()))
+}
+
+/// The worktree Claude Code makes itself for an isolated agent named `name`:
+/// `<repo>/.claude/worktrees/<name>` on a new branch `worktree-<name>` from
+/// HEAD, or that folder as it is when a worktree of that name already exists.
+fn plain_worktree(cwd: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    let root = repo_root(cwd)?;
+    let dir = root.join(".claude").join("worktrees").join(name);
+    if dir.join(".git").exists() {
+        return Ok(dir);
+    }
+    let dir_text = dir.to_string_lossy().into_owned();
+    let branch = format!("worktree-{name}");
+    if git_in(&root, &["worktree", "add", "-b", &branch, &dir_text, "HEAD"]).is_err() {
+        // The branch can outlive an earlier folder of the same name.
+        git_in(&root, &["worktree", "add", &dir_text, &branch])?;
+    }
+    Ok(dir)
+}
+
+/// `worktree-create` (plan 4d920eec decisions 1-2): the folder for an agent
+/// Claude Code starts with isolation "worktree", printed as the hook's last
+/// stdout line. While Claude Code leads a Mnemo project and an agent worker
+/// waits for its agent, Mnemo2 answers with that worker's warm pool checkout;
+/// otherwise the agent is not Mnemo work and gets the worktree Claude Code
+/// would make itself. Unlike the other hooks this one must answer: an error
+/// fails the agent's start, with the reason on stderr.
+pub fn worktree_create(env: &Env, stdin_text: &str) -> Result<String, String> {
+    let input = parse_input(stdin_text);
+    let cwd = hook_cwd(env, &input);
+    let name = input
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !valid_worktree_name(name) {
+        return Err(format!("unusable worktree name '{name}'"));
+    }
+    if let Some(instance) = find_instance_for_hook(env, &cwd) {
+        let reply = call(
+            &instance,
+            "/lead/worktree-claim",
+            &json!({
+                "root": instance.root,
+                "name": name,
+                "transcript_path": input.get("transcript_path").and_then(Value::as_str),
+            }),
+            CLAIM_TIMEOUT,
+        )
+        .ok_or_else(|| "Mnemo2 did not answer the worktree claim".to_string())?;
+        if let Some(worktree) = reply.get("worktree").and_then(Value::as_str) {
+            return Ok(worktree.to_string());
+        }
+        if let Some(error) = reply.get("error").and_then(Value::as_str) {
+            return Err(error.to_string());
+        }
+    }
+    plain_worktree(&cwd, name).map(|dir| dir.to_string_lossy().into_owned())
+}
+
+/// `worktree-remove`: removes a worktree [`worktree_create`] made the plain
+/// way (under `<repo>/.claude/worktrees/`) and its `worktree-<name>` branch.
+/// Any other folder, a Mnemo pool above all, is left alone: Mnemo releases
+/// its pools itself, keeping their build caches.
+pub fn worktree_remove(env: &Env, stdin_text: &str) -> Result<(), String> {
+    let input = parse_input(stdin_text);
+    let Some(path) = input.get("worktree_path").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let Ok(root) = repo_root(&hook_cwd(env, &input)) else {
+        return Ok(());
+    };
+    let plain = root.join(".claude").join("worktrees");
+    let (Ok(plain), Ok(target)) = (plain.canonicalize(), path.canonicalize()) else {
+        return Ok(());
+    };
+    if target.parent() != Some(plain.as_path()) {
+        return Ok(());
+    }
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    git_in(&root, &["worktree", "remove", "--force", &path.to_string_lossy()])?;
+    let _ = git_in(&root, &["branch", "-D", &format!("worktree-{name}")]);
+    Ok(())
+}
+
 // ---- hint --pre-search -----------------------------------------------------
 
 /// The names Claude Code lists the plugin's Mnemo tools under (the skills use

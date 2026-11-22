@@ -18541,3 +18541,62 @@ async fn integrating_the_lead_branch_clears_stale_base() {
     assert!(settled.worktree.join("lead.txt").is_file());
     fixture.team.shutdown().await;
 }
+
+// --- plan 4d920eec step 2: the WorktreeCreate hook's claim ---
+
+#[tokio::test]
+async fn worktree_claim_hands_the_waiting_agent_worker_its_pool() {
+    let (fixture, projects, transcript) = agent_watch_fixture("claimOne01").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let lead_transcript = std::fs::canonicalize(projects.path())
+        .expect("canonical projects folder")
+        .join("D--proj")
+        .join("session1.jsonl");
+    let before = team.worker("claimOne01").await.expect("worker");
+    assert!(before.claude_agent_id.is_none(), "the agent is not launched yet");
+
+    let claimed = team
+        .claim_agent_checkout("agent-a1b2c3", Some(&lead_transcript.to_string_lossy()))
+        .await
+        .expect("the claim");
+    assert_eq!(claimed, Some((before.worktree.clone(), "claimOne01".to_string())));
+    let worker = team.worker("claimOne01").await.expect("worker");
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    let agent = status_agent(team, "claimOne01").await;
+    assert_eq!(agent["tool_calls"], 2, "Mnemo follows the agent's transcript: {agent}");
+
+    // The worker no longer waits: the next isolated agent is not Mnemo work.
+    assert_eq!(
+        team.claim_agent_checkout("agent-ffff01", None).await.expect("second claim"),
+        None
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn worktree_claim_without_a_waiting_worker_falls_back() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    assert_eq!(
+        fixture.team.claim_agent_checkout("agent-a1b2c3", None).await.expect("claim"),
+        None
+    );
+    // A malformed name is never Mnemo's either.
+    assert_eq!(
+        fixture.team.claim_agent_checkout("../escape", None).await.expect("claim"),
+        None
+    );
+    fixture.team.shutdown().await;
+}

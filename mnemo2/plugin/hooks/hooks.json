@@ -1,5 +1,5 @@
 {
-  "description": "Mnemo lead hooks: add the team summary and pending worker notices at session start, deliver notices after tool calls, remind the lead to keep the background waiter running, point code and knowledge searches at the Mnemo tools that answer them better, and ask before Claude Code's own agents run. No hook blocks a tool call by itself, and all of them stay silent outside a Mnemo2 project.",
+  "description": "Mnemo lead hooks: add the team summary and pending worker notices at session start, deliver notices after tool calls, remind the lead to keep the background waiter running, point code and knowledge searches at the Mnemo tools that answer them better, and ask before Claude Code's own agents run. No hook blocks a tool call by itself, and all of them stay silent outside a Mnemo2 project, and give agents started with isolation \"worktree\" their Mnemo worker's warm checkout (or an ordinary worktree when they are not Mnemo work).",
   "hooks": {
     "SessionStart": [
       {
@@ -7,7 +7,10 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
-            "args": ["notices", "--session-start"],
+            "args": [
+              "notices",
+              "--session-start"
+            ],
             "timeout": 10
           }
         ]
@@ -20,7 +23,10 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
-            "args": ["notices", "--drain"],
+            "args": [
+              "notices",
+              "--drain"
+            ],
             "timeout": 10
           }
         ]
@@ -32,7 +38,10 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
-            "args": ["notices", "--stop-check"],
+            "args": [
+              "notices",
+              "--stop-check"
+            ],
             "timeout": 10
           }
         ]
@@ -45,7 +54,9 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
-            "args": ["gate-agent"],
+            "args": [
+              "gate-agent"
+            ],
             "timeout": 10
           }
         ]
@@ -56,8 +67,39 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
-            "args": ["hint", "--pre-search"],
+            "args": [
+              "hint",
+              "--pre-search"
+            ],
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
+            "args": [
+              "worktree-create"
+            ],
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
+            "args": [
+              "worktree-remove"
+            ],
+            "timeout": 60
           }
         ]
       }

@@ -158,6 +158,11 @@ enum Hook {
     /// PreToolUse on Grep/Glob: point a code or knowledge lookup at the
     /// Mnemo tool that answers it better. Never blocks.
     Hint,
+    /// WorktreeCreate: the folder for an isolated agent (a waiting agent
+    /// worker's warm pool, or a plain worktree). Must answer.
+    WorktreeCreate,
+    /// WorktreeRemove: removes only a plain worktree the create hook made.
+    WorktreeRemove,
 }
 
 /// Which hook `command rest...` names; the error is a note for stderr.
@@ -173,6 +178,8 @@ fn parse_hook(command: &str, rest: &[String]) -> Result<Hook, String> {
         },
         "gate-agent" if rest.is_empty() => Ok(Hook::GateAgent),
         "gate-agent" => Err("gate-agent takes no arguments".to_string()),
+        "worktree-create" => Ok(Hook::WorktreeCreate),
+        "worktree-remove" => Ok(Hook::WorktreeRemove),
         other => Err(format!("{other} is not a hook")),
     }
 }
@@ -189,6 +196,8 @@ fn hook_for_event(input: &str) -> Option<Hook> {
         "SessionStart" => Some(Hook::Notices(NoticesMode::SessionStart)),
         "PostToolUse" => Some(Hook::Notices(NoticesMode::Drain)),
         "Stop" => Some(Hook::Notices(NoticesMode::StopCheck)),
+        "WorktreeCreate" => Some(Hook::WorktreeCreate),
+        "WorktreeRemove" => Some(Hook::WorktreeRemove),
         // One event, two hooks: the search hint rides on Grep and Glob, the
         // agent gate on everything else (its plugin matcher lists the agents).
         "PreToolUse" => match event.get("tool_name").and_then(serde_json::Value::as_str) {
@@ -208,6 +217,8 @@ fn hook_args(hook: Hook) -> Vec<String> {
         Hook::Notices(NoticesMode::StopCheck) => &["notices", "--stop-check"],
         Hook::GateAgent => &["gate-agent"],
         Hook::Hint => &["hint", "--pre-search"],
+        Hook::WorktreeCreate => &["worktree-create"],
+        Hook::WorktreeRemove => &["worktree-remove"],
     };
     args.iter().map(|arg| arg.to_string()).collect()
 }
@@ -366,6 +377,9 @@ fn run_event_hook() -> ExitCode {
 }
 
 fn run_hook(hook: Hook, args: &[String], input: String) -> ExitCode {
+    if matches!(hook, Hook::WorktreeCreate | Hook::WorktreeRemove) {
+        return run_worktree_hook(hook, &input);
+    }
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // A fresher copy answers when it can; otherwise this copy does.
         let delegated = delegate_exe().and_then(|target| run_delegated_hook(&target, args, &input));
@@ -378,12 +392,38 @@ fn run_hook(hook: Hook, args: &[String], input: String) -> ExitCode {
             Hook::Notices(mode) => hooks::notices(&env, mode, &input),
             Hook::GateAgent => hooks::gate_agent(&env, &input),
             Hook::Hint => hooks::hint(&env, &input),
+            // Answered by `run_worktree_hook` before this point.
+            Hook::WorktreeCreate | Hook::WorktreeRemove => None,
         };
         if let Some(output) = output {
             print_line(&output);
         }
     }));
     ExitCode::SUCCESS
+}
+
+/// The worktree hooks must answer, so unlike the others they report failure:
+/// the reason on stderr and exit code 1 (Claude Code then refuses the
+/// agent's start instead of running it in the wrong folder). They are never
+/// delegated, so a claim is made exactly once.
+fn run_worktree_hook(hook: Hook, input: &str) -> ExitCode {
+    let env = Env::from_process();
+    let outcome = catch_unwind(AssertUnwindSafe(|| match hook {
+        Hook::WorktreeCreate => hooks::worktree_create(&env, input).map(Some),
+        _ => hooks::worktree_remove(&env, input).map(|()| None),
+    }))
+    .unwrap_or_else(|_| Err("the worktree hook stopped unexpectedly".to_string()));
+    match outcome {
+        Ok(Some(path)) => {
+            print_line(&path);
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("mnemo2-mcp: {reason}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// All of stdin (hooks pipe a small JSON document), empty on a terminal.
@@ -427,6 +467,8 @@ mod tests {
         );
         assert_eq!(hook_for_event(&event("PostToolUse")), Some(Hook::Notices(NoticesMode::Drain)));
         assert_eq!(hook_for_event(&event("Stop")), Some(Hook::Notices(NoticesMode::StopCheck)));
+        assert_eq!(hook_for_event(&event("WorktreeCreate")), Some(Hook::WorktreeCreate));
+        assert_eq!(hook_for_event(&event("WorktreeRemove")), Some(Hook::WorktreeRemove));
         assert_eq!(hook_for_event(&event("PreToolUse")), Some(Hook::GateAgent));
         // One PreToolUse hook per tool: the search hint on Grep and Glob, the
         // agent gate everywhere else (its plugin matcher lists the agents).

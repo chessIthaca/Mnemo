@@ -861,6 +861,9 @@ impl Shared {
             "/lead/notices" => self.notices(target, body).await,
             "/lead/wait" => self.wait(target, body).await,
             "/lead/gate-agent" => Response::json(200, &self.gate_agent(target, body).await),
+            "/lead/worktree-claim" => {
+                Response::json(200, &self.worktree_claim(target, body).await)
+            }
             "/lead/summary" => self.summary(target).await,
             "/lead/show-worker" => self.show_worker(target, body).await,
             _ => Response::json(200, &self.detach(target, body).await),
@@ -1056,6 +1059,32 @@ impl Shared {
             &json!({ "notices": outcome.notices, "status": outcome.status.as_str() }),
         )
         .carrying(&target.team, outcome.notices)
+    }
+
+    /// The WorktreeCreate hook's question (plan 4d920eec decisions 1-3): the
+    /// folder for an agent Claude Code starts with isolation "worktree".
+    /// While Claude Code leads and an agent worker waits for its agent, the
+    /// answer is that worker's pool checkout (`{"worktree", "worker_id"}`)
+    /// and the agent is registered with it. Anything else is not Mnemo work:
+    /// `{"fallback": true}` lets the hook make an ordinary worktree. A claim
+    /// that cannot be decided answers `{"error"}`.
+    async fn worktree_claim(&self, target: Option<Target>, body: Value) -> Value {
+        let Some(target) = target else {
+            return json!({ "fallback": true });
+        };
+        if !target.team.external_lead_attached() {
+            return json!({ "fallback": true });
+        }
+        let name = body.get("name").and_then(Value::as_str).unwrap_or_default();
+        let transcript = body.get("transcript_path").and_then(Value::as_str);
+        match target.team.claim_agent_checkout(name, transcript).await {
+            Ok(Some((worktree, worker_id))) => json!({
+                "worktree": worktree.to_string_lossy(),
+                "worker_id": worker_id,
+            }),
+            Ok(None) => json!({ "fallback": true }),
+            Err(error) => json!({ "error": error }),
+        }
     }
 
     async fn gate_agent(&self, target: Option<Target>, body: Value) -> Value {

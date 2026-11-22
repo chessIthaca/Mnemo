@@ -691,6 +691,17 @@ fn progress_now() -> u128 {
 /// The longest progress note, in characters.
 const PROGRESS_NOTE_CHARS: usize = 500;
 
+/// An agent worker whose agent has not been launched yet: it runs as a
+/// Claude Code agent, is Working or Fixing in a checkout, and has no agent
+/// registered. The WorktreeCreate hook hands the next isolated agent to it,
+/// so at most one may exist at a time (plan 4d920eec decision 4).
+pub(super) fn waits_for_agent(worker: &WorkerRecord) -> bool {
+    worker.claude_agent.is_some()
+        && worker.claude_agent_id.is_none()
+        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+        && !worker.worktree.as_os_str().is_empty()
+}
+
 /// The agent workers `team_agent_started` and `team_progress` accept.
 fn agent_worker_in_work(worker: &WorkerRecord, tool: &str) -> Result<(), String> {
     if worker.claude_agent.is_none() {
@@ -762,6 +773,66 @@ impl TeamRuntime {
         };
         let worker = self.worker(worker_id).await?;
         Ok((worker, text))
+    }
+
+    /// The worktree Claude Code's WorktreeCreate hook hands an agent launched
+    /// with isolation "worktree" (plan 4d920eec decision 3): the pool
+    /// checkout of the one agent worker that waits for its agent (Working or
+    /// Fixing, with no agent registered yet), with the agent registered as
+    /// `team_agent_started` would. `name` is the hook's worktree name,
+    /// `agent-<agent id>`; `transcript_path` is the lead session's
+    /// transcript, beside whose folder Claude Code writes the agent's
+    /// (`<session>/subagents/agent-<id>.jsonl`).
+    ///
+    /// `Ok(Some((worktree, worker_id)))` hands out that checkout; `Ok(None)`
+    /// means no agent worker waits, so the agent is not Mnemo work and the
+    /// hook makes an ordinary worktree. More than one waiting worker is an
+    /// error: the launch could belong to either, and dispatch never lets it
+    /// happen.
+    pub async fn claim_agent_checkout(
+        &self,
+        name: &str,
+        transcript_path: Option<&str>,
+    ) -> Result<Option<(PathBuf, String)>, String> {
+        let _guard = self.merge_lock.lock().await;
+        let name = name.trim();
+        let agent_id = name.strip_prefix("agent-").unwrap_or(name);
+        if !valid_agent_id(agent_id) {
+            return Ok(None);
+        }
+        let waiting: Vec<String> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| waits_for_agent(worker))
+            .map(|worker| worker.id.clone())
+            .collect();
+        let worker_id = match waiting.as_slice() {
+            [] => return Ok(None),
+            [one] => one.clone(),
+            many => {
+                return Err(format!(
+                    "{} agent workers wait for their agent ({}); Mnemo cannot tell which one this agent runs",
+                    many.len(),
+                    many.join(", ")
+                ));
+            }
+        };
+        let guess = transcript_path.and_then(|path| {
+            let path = Path::new(path);
+            Some(
+                path.parent()?
+                    .join(path.file_stem()?)
+                    .join("subagents")
+                    .join(format!("agent-{agent_id}.jsonl")),
+            )
+        });
+        let guess = guess.map(|path| path.to_string_lossy().into_owned());
+        self.agent_started(&worker_id, agent_id, guess.as_deref())
+            .await?;
+        let worker = self.worker(&worker_id).await?;
+        Ok(Some((worker.worktree, worker_id)))
     }
 
     /// `team_progress`: a one-line note from a worker's own Claude Code

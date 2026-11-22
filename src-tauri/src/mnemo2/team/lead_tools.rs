@@ -603,26 +603,14 @@ impl TeamRuntime {
                 if tier.is_none() && model.is_none() && reasoning_effort.is_none() {
                     self.resume(worker_id).await
                 } else {
-                    match self.lead_model_choice(tier.as_deref(), model) {
-                        Err(err) => Err(err),
-                        Ok(model) => {
-                            // An effort alone keeps the worker's model.
-                            let model = match model {
-                                Some(model) => Some(model),
-                                None => self.worker(worker_id).await.ok().and_then(|w| w.model),
-                            };
-                            let changed = self
-                                .change_model(worker_id, model, reasoning_effort, ChangeSource::Lead)
-                                .await;
-                            match (changed, tier) {
-                                (Ok(_), Some(tier)) => {
-                                    self.record_tier(worker_id, &tier).await;
-                                    self.worker(worker_id).await
-                                }
-                                (changed, _) => changed,
-                            }
-                        }
-                    }
+                    self.resume_on_tier(
+                        worker_id,
+                        tier.as_deref(),
+                        model,
+                        reasoning_effort,
+                        ChangeSource::Lead,
+                    )
+                    .await
                 }
             }
             "team_compact" => self.compact(worker_id).await,

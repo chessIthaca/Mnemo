@@ -6,6 +6,7 @@
 //! lead's model/tier choice, the classifier call at dispatch, and the
 //! routing-log rows a dispatch or a reroute appends.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use mnemo::config::endpoints::{Tier, TierLadder};
@@ -18,7 +19,7 @@ use crate::mnemo2::dispatch_routing::{
 use crate::mnemo2::runtime::LeadModel;
 
 use super::nudge::append_reroute_metadata;
-use super::record::{ChangeSource, MessageSender, WorkerRecord, WorkerRouting};
+use super::record::{session_model_spec, ChangeSource, MessageSender, WorkerRecord, WorkerRouting};
 use super::dispatch::{
     dispatch_lead_override_row, dispatch_route_row, DispatchRequest, DispatchSource,
 };
@@ -93,6 +94,132 @@ pub(super) struct PendingClassification {
     /// Whether a model choice was passed: the override comparison reads the
     /// resolved tier then, the requested tier otherwise.
     model_choice: bool,
+}
+
+/// How long a model whose worker hit a provider usage limit stays out of the
+/// tiers: six hours (plan e5d93df3 decision 8).
+pub(super) const USAGE_LIMIT_WINDOW_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// The models a provider usage limit took out: spec -> the epoch milliseconds
+/// it may serve again. In memory only, never persisted, so a restart forgets
+/// it; every read compares against the current time, so an entry whose time
+/// has passed counts as available again.
+pub(super) type UnavailableModels = Arc<std::sync::RwLock<HashMap<String, u64>>>;
+
+/// What the runtime shares with every worker pump for usage limits (plan
+/// e5d93df3 decision 8): the unavailable models, which a pump marks when its
+/// worker fails on a usage limit, and the runtime itself, so the pump can hand
+/// that worker to [`TeamRuntime::resume_usage_limited`] in routing mode auto.
+#[derive(Clone, Default)]
+pub(super) struct UsageLimits {
+    pub(super) unavailable: UnavailableModels,
+    /// The runtime, set once by `attach_board`: the first place the runtime
+    /// holds its own `Arc`. Shared (not copied) with the pumps, so a pump
+    /// spawned before the attach still finds it.
+    pub(super) team: Arc<std::sync::OnceLock<std::sync::Weak<TeamRuntime>>>,
+}
+
+impl UsageLimits {
+    /// The runtime, while it is alive and attached.
+    pub(super) fn team(&self) -> Option<Arc<TeamRuntime>> {
+        self.team.get()?.upgrade()
+    }
+
+    /// Take `spec` out of the tiers until `until_ms` (epoch milliseconds). A
+    /// later mark replaces an earlier one; entries whose time has passed are
+    /// dropped on the way.
+    pub(super) fn mark_model_unavailable(&self, spec: &str, until_ms: u64) {
+        let now = unix_ms();
+        let mut map = self.unavailable.write().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, until| *until > now);
+        map.insert(spec.to_string(), until_ms);
+    }
+
+    /// The epoch milliseconds `spec` serves again, while it is still out.
+    pub(super) fn until(&self, spec: &str, now_ms: u64) -> Option<u64> {
+        self.unavailable
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(spec)
+            .copied()
+            .filter(|until| *until > now_ms)
+    }
+
+    /// The inventory without the models a usage limit took out at `now_ms`.
+    fn available(&self, models: &[LeadModel], now_ms: u64) -> Vec<LeadModel> {
+        let map = self.unavailable.read().unwrap_or_else(|e| e.into_inner());
+        models
+            .iter()
+            .filter(|model| map.get(&model.spec).is_none_or(|until| *until <= now_ms))
+            .cloned()
+            .collect()
+    }
+
+    /// The refusal for naming `spec` explicitly while a usage limit has it
+    /// out, so the lead reads why instead of "not configured".
+    pub(super) fn refusal(&self, spec: &str) -> Option<String> {
+        self.until(spec, unix_ms()).map(|until| {
+            format!(
+                "'{spec}' is unavailable until {} after a usage limit; choose another model or dispatch by tier.",
+                local_hh_mm(until)
+            )
+        })
+    }
+
+    /// Take the model a worker's failed turn ran on out of the tiers for
+    /// [`USAGE_LIMIT_WINDOW_MS`] when its error is a provider usage limit,
+    /// and return that spec. The spec is the worker's current model as
+    /// [`session_model_spec`] resolves it; an unnamed default model is never
+    /// marked.
+    pub(super) fn mark_failure(&self, worker: &WorkerRecord, error: &str) -> Option<String> {
+        if !mnemo::error::is_usage_limit(error) {
+            return None;
+        }
+        let spec = session_model_spec(worker);
+        if spec == "default" {
+            return None;
+        }
+        self.mark_model_unavailable(spec, unix_ms().saturating_add(USAGE_LIMIT_WINDOW_MS));
+        Some(spec.to_string())
+    }
+}
+
+/// The model inventory as routing reads it: the configured models less the
+/// ones a usage limit took out. Tier resolution, the escalation and nudge
+/// paths in the worker pumps, and [`TeamRuntime::current_models`] all read
+/// the inventory through this, and its fields are private, so none of them
+/// can pick an exhausted model by reading the raw list.
+#[derive(Clone, Copy)]
+pub(super) struct ModelInventory<'a> {
+    models: &'a std::sync::RwLock<Vec<LeadModel>>,
+    limits: &'a UsageLimits,
+}
+
+impl<'a> ModelInventory<'a> {
+    pub(super) fn new(
+        models: &'a std::sync::RwLock<Vec<LeadModel>>,
+        limits: &'a UsageLimits,
+    ) -> Self {
+        Self { models, limits }
+    }
+
+    /// The available models right now.
+    pub(super) fn current(&self) -> Vec<LeadModel> {
+        self.limits.available(
+            &self.models.read().unwrap_or_else(|e| e.into_inner()),
+            unix_ms(),
+        )
+    }
+}
+
+/// An epoch-milliseconds instant as local `HH:MM`, the form the lead reads a
+/// usage-limited model's return time in.
+pub(super) fn local_hh_mm(epoch_ms: u64) -> String {
+    i64::try_from(epoch_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|| "later".to_string())
 }
 
 /// Whether the Laya-derived routing rows (`nudge`, `nudge_ignored`) may be
@@ -380,11 +507,82 @@ impl TeamRuntime {
             load_routing_settings(&self.config_dir);
     }
 
+    /// The model inventory less the models a provider usage limit took out:
+    /// tier resolution, fold-down, tier guidance and audits all read this, so
+    /// they skip a limited model until its window passes.
     pub(super) fn current_models(&self) -> Vec<LeadModel> {
-        self.models
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.model_inventory().current()
+    }
+
+    /// The model inventory the escalation and nudge paths read.
+    pub(super) fn model_inventory(&self) -> ModelInventory<'_> {
+        ModelInventory::new(&self.models, &self.usage_limits)
+    }
+
+    /// The handles a worker pump shares for usage limits.
+    pub(super) fn usage_limits(&self) -> UsageLimits {
+        self.usage_limits.clone()
+    }
+
+    /// `Mnemo marked <model> unavailable until <HH:MM>; the <tier> tier now
+    /// runs on <fold target, or no model>.`, plus the worker's tier and the
+    /// model it folds to now. A worker outside the tiers gets the first half
+    /// of the sentence and no tier.
+    pub(super) fn usage_limit_marked(
+        &self,
+        worker: &WorkerRecord,
+        spec: &str,
+        until_ms: u64,
+    ) -> (String, Option<(String, Option<String>)>) {
+        let until = local_hh_mm(until_ms);
+        let Some(tier) = worker.tier.clone() else {
+            return (format!("Mnemo marked {spec} unavailable until {until}."), None);
+        };
+        let fold = self
+            .resolve_tier_choice(&tier)
+            .ok()
+            .map(|(_, model)| model.spec)
+            .filter(|fold| fold != spec);
+        let runs_on = fold.as_deref().unwrap_or("no model");
+        (
+            format!("Mnemo marked {spec} unavailable until {until}; the {tier} tier now runs on {runs_on}."),
+            Some((tier, fold)),
+        )
+    }
+
+    /// What a worker's failure notice says in place of the generic
+    /// continue/retry lines when its error is a provider usage limit and its
+    /// model is out (plan e5d93df3 decision 8): what Mnemo marked, what the
+    /// worker's tier runs on now, and the next move. In routing mode auto
+    /// Mnemo resumes the worker itself; otherwise the notice ends with the
+    /// exact call. `None` for any other failure.
+    pub(crate) fn usage_limit_notice(&self, worker: &WorkerRecord, error: &str) -> Option<String> {
+        if !mnemo::error::is_usage_limit(error) {
+            return None;
+        }
+        let spec = session_model_spec(worker);
+        let until_ms = self.usage_limits.until(spec, unix_ms())?;
+        let (marked, tier) = self.usage_limit_marked(worker, spec, until_ms);
+        let id = &worker.id;
+        let next = match tier {
+            Some((tier, Some(fold))) => {
+                if self.routing_mode() == RoutingMode::Auto {
+                    format!("Mnemo is resuming it on {fold} with its transcript.")
+                } else {
+                    format!(
+                        "Move it there, then team_message it to continue: team_resume worker_id={id} tier={tier}"
+                    )
+                }
+            }
+            Some((tier, None)) => format!(
+                "No tier at or below {tier} has a model left, so it stays failed: team_resume it with worker_id={id} and another tier or model, or wait until {}.",
+                local_hh_mm(until_ms)
+            ),
+            None => format!(
+                "To retry on another model, use team_resume with worker_id={id} and a `tier` or `model`, then team_message it to continue."
+            ),
+        };
+        Some(format!("{marked}\n{next}"))
     }
 
     /// The live ladder new dispatches and tool descriptions resolve against.
@@ -443,6 +641,11 @@ impl TeamRuntime {
             (None, Some(tier)) => Some(self.resolve_tier_choice(tier)?.1.spec),
             (model, _) => model,
         };
+        // A model a usage limit took out is still configured: say why it is
+        // refused before the tier check calls it unknown.
+        if let Some(refusal) = model.as_deref().and_then(|spec| self.usage_limits.refusal(spec)) {
+            return Err(refusal);
+        }
         let tiered = self.tiered_models();
         match &model {
             Some(spec) if !tiered.is_empty() && !tiered.iter().any(|m| &m.spec == spec) => {

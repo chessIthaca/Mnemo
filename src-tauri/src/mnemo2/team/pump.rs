@@ -36,7 +36,7 @@ use super::record::{
     InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox, kickoff_message,
 };
 use super::review::{CheckRecorder, clear_review_for_a_newer_tip};
-use super::routing::{logs_label, outcome_row};
+use super::routing::{logs_label, outcome_row, ModelInventory, UsageLimits};
 
 /// The plan coordinate a worker may read: its own plan, or for an audit the
 /// plan of the worker it audits. The step stays 0-based, like the record.
@@ -508,6 +508,7 @@ pub(super) async fn pump_worker(
     fail_next_close: Arc<AtomicBool>,
     board: Option<Arc<PlanBoard>>,
     proof: super::proving::ProofCtx,
+    usage_limits: UsageLimits,
 ) {
     let mut turn_active = false;
     // A steered turn end is held here until its follow-up turn starts (the
@@ -877,6 +878,10 @@ pub(super) async fn pump_worker(
         // its live session is released below, once the save persists the
         // report and the `Completed` status.
         let mut audit_release = false;
+        // The model this event's failure took out of the tiers for a
+        // provider usage limit (plan e5d93df3 decision 8); in routing mode
+        // auto the worker is resumed on its tier's fold target below.
+        let mut usage_limited: Option<String> = None;
         {
             let mut records = records.lock().await;
             if let Some(worker) = records.iter_mut().find(|worker| {
@@ -1277,6 +1282,10 @@ pub(super) async fn pump_worker(
                                 // stop, merge, or cleanup.
                                 pending_outcome = outcome_row(worker, "failed")
                                     .filter(|_| logs_label(worker, mode));
+                                // Marked before the event is forwarded, so
+                                // the lead's failure notice already reads the
+                                // model as out.
+                                usage_limited = usage_limits.mark_failure(worker, error);
                             }
                             terminal = true;
                         }
@@ -1383,6 +1392,20 @@ pub(super) async fn pump_worker(
         if let Some(row) = pending_outcome.take() {
             mnemo::model_routing::append_row(&routing_log_path, &row);
         }
+        if let Some(spec) = usage_limited.take() {
+            let mode = routing.read().unwrap_or_else(|e| e.into_inner()).mode;
+            if mode == RoutingMode::Auto {
+                // Its own task: the resume stops this session, which aborts
+                // this pump.
+                if let Some(team) = usage_limits.team() {
+                    let worker_id = worker_id.clone();
+                    tokio::spawn(async move {
+                        team.resume_usage_limited(&worker_id, generation, &spec)
+                            .await;
+                    });
+                }
+            }
+        }
         if let Some((key, text)) = cost_notice.take() {
             let _ = signals.send(BoardSignal::Notice { key, text });
         }
@@ -1396,7 +1419,7 @@ pub(super) async fn pump_worker(
                     &worker_id,
                     StrikeNudges {
                         records: &records,
-                        models: &models,
+                        models: ModelInventory::new(&models, &usage_limits),
                         tiers: &tiers,
                         signals: &signals,
                         routing_log_path: &routing_log_path,
@@ -1419,7 +1442,7 @@ pub(super) async fn pump_worker(
                 AutoEscalation {
                     records: &records,
                     live: &live,
-                    models: &models,
+                    models: ModelInventory::new(&models, &usage_limits),
                     tiers: &tiers,
                     signals: &signals,
                     routing_log_path: &routing_log_path,

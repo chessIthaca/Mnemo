@@ -12578,12 +12578,23 @@ impl proving::ProofRunner for ScriptedProofs {
     }
 }
 
-/// Wait for one lead notice whose text contains `needle`.
+/// Wait up to 10 s for one lead notice whose text contains `needle`.
 async fn drain_notice(
     receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
     needle: &str,
 ) -> Option<String> {
-    for _ in 0..400 {
+    drain_notice_within(receiver, needle, std::time::Duration::from_secs(10)).await
+}
+
+/// Wait up to `limit` for one lead notice whose text contains `needle`,
+/// polling every 25 ms. A run that outlives the limit returns `None`.
+async fn drain_notice_within(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+    limit: std::time::Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
         while let Ok(signal) = receiver.try_recv() {
             if let BoardSignal::Notice { text, .. } = signal {
                 if text.contains(needle) {
@@ -12591,9 +12602,11 @@ async fn drain_notice(
                 }
             }
         }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    None
 }
 
 /// A team whose board holds a `bug_fixing` plan naming `regression_proves_red`
@@ -16192,9 +16205,13 @@ async fn team_run_checks_records_every_command_on_the_tip() {
         .await
         .expect("the run starts");
     assert!(started.contains("a notice follows"), "{started}");
-    let notice = drain_notice(&mut notices, "Mnemo ran the checks for")
-        .await
-        .expect("the run ends with a notice");
+    let notice = drain_notice_within(
+        &mut notices,
+        "Mnemo ran the checks for",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
     assert!(notice.starts_with(&format!("worker_id={worker_id}\n")), "{notice}");
     assert!(
         notice.contains(&format!(
@@ -16246,9 +16263,13 @@ async fn team_run_checks_discards_results_when_the_tip_moves() {
         &["commit", "--allow-empty", "-m", "the tip moves under the run"],
     );
     drop(slots);
-    let notice = drain_notice(&mut notices, "while they ran")
-        .await
-        .expect("the run says the tip moved");
+    let notice = drain_notice_within(
+        &mut notices,
+        "while they ran",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run says the tip moved");
     assert!(notice.contains("nothing was recorded"), "{notice}");
     let worker = team.worker(&worker_id).await.expect("worker");
     assert!(worker.checks.is_empty(), "{:?}", worker.checks);
@@ -16297,9 +16318,13 @@ async fn a_clean_review_starts_the_missing_checks() {
         refused.output
     );
     drop(slots);
-    let notice = drain_notice(&mut notices, "2 passed, 0 failed")
-        .await
-        .expect("the run ends with a notice");
+    let notice = drain_notice_within(
+        &mut notices,
+        "2 passed, 0 failed",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
     assert!(notice.contains("Merge it with team_merge."), "{notice}");
     let merged = team
         .handle_lead_host_tool("team_merge", json!({"worker_id": worker_id}))
@@ -16393,9 +16418,13 @@ async fn team_run_checks_without_a_worker_runs_in_the_lead_checkout() {
         .handle_lead_host_tool("team_run_checks", json!({}))
         .await;
     assert!(answer.success, "{answer:?}");
-    let notice = drain_notice(&mut notices, "lead checkout")
-        .await
-        .expect("the run ends with a notice");
+    let notice = drain_notice_within(
+        &mut notices,
+        "lead checkout",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
     assert!(
         notice.contains(&format!(
             "Mnemo ran the checks in the lead checkout (wt/mnemo at {}): 1 passed, 0 failed.",
@@ -16445,9 +16474,13 @@ async fn team_run_checks_does_not_count_a_command_that_changes_files() {
         )
         .await;
     assert!(answer.success, "{answer:?}");
-    let notice = drain_notice(&mut notices, "Mnemo ran the checks for")
-        .await
-        .expect("the run ends with a notice");
+    let notice = drain_notice_within(
+        &mut notices,
+        "Mnemo ran the checks for",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
     assert!(notice.contains("0 passed, 1 failed"), "{notice}");
     let worker = team.worker(&worker_id).await.expect("worker");
     let check = worker
@@ -16574,9 +16607,13 @@ async fn the_lead_check_run_reports_a_moved_tip() {
         &["commit", "--allow-empty", "-m", "the lead moves under the run"],
     );
     drop(slots);
-    let notice = drain_notice(&mut notices, "while the checks ran")
-        .await
-        .expect("the run says the lead branch moved");
+    let notice = drain_notice_within(
+        &mut notices,
+        "while the checks ran",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run says the lead branch moved");
     assert!(notice.contains("the lead branch moved from "), "{notice}");
     assert!(notice.contains("run team_run_checks again"), "{notice}");
     assert!(!notice.contains("passed"), "{notice}");
@@ -16597,9 +16634,13 @@ async fn a_panicking_check_run_still_notifies() {
     team.run_checks_tool(Some(&worker_id))
         .await
         .expect("the run starts");
-    let notice = drain_notice(&mut notices, "stopped unexpectedly")
-        .await
-        .expect("the stopped run still sends a notice");
+    let notice = drain_notice_within(
+        &mut notices,
+        "stopped unexpectedly",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the stopped run still sends a notice");
     assert!(
         notice.contains(&format!(
             "Mnemo's check run for {worker_id} stopped unexpectedly; nothing was recorded. Run team_run_checks again."

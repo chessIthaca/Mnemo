@@ -245,6 +245,8 @@ impl TeamRuntime {
             tier,
             claude_agent: None,
             claude_agent_effort: None,
+            claude_agent_id: None,
+            claude_agent_transcript: None,
             base_commit: Some(base_tip.clone()),
             routing: None,
             reroutes: Vec::new(),

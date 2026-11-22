@@ -35,6 +35,7 @@ use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::pricing::usage_model_key;
 use crate::mnemo2::usage::{ProjectUsage, ProjectUsageView};
 
+mod agent_watch;
 mod audit;
 mod check_run;
 mod control;
@@ -347,6 +348,9 @@ pub struct TeamRuntime {
     /// The workers (or the lead checkout) whose Mnemo-run check runs are in
     /// progress; the same entry points refuse them as refuse a proof.
     check_runs: check_run::CheckRuns,
+    /// The registered Claude Code agents' transcript readings and their
+    /// watcher task.
+    agent_watch: agent_watch::AgentWatch,
     /// The two proof commands, behind a seam a test can answer without a
     /// twenty-minute build.
     proofs: std::sync::RwLock<Arc<dyn proving::ProofRunner>>,
@@ -475,6 +479,7 @@ impl TeamRuntime {
             board: std::sync::Mutex::new(None),
             proving: proving::Proving::default(),
             check_runs: check_run::CheckRuns::default(),
+            agent_watch: agent_watch::AgentWatch::default(),
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
@@ -488,6 +493,8 @@ impl TeamRuntime {
         // App start: a checkout a previous run could not remove (something
         // held it) is retried now, and the branch it was blocking goes with it.
         runtime.retry_leftover_cleanups().await;
+        // A registered agent that was running when the app closed is watched again.
+        runtime.ensure_agent_watch().await;
         Ok(runtime)
     }
 
@@ -999,6 +1006,7 @@ impl TeamRuntime {
     pub async fn shutdown(&self) {
         // Void a pending telemetry flush: the final persist is the last write.
         self.persistence.closed.store(true, Ordering::SeqCst);
+        self.agent_watch.stop();
         *self.lead_session.lock().await = None;
         let live = {
             let mut map = self.live.lock().await;

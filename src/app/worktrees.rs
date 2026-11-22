@@ -296,7 +296,7 @@ fn same_checkout_path(left: &Path, right: &Path) -> bool {
 /// checkout guard). Windows junctions do not always report `is_symlink()`,
 /// so the reparse-point attribute is checked as well.
 #[cfg(windows)]
-fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+pub fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
     metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
@@ -305,7 +305,7 @@ fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
 /// Whether `metadata` describes a symlink — a pool path that is a link is
 /// refused rather than followed.
 #[cfg(not(windows))]
-fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+pub fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 

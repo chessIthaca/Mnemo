@@ -11175,6 +11175,46 @@ async fn auto_resume_does_nothing_after_shutdown() {
 }
 
 #[tokio::test]
+async fn resume_refuses_an_idle_live_worker_once_closing() {
+    // A failed worker whose session is still alive and idle: the resume fast
+    // path recovers it in place.
+    let (fixture, _notices, _generation) = usage_limited_failed_worker().await;
+    let persisted_status = || {
+        TeamPersistence::new(fixture.state.path())
+            .load()
+            .expect("load the ledger")
+            .expect("a saved ledger")
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == "routingworker")
+            .map(|worker| (worker.status, worker.error.is_some()))
+            .expect("the saved worker")
+    };
+    let before = persisted_status();
+    assert_eq!(before, (WorkerStatus::Failed, true));
+    // Shutdown marks the runtime closed while the resume is past its entry
+    // check and waits on the live map.
+    let live = fixture.team.live.lock().await;
+    assert!(live.contains_key("routingworker"), "the session is still live");
+    let resume = tokio::spawn({
+        let team = fixture.team.clone();
+        async move { team.resume("routingworker").await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    fixture.team.persistence.closed.store(true, Ordering::SeqCst);
+    drop(live);
+    let refused = resume
+        .await
+        .expect("the resume task")
+        .expect_err("no resume once closing");
+    assert_eq!(refused, "Mnemo2 is closing; the worker cannot be resumed now");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Failed);
+    assert_eq!(persisted_status(), before);
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
 async fn naming_an_unavailable_model_says_why() {
     let fixture = routing_fixture(
         crate::mnemo2::dispatch_routing::RoutingMode::Shadow,

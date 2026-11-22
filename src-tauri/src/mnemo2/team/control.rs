@@ -518,6 +518,12 @@ impl TeamRuntime {
                 None => None,
             }
         };
+        // `shutdown` marks the runtime closed and drains the live map without
+        // the merge lock, so it may have started while this waited on the
+        // live map: decide again before the fast path touches the record.
+        if self.persistence.closed.load(Ordering::SeqCst) {
+            return Err(CLOSING_RESUME_ERROR.to_string());
+        }
         if let Some(idle) = live_idle {
             let record = self.worker(worker_id).await?;
             // A failed worker whose session is still alive and idle is

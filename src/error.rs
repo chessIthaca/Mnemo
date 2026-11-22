@@ -361,9 +361,9 @@ pub fn retry_backoff_ms(attempt: u32) -> u64 {
 /// the failure reaches the team as the worker's final error string.
 ///
 /// The limit phrases count on their own. The bare words quota, credit and
-/// billing count only beside a limit signal (a 429, "limit", "exceeded",
-/// "exhausted"), so a 400 about an unsupported `credit` field is not a
-/// spent account.
+/// billing count only beside a limit signal (a 429 or 402, "limit",
+/// "exceeded", "exhausted", "insufficient"), so a 400 about an unsupported
+/// `credit` field is not a spent account.
 pub fn is_usage_limit(error: &str) -> bool {
     let text = error.to_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
@@ -376,7 +376,7 @@ pub fn is_usage_limit(error: &str) -> bool {
         "insufficient_quota",
         "exceeded your current",
     ]) || (has(&["quota", "credit", "billing"])
-        && has(&["429", "limit", "exceeded", "exhausted"]))
+        && has(&["429", "402", "limit", "exceeded", "exhausted", "insufficient"]))
 }
 
 #[cfg(test)]
@@ -611,6 +611,9 @@ mod tests {
              and billing details.\",\"type\":\"insufficient_quota\"}}",
             // GLM's own quota body on a 429.
             "HTTP 429 — Weekly/Monthly Limit Exhausted",
+            // A spent credit balance, as a 402 or in words.
+            "HTTP 402: Insufficient credits",
+            "insufficient credit balance",
         ];
         for text in limits {
             assert!(super::is_usage_limit(text), "a usage limit: {text}");

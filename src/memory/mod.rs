@@ -61,12 +61,49 @@ pub struct ScoredMemory {
 /// `tier = episodic` browse lists them (plan 373dec00 step 2).
 pub const SYNTHETIC_SUMMARY_PREFIX: &str = "Session involved ";
 
-/// If the stored model fingerprints don't exactly match the embedder's
-/// (model_id, dim), re-embed all rows. No-op (returns without re-embedding)
-/// when the fingerprint set already matches.
+/// One event of the automatic memory re-embed ([`reembed_if_needed`]).
 ///
-/// Extracted from the duplicated startup (main.rs) + post-config-save
-/// (rewire.rs) re-embed paths. The caller is responsible for the Ready-status +
+/// Serialised in the same `"type"`-tagged shape as the other indexing pass
+/// events (`started` / `progress {done,total}` / `done {summary}` /
+/// `failed {error}`), so the window's indexing tracker folds it with the same
+/// `apply_pass_event` as the code-graph and reconcile passes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReembedEvent {
+    /// A re-embed started for `model`; the status line shows a running pass.
+    Started {
+        /// The embedding model whose vectors are being written.
+        model: String,
+    },
+    /// A progress tick: `done` of `total` stale rows re-embedded.
+    Progress {
+        /// Rows re-embedded so far.
+        done: usize,
+        /// Stale rows this pass will re-embed.
+        total: usize,
+    },
+    /// Terminal success with a one-line summary (the status line's tooltip).
+    Done {
+        /// How many rows were re-embedded, and for which model.
+        summary: String,
+    },
+    /// Terminal failure with the error text.
+    Failed {
+        /// The error to show.
+        error: String,
+    },
+}
+
+/// If the stored model fingerprints don't exactly match the embedder's
+/// (model_id, dim), re-embed the STALE rows — the ones whose vector is missing
+/// or carries another fingerprint. A pass interrupted by a window close
+/// therefore resumes with only the rows still on the old model, instead of
+/// restarting from row 1 (plan ebd13a79). No-op (returns without re-embedding
+/// or publishing anything) when the fingerprint set already matches.
+///
+/// The pass is published on the store's [`MemoryStore::reembed_events`] watch
+/// channel as [`ReembedEvent`]s: `Started`, throttled `Progress` ticks, then
+/// `Done` (or `Failed`). The caller is still responsible for the Ready-status +
 /// hash-opt-out + pending-download guards (they differ between the two call
 /// sites) and for spawning this on a background task (it awaits DB I/O).
 pub async fn reembed_if_needed(store: &Arc<MemoryStore>, embedder: &Arc<dyn Embedder>) {
@@ -90,12 +127,47 @@ pub async fn reembed_if_needed(store: &Arc<MemoryStore>, embedder: &Arc<dyn Embe
             "info: re-embedding memories for model '{expected_model}' (dim {expected_dim}); \
              stored fingerprints: {fps:?}"
         );
+        // The pass rides the store's watch channel, not a host-event bus: the
+        // startup re-embed runs inside brain construction, before the window's
+        // tracker subscribes, and a `watch` hands a late subscriber the LAST
+        // event instead of dropping the whole pass (plan ebd13a79).
+        store.publish_reembed(ReembedEvent::Started {
+            model: expected_model.clone(),
+        });
+        // One tick per row floods the webview on a large store — forward with
+        // the same throttle the manual rebuild uses (always the first and the
+        // final `done == total` tick).
+        let tick = |done: usize, total: usize| {
+            if crate::host::maintenance::should_forward_progress(
+                done,
+                total,
+                crate::host::maintenance::PROGRESS_EVERY,
+            ) {
+                store.publish_reembed(ReembedEvent::Progress { done, total });
+            }
+        };
         // Do NOT overwrite the status here — the caller already set it to Ready
         // (the model loaded). Re-embedding is a background maintenance task,
         // not a status transition.
-        match store.reembed_all(embedder.clone(), None).await {
-            Ok(n) => eprintln!("info: re-embedded {n} memories"),
-            Err(e) => eprintln!("warning: reembed_all failed: {e}"),
+        match store.reembed_stale(embedder.clone(), Some(&tick)).await {
+            Ok(n) => {
+                eprintln!("info: re-embedded {n} memories");
+                // Let subscribers fold the final `done == total` tick before
+                // `Done` replaces it in the watch — a `watch` keeps only the
+                // last value, so without this yield a coalescing receiver (the
+                // window's status line) would jump from the previous throttled
+                // tick straight to the finished state.
+                tokio::task::yield_now().await;
+                store.publish_reembed(ReembedEvent::Done {
+                    summary: format!("{n} memories re-embedded for {expected_model}"),
+                });
+            }
+            Err(e) => {
+                eprintln!("warning: reembed_stale failed: {e}");
+                store.publish_reembed(ReembedEvent::Failed {
+                    error: e.to_string(),
+                });
+            }
         }
     }
 }
@@ -680,6 +752,11 @@ pub struct MemoryStore {
     /// rebuilds the pool when this moves ahead of
     /// [`EmbeddingCache::built_generation`].
     embedding_cache_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// The last event of the automatic re-embed ([`reembed_if_needed`]), on a
+    /// `watch` channel so a late subscriber — the window's indexing tracker
+    /// starts only after the brain built the store — reads the current state
+    /// instead of missing a pass that ran during startup.
+    reembed_tx: tokio::sync::watch::Sender<Option<ReembedEvent>>,
 }
 
 /// The outcome of an FTS5 candidate lookup, distinguishing "FTS unavailable"
@@ -762,6 +839,7 @@ impl MemoryStore {
                 entries: Vec::new(),
             })),
             embedding_cache_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reembed_tx: tokio::sync::watch::channel(None).0,
         })
     }
 
@@ -773,6 +851,22 @@ impl MemoryStore {
         // The cached vectors are in the OLD embedder's space (and may have a
         // different dimension) — drop the pool so the next recall rebuilds it.
         self.invalidate_embedding_pool();
+    }
+
+    /// Subscribe to the automatic re-embed's events (plan ebd13a79).
+    ///
+    /// The receiver's CURRENT value is the last event published, so a
+    /// subscriber that arrives after the pass finished still reads its
+    /// `Done` — and a store that never re-embedded reads `None`.
+    pub fn reembed_events(&self) -> tokio::sync::watch::Receiver<Option<ReembedEvent>> {
+        self.reembed_tx.subscribe()
+    }
+
+    /// Publish one automatic-re-embed event. `send_replace` never fails: with
+    /// no receivers it simply stores the value, which is exactly the late
+    /// subscriber case this channel exists for (`send` would error).
+    fn publish_reembed(&self, event: ReembedEvent) {
+        self.reembed_tx.send_replace(Some(event));
     }
 
     /// The live retrieval/indexing scale knobs (the Phase 2 `[memory]`
@@ -1170,6 +1264,7 @@ impl MemoryStore {
                 entries: Vec::new(),
             })),
             embedding_cache_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reembed_tx: tokio::sync::watch::channel(None).0,
         })
     }
 
@@ -1936,6 +2031,84 @@ impl MemoryStore {
         if let Err(e) = self.delete_working_for_session_before(session_id, boundary).await {
             eprintln!("mnemo: turn-boundary working cleanup failed: {e}");
         }
+    }
+}
+
+impl MemoryStore {
+    /// Re-embed only the rows whose stored vector is not from `embedder`'s
+    /// model/dim — the resume path after an interrupted re-embed (plan
+    /// ebd13a79): `embedding IS NULL` legacy rows, or a model/dim mismatch.
+    /// Unlike [`MemoryStoreTrait::reembed_all`] it leaves up-to-date rows
+    /// untouched, so reopening after a half-finished pass costs only the rows
+    /// still on the old fingerprint. Returns the count re-embedded.
+    async fn reembed_stale(
+        &self,
+        embedder: Arc<dyn Embedder>,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> Result<usize> {
+        let model_id = embedder.model_id().to_string();
+        let dim = embedder.dim() as i64;
+        let conn = self.conn.clone();
+        let rows: Vec<(String, String)> =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>> {
+                let conn = conn.lock().expect("conn lock poisoned");
+                // `IS NOT` is SQLite's null-safe inequality: a NULL model/dim
+                // (legacy rows) is stale too, as is a NULL vector.
+                let mut stmt = conn.prepare(
+                    "SELECT id, content FROM memories \
+                     WHERE embedding IS NULL OR embed_model IS NOT ?1 OR embed_dim IS NOT ?2",
+                )?;
+                let mut rows = stmt.query(params![model_id, dim])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    out.push((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| Error::Memory(format!("reembed_stale load task failed: {e}")))??;
+        self.reembed_rows(rows, &embedder, progress).await
+    }
+
+    /// Re-embed the given `(id, content)` rows: embed each, persist the vector
+    /// and its fingerprint, tick `progress(done, total)` after each row, and
+    /// invalidate the cosine pool at the end. The shared loop behind
+    /// [`Self::reembed_stale`] and [`MemoryStoreTrait::reembed_all`], which
+    /// differ only in which rows they load.
+    async fn reembed_rows(
+        &self,
+        rows: Vec<(String, String)>,
+        embedder: &Arc<dyn Embedder>,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> Result<usize> {
+        let model_id = embedder.model_id().to_string();
+        let dim = embedder.dim() as i64;
+        let total = rows.len();
+        let mut count = 0usize;
+        for (id, content) in rows {
+            let vec = embedder.embed(&content).await;
+            let blob = Self::encode_embedding(&vec);
+            let conn = self.conn.clone();
+            let model_id = model_id.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let conn = conn.lock().expect("conn lock poisoned");
+                conn.execute(
+                    "UPDATE memories SET embedding = ?1, embed_model = ?2, embed_dim = ?3 WHERE id = ?4",
+                    params![blob, model_id, dim, id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Memory(format!("reembed update task failed: {e}")))??;
+            count += 1;
+            if let Some(report) = progress {
+                report(count, total);
+            }
+        }
+        // Every touched embedding was rewritten — the pool's vectors are from
+        // the OLD space until the next recall rebuilds it from SQL.
+        self.invalidate_embedding_pool();
+        Ok(count)
     }
 }
 
@@ -2860,34 +3033,7 @@ impl MemoryStoreTrait for MemoryStore {
             .await
             .map_err(|e| Error::Memory(format!("reembed_all load task failed: {e}")))??;
 
-        let model_id = embedder.model_id().to_string();
-        let dim = embedder.dim() as i64;
-        let total = rows.len();
-        let mut count = 0usize;
-        for (id, content) in rows {
-            let vec = embedder.embed(&content).await;
-            let blob = Self::encode_embedding(&vec);
-            let conn = self.conn.clone();
-            let model_id = model_id.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = conn.lock().expect("conn lock poisoned");
-                conn.execute(
-                    "UPDATE memories SET embedding = ?1, embed_model = ?2, embed_dim = ?3 WHERE id = ?4",
-                    params![blob, model_id, dim, id],
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| Error::Memory(format!("reembed_all update task failed: {e}")))??;
-            count += 1;
-            if let Some(report) = progress {
-                report(count, total);
-            }
-        }
-        // Every embedding in the store was rewritten — the pool's vectors are
-        // from the OLD space until the next recall rebuilds it from SQL.
-        self.invalidate_embedding_pool();
-        Ok(count)
+        self.reembed_rows(rows, &embedder, progress).await
     }
 
     async fn start_session(&self, project: &str) -> Result<Session> {

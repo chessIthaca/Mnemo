@@ -61,7 +61,9 @@ In Mnemo2 Settings > Tiers, any tier except `escalate` can run as a Claude Code 
 
 With `read_back: true`, the agent's first run ends with its questions, or "No questions.". Record the answers with `plan_update`, then continue the agent with `SendMessage`. Call `team_agent_done` only after it has finished the step.
 
-To fix findings, continue the same agent with `SendMessage`. A new `Agent` gets a permission prompt, because the gate lets agents through only while an agent worker is working. Once the fix is committed, run the checks and `team_review` again on the new tip; `team_agent_done` is called only once per worker. `review_fix` works as usual, but `team_message`, `team_resume`, `team_route_fix` and `team_compact` refuse these workers. `team_stop` clears the worker record; stop your own agent separately. A failed agent worker cannot be resumed: dispatch the step again with a new `worker_id`, or `team_stop` it to clear it. Passing `model` to `team_dispatch` always starts a Mnemo worker. When Mnemo2's own lead leads, the tier runs on its models as usual.
+To fix findings, continue the same agent with `SendMessage`. A new `Agent` gets a permission prompt, because the gate lets agents through only while an agent worker is working. Once the fix is committed, run the checks and `team_review` again on the new tip; `team_agent_done` is called only once per worker. `review_fix` works as usual, but `team_message`, `team_resume`, `team_route_fix` and `team_compact` refuse these workers. `team_stop` clears the worker record; stop your own agent separately. A failed agent worker cannot be resumed: dispatch the step again with a new `worker_id`, or `team_stop` it to clear it.
+
+Passing `model` to `team_dispatch` always starts a Mnemo worker. When Mnemo2's own lead leads, the tier runs on its models as usual.
 
 ## Briefs
 

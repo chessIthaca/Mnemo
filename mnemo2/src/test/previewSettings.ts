@@ -74,11 +74,11 @@ const previewEndpoints: EndpointDetailDto[] = [
 
 const previewTiers: TiersDto = {
   tiers: [
-    { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["openrouter/glm-4.6-flash"], effort: null, role: null, resolves_to: "trivial", claude_agent: null },
-    { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["openrouter/glm-5.3-flash"], effort: null, role: null, resolves_to: "trivial", claude_agent: null },
-    { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: [], effort: null, role: null, resolves_to: "routine", claude_agent: null },
-    { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["openrouter/gpt-5.2"], effort: null, role: null, resolves_to: "medium", claude_agent: null },
-    { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high", claude_agent: null },
+    { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["openrouter/glm-4.6-flash"], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+    { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["openrouter/glm-5.3-flash"], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+    { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: [], effort: null, role: null, resolves_to: "routine", claude_agent: null, claude_agent_effort: null },
+    { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["openrouter/gpt-5.2"], effort: null, role: null, resolves_to: "medium", claude_agent: null, claude_agent_effort: null },
+    { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high", claude_agent: null, claude_agent_effort: null },
   ],
 };
 

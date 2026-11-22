@@ -323,11 +323,24 @@
     { value: "fable", label: "Claude Code agent — Fable" },
   ];
 
-  /** Write one rung's Run as choice; empty clears it back to Mnemo's models. */
+  /** Write one rung's Run as choice; empty clears it back to Mnemo's models,
+   * which also drops the agent effort (it only means something for an agent). */
   function setRungClaudeAgent(id: string, value: string): void {
     const rung = rungOf(id);
     if (rung === undefined) return;
     rung.claude_agent = value === "" ? null : value;
+    if (value === "") rung.claude_agent_effort = null;
+    ladderSaved = false;
+  }
+
+  /** The "Agent effort" choices, in the order the select offers them. */
+  const CLAUDE_AGENT_EFFORT_CHOICES: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+
+  /** Write one rung's Claude Code agent effort; empty clears it to the default. */
+  function setRungClaudeAgentEffort(id: string, value: string): void {
+    const rung = rungOf(id);
+    if (rung === undefined) return;
+    rung.claude_agent_effort = value === "" ? null : value;
     ladderSaved = false;
   }
 
@@ -389,7 +402,9 @@
       const effort = rung.effort === null || rung.effort === "" ? "" : `; effort ${rung.effort}`;
       const escalation = rung.role === "escalate" ? "; escalation only, never a first pick" : "";
       const claudeAgent = rung.claude_agent
-        ? `; runs as a Claude Code agent (${rung.claude_agent}) when Claude Code leads`
+        ? rung.claude_agent_effort
+          ? `; runs as a Claude Code agent (${rung.claude_agent}, ${rung.claude_agent_effort} effort) when Claude Code leads`
+          : `; runs as a Claude Code agent (${rung.claude_agent}) when Claude Code leads`
         : "";
       lines.push(`${rung.id} (${rung.name}) - ${rung.definition}: ${list}${effort}${escalation}${claudeAgent}`);
     }
@@ -706,6 +721,21 @@
                   {/each}
                 </select>
               </div>
+              {#if tier.claude_agent !== null}
+                <div class="tier-agent-effort">
+                  <label class="micro" for={`tier-agent-effort-${tier.id}`}>Agent effort</label>
+                  <select
+                    id={`tier-agent-effort-${tier.id}`}
+                    value={tier.claude_agent_effort ?? ""}
+                    onchange={(event) => setRungClaudeAgentEffort(tier.id, event.currentTarget.value)}
+                  >
+                    <option value="">Default</option>
+                    {#each CLAUDE_AGENT_EFFORT_CHOICES as effort (effort)}
+                      <option value={effort}>{effort}</option>
+                    {/each}
+                  </select>
+                </div>
+              {/if}
             {/if}
             {#if tier.id === "trivial"}
               <p class="micro hint">required: the default model</p>
@@ -845,6 +875,8 @@
   .tier-effort input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
   .tier-run-as { display: grid; gap: 2px; }
   .tier-run-as select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
+  .tier-agent-effort { display: grid; gap: 2px; }
+  .tier-agent-effort select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
   .tier-run-as-hint { flex-basis: 100%; }
   .hint { margin: 0; padding-bottom: 6px; }
 

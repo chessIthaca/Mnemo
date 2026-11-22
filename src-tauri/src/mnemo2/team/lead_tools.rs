@@ -132,6 +132,13 @@ impl TeamRuntime {
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
+                name: "team_run_checks".to_string(),
+                description: "Run every .coding/checks.toml command in a worker's checkout at its current tip, or in the lead checkout when worker_id is omitted, through the machine's heavy-command slots, and record each result as a check on that tip. Returns at once; a notice reports the results. Mnemo also starts it on its own after a review with no open findings whose tip lacks passing checks. Use it instead of running the full checks yourself.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","description":"The worker whose checkout to check; omit it to check the lead checkout."}}}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_message".to_string(),
                 description: "Send a message to a worker; a busy worker receives it as a steer.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"text":{"type":"string"}},"required":["worker_id","text"]}),
@@ -450,6 +457,13 @@ impl TeamRuntime {
                 Err(error) => ToolResult::error(error),
             };
         }
+        if name == "team_run_checks" {
+            let worker_id = args.get("worker_id").and_then(Value::as_str);
+            return match self.run_checks_tool(worker_id).await {
+                Ok(text) => ToolResult::success(text),
+                Err(error) => ToolResult::error(error),
+            };
+        }
         if name == "team_quality" {
             let window_days = args
                 .get("window_days")
@@ -660,6 +674,9 @@ impl TeamRuntime {
             // the lead reads "this is now a proposal" instead of reviewing it
             // for the fourth time.
             if let Some(reviewed) = &reviewed {
+                if let Some(line) = self.start_missing_checks(reviewed).await {
+                    answer.output = format!("{}\n{line}", answer.output);
+                }
                 let lines =
                     findings_ledger::recurrence_lines(&self.workspace_root, &reviewed.findings);
                 for line in lines {

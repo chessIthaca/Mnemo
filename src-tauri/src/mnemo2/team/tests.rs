@@ -16011,3 +16011,284 @@ async fn team_agent_done_rollback_keeps_a_concurrent_routing_update() {
     assert!(current.report.is_none());
     assert_eq!(current.routing.as_ref(), Some(&routing));
 }
+
+/// A team whose `.coding/checks.toml` lists `commands` and whose one pool
+/// worker sits idle on a committed change. Returns the workspace, the state
+/// dir, the config dir, the team and the worker id.
+async fn check_run_fixture(
+    id: &str,
+    commands: &[&str],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<TeamRuntime>,
+    String,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    // Mnemo2 never merges into main: the lead works on its own branch.
+    run_git(root.path(), &["switch", "-c", "wt/mnemo"]);
+    std::fs::create_dir_all(root.path().join(".coding")).expect("coding dir");
+    let list = commands
+        .iter()
+        .map(|command| format!("{command:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        format!("commands = [{list}]\n"),
+    )
+    .expect("checks.toml");
+    let team = Arc::new(
+        open_test_team_with_config(root.path(), state.path(), Vec::new(), config.path()).await,
+    );
+    let worker = provision_pool_worker(&team, id).await;
+    std::fs::write(worker.worktree.join("change.txt"), "change\n").expect("worker change");
+    run_git(&worker.worktree, &["add", "change.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    team.update_worker(&worker.id, |current| {
+        current.status = WorkerStatus::Completed;
+    })
+    .await;
+    (root, state, config, team, worker.id)
+}
+
+/// Take every heavy-command slot of the fixture's machine (the default two),
+/// so a check run started now waits until the returned guards drop.
+fn hold_all_slots(config: &std::path::Path) -> Vec<mnemo::machine_slots::SlotGuard> {
+    let slots = mnemo::machine_slots::HeavySlots::new(
+        mnemo::machine_slots::default_dir(config),
+        2,
+    );
+    (0..slots.slots())
+        .map(|_| slots.try_take().guard().expect("a free slot"))
+        .collect()
+}
+
+/// Mnemo's check run records one check per command on the tip it started at,
+/// names the exit code and run time in the detail, and the notice reports
+/// each command and the next move.
+#[tokio::test]
+async fn team_run_checks_records_every_command_on_the_tip() {
+    let (_root, _state, _config, team, worker_id) = check_run_fixture(
+        "runChecks01",
+        &["git --version", "git rev-parse --verify refs/heads/nope", "git status"],
+    )
+    .await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let mut notices = team.subscribe_board();
+    let started = team
+        .run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    assert!(started.contains("a notice follows"), "{started}");
+    let notice = drain_notice(&mut notices, "Mnemo ran the checks for")
+        .await
+        .expect("the run ends with a notice");
+    assert!(notice.starts_with(&format!("worker_id={worker_id}\n")), "{notice}");
+    assert!(
+        notice.contains(&format!(
+            "Mnemo ran the checks for {worker_id} at {}: 2 passed, 1 failed.",
+            &tip[..8]
+        )),
+        "{notice}"
+    );
+    assert!(notice.contains("PASS git --version (exit 0"), "{notice}");
+    assert!(
+        notice.contains("FAIL git rev-parse --verify refs/heads/nope (exit "),
+        "{notice}"
+    );
+    assert!(notice.ends_with("Route the failures with team_route_fix."), "{notice}");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert_eq!(worker.checks.len(), 3, "{:?}", worker.checks);
+    for (name, status) in [
+        ("git --version", "passed"),
+        ("git rev-parse --verify refs/heads/nope", "failed"),
+        ("git status", "passed"),
+    ] {
+        let check = worker
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("a check named {name}: {:?}", worker.checks));
+        assert_eq!(check.status, status, "{name}");
+        assert_eq!(check.tip, tip, "{name}");
+        let detail = check.detail.clone().unwrap_or_default();
+        assert!(detail.starts_with("run by Mnemo: exit "), "{detail}");
+    }
+    team.shutdown().await;
+}
+
+/// A tip that moves while the run waits for a slot makes the run record
+/// nothing and say so.
+#[tokio::test]
+async fn team_run_checks_discards_results_when_the_tip_moves() {
+    let (_root, _state, config, team, worker_id) =
+        check_run_fixture("runChecks02", &["git --version"]).await;
+    let slots = hold_all_slots(config.path());
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    run_git(
+        &worker.worktree,
+        &["commit", "--allow-empty", "-m", "the tip moves under the run"],
+    );
+    drop(slots);
+    let notice = drain_notice(&mut notices, "while they ran")
+        .await
+        .expect("the run says the tip moved");
+    assert!(notice.contains("nothing was recorded"), "{notice}");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(worker.checks.is_empty(), "{:?}", worker.checks);
+    team.shutdown().await;
+}
+
+/// A review with no open findings at a tip without checks starts Mnemo's own
+/// run and says so; team_merge waits for it and succeeds after its notice.
+#[tokio::test]
+async fn a_clean_review_starts_the_missing_checks() {
+    let (_root, _state, config, team, worker_id) =
+        check_run_fixture("runChecks03", &["git --version", "git status"]).await;
+    let slots = hold_all_slots(config.path());
+    let mut notices = team.subscribe_board();
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let answer = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": worker_id,
+                "summary": "checked the diff",
+                "findings": [],
+                "evidence": serde_json::to_value(evidence()).expect("evidence"),
+            }),
+        )
+        .await;
+    assert!(answer.success, "{answer:?}");
+    assert!(
+        answer.output.contains(&format!(
+            "Mnemo is running the missing checks at {}; merge after its notice.",
+            &tip[..8]
+        )),
+        "{}",
+        answer.output
+    );
+    let refused = team
+        .handle_lead_host_tool("team_merge", json!({"worker_id": worker_id}))
+        .await;
+    assert!(!refused.success, "{refused:?}");
+    assert!(
+        refused.output.contains(&format!(
+            "Mnemo is running the checks for {worker_id}; wait for its notice."
+        )),
+        "{}",
+        refused.output
+    );
+    drop(slots);
+    let notice = drain_notice(&mut notices, "2 passed, 0 failed")
+        .await
+        .expect("the run ends with a notice");
+    assert!(notice.contains("Merge it with team_merge."), "{notice}");
+    let merged = team
+        .handle_lead_host_tool("team_merge", json!({"worker_id": worker_id}))
+        .await;
+    assert!(merged.success, "{merged:?}");
+    team.shutdown().await;
+}
+
+/// While a run is in progress the entry points that would move or judge the
+/// checkout refuse with one message.
+#[tokio::test]
+async fn merge_waits_for_a_running_check_run() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks04", &["git --version"]).await;
+    assert!(team.check_runs.hold_for_test(&worker_id));
+    let expected = format!("Mnemo is running the checks for {worker_id}; wait for its notice.");
+    assert_eq!(
+        team.merge_as(&worker_id, true)
+            .await
+            .expect_err("a merge is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.message(&worker_id, "hello".to_string(), MessageSender::Lead)
+            .await
+            .expect_err("a message is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.resume(&worker_id)
+            .await
+            .expect_err("a resume is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.route_fix(&worker_id, "any-finding")
+            .await
+            .expect_err("a routed fix is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.review_fix(&worker_id, "any-finding", "change.txt", "change", "changed")
+            .await
+            .expect_err("review_fix is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.run_checks_tool(Some(&worker_id))
+            .await
+            .expect_err("a second run is refused"),
+        expected
+    );
+    team.shutdown().await;
+}
+
+/// Without a worker the run goes to the lead checkout: the notice names the
+/// lead branch and its tip, and nothing is recorded on any worker.
+#[tokio::test]
+async fn team_run_checks_without_a_worker_runs_in_the_lead_checkout() {
+    let (root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks05", &["git --version"]).await;
+    let tip = phase3::tip(root.path()).await.expect("lead tip");
+    let mut notices = team.subscribe_board();
+    let answer = team
+        .handle_lead_host_tool("team_run_checks", json!({}))
+        .await;
+    assert!(answer.success, "{answer:?}");
+    let notice = drain_notice(&mut notices, "lead checkout")
+        .await
+        .expect("the run ends with a notice");
+    assert!(
+        notice.contains(&format!(
+            "Mnemo ran the checks in the lead checkout (wt/mnemo at {}): 1 passed, 0 failed.",
+            &tip[..8]
+        )),
+        "{notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(worker.checks.is_empty(), "{:?}", worker.checks);
+    team.shutdown().await;
+}
+
+/// The routed-fix prompt asks for the narrowest covering tests instead of the
+/// full checks.
+#[test]
+fn route_fix_brief_asks_for_narrow_tests() {
+    let root = tempfile::tempdir().expect("workspace");
+    let mut record = worker(root.path(), "narrowfix001");
+    let routed = open_finding("finding1");
+    record.findings = vec![routed.clone()];
+    let brief = route_fix_brief(&record, &routed);
+    assert!(
+        brief.ends_with(
+            "\nCommit fixes for every finding above. Verify them with the narrowest tests that cover your change (for example the touched crate's tests or the tests the findings name), not with run_checks: Mnemo runs the full checks once at the reviewed tip. Report the commit and the tests you ran for delta review."
+        ),
+        "{brief}"
+    );
+}

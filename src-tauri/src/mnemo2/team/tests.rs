@@ -15392,6 +15392,17 @@ async fn agent_merge_and_outcome_use_the_claude_code_model() {
     without_merge.merge = None;
     let progress = merge_outcome_line(1, &without_merge);
     assert!(progress.contains("claude-code/opus"), "{progress}");
+
+    // A merged agent worker is done: no surface may offer to continue it.
+    let refusal = fixture
+        .team
+        .message("agenttier14", "continue please".into(), MessageSender::ExternalLead)
+        .await
+        .expect_err("a merged agent worker has nothing left to continue");
+    assert_eq!(
+        refusal,
+        "agenttier14 ran as a Claude Code agent and is merged: there is nothing left to continue."
+    );
 }
 
 

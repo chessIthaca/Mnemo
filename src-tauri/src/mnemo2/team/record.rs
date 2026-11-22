@@ -468,6 +468,9 @@ pub(super) fn agent_worker_refusal(worker: &WorkerRecord) -> Option<String> {
             WorkerStatus::Failed | WorkerStatus::Stopped | WorkerStatus::Cancelled => format!(
                 "{id} runs as a Claude Code agent and has ended: dispatch the step again with a new worker_id."
             ),
+            WorkerStatus::Merged | WorkerStatus::Merging => format!(
+                "{id} ran as a Claude Code agent and is merged: there is nothing left to continue."
+            ),
             _ => format!(
                 "{id} runs as a Claude Code agent: fix it with your own Agent (SendMessage to it), then run team_check and team_review on the new tip."
             ),

@@ -1650,6 +1650,86 @@ async fn reembed_if_needed_uniform_store_publishes_nothing() {
 }
 
 #[tokio::test]
+async fn reembed_stale_picks_up_legacy_null_rows() {
+    // Two legacy/partial states the fingerprint set alone does not cover: a
+    // row whose fingerprint columns are NULL (pre-fingerprint row) and a row
+    // whose vector is NULL. Both are stale, as are rows still on the old
+    // model, so the pass re-embeds all three groups and leaves no row without
+    // a vector (plan ebd13a79).
+    let store = Arc::new(make_store());
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        ids.push(
+            store
+                .write(Memory::new(
+                    MemoryTier::Semantic,
+                    format!("normal {i}"),
+                    format!("normal content {i}"),
+                    1000,
+                ))
+                .await
+                .unwrap(),
+        );
+    }
+    // Two rows still on the OLD model.
+    store.set_embedder(Arc::new(CountingEmbedder {
+        model_id: "test-other",
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    for i in 0..2 {
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                format!("old {i}"),
+                format!("old content {i}"),
+                1000,
+            ))
+            .await
+            .unwrap();
+    }
+    store.set_embedder(Arc::new(HashEmbedder::new()));
+    // Doctor the two legacy/partial states through the writer connection.
+    {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        conn.execute(
+            "UPDATE memories SET embed_model = NULL, embed_dim = NULL WHERE id = ?1",
+            rusqlite::params![ids[0]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memories SET embedding = NULL WHERE id = ?1",
+            rusqlite::params![ids[1]],
+        )
+        .unwrap();
+    }
+
+    let count = store
+        .reembed_stale(Arc::new(HashEmbedder::new()), None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        count, 4,
+        "two doctored rows + the two rows still on the old model"
+    );
+    let null_embeddings: i64 = {
+        let conn = store.conn.lock().expect("conn lock poisoned");
+        conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(null_embeddings, 0, "no row is left without a vector");
+    assert_eq!(
+        store.stored_model_fingerprints().await.unwrap(),
+        vec![("hash".to_string(), 768)],
+        "the whole store is uniform afterwards"
+    );
+}
+
+#[tokio::test]
 async fn stored_model_fingerprints_reflect_writes() {
     // After writing memories, the stored fingerprints must include the
     // embedder's model_id + dim (so a startup mismatch is detectable).

@@ -1,6 +1,6 @@
 use super::*;
 use crate::memory::embedder::HashEmbedder;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 fn make_store() -> MemoryStore {
     let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new());
@@ -49,6 +49,31 @@ impl Embedder for AnchorEmbedder {
     fn model_id(&self) -> &str {
         self.model_id
     }
+}
+
+/// Collect every value the store's re-embed watch publishes while a test runs,
+/// so the event sequence can be asserted once the pass is over. The collector
+/// ends when the store — and with it the channel's sender — is dropped.
+fn collect_reembed_events(
+    mut rx: tokio::sync::watch::Receiver<Option<ReembedEvent>>,
+) -> (
+    Arc<std::sync::Mutex<Vec<ReembedEvent>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let seen: Arc<std::sync::Mutex<Vec<ReembedEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Some(event) = rx.borrow_and_update().clone() {
+                sink.lock().unwrap().push(event);
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+    (seen, handle)
 }
 
 /// Open an in-memory store with an [`AnchorEmbedder`] and the standard
@@ -1426,6 +1451,202 @@ async fn delete_working_for_session_no_match_is_zero() {
         .await
         .unwrap();
     assert_eq!(deleted, 0);
+}
+
+/// A test embedder with a deliberately different `model_id` that counts its
+/// `embed` calls, so a test can prove which rows a re-embed actually touched.
+/// Its vectors match the hash embedder's, so only the fingerprint distinguishes
+/// the two "models".
+struct CountingEmbedder {
+    model_id: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Embedder for CountingEmbedder {
+    async fn embed(&self, text: &str) -> Vec<f32> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        HashEmbedder::new().embed(text).await
+    }
+
+    fn model_id(&self) -> &str {
+        self.model_id
+    }
+}
+
+#[tokio::test]
+async fn reembed_if_needed_only_touches_stale_rows() {
+    // A re-embed interrupted by a window close must resume, not restart: rows
+    // already carrying the new fingerprint are left alone, so the second pass
+    // over a large store costs only the stale remainder (plan ebd13a79).
+    let store = Arc::new(make_store());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let other: Arc<dyn Embedder> = Arc::new(CountingEmbedder {
+        model_id: "test-other",
+        calls: calls.clone(),
+    });
+    // Four rows already re-embedded for the new model …
+    store.set_embedder(other.clone());
+    for i in 0..4 {
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                format!("new {i}"),
+                format!("new content {i}"),
+                1000,
+            ))
+            .await
+            .unwrap();
+    }
+    // … and six rows still on the old (hash) model.
+    store.set_embedder(Arc::new(HashEmbedder::new()));
+    for i in 0..6 {
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                format!("old {i}"),
+                format!("old content {i}"),
+                1000,
+            ))
+            .await
+            .unwrap();
+    }
+
+    calls.store(0, Ordering::SeqCst);
+    let (seen, collector) = collect_reembed_events(store.reembed_events());
+    reembed_if_needed(&store, &other).await;
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        6,
+        "only the six stale rows are re-embedded"
+    );
+    let fps = store.stored_model_fingerprints().await.unwrap();
+    assert_eq!(
+        fps,
+        vec![("test-other".to_string(), 768)],
+        "every row carries the new fingerprint afterwards"
+    );
+    drop(store);
+    collector.await.unwrap();
+    let events = seen.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ReembedEvent::Progress { done: 6, total: 6 })),
+        "the pass reports the six stale rows, not all ten: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn reembed_if_needed_publishes_started_progress_done() {
+    // The whole point of the plan: the re-embed is visible. A subscriber taken
+    // before the pass sees Started, throttled Progress ticks ending complete,
+    // and a Done that names the count and the model.
+    let store = Arc::new(make_store());
+    for i in 0..3 {
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                format!("fact {i}"),
+                format!("content {i}"),
+                1000,
+            ))
+            .await
+            .unwrap();
+    }
+    let other: Arc<dyn Embedder> = Arc::new(CountingEmbedder {
+        model_id: "test-other",
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let (seen, collector) = collect_reembed_events(store.reembed_events());
+    reembed_if_needed(&store, &other).await;
+    drop(store);
+    collector.await.unwrap();
+
+    let events = seen.lock().unwrap().clone();
+    assert_eq!(
+        events.first(),
+        Some(&ReembedEvent::Started {
+            model: "test-other".to_string()
+        }),
+        "the pass opens with Started: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ReembedEvent::Progress {
+                done: 3,
+                total: 3
+            }
+        )),
+        "the final tick is always forwarded and ends complete: {events:?}"
+    );
+    assert_eq!(
+        events.last(),
+        Some(&ReembedEvent::Done {
+            summary: "3 memories re-embedded for test-other".to_string()
+        }),
+        "the pass closes with a Done naming count and model: {events:?}"
+    );
+    // The wire shape is exactly the pass-event shape the app folds.
+    assert_eq!(
+        serde_json::to_value(ReembedEvent::Progress { done: 1, total: 3 }).unwrap(),
+        serde_json::json!({"type": "progress", "done": 1, "total": 3})
+    );
+}
+
+#[tokio::test]
+async fn reembed_if_needed_late_receiver_sees_done() {
+    // The startup re-embed runs before the window's tracker subscribes; a
+    // receiver created afterwards must still read the final event (a watch
+    // keeps the last value) instead of showing nothing.
+    let store = Arc::new(make_store());
+    store
+        .write(Memory::new(MemoryTier::Semantic, "fact", "content", 1000))
+        .await
+        .unwrap();
+    let other: Arc<dyn Embedder> = Arc::new(CountingEmbedder {
+        model_id: "test-other",
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    reembed_if_needed(&store, &other).await;
+
+    let rx = store.reembed_events();
+    assert_eq!(
+        *rx.borrow(),
+        Some(ReembedEvent::Done {
+            summary: "1 memories re-embedded for test-other".to_string()
+        })
+    );
+}
+
+#[tokio::test]
+async fn reembed_if_needed_uniform_store_publishes_nothing() {
+    // A store already uniform on the expected fingerprint is a no-op: the
+    // watch stays `None` and not a single row is re-embedded.
+    let store = Arc::new(make_store());
+    for i in 0..3 {
+        store
+            .write(Memory::new(
+                MemoryTier::Semantic,
+                format!("fact {i}"),
+                format!("content {i}"),
+                1000,
+            ))
+            .await
+            .unwrap();
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let same: Arc<dyn Embedder> = Arc::new(CountingEmbedder {
+        model_id: "hash",
+        calls: calls.clone(),
+    });
+    calls.store(0, Ordering::SeqCst);
+    reembed_if_needed(&store, &same).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no row is touched");
+    assert_eq!(*store.reembed_events().borrow(), None, "nothing is published");
 }
 
 #[tokio::test]

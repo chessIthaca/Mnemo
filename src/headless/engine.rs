@@ -611,6 +611,15 @@ impl Engine {
         self.brain.factory.memory_handle()
     }
 
+    /// The engine's OWN concrete memory store, if it built one (memory
+    /// enabled and not a G8-injected store). The dyn handle above cannot
+    /// expose the store's inherent methods — the Mnemo2 indexing tracker
+    /// subscribes to [`crate::memory::MemoryStore::reembed_events`] through
+    /// this to show the automatic re-embed as a status pass (plan ebd13a79).
+    pub fn concrete_memory_store(&self) -> Option<std::sync::Arc<crate::memory::MemoryStore>> {
+        self.brain.own_memory_store.clone()
+    }
+
     /// The project knowledge store (`<state_dir>/knowledge`), if wired.
     pub fn knowledge_store_handle(&self) -> Option<std::sync::Arc<crate::memory::knowledge::KnowledgeStore>> {
         self.brain.factory.knowledge_handle()

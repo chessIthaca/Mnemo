@@ -16246,6 +16246,32 @@ async fn merge_waits_for_a_running_check_run() {
             .expect_err("a second run is refused"),
         expected
     );
+    // A re-dispatch of the same worker id starts a turn in its checkout, so it
+    // is refused too.
+    team.update_worker(&worker_id, |current| {
+        current.status = WorkerStatus::Failed;
+        current.brief_sent = false;
+    })
+    .await;
+    let brief = team.worker(&worker_id).await.expect("worker").brief;
+    assert_eq!(
+        team.dispatch_request(DispatchRequest {
+            brief,
+            tier: None,
+            dispatch_routing: false,
+            source: DispatchSource::Ipc,
+            sender: MessageSender::User,
+            model: None,
+            reasoning_effort: None,
+            worker_id: Some(worker_id.clone()),
+            plan: None,
+            review_risk: None,
+            read_back: false,
+        })
+        .await
+        .expect_err("a re-dispatch is refused while the checks run"),
+        expected
+    );
     team.shutdown().await;
 }
 
@@ -16341,5 +16367,89 @@ async fn team_run_checks_does_not_count_a_command_that_changes_files() {
         "{}",
         refused.output
     );
+    team.shutdown().await;
+}
+
+/// A turn-end proof cannot claim a checkout while Mnemo's check run measures
+/// it: the proof's edit and restore would taint what the checks see.
+#[tokio::test]
+async fn a_proof_cannot_claim_during_a_check_run() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveVsChecks1").await;
+    assert!(team.check_runs.hold_for_test(&worker_id));
+    let error = team
+        .proof_ctx()
+        .spawn(&worker_id, &[proving::ProofJob::Regression])
+        .await
+        .expect_err("a proof is refused while the checks run");
+    assert_eq!(
+        error,
+        format!("Mnemo is running the checks for {worker_id}; wait for its notice.")
+    );
+    team.shutdown().await;
+}
+
+/// The run uses the configured core-operation list, like a worker session's
+/// tool: a check command that is one of them is refused, not run.
+#[tokio::test]
+async fn mnemo_check_run_refuses_a_configured_core_operation() {
+    let (_root, _state, config, team, worker_id) =
+        check_run_fixture("runChecks07", &["git --version", "git status"]).await;
+    let mut text = std::fs::read_to_string(config.path().join("config.toml")).expect("config.toml");
+    text.push_str("\n[git]\ncore_operations = [\"status\"]\n");
+    std::fs::write(config.path().join("config.toml"), text).expect("config.toml");
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    let notice = drain_notice(&mut notices, "Mnemo ran the checks for")
+        .await
+        .expect("the run ends with a notice");
+    assert!(notice.contains("1 passed, 1 failed"), "{notice}");
+    assert!(
+        notice.contains("FAIL git status (refused: core git operation)"),
+        "{notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let check = worker
+        .checks
+        .iter()
+        .find(|check| check.name == "git status")
+        .expect("the refused command is recorded");
+    assert_eq!(check.status, "failed");
+    team.shutdown().await;
+}
+
+/// Mnemo checks only a committed tip: a checkout with uncommitted changes is
+/// refused up front, and the automatic start after a clean review says so in
+/// the review result instead of starting.
+#[tokio::test]
+async fn team_run_checks_refuses_a_dirty_checkout() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks08", &["git --version"]).await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    std::fs::write(worker.worktree.join("scratch.txt"), "uncommitted\n").expect("dirty file");
+    let sentence = format!(
+        "{worker_id}'s checkout has uncommitted changes; Mnemo checks only a committed tip. Commit or discard them first."
+    );
+    assert_eq!(
+        team.run_checks_tool(Some(&worker_id))
+            .await
+            .expect_err("a dirty checkout is refused"),
+        sentence
+    );
+    let answer = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": worker_id,
+                "summary": "checked the diff",
+                "findings": [],
+                "evidence": serde_json::to_value(evidence()).expect("evidence"),
+            }),
+        )
+        .await;
+    assert!(answer.success, "{answer:?}");
+    assert!(answer.output.contains(&sentence), "{}", answer.output);
+    assert!(!answer.output.contains("Mnemo is running the missing checks"), "{}", answer.output);
     team.shutdown().await;
 }

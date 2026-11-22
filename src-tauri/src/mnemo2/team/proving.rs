@@ -325,6 +325,8 @@ pub(crate) struct ProofCtx {
     pub(super) signals: broadcast::Sender<BoardSignal>,
     /// The live claim set.
     pub(super) proving: Proving,
+    /// Mnemo's own check runs: a proof must not edit a checkout they measure.
+    pub(super) check_runs: super::check_run::CheckRuns,
     /// The plan board, when the host attached one.
     pub(super) board: Option<Arc<PlanBoard>>,
     /// The proof commands.
@@ -386,6 +388,9 @@ impl ProofCtx {
         let _lock = self.merge_lock.lock().await;
         if self.proving.is_active(worker_id) {
             return Err(proving_error(worker_id));
+        }
+        if self.check_runs.is_active(worker_id) {
+            return Err(super::check_run::check_run_error(worker_id));
         }
         let (worktree, claimable) = {
             let records = self.records.lock().await;

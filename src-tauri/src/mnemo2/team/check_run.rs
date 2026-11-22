@@ -109,6 +109,14 @@ pub(super) fn check_run_error(worker_id: &str) -> String {
     format!("Mnemo is running the checks for {worker_id}; wait for its notice.")
 }
 
+/// The refusal for a checkout with uncommitted changes: Mnemo checks only a
+/// committed tip.
+fn dirty_error(worker_id: &str) -> String {
+    format!(
+        "{worker_id}'s checkout has uncommitted changes; Mnemo checks only a committed tip. Commit or discard them first."
+    )
+}
+
 /// What a command that exited 0 but changed files is reported with.
 const CHANGED_FILES: &str = ", but it changed the checkout's files, so it does not count. Commit or discard the change, or fix the command.";
 
@@ -158,35 +166,53 @@ impl CommandOutcome {
     }
 }
 
-/// Split the `run_checks` answer into one outcome per command. The tool prints
-/// one block per command, in order, each opening with `PASS <command> (` or
-/// `FAIL <command> (`, then a `N passed, M failed` summary.
-fn parse_outcomes(commands: &[String], text: &str) -> Vec<CommandOutcome> {
+/// The headline and failing lines one command's block carries in the
+/// `run_checks` text.
+struct Block {
+    /// What sits inside the parentheses of the block's first line.
+    headline: String,
+    /// The extracted failing lines, one per line.
+    failing: String,
+}
+
+/// Find each command's block in the `run_checks` answer, aligned with
+/// `commands`: `None` for a command whose block is not in the text (the text
+/// is capped, so a long run can lose its tail). The tool prints one block per
+/// command, in order, each opening with `PASS <command> (` or `FAIL <command>
+/// (`, then a `N passed, M failed` summary.
+fn parse_blocks(commands: &[String], text: &str) -> Vec<Option<Block>> {
     let lines: Vec<&str> = text.lines().collect();
-    // (line index, command, passed, the text after the command)
-    let mut starts: Vec<(usize, &String, bool, &str)> = Vec::new();
+    // (line index, the text after the command) per found command.
+    let mut found: Vec<Option<(usize, &str)>> = Vec::new();
     let mut from = 0;
     for command in commands {
-        let found = lines.iter().enumerate().skip(from).find_map(|(index, line)| {
-            let (passed, rest) = match (line.strip_prefix("PASS "), line.strip_prefix("FAIL ")) {
-                (Some(rest), _) => (true, rest),
-                (_, Some(rest)) => (false, rest),
-                _ => return None,
-            };
+        let hit = lines.iter().enumerate().skip(from).find_map(|(index, line)| {
+            let rest = line
+                .strip_prefix("PASS ")
+                .or_else(|| line.strip_prefix("FAIL "))?;
             rest.strip_prefix(command.as_str())
                 .filter(|tail| tail.starts_with(" ("))
-                .map(|tail| (index, passed, tail))
+                .map(|tail| (index, tail))
         });
-        if let Some((index, passed, tail)) = found {
-            starts.push((index, command, passed, tail));
+        if let Some((index, _)) = hit {
             from = index + 1;
         }
+        found.push(hit);
     }
-    let mut outcomes = Vec::new();
-    for (position, (index, command, passed, tail)) in starts.iter().enumerate() {
-        let end = starts.get(position + 1).map_or(lines.len(), |next| next.0);
+    let mut blocks = Vec::new();
+    for (position, hit) in found.iter().enumerate() {
+        let Some((index, tail)) = hit else {
+            blocks.push(None);
+            continue;
+        };
+        // The block ends where the next found block starts.
+        let end = found[position + 1..]
+            .iter()
+            .flatten()
+            .next()
+            .map_or(lines.len(), |next| next.0);
         let mut body: Vec<&str> = lines[index + 1..end].to_vec();
-        if position + 1 == starts.len() {
+        if found[position + 1..].iter().all(Option::is_none) {
             // The summary line closes the last block.
             if let Some(summary) = body
                 .iter()
@@ -204,15 +230,30 @@ fn parse_outcomes(commands: &[String], text: &str) -> Vec<CommandOutcome> {
             .next()
             .unwrap_or("")
             .to_string();
-        outcomes.push(CommandOutcome {
-            command: (*command).clone(),
-            passed: *passed,
+        blocks.push(Some(Block {
             headline,
-            failing: if *passed { String::new() } else { body.join("\n") },
-            changed_files: false,
-        });
+            failing: body.join("\n"),
+        }));
     }
-    outcomes
+    blocks
+}
+
+/// What one run found: an outcome per `data.checks` entry, and the commands
+/// that had no entry at all.
+struct RunReport {
+    outcomes: Vec<CommandOutcome>,
+    /// Allow-listed commands the tool returned no entry for.
+    missing: Vec<String>,
+}
+
+impl RunReport {
+    /// Everything ran and counted: an empty list, or a command with no entry,
+    /// is never a pass.
+    fn all_passed(&self) -> bool {
+        !self.outcomes.is_empty()
+            && self.missing.is_empty()
+            && self.outcomes.iter().all(|outcome| outcome.passed)
+    }
 }
 
 /// Run every command with the `run_checks` tool in `checkout`.
@@ -220,18 +261,24 @@ async fn run_all(
     checkout: &Path,
     commands: &[String],
     config_dir: &Path,
-) -> Result<Vec<CommandOutcome>, String> {
+) -> Result<RunReport, String> {
     let sandbox = Sandbox::new(checkout.to_path_buf())
         .map_err(|error| format!("cannot open the checkout {}: {error}", checkout.display()))?;
     let mut tool = RunChecksTool::new(sandbox).with_check_commands(commands.to_vec());
-    // The same slots the worker sessions' tool takes: the saved
-    // `[general.machine]` limit, the slot files under the config dir. A config
-    // that cannot be read runs unslotted; the limit is never a failure mode.
+    // The same slots and the same core-operation list the worker sessions'
+    // tool gets (`agent/factory.rs`): the saved `[general.machine]` limit, the
+    // slot files under the config dir, and `[git] core_operations`. A config
+    // that cannot be read runs unslotted with the default list; the limit is
+    // never a failure mode.
     if let Ok(config) = mnemo::config::Config::load(config_dir) {
-        tool = tool.with_machine(
-            Arc::new(RwLock::new(config.general.general.machine.clone())),
-            mnemo::machine_slots::default_dir(config_dir),
-        );
+        tool = tool
+            .with_machine(
+                Arc::new(RwLock::new(config.general.general.machine.clone())),
+                mnemo::machine_slots::default_dir(config_dir),
+            )
+            .with_core_operations(Arc::new(RwLock::new(
+                config.general.git.core_operations.clone(),
+            )));
     }
     if !tool.has_checks() {
         return Err(NO_CHECKS.to_string());
@@ -257,17 +304,58 @@ async fn run_all(
         .filter_map(|entry| entry.get("command").and_then(Value::as_str))
         .map(str::to_string)
         .collect();
-    let mut outcomes = parse_outcomes(&run, &result.output);
-    for outcome in &mut outcomes {
-        let exited_zero = entries.iter().any(|entry| {
-            entry.get("command").and_then(Value::as_str) == Some(outcome.command.as_str())
-                && entry.get("exit_code").and_then(Value::as_i64) == Some(0)
+    // One outcome per entry; the capped text only supplies the headline and
+    // the failing lines.
+    let blocks = parse_blocks(&run, &result.output);
+    let mut outcomes = Vec::new();
+    for (entry, block) in entries.iter().zip(blocks) {
+        let Some(command) = entry.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        let exit = entry.get("exit_code").and_then(Value::as_i64);
+        let is_counted = counted.iter().any(|(counted, _)| counted == command);
+        let (headline, failing) = match block {
+            Some(block) => (block.headline, block.failing),
+            None => (
+                format!(
+                    "exit {}; its output was cut off",
+                    exit.map_or_else(|| "none".to_string(), |code| code.to_string())
+                ),
+                String::new(),
+            ),
+        };
+        outcomes.push(CommandOutcome {
+            command: command.to_string(),
+            passed: is_counted,
+            headline,
+            failing: if is_counted { String::new() } else { failing },
+            changed_files: exit == Some(0) && !is_counted,
         });
-        let is_counted = counted.iter().any(|(command, _)| command == &outcome.command);
-        outcome.passed = is_counted;
-        outcome.changed_files = exited_zero && !is_counted;
     }
-    Ok(outcomes)
+    let missing = commands
+        .iter()
+        .filter(|command| !run.contains(command))
+        .cloned()
+        .collect();
+    Ok(RunReport { outcomes, missing })
+}
+
+/// Watch a spawned run: when it panics or is cancelled, the lead still gets a
+/// notice (the claim is released as the task unwinds).
+fn supervise(
+    signals: broadcast::Sender<BoardSignal>,
+    key: String,
+    text: String,
+    run: tokio::task::JoinHandle<()>,
+) {
+    tokio::spawn(async move {
+        if run.await.is_err() {
+            let _ = signals.send(BoardSignal::Notice {
+                key: format!("checks:{key}:stopped:{}", now_key()),
+                text,
+            });
+        }
+    });
 }
 
 /// The first eight characters of a commit id.
@@ -291,9 +379,10 @@ impl CheckCtx {
     fn notice_text(
         header: Option<&str>,
         subject: &str,
-        outcomes: &[CommandOutcome],
+        report: &RunReport,
         next: &str,
     ) -> String {
+        let outcomes = &report.outcomes;
         let passed = outcomes.iter().filter(|outcome| outcome.passed).count();
         let failed = outcomes.len() - passed;
         let mut text = String::new();
@@ -305,6 +394,9 @@ impl CheckCtx {
         for outcome in outcomes {
             text.push_str(&outcome.notice_block());
             text.push('\n');
+        }
+        for command in &report.missing {
+            text.push_str(&format!("NO RESULT {command} (the tool returned no entry)\n"));
         }
         text.push_str(next);
         text
@@ -328,7 +420,8 @@ impl CheckCtx {
         let outcomes = run_all(&worktree, &commands, &self.config_dir).await;
         let text = match outcomes {
             Err(error) => format!("{header}\nMnemo could not run the checks for {worker_id}: {error}"),
-            Ok(outcomes) => {
+            Ok(report) => {
+                let outcomes = &report.outcomes;
                 let now = phase3::tip(&worktree).await.unwrap_or_default();
                 if now != tip {
                     format!(
@@ -344,7 +437,7 @@ impl CheckCtx {
                         &self.persistence,
                     );
                     let mut problem = None;
-                    for outcome in &outcomes {
+                    for outcome in outcomes {
                         let check = WorkerCheck {
                             name: outcome.command.clone(),
                             status: if outcome.passed { "passed" } else { "failed" }.to_string(),
@@ -366,8 +459,7 @@ impl CheckCtx {
                         .await
                         .err();
                     }
-                    let all_passed = outcomes.iter().all(|outcome| outcome.passed);
-                    let next = match (&problem, all_passed) {
+                    let next = match (&problem, report.all_passed()) {
                         (Some(error), _) => format!("The results could not be recorded: {error}"),
                         (None, true) => "Merge it with team_merge.".to_string(),
                         (None, false) => "Route the failures with team_route_fix.".to_string(),
@@ -375,7 +467,7 @@ impl CheckCtx {
                     Self::notice_text(
                         Some(&header),
                         &format!("Mnemo ran the checks for {worker_id} at {}", short(&tip)),
-                        &outcomes,
+                        &report,
                         &next,
                     )
                 }
@@ -396,13 +488,22 @@ impl CheckCtx {
         );
         let text = match outcomes {
             Err(error) => format!("Mnemo could not run the checks in the lead checkout: {error}"),
-            Ok(outcomes) => {
-                let next = if outcomes.iter().all(|outcome| outcome.passed) {
-                    "The lead branch passes the checks."
+            Ok(report) => {
+                let now = phase3::tip(&self.workspace_root).await.unwrap_or_default();
+                if now != tip {
+                    format!(
+                        "Mnemo ran the checks in the lead checkout, but the lead branch moved from {} to {} while the checks ran; run team_run_checks again.",
+                        short(&tip),
+                        short(&now)
+                    )
                 } else {
-                    "The lead branch fails the checks; nothing was recorded on any worker."
-                };
-                Self::notice_text(None, &subject, &outcomes, next)
+                    let next = if report.all_passed() {
+                        "The lead branch passes the checks."
+                    } else {
+                        "The lead branch fails the checks; nothing was recorded on any worker."
+                    };
+                    Self::notice_text(None, &subject, &report, next)
+                }
             }
         };
         drop(guard);
@@ -445,7 +546,16 @@ impl TeamRuntime {
                     .map_err(|error| format!("cannot read the lead branch: {error}"))?;
                 let ctx = self.check_ctx();
                 let started = format!("{branch} at {}", short(&tip));
-                tokio::spawn(async move { ctx.run_lead(tip, branch, commands, guard).await });
+                let signals = ctx.signals.clone();
+                let run = tokio::spawn(async move {
+                    ctx.run_lead(tip, branch, commands, guard).await
+                });
+                supervise(
+                    signals,
+                    "lead".to_string(),
+                    "Mnemo's check run in the lead checkout stopped unexpectedly; nothing was recorded. Run team_run_checks again.".to_string(),
+                    run,
+                );
                 return Ok(format!(
                     "Mnemo is running the checks in the lead checkout ({started}); a notice follows. Nothing is recorded."
                 ));
@@ -480,12 +590,22 @@ impl TeamRuntime {
             let Some(guard) = self.check_runs.claim(worker_id) else {
                 return Err(check_run_error(worker_id));
             };
+            if phase3::require_clean(&worker.worktree, "worker").await.is_err() {
+                return Err(dirty_error(worker_id));
+            }
             let tip = self.worker_tip(&worker).await?;
             let worktree = worker.worktree.clone();
             let ctx = self.check_ctx();
             let id = worker_id.to_string();
             let started = short(&tip).to_string();
-            tokio::spawn(async move { ctx.run_worker(&id, worktree, tip, commands, guard).await });
+            let signals = ctx.signals.clone();
+            let stopped = format!(
+                "worker_id={worker_id}\nMnemo's check run for {worker_id} stopped unexpectedly; nothing was recorded. Run team_run_checks again."
+            );
+            let run = tokio::spawn(async move {
+                ctx.run_worker(&id, worktree, tip, commands, guard).await
+            });
+            supervise(signals, worker_id.to_string(), stopped, run);
             Ok(format!(
                 "Mnemo is running the checks for {worker_id} at {started}; a notice follows and records each command on that tip."
             ))
@@ -520,6 +640,8 @@ impl TeamRuntime {
                     "Mnemo is running the missing checks at {}; merge after its notice.",
                     short(&tip)
                 )),
+                // A dirty checkout is the lead's to know: the review result says so.
+                Err(error) if error == dirty_error(&reviewed.id) => Some(error),
                 Err(error) => {
                     eprintln!("team: the missing checks of {} did not start: {error}", reviewed.id);
                     None

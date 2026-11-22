@@ -599,6 +599,7 @@ impl TeamRuntime {
             persistence: self.persistence.clone(),
             signals: self.signals.clone(),
             proving: self.proving.clone(),
+            check_runs: self.check_runs.clone(),
             board: self.board(),
             runner: Arc::clone(&*self.proofs.read().unwrap_or_else(|e| e.into_inner())),
             mutation_memory: self.mutation_memory.clone(),

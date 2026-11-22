@@ -316,6 +316,11 @@ pub struct TeamRuntime {
     /// The dispatch-routing settings, shared with every worker pump so a
     /// failure's `outcome` row follows the mode in force when it happens.
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
+    /// The models a provider usage limit took out, with the time each serves
+    /// again, and the runtime's own handle (plan e5d93df3 decision 8). Shared
+    /// with every worker pump, which marks the model a usage-limited worker
+    /// ran on and, in routing mode auto, resumes that worker. In memory only.
+    usage_limits: routing::UsageLimits,
     classifier: Option<ClassifierSlot>,
     /// The online-learning overlay over `dispatch_routing.jsonl`, present when
     /// the engine exposes its shared embedder. Consulted before Laya.
@@ -458,6 +463,7 @@ impl TeamRuntime {
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
             config_dir: config_dir.clone(),
             routing: Arc::new(std::sync::RwLock::new(load_routing_settings(&config_dir))),
+            usage_limits: routing::UsageLimits::default(),
             classifier: options.classifier,
             route_knn,
             routing_permit: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -530,6 +536,9 @@ impl TeamRuntime {
     /// that tells working workers when the lead records something new.
     pub(crate) fn attach_board(self: &Arc<Self>, board: Arc<PlanBoard>) {
         board.set_external_lead_attached(self.external_lead_attached());
+        // The worker pumps resume a usage-limited worker through this handle;
+        // a second attach finds it already set to this same runtime.
+        let _ = self.usage_limits.team.set(Arc::downgrade(self));
         let team = Arc::downgrade(self);
         let runtime = tokio::runtime::Handle::try_current().ok();
         board.set_edit_observer(Box::new(move |plan_id, kinds| {

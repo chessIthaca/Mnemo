@@ -446,6 +446,39 @@ impl TeamRuntime {
         self.resume_inner(worker_id).await
     }
 
+    /// Move a worker onto the lead's `tier`/`model`/`reasoning_effort` choice
+    /// and resume it there with its transcript: the path `team_resume` with a
+    /// choice takes, and the one Mnemo takes itself for a usage-limited worker
+    /// in routing mode auto. The choice resolves through the ladder (an empty
+    /// or unavailable tier folds down); an effort alone keeps the worker's
+    /// model; the tier the choice resolved to is stamped once the switch is
+    /// made.
+    pub(super) async fn resume_on_tier(
+        &self,
+        worker_id: &str,
+        tier: Option<&str>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+    ) -> Result<WorkerRecord, String> {
+        let model = self.lead_model_choice(tier, model)?;
+        // An effort alone keeps the worker's model.
+        let model = match model {
+            Some(model) => Some(model),
+            None => self.worker(worker_id).await.ok().and_then(|w| w.model),
+        };
+        let changed = self
+            .change_model(worker_id, model, reasoning_effort, source)
+            .await;
+        match (changed, tier) {
+            (Ok(_), Some(tier)) => {
+                self.record_tier(worker_id, tier).await;
+                self.worker(worker_id).await
+            }
+            (changed, _) => changed,
+        }
+    }
+
     pub(super) async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let live_idle = {
             let live = self.live.lock().await;
@@ -555,6 +588,7 @@ impl TeamRuntime {
             self.fail_next_close.clone(),
             self.board(),
             self.proof_ctx(),
+            self.usage_limits(),
         ));
         self.live.lock().await.insert(
             worker_id.to_string(),

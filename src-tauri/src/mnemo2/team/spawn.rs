@@ -390,6 +390,7 @@ impl TeamRuntime {
             self.fail_next_close.clone(),
             self.board(),
             self.proof_ctx(),
+            self.usage_limits(),
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {

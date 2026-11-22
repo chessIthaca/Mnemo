@@ -10748,6 +10748,225 @@ async fn auto_strike_streak_escalates_when_the_worker_becomes_idle() {
     fixture.team.shutdown().await;
 }
 
+/// The Ollama Cloud glm weekly limit as the provider streams it: a 429 whose
+/// body says the account's usage is spent (plan e5d93df3 decision 8).
+const GLM_WEEKLY_LIMIT: &str = "stream request: HTTP 429 from https://ollama.com/v1/chat/completions — {\"error\":\"you (x) have reached your weekly usage limit, add usage credits\"}";
+
+/// The scripted turn that fails a worker on the glm weekly limit: the stream
+/// errors before any output, so the session fails the turn at once (a 429
+/// with no alternate endpoint is never retried).
+fn glm_weekly_limit_turn() -> Vec<mnemo::provider::LlmEvent> {
+    vec![mnemo::provider::LlmEvent::Error {
+        error: GLM_WEEKLY_LIMIT.to_string(),
+    }]
+}
+
+/// `Mnemo marked <spec> unavailable until <HH:MM>; ...`, with the local time
+/// read from the team's own mark, formatted independently of the code under
+/// test. Also checks the mark lasts six hours.
+fn usage_limit_marked_sentence(team: &TeamRuntime, spec: &str, tail: &str) -> String {
+    let now = unix_ms();
+    let until = team
+        .usage_limits
+        .until(spec, now)
+        .unwrap_or_else(|| panic!("{spec} is marked unavailable"));
+    let six_hours = 6 * 60 * 60 * 1000;
+    assert!(
+        until > now + six_hours - 120_000 && until <= now + six_hours,
+        "the mark lasts six hours: until {until}, now {now}"
+    );
+    let local = chrono::DateTime::from_timestamp_millis(until as i64)
+        .expect("a valid instant")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M");
+    format!("Mnemo marked {spec} unavailable until {local}; {tail}")
+}
+
+#[tokio::test]
+async fn a_usage_limit_marks_the_model_and_folds_the_tier() {
+    // Shadow mode: Mnemo marks the model, but only auto mode resumes.
+    let (fixture, mut notices) = nudge_fixture(vec![glm_weekly_limit_turn()]).await;
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high resolves");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("high", "test/scripted-difficult")
+    );
+    let dispatched = fixture.dispatch(Some("high"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    let failed = eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        (worker.status == WorkerStatus::Failed).then_some(worker)
+    })
+    .await;
+    let error = failed.error.clone().expect("the failure is recorded");
+    assert!(error.contains("weekly usage limit"), "{error}");
+    // The next dispatch on high folds past the limited model.
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high still resolves");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("routine", "test/scripted-average")
+    );
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    assert!(
+        guidance.contains("high (") && guidance.contains("no model; folds down to routine"),
+        "{guidance}"
+    );
+    // The failure notice says what Mnemo marked and ends with the call.
+    let notice = fixture
+        .team
+        .usage_limit_notice(&failed, &error)
+        .expect("a usage-limit failure notice");
+    let marked = usage_limit_marked_sentence(
+        &fixture.team,
+        "test/scripted-difficult",
+        "the high tier now runs on test/scripted-average.",
+    );
+    assert_eq!(
+        notice,
+        format!(
+            "{marked}\nMove it there, then team_message it to continue: team_resume worker_id=routingworker tier=high"
+        )
+    );
+    // Any other failure keeps the generic lines.
+    assert!(fixture
+        .team
+        .usage_limit_notice(&failed, "provider error: HTTP 500 from gateway")
+        .is_none());
+    // Outside auto mode nothing resumes the worker.
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Failed);
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    while let Ok(signal) = notices.try_recv() {
+        if let BoardSignal::Notice { key, text } = signal {
+            assert!(!key.starts_with("usage-limit:"), "no resume notice: {text}");
+        }
+    }
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_mode_resumes_a_usage_limited_worker_on_the_fold_target() {
+    let (fixture, mut notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+        std::time::Duration::ZERO,
+        vec![glm_weekly_limit_turn()],
+    )
+    .await;
+    let dispatched = fixture.dispatch(Some("high"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    let message = "Your previous model test/scripted-difficult hit its usage limit; you are now on test/scripted-average. Run git status and git diff --stat to see where you were, then continue your task.";
+    let resumed = eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        worker
+            .inbox
+            .iter()
+            .any(|entry| entry.sender == MessageSender::Mnemo && entry.text == message)
+            .then_some(worker)
+    })
+    .await;
+    assert_eq!(resumed.model.as_deref(), Some("test/scripted-average"));
+    assert_eq!(resumed.tier.as_deref(), Some("routine"));
+    assert_ne!(resumed.status, WorkerStatus::Failed);
+    assert!(
+        !resumed.transcript.messages.is_empty(),
+        "the failed turn's transcript was kept"
+    );
+    assert_eq!(
+        resumed.models_used,
+        vec![
+            "test/scripted-difficult".to_string(),
+            "test/scripted-average".to_string()
+        ]
+    );
+    // The lead hears what Mnemo marked and that it resumed the worker.
+    let marked = usage_limit_marked_sentence(
+        &fixture.team,
+        "test/scripted-difficult",
+        "the high tier now runs on test/scripted-average.",
+    );
+    let mut notice = None;
+    for _ in 0..800 {
+        while let Ok(signal) = notices.try_recv() {
+            if let BoardSignal::Notice { key, text } = signal {
+                if key.starts_with("usage-limit:routingworker:") {
+                    notice = Some(text);
+                }
+            }
+        }
+        if notice.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        notice.expect("the usage-limit notice"),
+        format!("{marked} Mnemo resumed routingworker on test/scripted-average with its transcript.")
+    );
+    // Outside auto mode the same failure's notice ends with the resume call
+    // instead.
+    crate::mnemo2::dispatch_routing::save_routing_settings(
+        fixture._config.path(),
+        &crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+    )
+    .expect("save shadow mode");
+    fixture.team.reload_routing_settings();
+    let mut failed = resumed.clone();
+    failed.status = WorkerStatus::Failed;
+    failed.model = Some("test/scripted-difficult".into());
+    failed.tier = Some("high".into());
+    let notice = fixture
+        .team
+        .usage_limit_notice(&failed, &format!("provider error: {GLM_WEEKLY_LIMIT}"))
+        .expect("a usage-limit failure notice");
+    assert!(
+        notice.ends_with("team_resume worker_id=routingworker tier=high"),
+        "{notice}"
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn unavailable_models_return_after_their_window() {
+    let fixture = routing_fixture(
+        crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+        None,
+        false,
+    )
+    .await;
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms() + 60_000);
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high folds");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("routine", "test/scripted-average")
+    );
+    // A window that has passed leaves the model available again.
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms().saturating_sub(1));
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high resolves");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("high", "test/scripted-difficult")
+    );
+    assert!(fixture
+        .team
+        .current_models()
+        .iter()
+        .any(|model| model.spec == "test/scripted-difficult"));
+    fixture.team.shutdown().await;
+}
+
 #[tokio::test]
 async fn worker_host_tools_offer_plan_read() {
     let root = tempfile::tempdir().expect("workspace");
@@ -13394,6 +13613,7 @@ async fn manual_pump_worker(
         team.fail_next_close.clone(),
         team.board(),
         team.proof_ctx(),
+        team.usage_limits(),
     ));
     session
         .send(mnemo::headless::SessionCommand::Prompt {

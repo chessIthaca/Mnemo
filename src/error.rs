@@ -348,6 +348,31 @@ pub fn retry_backoff_ms(attempt: u32) -> u64 {
     half + nanos % (half + 1)
 }
 
+/// Whether a provider failure text says the account ran out of what it may
+/// spend — a usage limit, quota, credit or billing cap — rather than a
+/// passing overload.
+///
+/// Such a limit holds for hours (Ollama Cloud's weekly glm limit, OpenAI's
+/// `insufficient_quota`), so retrying the same model soon cannot help, while
+/// an overloaded or "temporarily" unavailable endpoint recovers on its own.
+/// Mnemo2 takes a model whose worker failed this way out of its tiers until
+/// the limit resets. Matched case-insensitively on the text alone, because
+/// the failure reaches the team as the worker's final error string.
+pub fn is_usage_limit(error: &str) -> bool {
+    let text = error.to_lowercase();
+    let limited = [
+        "usage limit",
+        "quota",
+        "insufficient_quota",
+        "credit",
+        "billing",
+        "exceeded your current",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    limited && !text.contains("overloaded") && !text.contains("temporarily")
+}
+
 #[cfg(test)]
 mod tests {
     use super::Error;
@@ -562,6 +587,42 @@ mod tests {
     fn non_provider_errors_are_not_rate_limited() {
         assert!(!Error::Tool("oops".into()).is_rate_limited());
         assert!(!Error::Config("bad".into()).is_rate_limited());
+    }
+
+    // --- is_usage_limit --------------------------------------------------
+
+    #[test]
+    fn usage_limit_errors_are_classified() {
+        // The Ollama Cloud glm weekly limit, as the worker's final error
+        // carries it, and OpenAI's quota body are limits that hold for hours.
+        let limits = [
+            "provider error: stream request: HTTP 429 from https://ollama.com/v1/chat/completions — \
+             {\"error\":\"you (x) have reached your weekly usage limit, add usage credits\"} — \
+             rate limited (429), no alternate provider found. Switch models via the status-bar \
+             picker, or configure another endpoint serving this model.",
+            "stream request: HTTP 429 from https://api.openai.com/v1/chat/completions — \
+             {\"error\":{\"message\":\"You exceeded your current quota, please check your plan \
+             and billing details.\",\"type\":\"insufficient_quota\"}}",
+        ];
+        for text in limits {
+            assert!(super::is_usage_limit(text), "a usage limit: {text}");
+        }
+        // An overloaded engine and a plain rate limit recover on their own.
+        let passing = [
+            "stream request: HTTP 429 from https://api.moonshot.ai/v1/chat/completions — \
+             {\"error\":{\"message\":\"The engine is currently overloaded, please try again \
+             later\",\"type\":\"engine_overloaded_error\"}}",
+            "provider error: HTTP 429 Too Many Requests — rate limited (429), no alternate \
+             provider found. Switch models via the status-bar picker, or configure another \
+             endpoint serving this model.",
+            // A quota word beside an overload or a temporary outage is still
+            // an overload, not a spent account.
+            "engine_overloaded_error: the engine is overloaded; your quota is untouched",
+            "the service is temporarily over its request quota, retry shortly",
+        ];
+        for text in passing {
+            assert!(!super::is_usage_limit(text), "not a usage limit: {text}");
+        }
     }
 
     #[test]

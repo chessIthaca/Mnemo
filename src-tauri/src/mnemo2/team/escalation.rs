@@ -18,9 +18,12 @@ use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
 use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::usage::ProjectUsage;
 
+use super::dispatch::BoxFuture;
 use super::nudge::append_reroute_metadata;
 use super::persistence::TeamPersistence;
-use super::record::{note_model, ChangeSource, WorkerRecord};
+use super::record::{
+    note_model, session_model_spec, ChangeSource, MessageSender, WorkerRecord, WorkerStatus,
+};
 use super::routing::{final_tier, resolve_tier_over, tier_ladder_from_dto};
 use super::pump::save_workers;
 use super::{status_name, unix_ms, BoardSignal, LiveWorker, TeamRuntime};
@@ -142,6 +145,70 @@ pub(super) async fn auto_escalate_idle(worker_id: &str, ctx: AutoEscalation<'_>)
 }
 
 impl TeamRuntime {
+    /// Continue a worker that failed on a provider usage limit (plan e5d93df3
+    /// decision 8, routing mode auto): its pump took `failed_spec` out of the
+    /// tiers, so its tier now folds; Mnemo resumes it there with its
+    /// transcript through [`TeamRuntime::resume_on_tier`] — the path
+    /// `team_resume` with a tier takes — tells it where it is, and notices
+    /// the lead. Nothing happens unless the worker is still the failed
+    /// generation `generation` (the lead may have moved it first) and its
+    /// tier yields a different, available model; a worker with no fold target
+    /// stays failed, and its failure notice says so.
+    ///
+    /// Boxed: the resume starts a new worker pump, and the pump spawns this
+    /// future, so its type must not be inferred through the pump's own.
+    pub(super) fn resume_usage_limited<'a>(
+        &'a self,
+        worker_id: &'a str,
+        generation: u64,
+        failed_spec: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(record) = self.worker(worker_id).await else {
+                return;
+            };
+            if record.status != WorkerStatus::Failed || record.generation != generation {
+                return;
+            }
+            let Some(until_ms) = self.usage_limits.until(failed_spec, unix_ms()) else {
+                return;
+            };
+            let (marked, tier) = self.usage_limit_marked(&record, failed_spec, until_ms);
+            let Some((tier, Some(_))) = tier else {
+                return;
+            };
+            let key = format!("usage-limit:{worker_id}:{generation}");
+            let resumed = match self
+                .resume_on_tier(worker_id, Some(&tier), None, None, ChangeSource::Lead)
+                .await
+            {
+                Ok(resumed) => resumed,
+                Err(error) => {
+                    self.notify_lead(
+                        key,
+                        format!(
+                            "{marked} Mnemo could not resume {worker_id} there: {error}\nMove it yourself, then team_message it to continue: team_resume worker_id={worker_id} tier={tier}"
+                        ),
+                    );
+                    return;
+                }
+            };
+            let new_spec = session_model_spec(&resumed).to_string();
+            let text = format!(
+                "Your previous model {failed_spec} hit its usage limit; you are now on {new_spec}. Run git status and git diff --stat to see where you were, then continue your task."
+            );
+            let told = self.message(worker_id, text, MessageSender::Mnemo).await;
+            let mut notice =
+                format!("{marked} Mnemo resumed {worker_id} on {new_spec} with its transcript.");
+            if let Err(error) = told {
+                notice.push_str(&format!(
+                    "\nIt could not be told to continue ({error}); team_message it to continue."
+                ));
+            }
+            self.notify_lead(key, notice);
+        })
+    }
+
     pub(super) async fn auto_escalate_worker(&self, worker_id: &str) -> Result<bool, String> {
         auto_escalate_idle(
             worker_id,

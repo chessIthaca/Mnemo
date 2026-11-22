@@ -580,11 +580,15 @@ fn restore_now(checkout: &Path, tip: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Test seam: the git subcommand it targets, then the program and leading
+/// arguments that run it as `<program> <args...> git <subcommand> ...`.
+#[cfg(test)]
+type Seam = (String, String, Vec<String>);
+
 #[cfg(test)]
 thread_local! {
-    /// Test seam: a program and leading arguments that run the apply as
-    /// `<program> <args...> git apply -R ...`, to make the apply slow.
-    static APPLY_SEAM: std::cell::RefCell<Option<(String, Vec<String>)>> =
+    /// Makes one git subcommand of the proof slow (see [`Seam`]).
+    static APPLY_SEAM: std::cell::RefCell<Option<Seam>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -638,11 +642,13 @@ impl<'a> RestoreGuard<'a> {
     /// net). Never blocks the runtime: the child is polled with short sleeps.
     async fn run_git(&self, args: &[&str]) -> Result<std::process::Output, String> {
         #[cfg(test)]
-        let seam = APPLY_SEAM.with(|seam| seam.borrow().clone());
+        let seam = APPLY_SEAM
+            .with(|seam| seam.borrow().clone())
+            .filter(|(target, _, _)| args.first() == Some(&target.as_str()));
         #[cfg(not(test))]
-        let seam: Option<(String, Vec<String>)> = None;
+        let seam: Option<((), String, Vec<String>)> = None;
         let mut command = match seam {
-            Some((program, prefix)) => {
+            Some((_, program, prefix)) => {
                 let mut command = tokio::process::Command::new(program);
                 command.args(prefix).arg("git");
                 command
@@ -677,16 +683,18 @@ impl<'a> RestoreGuard<'a> {
                         Ok(status)
                     }
                     Some(Ok(None)) => Err(None),
-                    Some(Err(error)) => {
-                        slot.take();
-                        Err(Some(error))
-                    }
+                    Some(Err(error)) => Err(Some(error)),
                     None => Err(Some(std::io::Error::other("git child vanished"))),
                 }
             };
             match polled {
                 Ok(status) => break status,
-                Err(Some(error)) => return Err(fail(error)),
+                Err(Some(error)) => {
+                    // A child we cannot poll is killed and reaped, not left
+                    // running behind the error.
+                    self.reap_inflight();
+                    return Err(fail(error));
+                }
                 Err(None) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         };
@@ -697,22 +705,72 @@ impl<'a> RestoreGuard<'a> {
         })
     }
 
-    /// Kill the in-flight child and wait for it to exit (bounded).
-    fn reap_inflight(&self) {
+    /// Kill the in-flight child and wait for it to exit; `true` when there is
+    /// no child or it was reaped.
+    ///
+    /// Best effort by necessity: [`Drop`] cannot wait forever, so after about
+    /// 5 s a child that will not die is reported on stderr and given up on
+    /// (`false`), and the caller restores anyway. A failed kill or a failed
+    /// poll is reported and never counted as an exit.
+    fn reap_inflight(&self) -> bool {
         let child = self
             .inflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(mut child) = child {
-            let _ = child.start_kill();
-            for _ in 0..500 {
-                if !matches!(child.try_wait(), Ok(None)) {
-                    return;
+        let Some(mut child) = child else {
+            return true;
+        };
+        if let Err(error) = child.start_kill() {
+            eprintln!("Mnemo2: could not kill the proof's git child: {error}");
+        }
+        for _ in 0..500 {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("Mnemo2: could not poll the proof's git child: {error}");
                 }
-                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!("Mnemo2: the proof's git child could not be reaped; restoring anyway");
+        false
+    }
+
+    /// [`restore_checkout`] through [`Self::run_git`]: every child is
+    /// registered, so a proof dropped mid-restore kills and reaps it before
+    /// the guard's own restore.
+    async fn restore(&self) -> Result<(), String> {
+        let reset_args = ["reset", "--hard", self.tip];
+        let clean_args = ["clean", "-ffd"];
+        for args in [&reset_args[..], &clean_args[..]] {
+            let output = self.run_git(args).await?;
+            if !output.status.success() {
+                return Err(git_error(args, &output));
             }
         }
+        let head = self.run_git(&["rev-parse", "HEAD"]).await?;
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if head != self.tip {
+            return Err(format!(
+                "the checkout is at {head} after the restore, not at {}",
+                self.tip
+            ));
+        }
+        let status_args = ["status", "--porcelain", "-uall"];
+        let status = self.run_git(&status_args).await?;
+        if !status.status.success() {
+            return Err(git_error(&status_args, &status));
+        }
+        let status = String::from_utf8_lossy(&status.stdout).trim().to_string();
+        if !status.is_empty() {
+            return Err(format!(
+                "the checkout is still dirty after the restore: {}",
+                tail(&status, 400)
+            ));
+        }
+        Ok(())
     }
 
     /// Take ownership: from here a restore is owed until [`Self::disarm`].
@@ -729,7 +787,7 @@ impl<'a> RestoreGuard<'a> {
 impl Drop for RestoreGuard<'_> {
     fn drop(&mut self) {
         // A child still running would apply after the restore below.
-        self.reap_inflight();
+        let _ = self.reap_inflight();
         if !self.armed {
             return;
         }
@@ -849,7 +907,7 @@ pub async fn prove_regression(
             // An apply that could not even run is not an error of the proof:
             // the caller gets an outcome, restored like every other path.
             let reason = format!("the source patch could not be reverse-applied: {error}");
-            return match restore_checkout(&checkout, &tip).await {
+            return match guard.restore().await {
                 Ok(()) => {
                     guard.disarm();
                     Ok(RedOutcome::Inconclusive { reason })
@@ -894,7 +952,7 @@ pub async fn prove_regression(
 
     // 5. RESTORE ALWAYS, and only then report: a checkout that cannot be
     //    verified is an error the caller has to surface, not an outcome.
-    match restore_checkout(&checkout, &tip).await {
+    match guard.restore().await {
         Ok(()) => {
             guard.disarm();
             outcome
@@ -1663,6 +1721,7 @@ Start-Sleep -Seconds 3
             )
             .expect("script");
             (
+                "apply".to_string(),
                 "powershell".to_string(),
                 vec![
                     "-NoProfile".to_string(),
@@ -1672,6 +1731,7 @@ Start-Sleep -Seconds 3
             )
         } else {
             (
+                "apply".to_string(),
                 "sh".to_string(),
                 vec![
                     "-c".to_string(),
@@ -1723,6 +1783,122 @@ Start-Sleep -Seconds 3
             std::fs::read_to_string(root.join("src.txt")).expect("source"),
             "fixed\n"
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_proof_mid_restore_leaves_the_checkout_clean() {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path().to_path_buf();
+        let (base, tip) = demo_repo(&root);
+        let tools = tempfile::tempdir().expect("tools");
+        let started = tools.path().join("reset.started");
+        // A wrapper for the restore's `git reset`: it marks its start, sleeps
+        // 3 s, leaves a late untracked file (what an orphaned restore child
+        // does after the guard restored), then runs the real reset.
+        let seam = if cfg!(windows) {
+            let script = tools.path().join("slow-reset.ps1");
+            std::fs::write(
+                &script,
+                format!(
+                    "Set-Content -Path '{started}' -Value x
+Start-Sleep -Seconds 3
+Set-Content -Path leftover.txt -Value late
+$rest = $args[1..($args.Length-1)]
+& $args[0] @rest
+",
+                    started = started.display()
+                ),
+            )
+            .expect("script");
+            (
+                "reset".to_string(),
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-File".to_string(),
+                    script.to_string_lossy().into_owned(),
+                ],
+            )
+        } else {
+            (
+                "reset".to_string(),
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        ": > '{started}'; sleep 3; echo late > leftover.txt; exec \"$@\"",
+                        started = started.display()
+                    ),
+                    "sh".to_string(),
+                ],
+            )
+        };
+        APPLY_SEAM.with(|cell| *cell.borrow_mut() = Some(seam));
+        // Red once the source is reverted, and it leaves an untracked file.
+        let script = if cfg!(windows) {
+            "if ((Get-Content src.txt) -eq 'fixed') { 'demo ... ok' } else { Set-Content leftover.txt scratch; 'demo ... FAILED'; exit 1 }"
+        } else {
+            "if [ \"$(cat src.txt)\" = fixed ]; then echo 'demo ... ok'; else echo scratch > leftover.txt; echo 'demo ... FAILED'; exit 1; fi"
+        };
+        let proof = prove_regression(
+            root.clone(),
+            base,
+            tip.clone(),
+            cfg_for(script.to_string()),
+            "demo".to_string(),
+            None,
+        );
+        {
+            tokio::pin!(proof);
+            let marker = async {
+                for _ in 0..3000 {
+                    if started.exists() {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                false
+            };
+            tokio::select! {
+                finished = &mut proof => {
+                    APPLY_SEAM.with(|cell| *cell.borrow_mut() = None);
+                    panic!("the proof finished before the restore started: {finished:?}");
+                }
+                seen = marker => {
+                    APPLY_SEAM.with(|cell| *cell.borrow_mut() = None);
+                    assert!(seen, "the restore wrapper never started within 60 s");
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(git_in(&root, &["status", "--porcelain", "-uall"]), "");
+    }
+
+    #[tokio::test]
+    async fn reap_inflight_kills_and_reaps_a_running_child() {
+        let dir = tempfile::tempdir().expect("dir");
+        let guard = RestoreGuard::new(dir.path(), "tip");
+        let mut command = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("powershell");
+            command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("60");
+            command
+        };
+        let child = command.kill_on_drop(true).spawn().expect("spawn");
+        *guard.inflight.lock().expect("slot") = Some(child);
+        let begun = std::time::Instant::now();
+        assert!(guard.reap_inflight(), "the child must be reaped");
+        assert!(
+            begun.elapsed() < Duration::from_secs(4),
+            "reaping took {:?}",
+            begun.elapsed()
+        );
+        assert!(guard.inflight.lock().expect("slot").is_none());
+        assert!(guard.reap_inflight(), "no child counts as reaped");
     }
 
     #[tokio::test]

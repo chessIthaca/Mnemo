@@ -239,10 +239,23 @@ fn plain_path(raw: &str) -> String {
         .to_string()
 }
 
-/// The one-based line of the first `#[cfg(test)]` in a file's text.
+/// The one-based line of the `#[cfg(test)]` that opens a file's inline test
+/// module: the first `#[cfg(test)]` whose next non-blank line starts with
+/// `mod `. Other `#[cfg(test)]` items above it (a test seam in production
+/// code) do not start the test code. Without such a line the first
+/// `#[cfg(test)]` of any kind is used.
 fn cfg_test_line(text: &str) -> Option<u32> {
-    text.lines()
-        .position(|line| line.trim_start().starts_with("#[cfg(test)]"))
+    let lines: Vec<&str> = text.lines().collect();
+    let is_cfg = |line: &&str| line.trim_start().starts_with("#[cfg(test)]");
+    let module = lines.iter().enumerate().position(|(index, line)| {
+        is_cfg(line)
+            && lines[index + 1..]
+                .iter()
+                .find(|next| !next.trim().is_empty())
+                .is_some_and(|next| next.trim().starts_with("mod "))
+    });
+    module
+        .or_else(|| lines.iter().position(is_cfg))
         .map(|index| index as u32 + 1)
 }
 
@@ -1269,6 +1282,46 @@ mod tests {
         assert!(patch.contains("--- a/src/host/brain.rs"), "{patch}");
         assert!(patch.contains("+++ b/src/host/brain.rs"), "{patch}");
         assert!(patch.contains("+let added = 1;"), "{patch}");
+        assert!(!patch.contains("test_only"), "{patch}");
+    }
+
+    #[test]
+    fn cfg_test_items_above_the_test_module_stay_source() {
+        let diff = concat!(
+            "diff --git a/src/host/brain.rs b/src/host/brain.rs
+",
+            "index 1111111..2222222 100644
+",
+            "--- a/src/host/brain.rs
+",
+            "+++ b/src/host/brain.rs
+",
+            "@@ -14,0 +15,1 @@
+",
+            "+let fixed = 1;
+",
+            "@@ -28,0 +30,1 @@
+",
+            "+let test_only = 2;
+",
+        );
+        // Line 5 is a cfg(test) item in production code; the production fix is
+        // at line 15 and the test module opens at line 20.
+        let tip = (1..=35)
+            .map(|line| match line {
+                5 => "#[cfg(test)]".to_string(),
+                6 => "const SEAM: u32 = 1;".to_string(),
+                20 => "#[cfg(test)]".to_string(),
+                21 => "mod tests {".to_string(),
+                _ => format!("// line {line}"),
+            })
+            .collect::<Vec<_>>()
+            .join("
+");
+        let patch = source_hunks_patch(diff, &|rel| {
+            (rel == "src/host/brain.rs").then(|| tip.clone())
+        });
+        assert!(patch.contains("+let fixed = 1;"), "{patch}");
         assert!(!patch.contains("test_only"), "{patch}");
     }
 

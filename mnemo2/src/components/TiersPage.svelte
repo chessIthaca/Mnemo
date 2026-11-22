@@ -746,7 +746,7 @@
             {/if}
             {#if tier.role !== "escalate" && tier.claude_agent !== null}
               <p class="micro hint tier-run-as-hint">
-                When Claude Code leads, this tier runs on your Claude Code agent; the models above are used otherwise.
+                When Claude Code leads, this tier runs on your Claude Code agent, and Mnemo follows it through its transcript; the models above are used otherwise.
               </p>
             {/if}
           </div>

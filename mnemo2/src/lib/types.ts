@@ -241,10 +241,10 @@ export interface MergeRecord {
 }
 
 /** Who sent a message to a worker: Claude Code through MCP, the built-in lead, the user in mission control, or Mnemo2 itself. */
-export type InboxSender = "external_lead" | "lead" | "user" | "mnemo";
+export type InboxSender = "external_lead" | "lead" | "user" | "mnemo" | "claude_agent";
 
 /** The form a message to a worker was delivered in: a fresh prompt, a mid-turn steer, a route-fix brief, or a fix request. */
-export type InboxKind = "prompt" | "steer" | "brief" | "fix";
+export type InboxKind = "prompt" | "steer" | "brief" | "fix" | "progress";
 
 /** One message a worker received, from the durable inbox ledger. */
 export interface InboxEntry {
@@ -275,6 +275,20 @@ export interface WorkerRouting {
   ran_tier: string | null;
   /** The tier the one nudge suggested, if any. */
   nudged: string | null;
+}
+
+/** A registered Claude Code agent as the worker panel shows it. */
+export interface WorkerAgent {
+  id: string;
+  /** The agent's transcript file, when Mnemo has found it. */
+  transcript: string | null;
+  /** When the transcript last changed (ms epoch); null before it exists. */
+  lastActivityMs: number | null;
+  toolCalls: number;
+  tokens: number;
+  finished: boolean;
+  /** Working with a silent transcript for ten minutes. */
+  stalled: boolean;
 }
 
 export interface Worker {
@@ -336,6 +350,8 @@ export interface Worker {
    * ledger predates sender recording.
    */
   inbox: InboxEntry[];
+  /** A worker that runs as a Claude Code agent: where its log is and how it is doing. */
+  agent?: WorkerAgent;
   screenshots: string[];
   timeline: TimelineStep[];
   diff: DiffStats;

@@ -222,7 +222,11 @@ export async function syncTeam(): Promise<void> {
       return {
         ...state,
         workers: snapshot.workers.map((record, index) => {
-          const next = workerFromRecord(record, index, messages);
+          const next = workerFromRecord(
+            snapshot.agents?.[record.id] ? { ...record, agent: snapshot.agents[record.id] } : record,
+            index,
+            messages,
+          );
           workerSaved.set(record.id, {
             generation: record.generation,
             length: record.transcript.messages.length,

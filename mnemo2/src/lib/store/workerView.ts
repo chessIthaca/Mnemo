@@ -208,6 +208,17 @@ export function buildWorker(
       : undefined,
     messages: workerThreadFromRecord(record, messages),
     inbox: (record.inbox ?? []).map(inboxFromWire),
+    agent: record.agent
+      ? {
+          id: record.agent.id,
+          transcript: record.agent.transcript,
+          lastActivityMs: record.agent.last_activity_ms,
+          toolCalls: record.agent.tool_calls,
+          tokens: record.agent.tokens,
+          finished: record.agent.finished,
+          stalled: record.agent.stalled,
+        }
+      : undefined,
     screenshots: workerScreenshotPaths(record.transcript),
     timeline: workerTimeline(record),
     diff: record.merge

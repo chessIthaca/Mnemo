@@ -342,7 +342,7 @@ describe("TiersPage", () => {
     // The hint under the select explains when the choice applies.
     expect(
       within(high).getByText(
-        "When Claude Code leads, this tier runs on your Claude Code agent; the models above are used otherwise.",
+        "When Claude Code leads, this tier runs on your Claude Code agent, and Mnemo follows it through its transcript; the models above are used otherwise.",
       ),
     ).toBeTruthy();
     // The preview line carries the same suffix the backend's tier_guidance adds.

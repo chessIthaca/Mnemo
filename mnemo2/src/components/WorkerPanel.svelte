@@ -5,6 +5,7 @@
   import { actions, app } from "../lib/store";
   import { workerStatusText, type Worker, type WorkerStatus } from "../lib/types";
   import ModelBadge from "./ModelBadge.svelte";
+  import WorkerAgentLine from "./WorkerAgentLine.svelte";
   import WorkerThread from "./WorkerThread.svelte";
 
   /**
@@ -127,6 +128,8 @@
         <button class="close-button" aria-label="Close worker panel" onclick={actions.closeWorkerPanel}><X size={15} /></button>
       </div>
     </header>
+
+    {#if worker.agent}<WorkerAgentLine agent={worker.agent} />{/if}
 
     {#if blocked}
       <div class="panel-banner" role="status" data-status={worker.status}>

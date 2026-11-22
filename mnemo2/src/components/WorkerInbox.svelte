@@ -22,9 +22,10 @@
     lead: "Built-in lead",
     user: "You",
     mnemo: "Mnemo2",
+    claude_agent: "Worker's agent",
   };
   /** Prompt and brief are the norm; only the interrupting forms get a tag. */
-  const KIND_TAG: Partial<Record<InboxKind, string>> = { steer: "steer", fix: "fix" };
+  const KIND_TAG: Partial<Record<InboxKind, string>> = { steer: "steer", fix: "fix", progress: "progress note" };
 </script>
 
 {#if worker.inbox.length > 0}

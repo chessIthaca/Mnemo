@@ -3,6 +3,7 @@ import {
   applyTeamEvent,
   applyTeamSnapshot,
   emptyProjectUsageView,
+  inboxFromWire,
   initialTeamState,
   projectUsageFrom,
   restoreTranscripts,
@@ -489,5 +490,13 @@ describe("restoreTranscripts", () => {
     restoreTranscripts({ ...snapshot([worker]), transcript_revs: { w1: 4 } }, cache);
     expect(cache.has("gone")).toBe(false);
     expect(cache.get("w1")?.rev).toBe(4);
+  });
+});
+
+describe("inboxFromWire", () => {
+  it("keeps the agent sender and the progress kind", () => {
+    expect(
+      inboxFromWire({ sender: "claude_agent", kind: "progress", text: "built", at_ms: 5 }),
+    ).toEqual({ sender: "claude_agent", kind: "progress", text: "built", atMs: 5 });
   });
 });

@@ -35,6 +35,7 @@ use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::pricing::usage_model_key;
 use crate::mnemo2::usage::{ProjectUsage, ProjectUsageView};
 
+mod agent_log;
 mod agent_watch;
 mod audit;
 mod check_run;
@@ -197,6 +198,11 @@ pub struct TeamSnapshot {
     /// already holds that revision.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub omitted_transcripts: Vec<String>,
+    /// What Mnemo knows about each registered Claude Code agent, by worker
+    /// id (the `agent` object of `team_status`). Such a worker's transcript
+    /// above is the agent's own log, converted.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub agents: HashMap<String, serde_json::Value>,
 }
 
 /// One event forwarded from a worker session, tagged with its worker id.
@@ -884,6 +890,10 @@ impl TeamRuntime {
                 .iter()
                 .map(|record| {
                     let mut record = record.clone();
+                    // A registered agent's thread is its own log, read-only.
+                    if let Some(log) = agent_log::agent_transcript(&self.agent_watch, &record) {
+                        record.transcript = log;
+                    }
                     let rev = match revisions.get(&record.id) {
                         Some((cached, rev)) if Arc::ptr_eq(cached, &record.transcript) => *rev,
                         _ => {
@@ -905,6 +915,12 @@ impl TeamRuntime {
             revisions.retain(|id, _| transcript_revs.contains_key(id));
             workers
         };
+        let mut agents = HashMap::new();
+        for worker in workers.iter().filter(|worker| worker.claude_agent_id.is_some()) {
+            if let Some(view) = self.agent_view(worker).await {
+                agents.insert(worker.id.clone(), view.to_json());
+            }
+        }
         let active = self.live.lock().await.len();
         let usage = self.usage.lock().await.clone();
         let pricing = self
@@ -919,6 +935,7 @@ impl TeamRuntime {
             usage: usage.view(&pricing),
             transcript_revs,
             omitted_transcripts,
+            agents,
         }
     }
 

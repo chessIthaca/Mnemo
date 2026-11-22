@@ -22,6 +22,7 @@
   import ModelEffortPicker from "./ModelEffortPicker.svelte";
   import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
+  import WorkerAgentLine from "./WorkerAgentLine.svelte";
   import WorkerInbox from "./WorkerInbox.svelte";
   import WorkerPlanTab from "./WorkerPlanTab.svelte";
   import WorkerThread from "./WorkerThread.svelte";
@@ -186,6 +187,8 @@
         <button class="toolbar-button danger" type="button" aria-label={`Delete ${worker.name}`} title="Delete this worker and its history" disabled={worker.status === "merging"} onclick={() => actions.requestDeleteWorkers([worker.id])}><Trash2 size={10} /> Delete</button>
       </div>
     </div>
+
+    {#if worker.agent}<WorkerAgentLine agent={worker.agent} />{/if}
 
     <section class="worker-brief" aria-label="Worker brief">
       {#if briefOverflowing}

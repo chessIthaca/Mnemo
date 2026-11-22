@@ -11,6 +11,7 @@ The review is yours; the worker's summary is a claim, not evidence. The merge ga
 ## 1. Orient
 
 - `team_status` with the exact `worker_id` from the notice. Note `status`, `branch`, `worktree`, `plan_id` and step, `review_risk`, any open findings and recorded checks. A worker is reviewable when it is idle (completed or in review). If it is still working, wait for its notice.
+- A worker whose `model` is `claude-code/<model>` runs as a Claude Code agent and has no Mnemo session. Review it the same way, but run the checks yourself, since Mnemo2 does not see the agent's runs. For a fix larger than `review_fix`, continue the agent with `SendMessage` instead of `team_route_fix`, then check and review the new tip.
 - `plan_show` for the plan: the step's text, the decisions and the interfaces are the intent you review against.
 
 ## 2. Read the diff unanchored

@@ -184,6 +184,7 @@ impl TeamRuntime {
         };
         let millis = phase3::now_ms();
         let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
+        self.release_idle_checkouts().await;
         let held = self.held_checkouts().await;
         let (worktree, branch) = provision_agent_checkout(
             self.workspace_root.clone(),

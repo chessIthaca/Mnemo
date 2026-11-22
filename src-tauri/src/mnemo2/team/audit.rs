@@ -346,6 +346,7 @@ impl TeamRuntime {
         // The audit worktree checks out the audited branch itself so the
         // reviewer reads the exact tree it is auditing.
         let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
+        self.release_idle_checkouts().await;
         let held = self.held_checkouts().await;
         let (worktree, branch_created) = provision_agent_checkout(
             self.workspace_root.clone(),

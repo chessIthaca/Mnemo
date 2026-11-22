@@ -18736,3 +18736,83 @@ async fn a_hand_off_counts_toward_the_waiting_rule() {
     assert!(worker.claude_agent.is_none(), "the refused hand-off changed nothing");
     fixture.team.shutdown().await;
 }
+
+// --- plan 4d920eec step 4: pools return when no worker needs them ---
+
+/// A routine Mnemo worker, stopped, in its pool checkout.
+async fn stopped_pool_worker() -> (RoutingFixture, std::path::PathBuf) {
+    let fixture = routing_fixture(RoutingMode::Off, None, false).await;
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    fixture.team.stop("routingworker").await.expect("stop");
+    let worktree = fixture.team.worker("routingworker").await.expect("worker").worktree;
+    assert!(mnemo::app::worktrees::is_pool_checkout(&worktree), "{}", worktree.display());
+    (fixture, worktree)
+}
+
+#[tokio::test]
+async fn a_reported_audit_releases_its_pool() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    fixture
+        .team
+        .update_worker("routingworker", |worker| {
+            worker.kind = "audit".into();
+            worker.report_delivered = true;
+            worker.report = Some("no findings".into());
+        })
+        .await;
+    fixture.team.release_idle_checkouts().await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert!(worker.worktree.as_os_str().is_empty(), "the record no longer holds the pool");
+    assert_eq!(worker.report.as_deref(), Some("no findings"), "the report stays");
+    assert!(pool.join(".git").exists(), "the pool folder stays for reuse");
+    assert_eq!(git_stdout(&pool, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stopped_worker_on_a_done_step_releases_its_pool() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    let board = fixture.team.board().expect("board");
+    board.tick(&fixture.plan_id, 0, "done by the lead").expect("tick");
+    fixture.team.release_idle_checkouts().await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert!(worker.worktree.as_os_str().is_empty());
+    assert!(pool.join(".git").exists());
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stopped_worker_on_an_open_step_keeps_its_pool() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    fixture.team.release_idle_checkouts().await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.worktree, pool, "it may still be resumed");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_released_audit_pool_is_reused_warm() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    let root = fixture._root.path().to_path_buf();
+    let exclude = root.join(".git").join("info").join("exclude");
+    let mut ignored = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ignored.push_str("\ntarget/\n");
+    std::fs::write(&exclude, ignored).expect("ignore target/");
+    std::fs::create_dir_all(pool.join("target")).expect("target");
+    std::fs::write(pool.join("target").join("WARM_MARKER"), "warm\n").expect("marker");
+    fixture
+        .team
+        .update_worker("routingworker", |worker| {
+            worker.kind = "audit".into();
+            worker.report_delivered = true;
+        })
+        .await;
+
+    let next = external_dispatch(&fixture, "warmNext01", Some("routine"), None).await;
+    assert!(next.success, "{}", next.output);
+    let worker = fixture.team.worker("warmNext01").await.expect("worker");
+    assert_eq!(worker.worktree, pool, "the next dispatch reuses the released pool");
+    assert!(pool.join("target").join("WARM_MARKER").exists(), "with its build output");
+    fixture.team.shutdown().await;
+}

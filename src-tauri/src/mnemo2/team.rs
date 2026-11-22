@@ -392,6 +392,71 @@ impl TeamRuntime {
             .collect()
     }
 
+    /// Give back the pool checkouts no worker needs any more (plan 4d920eec
+    /// decision 8), so the next dispatch reuses them warm instead of making a
+    /// cold pool: an audit that has delivered its report (it is locked and
+    /// never builds again), and a Stopped or Failed worker whose plan step is
+    /// already done on the board. Each is released the way a merge releases
+    /// a pool (detached, build caches kept, the record's worktree cleared);
+    /// one with a live session or uncommitted work keeps its pool. Runs
+    /// right before a pool is handed out, so no background job is needed.
+    pub(super) async fn release_idle_checkouts(&self) {
+        let board = self.board();
+        let step_done = |worker: &WorkerRecord| -> bool {
+            let (Some(board), Some(plan_id), Some(step)) =
+                (board.as_ref(), worker.plan_id.as_deref(), worker.plan_step)
+            else {
+                return false;
+            };
+            board
+                .get(plan_id)
+                .ok()
+                .and_then(|plan| plan.steps.get(step).map(|board_step| board_step.done))
+                .unwrap_or(false)
+        };
+        let candidates: Vec<(String, PathBuf, String)> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| mnemo::app::worktrees::is_pool_checkout(&worker.worktree))
+            .filter(|worker| {
+                (worker.kind == "audit" && worker.report_delivered)
+                    || (matches!(worker.status, WorkerStatus::Stopped | WorkerStatus::Failed)
+                        && step_done(worker))
+            })
+            .map(|worker| (worker.id.clone(), worker.worktree.clone(), worker.branch.clone()))
+            .collect();
+        let mut released = false;
+        for (worker_id, checkout, branch) in candidates {
+            if self.live.lock().await.contains_key(&worker_id) {
+                continue;
+            }
+            match mnemo::app::worktrees::release_pool_checkout(
+                self.workspace_root.clone(),
+                checkout.clone(),
+                branch,
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.update_worker(&worker_id, |worker| worker.worktree = PathBuf::new())
+                        .await;
+                    released = true;
+                }
+                Err(error) => eprintln!(
+                    "team: kept the pool checkout {} of {worker_id}: {error}",
+                    checkout.display()
+                ),
+            }
+        }
+        if released {
+            if let Err(error) = self.persist().await {
+                eprintln!("team: could not save the released pool checkouts: {error}");
+            }
+        }
+    }
+
     /// Every checkout held by a record other than `worker_id`.
     async fn other_held_checkouts(&self, worker_id: &str) -> Vec<PathBuf> {
         self.records
@@ -759,7 +824,10 @@ impl TeamRuntime {
             .iter()
             .filter(|worker| {
                 worker.claude_agent.is_some()
-                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Interrupted)
+                    && matches!(
+                        worker.status,
+                        WorkerStatus::Working | WorkerStatus::Fixing | WorkerStatus::Interrupted
+                    )
             })
             .count();
         self.live.lock().await.len() + active_agents

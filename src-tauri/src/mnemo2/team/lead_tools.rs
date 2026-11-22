@@ -289,6 +289,13 @@ impl TeamRuntime {
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
+                name: "team_tiers".to_string(),
+                description: "The live tier setup: each tier's models in order with their health (available, unavailable until a time after a usage limit, or not configured), its effort, whether it runs as a Claude Code agent when Claude Code leads, and the tier and model a dispatch would run on now. Read it before choosing a tier or model, and whenever a result says the tiers changed.".to_string(),
+                parameters: json!({"type":"object","properties":{}}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_quality".to_string(),
                 description: "Whether merged work holds up, per tier and per model: merges, first-pass share, average fix rounds and findings, high findings, reverts, merges a later bug-fix plan changed the same files for, and cost per merge. Read-only; use it when deciding a tier or model on evidence rather than on impressions.".to_string(),
                 parameters: json!({"type":"object","properties":{
@@ -396,7 +403,18 @@ impl TeamRuntime {
             let fold_request = if model.is_none() { tier.clone() } else { None };
             // Read before the dispatch: a deferred classification may already
             // be waiting on its timer once the worker exists.
-            let warnings = self.lead_checkout_warnings().await;
+            let mut warnings = self.lead_checkout_warnings().await;
+            if sender == MessageSender::ExternalLead {
+                if let Some(line) = self.tier_changes().changed_line() {
+                    warnings.push(line);
+                }
+                if let Some(line) = model
+                    .as_deref()
+                    .and_then(|model| self.bypass_warning(tier.as_deref(), model))
+                {
+                    warnings.push(line);
+                }
+            }
             let result = self
                 .dispatch_request(DispatchRequest {
                     brief: brief.to_string(),
@@ -508,6 +526,15 @@ impl TeamRuntime {
                     .with_data(serde_json::to_value(&worker).unwrap_or(Value::Null)),
                 Err(error) => team_tool_error(error),
             };
+        }
+        if name == "team_tiers" {
+            if sender == MessageSender::ExternalLead {
+                self.tier_changes().mark_seen();
+            }
+            let view = self.tiers_view();
+            let output = serde_json::to_string(&json!({"action": "team_tiers", "result": view}))
+                .unwrap_or_else(|_| "team_tiers".to_string());
+            return ToolResult::success(output).with_data(view);
         }
         if name == "team_quality" {
             let window_days = args
@@ -698,6 +725,16 @@ impl TeamRuntime {
         let mut answer = worker_result(result, name);
         if let (true, Some(missing)) = (answer.success, stale) {
             answer.output = format!("{}\n{}", answer.output, stale_base_line(missing));
+        }
+        // Resume and route-fix results carry no `warnings` array: the tier
+        // change line follows the JSON, as the stale-base line does.
+        if answer.success
+            && sender == MessageSender::ExternalLead
+            && matches!(name, "team_resume" | "team_route_fix")
+        {
+            if let Some(line) = self.tier_changes().changed_line() {
+                answer.output = format!("{}\n{line}", answer.output);
+            }
         }
         if name == "team_review" && answer.success {
             if let Some(line) = finding_categories_line(&self.workspace_root) {

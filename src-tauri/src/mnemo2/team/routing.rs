@@ -6,17 +6,19 @@
 //! lead's model/tier choice, the classifier call at dispatch, and the
 //! routing-log rows a dispatch or a reroute appends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use mnemo::config::endpoints::{Tier, TierLadder};
 use mnemo::RouteKnn;
+use serde_json::{json, Value};
 
 use crate::mnemo2::dispatch_routing::{
     classify_dispatch, load_routing_settings, outcome_label, routing_text,
     DispatchRoutingDecision, DispatchRoutingRow, EnabledTiers, RoutingMode, RoutingSettings,
 };
-use crate::mnemo2::runtime::LeadModel;
+use crate::mnemo2::runtime::{LeadModel, TEAM_NOTICE_PREFIX};
 
 use super::nudge::append_reroute_metadata;
 use super::record::{session_model_spec, ChangeSource, MessageSender, WorkerRecord, WorkerRouting};
@@ -94,6 +96,65 @@ pub(super) struct PendingClassification {
     /// Whether a model choice was passed: the override comparison reads the
     /// resolved tier then, the requested tier otherwise.
     model_choice: bool,
+    /// The model the external lead pinned, so a label that lands on a tier
+    /// which runs as a Claude Code agent can say the pin bypassed it.
+    pinned_by_external_lead: Option<String>,
+}
+
+/// How the tier setup the lead reads has moved (plan e52e0be1 decision 2):
+/// a revision that a changed ladder or a usage limit bumps, when it last
+/// moved, and the revision the external lead last read through `team_tiers`
+/// or attached at. Shared through [`UsageLimits`], because the worker pumps
+/// mark usage limits too.
+#[derive(Default)]
+pub(super) struct TierChanges {
+    revision: AtomicU64,
+    /// Epoch milliseconds of the last bump; 0 until the first one.
+    changed_at_ms: AtomicU64,
+    lead_seen: AtomicU64,
+    /// The runtime's first ladder is its starting setup, not a change.
+    loaded: AtomicBool,
+    /// Workers whose pinned model a Laya label already flagged.
+    bypass_noticed: std::sync::Mutex<HashSet<String>>,
+}
+
+impl TierChanges {
+    fn bump(&self) {
+        self.changed_at_ms.store(unix_ms(), Ordering::SeqCst);
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record that the external lead has read the current setup.
+    pub(super) fn mark_seen(&self) {
+        self.lead_seen
+            .store(self.revision.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+
+    /// Local `HH:MM` of the last change, `None` while unchanged since start.
+    pub(super) fn changed_at(&self) -> Option<String> {
+        let at = self.changed_at_ms.load(Ordering::SeqCst);
+        (at != 0).then(|| local_hh_mm(at))
+    }
+
+    /// The warning a dispatch, resume or route-fix result carries while the
+    /// external lead has not read the setup since it last changed.
+    pub(super) fn changed_line(&self) -> Option<String> {
+        if self.revision.load(Ordering::SeqCst) == self.lead_seen.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(format!(
+            "Tiers changed at {} since you last read them; call team_tiers for the live setup.",
+            self.changed_at().unwrap_or_else(|| "an earlier time".to_string())
+        ))
+    }
+
+    /// True the first time `worker_id` asks, false after.
+    fn first_bypass_notice(&self, worker_id: &str) -> bool {
+        self.bypass_noticed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worker_id.to_string())
+    }
 }
 
 /// How long a model whose worker hit a provider usage limit stays out of the
@@ -117,6 +178,8 @@ pub(super) struct UsageLimits {
     /// holds its own `Arc`. Shared (not copied) with the pumps, so a pump
     /// spawned before the attach still finds it.
     pub(super) team: Arc<std::sync::OnceLock<std::sync::Weak<TeamRuntime>>>,
+    /// The tier revision a usage limit bumps, shared with the runtime.
+    pub(super) changes: Arc<TierChanges>,
 }
 
 impl UsageLimits {
@@ -130,9 +193,12 @@ impl UsageLimits {
     /// dropped on the way.
     pub(super) fn mark_model_unavailable(&self, spec: &str, until_ms: u64) {
         let now = unix_ms();
-        let mut map = self.unavailable.write().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, until| *until > now);
-        map.insert(spec.to_string(), until_ms);
+        {
+            let mut map = self.unavailable.write().unwrap_or_else(|e| e.into_inner());
+            map.retain(|_, until| *until > now);
+            map.insert(spec.to_string(), until_ms);
+        }
+        self.changes.bump();
     }
 
     /// The epoch milliseconds `spec` serves again, while it is still out.
@@ -209,6 +275,16 @@ impl<'a> ModelInventory<'a> {
             &self.models.read().unwrap_or_else(|e| e.into_inner()),
             unix_ms(),
         )
+    }
+
+    /// Whether `spec` names a configured model, available or not: the
+    /// difference between "unavailable" and "not configured" in team_tiers.
+    pub(super) fn configured(&self, spec: &str) -> bool {
+        self.models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|model| model.spec == spec)
     }
 }
 
@@ -480,9 +556,144 @@ impl TeamRuntime {
         self.route_knn.clone()
     }
 
-    /// Replace the model tiers new dispatches resolve against.
+    /// Replace the model tiers new dispatches resolve against. A ladder that
+    /// differs from the current one (models, effort, run as, anything) bumps
+    /// the tier revision, so the external lead hears the setup changed; the
+    /// runtime's first ladder is its starting setup and an identical one is
+    /// no change.
     pub fn set_tiers(&self, tiers: mnemo::headless::TiersDto) {
-        *self.tiers.write().unwrap_or_else(|e| e.into_inner()) = tiers;
+        let changes = &self.usage_limits.changes;
+        let first = !changes.loaded.swap(true, Ordering::SeqCst);
+        let mut current = self.tiers.write().unwrap_or_else(|e| e.into_inner());
+        // Compare the ladders, not the DTOs: a DTO's `resolves_to` is output
+        // only and may be stale without the setup having changed.
+        let changed =
+            tier_ladder_from_dto(&current).ordered() != tier_ladder_from_dto(&tiers).ordered();
+        *current = tiers;
+        if changed && !first {
+            changes.bump();
+        }
+    }
+
+    /// The tier revision the lead's results and `team_tiers` read.
+    pub(super) fn tier_changes(&self) -> &TierChanges {
+        &self.usage_limits.changes
+    }
+
+    /// `team_tiers` (plan e52e0be1 decision 1): each tier in ladder order
+    /// with its models and their health, its effort, how it runs, and the
+    /// tier and model a dispatch by that tier would run on now. It reads the
+    /// same resolution a dispatch uses ([`Self::resolve_tier_choice`] and the
+    /// agent rule of [`Self::claude_agent_dispatch`]), so the two never
+    /// disagree.
+    pub(super) fn tiers_view(&self) -> Value {
+        let ladder = self.tier_ladder();
+        let inventory = self.model_inventory();
+        let claude_leads = self.external_lead_attached();
+        let now = unix_ms();
+        let tiers: Vec<Value> = ladder
+            .ordered()
+            .iter()
+            .map(|tier| {
+                let models: Vec<Value> = tier
+                    .models
+                    .iter()
+                    .map(|spec| {
+                        let health = match self.usage_limits.until(spec, now) {
+                            Some(until) => {
+                                format!("unavailable until {} (usage limit)", local_hh_mm(until))
+                            }
+                            None if !inventory.configured(spec) => "not configured".to_string(),
+                            None => "available".to_string(),
+                        };
+                        json!({"spec": spec, "health": health})
+                    })
+                    .collect();
+                let mnemo = self
+                    .resolve_tier_choice(&tier.id)
+                    .ok()
+                    .map(|(ran, model)| json!({"tier": ran, "model": model.spec}));
+                let (run_as, resolves_to) = match &tier.claude_agent {
+                    Some(agent) => (
+                        json!({
+                            "kind": "claude_agent",
+                            "model": agent,
+                            "effort": tier.claude_agent_effort,
+                            "applies": claude_leads,
+                        }),
+                        if claude_leads {
+                            json!({"tier": tier.id, "model": format!("claude-code/{agent}")})
+                        } else {
+                            mnemo.clone().unwrap_or(Value::Null)
+                        },
+                    ),
+                    None => (json!({"kind": "mnemo"}), mnemo.clone().unwrap_or(Value::Null)),
+                };
+                let mut entry = json!({
+                    "id": tier.id,
+                    "name": tier.name,
+                    "definition": tier.definition,
+                    "models": models,
+                    "effort": tier.effort,
+                    "run_as": run_as,
+                    "resolves_to": resolves_to,
+                });
+                // Audits, escalation and resumes of Mnemo workers on an agent
+                // tier still run on its Mnemo model.
+                if claude_leads && tier.claude_agent.is_some() {
+                    entry["mnemo_resolves_to"] = mnemo.unwrap_or(Value::Null);
+                }
+                entry
+            })
+            .collect();
+        json!({
+            "tiers": tiers,
+            "tiers_changed_at": self.tier_changes().changed_at(),
+            "lead": if claude_leads { "claude_code" } else { "in_app" },
+        })
+    }
+
+    /// The warning for an external-lead dispatch that pins `model` (plan
+    /// e52e0be1 decision 4): it names the dispatch's tier when that tier runs
+    /// as a Claude Code agent, or, without a tier, the first tier that lists
+    /// the model and runs as one. The dispatch itself is unchanged.
+    pub(super) fn bypass_warning(&self, tier: Option<&str>, model: &str) -> Option<String> {
+        let ladder = self.tier_ladder();
+        let (tier, agent) = match tier {
+            Some(tier) => {
+                let rung = ladder.get(tier)?;
+                (rung.id.clone(), rung.claude_agent.clone()?)
+            }
+            None => ladder.ordered().iter().find_map(|rung| {
+                let agent = rung.claude_agent.clone()?;
+                rung.models
+                    .iter()
+                    .any(|spec| spec == model)
+                    .then(|| (rung.id.clone(), agent))
+            })?,
+        };
+        Some(format!(
+            "model {model} bypasses tier {tier}'s Claude Code agent ({agent}); dispatch by tier to use the agent."
+        ))
+    }
+
+    /// Tell the external lead, once per worker, that Laya reads a
+    /// model-pinned dispatch's step as a tier that runs as a Claude Code
+    /// agent the pin bypassed.
+    pub(super) fn notice_laya_bypass(&self, worker_id: &str, laya_tier: &str, pinned: &str) {
+        let Some(agent) = self
+            .tier_ladder()
+            .get(laya_tier)
+            .and_then(|rung| rung.claude_agent.clone())
+        else {
+            return;
+        };
+        if !self.external_lead_attached() || !self.tier_changes().first_bypass_notice(worker_id) {
+            return;
+        }
+        self.push_external_notice(format!(
+            "{TEAM_NOTICE_PREFIX} worker_id={worker_id}\nLaya reads {worker_id}'s step as {laya_tier}, which runs as a Claude Code agent ({agent}); the pinned model {pinned} bypassed it."
+        ));
     }
 
     /// Refresh the model inventory, tiers and prices after a settings save.
@@ -830,6 +1041,10 @@ impl TeamRuntime {
                         chosen_tier: chosen_tier.clone(),
                         chosen_model,
                         model_choice: request.model.is_some(),
+                        pinned_by_external_lead: request
+                            .model
+                            .clone()
+                            .filter(|_| request.sender == MessageSender::ExternalLead),
                     }),
                     error: None,
                 });
@@ -1036,6 +1251,7 @@ impl TeamRuntime {
         let usage = self.usage.clone();
         let save_lock = self.save_lock.clone();
         let persistence = self.persistence.clone();
+        let usage_limits = self.usage_limits.clone();
         tokio::spawn(async move {
             let attempt = async {
                 let _permit = pending
@@ -1146,6 +1362,13 @@ impl TeamRuntime {
             };
             if attached {
                 let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
+                if let (Some(pinned), Some(tier), Some(team)) = (
+                    pending.pinned_by_external_lead.as_deref(),
+                    laya_tier.as_deref(),
+                    usage_limits.team(),
+                ) {
+                    team.notice_laya_bypass(&worker_id, tier, pinned);
+                }
             }
         });
     }

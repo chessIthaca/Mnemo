@@ -183,6 +183,9 @@ impl TeamRuntime {
         state.memory_search_since_plan_create = false;
         state.bug_search_since_plan_create = false;
         drop(state);
+        // A new lead reads the tier setup in its fresh tool list, so nothing
+        // has changed since it last read it.
+        self.tier_changes().mark_seen();
         if let Some(board) = self.board() {
             board.set_external_lead_attached(true);
         }

@@ -17648,3 +17648,280 @@ async fn an_over_cap_line_is_skipped() {
     assert_eq!(agent["tool_calls"], 2, "the over-cap line is skipped: {agent}");
     team.shutdown().await;
 }
+
+// --- plan e52e0be1 step 1: team_tiers, tier changes and bypass warnings ---
+
+/// A `team_dispatch` from Claude Code (the external lead) on the fixture's
+/// plan, with the given tier and model.
+async fn external_dispatch(
+    fixture: &RoutingFixture,
+    worker_id: &str,
+    tier: Option<&str>,
+    model: Option<&str>,
+) -> ToolResult {
+    let mut args = json!({
+        "worker_id": worker_id,
+        "plan_id": fixture.plan_id,
+        "step": 1,
+        "brief": "Implement the step exactly and run its focused regression tests.",
+    });
+    if let Some(tier) = tier {
+        args["tier"] = json!(tier);
+    }
+    if let Some(model) = model {
+        args["model"] = json!(model);
+    }
+    fixture
+        .team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await
+}
+
+/// The `warnings` of a dispatch result.
+fn dispatch_warnings(result: &ToolResult) -> Vec<String> {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data["warnings"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|line| line.as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn team_tiers_reports_models_health_and_run_as() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into(), "test/ghost".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let until = unix_ms() + 60 * 60 * 1000;
+    fixture
+        .team
+        .usage_limits()
+        .mark_model_unavailable("test/scripted-average", until);
+
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from("team_tiers", json!({}), MessageSender::ExternalLead)
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let view = answer.data.expect("team_tiers data");
+    assert_eq!(view["lead"], "claude_code", "{view}");
+    assert!(view["tiers_changed_at"].is_string(), "the usage limit is a change: {view}");
+    let tiers = view["tiers"].as_array().expect("tiers");
+    assert_eq!(
+        tiers.iter().map(|tier| tier["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        ["trivial", "routine", "medium", "high", "escalate"]
+    );
+
+    let high = &tiers[3];
+    assert_eq!(
+        high["models"],
+        json!([
+            {"spec": "test/scripted-difficult", "health": "available"},
+            {"spec": "test/ghost", "health": "not configured"},
+        ])
+    );
+    assert_eq!(
+        high["run_as"],
+        json!({"kind": "claude_agent", "model": "opus", "effort": null, "applies": true})
+    );
+    assert_eq!(high["resolves_to"], json!({"tier": "high", "model": "claude-code/opus"}));
+    assert_eq!(
+        high["mnemo_resolves_to"],
+        json!({"tier": "high", "model": "test/scripted-difficult"})
+    );
+
+    let routine = &tiers[1];
+    assert_eq!(
+        routine["models"],
+        json!([{
+            "spec": "test/scripted-average",
+            "health": format!("unavailable until {} (usage limit)", routing::local_hh_mm(until)),
+        }])
+    );
+    assert_eq!(routine["run_as"], json!({"kind": "mnemo"}));
+    // Its only model is out, so a routine dispatch folds down to trivial.
+    assert_eq!(
+        routine["resolves_to"],
+        json!({"tier": "trivial", "model": "test/scripted-simple"})
+    );
+    assert!(routine.get("mnemo_resolves_to").is_none());
+
+    // With the in-app lead the agent tier still shows how it would run.
+    fixture.team.detach_external_lead();
+    let view = fixture
+        .team
+        .handle_lead_host_tool("team_tiers", json!({}))
+        .await
+        .data
+        .expect("team_tiers data");
+    assert_eq!(view["lead"], "in_app");
+    assert_eq!(view["tiers"][3]["run_as"]["applies"], false);
+    assert_eq!(
+        view["tiers"][3]["resolves_to"],
+        json!({"tier": "high", "model": "test/scripted-difficult"})
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_tier_change_is_flagged_until_the_lead_reads_team_tiers() {
+    let fixture = routing_fixture(RoutingMode::Off, None, false).await;
+    assert!(fixture.team.attach_external_lead());
+    let changed = |result: &ToolResult| {
+        dispatch_warnings(result).iter().any(|line| {
+            line.starts_with("Tiers changed at ")
+                && line.ends_with(" since you last read them; call team_tiers for the live setup.")
+        })
+    };
+
+    let first = external_dispatch(&fixture, "chgOne01", Some("routine"), None).await;
+    assert!(first.success, "{}", first.output);
+    assert!(!changed(&first), "nothing changed since the lead attached: {:?}", dispatch_warnings(&first));
+    fixture.team.stop("chgOne01").await.expect("stop");
+
+    // The same ladder again is no change.
+    fixture
+        .team
+        .set_tiers(mnemo::headless::TiersDto::from(fixture.team.tier_ladder()));
+    let same = external_dispatch(&fixture, "chgTwo01", Some("routine"), None).await;
+    assert!(same.success, "{}", same.output);
+    assert!(!changed(&same), "{:?}", dispatch_warnings(&same));
+    fixture.team.stop("chgTwo01").await.expect("stop");
+
+    // High now runs as a Claude Code agent: the setup changed.
+    let mut dto = mnemo::headless::TiersDto::from(fixture.team.tier_ladder());
+    dto.tiers[3].claude_agent = Some("opus".into());
+    fixture.team.set_tiers(dto);
+    let second = external_dispatch(&fixture, "chgThree1", Some("routine"), None).await;
+    assert!(second.success, "{}", second.output);
+    assert!(changed(&second), "{:?}", dispatch_warnings(&second));
+    fixture.team.stop("chgThree1").await.expect("stop");
+
+    // Reading team_tiers clears it.
+    let read = fixture
+        .team
+        .handle_lead_host_tool_from("team_tiers", json!({}), MessageSender::ExternalLead)
+        .await;
+    assert!(read.success, "{}", read.output);
+    let third = external_dispatch(&fixture, "chgFour01", Some("routine"), None).await;
+    assert!(third.success, "{}", third.output);
+    assert!(!changed(&third), "{:?}", dispatch_warnings(&third));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn pinned_model_on_an_agent_tier_warns() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let warning = "model test/scripted-difficult bypasses tier high's Claude Code agent (opus); dispatch by tier to use the agent.";
+
+    // (a) The tier runs as an agent and the lead pins a model on it.
+    let pinned = external_dispatch(
+        &fixture,
+        "bypOne01",
+        Some("high"),
+        Some("test/scripted-difficult"),
+    )
+    .await;
+    assert!(pinned.success, "{}", pinned.output);
+    assert!(
+        dispatch_warnings(&pinned).iter().any(|line| line == warning),
+        "{:?}",
+        dispatch_warnings(&pinned)
+    );
+    let data = pinned.data.clone().expect("dispatch data");
+    assert!(data["claude_agent"].is_null(), "a pinned model starts a Mnemo worker: {data}");
+    let worker = fixture.team.worker("bypOne01").await.expect("worker");
+    assert!(worker.claude_agent.is_none());
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    fixture.team.stop("bypOne01").await.expect("stop");
+
+    // (b) No tier: the model is listed in a tier that runs as an agent.
+    let untiered =
+        external_dispatch(&fixture, "bypTwo01", None, Some("test/scripted-difficult")).await;
+    assert!(untiered.success, "{}", untiered.output);
+    assert!(
+        dispatch_warnings(&untiered).iter().any(|line| line == warning),
+        "{:?}",
+        dispatch_warnings(&untiered)
+    );
+    assert!(fixture
+        .team
+        .worker("bypTwo01")
+        .await
+        .expect("worker")
+        .claude_agent
+        .is_none());
+    fixture.team.stop("bypTwo01").await.expect("stop");
+
+    // A model on a tier without an agent is no bypass.
+    let plain = external_dispatch(
+        &fixture,
+        "bypThree1",
+        Some("routine"),
+        Some("test/scripted-average"),
+    )
+    .await;
+    assert!(plain.success, "{}", plain.output);
+    assert!(
+        dispatch_warnings(&plain).iter().all(|line| !line.contains("bypasses tier")),
+        "{:?}",
+        dispatch_warnings(&plain)
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn laya_label_on_an_agent_tier_notifies_the_pinned_dispatch() {
+    let fixture = agent_fixture(
+        RoutingMode::Shadow,
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.9),
+        true,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let result = external_dispatch(
+        &fixture,
+        "layaBypass01",
+        Some("routine"),
+        Some("test/scripted-average"),
+    )
+    .await;
+    assert!(result.success, "{}", result.output);
+    let routing = wait_laya_label(&fixture.team, "layaBypass01").await;
+    assert_eq!(routing.laya_tier.as_deref(), Some("high"));
+    let expected = "Laya reads layaBypass01's step as high, which runs as a Claude Code agent (opus); the pinned model test/scripted-average bypassed it.";
+    let notices = || {
+        fixture
+            .team
+            .peek_external_notices()
+            .into_iter()
+            .filter(|notice| notice.contains(expected))
+            .count()
+    };
+    eventually(|| async { (notices() == 1).then_some(()) }).await;
+
+    // At most once per worker.
+    fixture
+        .team
+        .notice_laya_bypass("layaBypass01", "high", "test/scripted-average");
+    assert_eq!(notices(), 1);
+    fixture.team.shutdown().await;
+}

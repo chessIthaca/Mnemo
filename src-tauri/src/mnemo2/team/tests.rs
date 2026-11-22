@@ -16292,3 +16292,54 @@ fn route_fix_brief_asks_for_narrow_tests() {
         "{brief}"
     );
 }
+
+/// A command that exits 0 but rewrites tracked files is not a passed check:
+/// the pump's counting rule rejects it, Mnemo records it failed with the
+/// reason, and the merge gate refuses because of it.
+#[tokio::test]
+async fn team_run_checks_does_not_count_a_command_that_changes_files() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks06", &["git mv change.txt moved.txt"]).await;
+    let mut notices = team.subscribe_board();
+    let answer = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": worker_id,
+                "summary": "checked the diff",
+                "findings": [],
+                "evidence": serde_json::to_value(evidence()).expect("evidence"),
+            }),
+        )
+        .await;
+    assert!(answer.success, "{answer:?}");
+    let notice = drain_notice(&mut notices, "Mnemo ran the checks for")
+        .await
+        .expect("the run ends with a notice");
+    assert!(notice.contains("0 passed, 1 failed"), "{notice}");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let check = worker
+        .checks
+        .iter()
+        .find(|check| check.name == "git mv change.txt moved.txt")
+        .expect("the command is recorded");
+    assert_eq!(check.status, "failed");
+    let detail = check.detail.clone().unwrap_or_default();
+    assert!(detail.starts_with("run by Mnemo: exit 0, "), "{detail}");
+    assert!(
+        detail.ends_with(", but it changed the checkout's files, so it does not count. Commit or discard the change, or fix the command."),
+        "{detail}"
+    );
+    // The command left the checkout dirty and its check is failed: the merge
+    // is refused (the dirty-tree gate answers first).
+    let refused = team
+        .handle_lead_host_tool("team_merge", json!({"worker_id": worker_id}))
+        .await;
+    assert!(!refused.success, "{refused:?}");
+    assert!(
+        refused.output.contains("the worker working tree must be clean"),
+        "{}",
+        refused.output
+    );
+    team.shutdown().await;
+}

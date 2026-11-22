@@ -33,6 +33,7 @@ use crate::mnemo2::usage::ProjectUsage;
 
 use super::dispatch::BoxFuture;
 use super::persistence::TeamPersistence;
+use super::pump::counted_checks;
 use super::pump::save_workers;
 use super::record::{WorkerCheck, WorkerRecord, WorkerStatus};
 use super::review::CheckRecorder;
@@ -108,6 +109,9 @@ pub(super) fn check_run_error(worker_id: &str) -> String {
     format!("Mnemo is running the checks for {worker_id}; wait for its notice.")
 }
 
+/// What a command that exited 0 but changed files is reported with.
+const CHANGED_FILES: &str = ", but it changed the checkout's files, so it does not count. Commit or discard the change, or fix the command.";
+
 /// One command's outcome as the run reports and records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CommandOutcome {
@@ -119,6 +123,9 @@ struct CommandOutcome {
     headline: String,
     /// The failing lines `run_checks` extracted, one per line; empty on a pass.
     failing: String,
+    /// The command exited 0 but the pump's counting rule rejected it (it
+    /// changed the checkout's files), so it is recorded as failed.
+    changed_files: bool,
 }
 
 impl CommandOutcome {
@@ -126,6 +133,9 @@ impl CommandOutcome {
     /// failing lines.
     fn detail(&self) -> String {
         let mut detail = format!("run by Mnemo: {}", self.headline);
+        if self.changed_files {
+            detail.push_str(CHANGED_FILES);
+        }
         if !self.failing.is_empty() {
             detail.push('\n');
             detail.push_str(&self.failing);
@@ -137,6 +147,9 @@ impl CommandOutcome {
     fn notice_block(&self) -> String {
         let word = if self.passed { "PASS" } else { "FAIL" };
         let mut block = format!("{word} {} ({})", self.command, self.headline);
+        if self.changed_files {
+            block.push_str(CHANGED_FILES);
+        }
         if !self.failing.is_empty() {
             block.push('\n');
             block.push_str(&self.failing);
@@ -196,6 +209,7 @@ fn parse_outcomes(commands: &[String], text: &str) -> Vec<CommandOutcome> {
             passed: *passed,
             headline,
             failing: if *passed { String::new() } else { body.join("\n") },
+            changed_files: false,
         });
     }
     outcomes
@@ -222,26 +236,38 @@ async fn run_all(
     if !tool.has_checks() {
         return Err(NO_CHECKS.to_string());
     }
-    let result = tool
-        .execute(json!({"purpose": "Mnemo running the project checks"}))
-        .await;
+    let args = json!({"purpose": "Mnemo running the project checks"});
+    let result = tool.execute(args.clone()).await;
     if !result.success {
         return Err(result.output);
     }
-    let run: Vec<String> = result
+    let Some(entries) = result
         .data
         .as_ref()
         .and_then(|data| data.get("checks"))
         .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("command").and_then(Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_else(|| commands.to_vec());
-    Ok(parse_outcomes(&run, &result.output))
+    else {
+        return Err("the check tool returned no per-command results".to_string());
+    };
+    // The pump's own counting rule decides what passed: exit 0, an allowed
+    // command, run from the checkout, files unchanged.
+    let counted = counted_checks("run_checks", &args, &result, checkout, commands);
+    let run: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry.get("command").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut outcomes = parse_outcomes(&run, &result.output);
+    for outcome in &mut outcomes {
+        let exited_zero = entries.iter().any(|entry| {
+            entry.get("command").and_then(Value::as_str) == Some(outcome.command.as_str())
+                && entry.get("exit_code").and_then(Value::as_i64) == Some(0)
+        });
+        let is_counted = counted.iter().any(|(command, _)| command == &outcome.command);
+        outcome.passed = is_counted;
+        outcome.changed_files = exited_zero && !is_counted;
+    }
+    Ok(outcomes)
 }
 
 /// The first eight characters of a commit id.

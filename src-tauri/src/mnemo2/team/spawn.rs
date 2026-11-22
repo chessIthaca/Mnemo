@@ -244,6 +244,7 @@ impl TeamRuntime {
             plan_step: plan.map(|plan| plan.step),
             tier,
             claude_agent: None,
+            claude_agent_effort: None,
             base_commit: Some(base_tip.clone()),
             routing: None,
             reroutes: Vec::new(),
@@ -289,6 +290,7 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let model = format!("claude-code/{}", agent.model);
         record.claude_agent = Some(agent.model);
+        record.claude_agent_effort = agent.effort;
         record.tier = Some(agent.tier);
         record.status = WorkerStatus::Working;
         record.brief_sent = true;
@@ -296,6 +298,7 @@ impl TeamRuntime {
         note_model(&mut record, &model);
         self.update_worker(&record.id, |worker| {
             worker.claude_agent = record.claude_agent.clone();
+            worker.claude_agent_effort = record.claude_agent_effort.clone();
             worker.tier = record.tier.clone();
             worker.status = WorkerStatus::Working;
             worker.brief_sent = true;

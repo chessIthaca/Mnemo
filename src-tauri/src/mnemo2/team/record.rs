@@ -383,6 +383,10 @@ pub struct WorkerRecord {
     /// session; `team_agent_done` closes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_agent: Option<String>,
+    /// The Claude Code effort such a worker's agent runs at (`low`,
+    /// `medium`, `high`, `xhigh`, or `max`); `None` when its tier sets none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_agent_effort: Option<String>,
     /// The full sha of the lead commit this worker's checkout started from
     /// (advanced when an idle worker without commits is fast-forwarded).
     /// `None` for workers recorded before it existed.

@@ -1766,6 +1766,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         model_id: None,
         reasoning_effort: None,
         claude_agent: None,
+        claude_agent_effort: None,
         base_commit: None,
         report: None,
         branch,
@@ -15184,6 +15185,109 @@ async fn tier_guidance_names_the_claude_agent() {
     assert!(line.contains("no model; folds down to routine"), "{line}");
     assert!(
         line.ends_with("; runs as a Claude Code agent (haiku) when Claude Code leads"),
+        "{line}"
+    );
+}
+
+/// The agent fixture with the high tier's Claude Code effort set too.
+async fn agent_fixture_with_effort(
+    claude_model: &str,
+    effort: &str,
+    high_models: Vec<String>,
+) -> RoutingFixture {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, claude_model, high_models).await;
+    let mut dto = mnemo::headless::TiersDto::from(fixture.team.tier_ladder());
+    dto.tiers[3].claude_agent_effort = Some(effort.into());
+    fixture.team.set_tiers(dto);
+    fixture
+}
+
+#[tokio::test]
+async fn agent_dispatch_carries_the_tier_effort() {
+    let fixture = agent_fixture_with_effort("opus", "xhigh", vec!["test/scripted-difficult".into()])
+        .await;
+    assert!(fixture.team.attach_external_lead());
+    let request = agent_dispatch_request(
+        &fixture.plan_id,
+        "run the step at the tier's effort",
+        "agenttier14",
+    );
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    assert_eq!(block["effort"], "xhigh", "{block}");
+
+    // An idempotent re-dispatch returns the same block.
+    let request = agent_dispatch_request(
+        &fixture.plan_id,
+        "run the step at the tier's effort",
+        "agenttier14",
+    );
+    let (retry, reused, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the same-id retry");
+    assert!(reused);
+    assert_eq!(block, claude_agent_block(&retry).expect("the retry block"));
+
+    // A tier without an effort carries null.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let request = agent_dispatch_request(
+        &fixture.plan_id,
+        "run the step without an effort",
+        "agenttier15",
+    );
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    assert!(block["effort"].is_null(), "{block}");
+}
+
+#[tokio::test]
+async fn tier_guidance_names_the_agent_effort() {
+    let fixture = agent_fixture_with_effort("opus", "xhigh", vec!["test/scripted-difficult".into()])
+        .await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (opus, xhigh effort) when Claude Code leads"),
+        "{line}"
+    );
+
+    // Without an effort the suffix stays exactly as it was.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (opus) when Claude Code leads"),
         "{line}"
     );
 }

@@ -35,6 +35,9 @@ pub struct EndpointsFile {
 /// The fixed tier ids, cheapest first. The set and order are part of the wire contract.
 pub const TIER_IDS: [&str; 5] = ["trivial", "routine", "medium", "high", "escalate"];
 
+/// The Claude Code effort values an agent tier may carry, weakest first.
+pub const CLAUDE_AGENT_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
 /// One rung of the unified model ladder.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tier {
@@ -58,6 +61,11 @@ pub struct Tier {
     /// Mnemo models only. Never set on the escalate rung.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_agent: Option<String>,
+    /// The effort the Claude Code agent runs at (`low`, `medium`, `high`,
+    /// `xhigh`, or `max`); absent when the tier sets no effort. Only allowed
+    /// beside [`claude_agent`](Self::claude_agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_agent_effort: Option<String>,
 }
 
 impl Tier {
@@ -70,6 +78,7 @@ impl Tier {
             effort: None,
             role: (id == "escalate").then(|| "escalate".to_string()),
             claude_agent: None,
+            claude_agent_effort: None,
         }
     }
 }
@@ -181,7 +190,8 @@ impl TierLadder {
     /// Refuse unknown, duplicate, missing, or out-of-order ids, a malformed
     /// escalation role, an empty lowest tier (the default-model rung), a
     /// `claude_agent` other than the four Claude models, and `claude_agent`
-    /// on the escalate rung.
+    /// on the escalate rung, plus a `claude_agent_effort` outside the five
+    /// efforts or without a `claude_agent`.
     pub fn validate(&self) -> std::result::Result<(), String> {
         for expected in TIER_IDS {
             let matches = self.tiers.iter().filter(|tier| tier.id == expected).count();
@@ -226,6 +236,22 @@ impl TierLadder {
             .is_some()
         {
             return Err("the escalate tier cannot run as a Claude Code agent".to_string());
+        }
+        for tier in &self.tiers {
+            if let Some(effort) = &tier.claude_agent_effort {
+                if !CLAUDE_AGENT_EFFORTS.contains(&effort.as_str()) {
+                    return Err(format!(
+                        "tier '{}': claude_agent_effort '{}' must be one of low, medium, high, xhigh, max",
+                        tier.id, effort
+                    ));
+                }
+                if tier.claude_agent.is_none() {
+                    return Err(format!(
+                        "tier '{}': claude_agent_effort needs claude_agent",
+                        tier.id
+                    ));
+                }
+            }
         }
         if self.first_model("trivial").is_none() {
             return Err("the lowest tier 'trivial' must have a model".to_string());
@@ -2630,6 +2656,62 @@ difficult = ["ep/hard"]
 
         // Removing the setting again keeps the file byte-identical.
         ladder.tiers[4].claude_agent = None;
+        save_tier_ladder(&path, &ladder).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), baseline);
+    }
+
+    #[test]
+    fn claude_agent_effort_round_trips_and_validates() {
+        // A tier may carry the effort its Claude Code agent runs at: the
+        // setting saves and loads with the ladder, stays absent byte-for-byte
+        // when unset, only ever carries one of the five efforts, and needs a
+        // `claude_agent` beside it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("endpoints.toml");
+
+        // A ladder without the setting round-trips identical bytes.
+        let ladder = ladder_with_models();
+        save_tier_ladder(&path, &ladder).unwrap();
+        let baseline = std::fs::read(&path).unwrap();
+        let reloaded = load_tier_ladder(&path, None).unwrap();
+        assert!(reloaded.get("high").unwrap().claude_agent_effort.is_none());
+        save_tier_ladder(&path, &reloaded).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), baseline);
+
+        // Beside an agent the effort saves, loads and validates.
+        let mut ladder = reloaded;
+        ladder.tiers[3].claude_agent = Some("opus".into());
+        ladder.tiers[3].claude_agent_effort = Some("xhigh".into());
+        save_tier_ladder(&path, &ladder).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("claude_agent_effort = \"xhigh\"")
+        );
+        let loaded = load_tier_ladder(&path, None).unwrap();
+        assert_eq!(
+            loaded.get("high").unwrap().claude_agent_effort.as_deref(),
+            Some("xhigh")
+        );
+        loaded.validate().unwrap();
+
+        // Any other effort is refused, with the allowed values in the error.
+        ladder.tiers[3].claude_agent_effort = Some("ultra".into());
+        assert_eq!(
+            ladder.validate().unwrap_err(),
+            "tier 'high': claude_agent_effort 'ultra' must be one of low, medium, high, xhigh, max"
+        );
+
+        // The effort needs an agent beside it.
+        ladder.tiers[3].claude_agent = None;
+        ladder.tiers[3].claude_agent_effort = Some("xhigh".into());
+        assert_eq!(
+            ladder.validate().unwrap_err(),
+            "tier 'high': claude_agent_effort needs claude_agent"
+        );
+
+        // Removing the setting again keeps the file byte-identical.
+        ladder.tiers[3].claude_agent_effort = None;
         save_tier_ladder(&path, &ladder).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), baseline);
     }

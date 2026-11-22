@@ -3063,6 +3063,178 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "No governed capability files change; the status line and memory store re-embed are not covered by an OpenSpec capability."
+    },
+    {
+      "id": "e21c4820",
+      "status": "open",
+      "created_at_ms": 1795339166391,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "tier-ladder",
+          "added": [
+            {
+              "requirement": "A tier can run as a Claude Code agent",
+              "text": "Every tier except escalate MAY carry `claude_agent` set to opus, sonnet, haiku or fable. When an external Claude Code lead is attached and a dispatch settles on such a tier, the step SHALL be handed to the lead's own Claude Code agent with that model instead of a Mnemo worker session; without an external lead the tier SHALL resolve to its models exactly as before.",
+              "scenarios": [
+                {
+                  "name": "Agent tier with Claude Code leading",
+                  "when": [
+                    "Claude Code is attached as lead",
+                    "the high tier has claude_agent opus",
+                    "the lead dispatches a step on high"
+                  ],
+                  "then": [
+                    "the result carries a claude_agent block with the worktree, branch and prompt",
+                    "no Mnemo worker session is started"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Agent tier with the in-app lead",
+                  "when": [
+                    "no external lead is attached",
+                    "the high tier has claude_agent opus and a model"
+                  ],
+                  "then": [
+                    "the dispatch starts a Mnemo worker on that model"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Escalate cannot be an agent tier",
+                  "when": [
+                    "a ladder sets claude_agent on escalate"
+                  ],
+                  "then": [
+                    "saving the ladder fails with a validation error"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "The lead finishes a Claude Code agent worker",
+              "text": "A worker handed to a Claude Code agent SHALL become finished only through team_agent_done, which records the report, marks the worker completed or failed and delivers the finished notice to the external lead. While such a worker is working, the agent gate SHALL allow the lead's Agent calls without asking.",
+              "scenarios": [
+                {
+                  "name": "Agent worker reaches review",
+                  "when": [
+                    "the lead's agent committed in the worker's worktree",
+                    "the lead calls team_agent_done with a report"
+                  ],
+                  "then": [
+                    "the worker is completed and a finished notice reaches the lead",
+                    "team_check, team_review and team_merge work as for any worker"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Gate lets the agent run",
+                  "when": [
+                    "an agent-tier worker is working",
+                    "the gate-agent hook asks about subagent_type general-purpose"
+                  ],
+                  "then": [
+                    "the decision is allow"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Agent tiers are decided before fold-down",
+              "text": "Whether a dispatch goes to a Claude Code agent SHALL be decided from the tier routing settled on (the lead's explicit tier or Laya's cleared tier) before an empty tier folds down.",
+              "scenarios": [
+                {
+                  "name": "Empty agent tier",
+                  "when": [
+                    "the high tier has claude_agent opus and no models",
+                    "Claude Code leads and dispatches on high"
+                  ],
+                  "then": [
+                    "the step is handed to the Claude Code agent"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "worker-brief",
+          "added": [
+            {
+              "requirement": "The agent prompt carries the worker brief",
+              "text": "The prompt handed to a Claude Code agent SHALL contain the same plan, step and brief a Mnemo worker receives, plus the worktree it must work in, the branch to commit on, and the rules never push, never git stash, never merge, and run the project checks before the last commit.",
+              "scenarios": [
+                {
+                  "name": "Prompt contents",
+                  "when": [
+                    "a step is handed to a Claude Code agent"
+                  ],
+                  "then": [
+                    "the prompt names the worktree path and branch",
+                    "the prompt contains the step text and the brief"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "The Tiers page offers Run as a Claude Code agent",
+              "text": "Each tier card except escalate SHALL offer a Run as choice between Mnemo models and a Claude Code agent with Opus, Sonnet, Haiku or Fable, saved with the ladder.",
+              "scenarios": [
+                {
+                  "name": "Choose Opus for high",
+                  "when": [
+                    "the user picks Claude Code agent — Opus on the High card and saves"
+                  ],
+                  "then": [
+                    "endpoints.toml stores claude_agent opus on the high tier",
+                    "the lead preview shows the agent suffix on the High line"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

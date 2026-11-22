@@ -244,6 +244,7 @@ impl TeamRuntime {
             plan_step: plan.map(|plan| plan.step),
             tier,
             claude_agent: None,
+            base_commit: Some(base_tip.clone()),
             routing: None,
             reroutes: Vec::new(),
         };

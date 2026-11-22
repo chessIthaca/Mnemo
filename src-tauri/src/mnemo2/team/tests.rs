@@ -1766,6 +1766,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         model_id: None,
         reasoning_effort: None,
         claude_agent: None,
+        base_commit: None,
         report: None,
         branch,
         worktree: root
@@ -14586,6 +14587,7 @@ async fn agent_tier_dispatch_prepares_the_checkout_without_a_session() {
         RoutingMode::Off,
         None,
         false,
+        Vec::new(),
     );
     let result: Value =
         serde_json::from_str(&answer.output).expect("the dispatch answer JSON");
@@ -15239,6 +15241,7 @@ async fn agent_dispatch_read_back_uses_the_updated_record_and_reuses_the_same_bl
         RoutingMode::Auto,
         None,
         false,
+        Vec::new(),
     );
     let data = answer.data.expect("dispatch data");
     assert_eq!(data["worker"]["read_back"], true);
@@ -15405,6 +15408,236 @@ async fn agent_merge_and_outcome_use_the_claude_code_model() {
     );
 }
 
+
+/// A git command's trimmed stdout.
+fn git_stdout(root: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The lead commits `file` on the fixture's lead branch.
+fn lead_commit(root: &std::path::Path, file: &str, message: &str) -> String {
+    std::fs::write(root.join(file), format!("{message}\n")).expect("lead file");
+    run_git(root, &["add", file]);
+    run_git(root, &["commit", "-m", message]);
+    git_stdout(root, &["rev-parse", "HEAD"])
+}
+
+/// The worker's transcript as one JSON string, for what a session received.
+async fn transcript_text(team: &TeamRuntime, worker_id: &str) -> String {
+    let worker = team.worker(worker_id).await.expect("worker record");
+    serde_json::to_string(&worker.transcript.messages).expect("transcript json")
+}
+
+const FAST_FORWARD_NOTE: &str =
+    "[From Mnemo2] The lead branch moved: your checkout was fast-forwarded to";
+
+#[tokio::test]
+async fn dispatch_records_and_names_the_base_commit() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let lead_tip = git_stdout(root, &["rev-parse", "HEAD"]);
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.base_commit.as_deref(), Some(lead_tip.as_str()));
+    let prompt = record.opening_prompt.as_deref().expect("opening prompt");
+    let line = format!(
+        "You start at {} (seed), the tip of main when you were dispatched.",
+        &lead_tip[..8]
+    );
+    assert!(prompt.ends_with(&line), "{prompt}");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_after_a_lead_commit_gets_the_new_tip() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let root = fixture._root.path();
+    assert!(fixture.team.attach_external_lead());
+    let first_tip = git_stdout(root, &["rev-parse", "HEAD"]);
+    let (first, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "first fresh worker",
+            "alphabase1",
+        ))
+        .await
+        .expect("first dispatch");
+    assert_eq!(first.base_commit.as_deref(), Some(first_tip.as_str()));
+    let second_tip = lead_commit(root, "lead.txt", "lead moves on");
+    let (second, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "second fresh worker",
+            "betabase02",
+        ))
+        .await
+        .expect("second dispatch");
+    assert_eq!(second.base_commit.as_deref(), Some(second_tip.as_str()));
+    assert_eq!(git_stdout(&second.worktree, &["rev-parse", "HEAD"]), second_tip);
+    let prompt = second.opening_prompt.as_deref().expect("opening prompt");
+    assert!(
+        prompt.ends_with(&format!(
+            "You start at {} (lead moves on), the tip of main when you were dispatched.",
+            &second_tip[..8]
+        )),
+        "{prompt}"
+    );
+    let first_again = fixture.team.worker("alphabase1").await.expect("first record");
+    assert_eq!(first_again.base_commit.as_deref(), Some(first_tip.as_str()));
+}
+
+#[tokio::test]
+async fn idle_worker_without_commits_follows_the_lead() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    let lead_tip = lead_commit(root, "lead.txt", "lead moves on");
+    assert_ne!(settled.base_commit.as_deref(), Some(lead_tip.as_str()));
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the idle worker");
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), lead_tip);
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.base_commit.as_deref(), Some(lead_tip.as_str()));
+    let expected = format!("{FAST_FORWARD_NOTE} {} (lead moves on).", &lead_tip[..8]);
+    eventually(|| async {
+        transcript_text(&fixture.team, "routingworker")
+            .await
+            .contains(&expected)
+            .then_some(())
+    })
+    .await;
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn worker_with_commits_is_flagged_stale_not_rewritten() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    std::fs::write(settled.worktree.join("work.txt"), "work\n").expect("worker file");
+    run_git(&settled.worktree, &["add", "work.txt"]);
+    run_git(&settled.worktree, &["commit", "-m", "worker commit"]);
+    let worker_tip = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    lead_commit(root, "lead.txt", "lead moves on");
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the worker");
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), worker_tip);
+    assert!(!transcript_text(&fixture.team, "routingworker")
+        .await
+        .contains(FAST_FORWARD_NOTE));
+
+    let status = fixture
+        .team
+        .handle_lead_host_tool("team_status", json!({"worker_id": "routingworker"}))
+        .await;
+    let status: Value = serde_json::from_str(&status.output).expect("status json");
+    assert_eq!(status["result"][0]["stale_base"], 1, "{status}");
+
+    let check = fixture
+        .team
+        .handle_lead_host_tool(
+            "team_check",
+            json!({"worker_id": "routingworker", "name": "cargo test", "status": "passed"}),
+        )
+        .await;
+    assert!(check.success, "{}", check.output);
+    assert!(
+        check.output.contains(
+            "stale base: the lead branch has 1 commit(s) this branch does not; the checks ran without them. Rebase or merge deliberately if they matter."
+        ),
+        "{}",
+        check.output
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn dirty_worker_is_not_fast_forwarded() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    let base = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(settled.worktree.join("README.md"), "edited by the worker\n")
+        .expect("uncommitted change");
+    lead_commit(root, "lead.txt", "lead moves on");
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the dirty worker");
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), base);
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.base_commit.as_deref(), Some(base.as_str()));
+    assert!(!transcript_text(&fixture.team, "routingworker")
+        .await
+        .contains(FAST_FORWARD_NOTE));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_warns_about_uncommitted_coding_files() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    // Track `.coding/` for this test: the fixture ignores it.
+    std::fs::write(root.join(".gitignore"), ".worktrees/\n").expect("gitignore");
+    run_git(root, &["add", ".gitignore"]);
+    run_git(root, &["commit", "-m", "track .coding"]);
+    std::fs::create_dir_all(root.join(".coding/plans")).expect("plans dir");
+    std::fs::write(root.join(".coding/plans/x.md"), "dirty plan\n").expect("plan file");
+
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let answer: Value = serde_json::from_str(result.output.lines().next().unwrap()).expect("dispatch json");
+    assert_eq!(answer["result"]["warnings"], json!([]), "plan files alone: {answer}");
+
+    std::fs::write(root.join(".coding/notes.md"), "scratch\n").expect("notes file");
+    // The same dispatch again is an idempotent reuse and still warns.
+    let again = fixture.dispatch(Some("routine"), None).await;
+    assert!(again.success, "{}", again.output);
+    let answer: Value = serde_json::from_str(again.output.lines().next().unwrap()).expect("dispatch json");
+    assert_eq!(
+        answer["result"]["warnings"][0],
+        "The lead checkout has 1 uncommitted file(s) under .coding/ that this worker's checkout will not contain: .coding/notes.md. Commit them first if the worker needs them.",
+        "{answer}"
+    );
+    assert_eq!(again.data.as_ref().unwrap()["warnings"], answer["result"]["warnings"]);
+    fixture.team.shutdown().await;
+}
 
 #[tokio::test]
 async fn agent_done_persist_failure_rolls_back_and_can_retry() {

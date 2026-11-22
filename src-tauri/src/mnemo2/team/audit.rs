@@ -394,6 +394,7 @@ impl TeamRuntime {
             audit_tip: Some(tip),
             report_delivered: false,
             claude_agent: None,
+            base_commit: None,
             report: None,
             reasoning_effort,
             review_rounds: 0,

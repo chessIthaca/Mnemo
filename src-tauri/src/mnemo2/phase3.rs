@@ -471,6 +471,18 @@ fn is_lead_bookkeeping(path: &str) -> bool {
 /// dirty plan must not block integration. Worker checks stay strict
 /// ([`require_clean`]).
 pub async fn require_clean_lead(root: &Path, label: &str) -> Result<(), String> {
+    for (path, source) in status_entries(root).await? {
+        if is_lead_bookkeeping(&path) && source.as_deref().is_none_or(is_lead_bookkeeping) {
+            continue;
+        }
+        return Err(format!("the {label} working tree must be clean"));
+    }
+    Ok(())
+}
+
+/// Every entry of `git status --porcelain -z -uall` as `(path, rename or copy
+/// source)`; the source is `None` for any other change.
+async fn status_entries(root: &Path) -> Result<Vec<(String, Option<String>)>, String> {
     let args = ["status", "--porcelain", "-z", "-uall"];
     let output = git(root, &args).await?;
     if !output.status.success() {
@@ -478,20 +490,35 @@ pub async fn require_clean_lead(root: &Path, label: &str) -> Result<(), String> 
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut entries = stdout.split('\0').filter(|entry| !entry.is_empty());
+    let mut found = Vec::new();
     while let Some(entry) = entries.next() {
         let (status, path) = entry.split_at(entry.len().min(3));
         // A rename or copy is followed by its source path as its own entry.
         let source = if status.contains(['R', 'C']) {
-            entries.next()
+            entries.next().map(str::to_string)
         } else {
             None
         };
-        if is_lead_bookkeeping(path) && source.is_none_or(is_lead_bookkeeping) {
-            continue;
-        }
-        return Err(format!("the {label} working tree must be clean"));
+        found.push((path.to_string(), source));
     }
-    Ok(())
+    Ok(found)
+}
+
+/// The lead checkout's uncommitted paths (modified, added or untracked) under
+/// `.coding/`, leaving out the bookkeeping Mnemo serves from the lead's own
+/// store ([`LEAD_BOOKKEEPING_PREFIXES`]). A rename counts when either side
+/// qualifies. Porcelain order, each path once.
+pub async fn uncommitted_lead_files(root: &Path) -> Result<Vec<String>, String> {
+    let counts = |path: &str| path.starts_with(".coding/") && !is_lead_bookkeeping(path);
+    let mut files = Vec::new();
+    for (path, source) in status_entries(root).await? {
+        for candidate in std::iter::once(path).chain(source) {
+            if counts(&candidate) && !files.contains(&candidate) {
+                files.push(candidate);
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Resolve an existing, canonical, symlink-free review-edit source file inside

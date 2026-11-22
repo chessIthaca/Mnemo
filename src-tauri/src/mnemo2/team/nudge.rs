@@ -353,7 +353,7 @@ pub(super) fn route_fix_brief(worker: &WorkerRecord, routed: &Finding) -> String
         ));
     }
     brief.push_str(
-        "\nCommit fixes for every finding above, rerun the affected checks, and report evidence for delta review.",
+        "\nCommit fixes for every finding above. Verify them with the narrowest tests that cover your change (for example the touched crate's tests or the tests the findings name), not with run_checks: Mnemo runs the full checks once at the reviewed tip. Report the commit and the tests you ran for delta review.",
     );
     brief
 }

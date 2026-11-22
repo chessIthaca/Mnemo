@@ -36,6 +36,7 @@ use crate::mnemo2::pricing::usage_model_key;
 use crate::mnemo2::usage::{ProjectUsage, ProjectUsageView};
 
 mod audit;
+mod check_run;
 mod control;
 mod deletion;
 mod dispatch;
@@ -343,6 +344,9 @@ pub struct TeamRuntime {
     /// The workers whose proofs are running. Every entry point that would move
     /// a proved checkout refuses while the worker's id is in here.
     proving: proving::Proving,
+    /// The workers (or the lead checkout) whose Mnemo-run check runs are in
+    /// progress; the same entry points refuse them as refuse a proof.
+    check_runs: check_run::CheckRuns,
     /// The two proof commands, behind a seam a test can answer without a
     /// twenty-minute build.
     proofs: std::sync::RwLock<Arc<dyn proving::ProofRunner>>,
@@ -470,6 +474,7 @@ impl TeamRuntime {
             transcript_revs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             board: std::sync::Mutex::new(None),
             proving: proving::Proving::default(),
+            check_runs: check_run::CheckRuns::default(),
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
@@ -594,6 +599,7 @@ impl TeamRuntime {
             persistence: self.persistence.clone(),
             signals: self.signals.clone(),
             proving: self.proving.clone(),
+            check_runs: self.check_runs.clone(),
             board: self.board(),
             runner: Arc::clone(&*self.proofs.read().unwrap_or_else(|e| e.into_inner())),
             mutation_memory: self.mutation_memory.clone(),
@@ -602,14 +608,17 @@ impl TeamRuntime {
         }
     }
 
-    /// The refusal an entry point returns while a proof owns the worker's
-    /// checkout. Every path that would move that checkout, or start a turn in
+    /// The refusal an entry point returns while a proof, or Mnemo's own check
+    /// run, owns the worker's checkout. Every path that would move that checkout, or start a turn in
     /// it, must ask this **after** it takes the merge lock (finding
     /// claimRace): a claim holds the same lock while it decides, so the check
     /// and the claim are serialized and one of them always sees the other.
     pub(super) fn proving_guard(&self, worker_id: &str) -> Result<(), String> {
         if self.proving.is_active(worker_id) {
             return Err(proving::proving_error(worker_id));
+        }
+        if self.check_runs.is_active(worker_id) {
+            return Err(check_run::check_run_error(worker_id));
         }
         Ok(())
     }

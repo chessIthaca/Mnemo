@@ -46,6 +46,7 @@ mod escalation;
 mod external_lead;
 pub(crate) mod findings_ledger;
 mod guardrails;
+mod integrate;
 mod lead_tools;
 mod merge;
 mod nudge;

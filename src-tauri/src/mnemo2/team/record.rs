@@ -399,6 +399,14 @@ pub struct WorkerRecord {
     /// The agent's transcript file (`agent-<id>.jsonl`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_agent_transcript: Option<String>,
+    /// The branches `team_integrate` merged into this worker's branch, in
+    /// order (plan ca7f2177 decision 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrations: Vec<Integration>,
+    /// What Mnemo tells a Mnemo worker about integrations at the start of
+    /// its next message, consumed when that message is delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_note: Option<String>,
     /// The full sha of the lead commit this worker's checkout started from
     /// (advanced when an idle worker without commits is fast-forwarded).
     /// `None` for workers recorded before it existed.
@@ -413,6 +421,15 @@ pub struct WorkerRecord {
     /// the log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reroutes: Vec<DispatchRoutingRow>,
+}
+
+/// One branch `team_integrate` merged into a worker's branch: the branch, the
+/// merge commit it made, and when.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Integration {
+    pub branch: String,
+    pub commit: String,
+    pub at_ms: u64,
 }
 
 /// The opening prompt of a worker that implements its pinned task straight

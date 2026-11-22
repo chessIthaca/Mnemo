@@ -289,6 +289,16 @@ impl TeamRuntime {
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
+                name: "team_integrate".to_string(),
+                description: "Merge an existing local branch into a worker's branch, in the worker's checkout, done by TeamManager: use it when a step needs another branch's work, or to bring a stale worker up to the lead branch. A conflict aborts the merge, changes nothing and lists the conflicting files. Refused while the worker is busy or its checkout is dirty.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The worker whose branch receives the merge."},
+                    "branch":{"type":"string","description":"An existing local branch to merge in, for example the lead branch or another worker's wt/agent-* branch."}
+                },"required":["worker_id","branch"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(120_000),
+            },
+            HostToolSpec {
                 name: "team_tiers".to_string(),
                 description: "The live tier setup: each tier's models in order with their health (available, unavailable until a time after a usage limit, or not configured), its effort, whether it runs as a Claude Code agent when Claude Code leads, and the tier and model a dispatch would run on now. Read it before choosing a tier or model, and whenever a result says the tiers changed.".to_string(),
                 parameters: json!({"type":"object","properties":{}}),
@@ -524,6 +534,35 @@ impl TeamRuntime {
             return match Box::pin(self.agent_started(worker_id, agent_id, transcript)).await {
                 Ok((worker, text)) => ToolResult::success(text)
                     .with_data(serde_json::to_value(&worker).unwrap_or(Value::Null)),
+                Err(error) => team_tool_error(error),
+            };
+        }
+        if name == "team_integrate" {
+            let (Some(worker_id), Some(branch)) = (
+                args.get("worker_id").and_then(Value::as_str),
+                args.get("branch").and_then(Value::as_str),
+            ) else {
+                return ToolResult::error("team_integrate requires 'worker_id' and 'branch' strings");
+            };
+            return match self.integrate(worker_id, branch).await {
+                Ok((worker, agent_note)) => {
+                    let mut answer = worker_answer(&worker, "team_integrate");
+                    if let Some(merged) = worker.integrations.last() {
+                        answer.output = format!(
+                            "{}\nMerged {} into {worker_id} at {}; its checks and review start over on the new tip.",
+                            answer.output,
+                            merged.branch,
+                            super::dispatch::short_sha(&merged.commit)
+                        );
+                    }
+                    if let Some(note) = agent_note {
+                        answer.output = format!(
+                            "{}\nPass this to its Claude Code agent with your next message: {note}",
+                            answer.output
+                        );
+                    }
+                    answer
+                }
                 Err(error) => team_tool_error(error),
             };
         }

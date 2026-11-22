@@ -397,6 +397,8 @@ impl TeamRuntime {
             claude_agent_effort: None,
             claude_agent_id: None,
             claude_agent_transcript: None,
+            integrations: Vec::new(),
+            integration_note: None,
             base_commit: None,
             report: None,
             reasoning_effort,

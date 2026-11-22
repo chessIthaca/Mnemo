@@ -1769,6 +1769,8 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         claude_agent_effort: None,
         claude_agent_id: None,
         claude_agent_transcript: None,
+        integrations: Vec::new(),
+        integration_note: None,
         base_commit: None,
         report: None,
         branch,
@@ -18342,4 +18344,200 @@ async fn resume_and_compact_still_refuse_agent_workers_with_guidance() {
         assert!(answer.output.contains(guidance), "{tool}: {}", answer.output);
     }
     team.shutdown().await;
+}
+
+// --- plan ca7f2177 step 3: team_integrate ---
+
+/// A branch `name` off the lead checkout's HEAD with one commit writing
+/// `file`; the lead checkout is back on its own branch afterwards.
+fn side_branch(root: &std::path::Path, name: &str, file: &str, text: &str) -> String {
+    run_git(root, &["checkout", "-q", "-b", name]);
+    std::fs::write(root.join(file), text).expect("side file");
+    run_git(root, &["add", file]);
+    run_git(root, &["commit", "-q", "-m", &format!("{name} work")]);
+    let tip = git_stdout(root, &["rev-parse", "HEAD"]);
+    run_git(root, &["checkout", "-q", "-"]);
+    tip
+}
+
+async fn integrate(fixture: &RoutingFixture, branch: &str) -> ToolResult {
+    fixture
+        .team
+        .handle_lead_host_tool(
+            "team_integrate",
+            json!({"worker_id": "routingworker", "branch": branch}),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn team_integrate_merges_a_branch_into_the_worker() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    side_branch(root, "side", "side.txt", "from the side\n");
+
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.success, "{}", answer.output);
+    let tip = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    assert!(settled.worktree.join("side.txt").is_file());
+    assert_eq!(
+        git_stdout(&settled.worktree, &["log", "-1", "--format=%s"]),
+        format!("integrate side into {} (team_integrate)", settled.branch)
+    );
+    let parents = git_stdout(&settled.worktree, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 3, "a merge commit: {parents}");
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.integrations.len(), 1);
+    assert_eq!(record.integrations[0].branch, "side");
+    assert_eq!(record.integrations[0].commit, tip);
+    assert_eq!(
+        record.integration_note.as_deref(),
+        Some(
+            format!(
+                "[From Mnemo2] Mnemo merged side into your branch at {}; read git log -1 --stat to see what came in.",
+                &tip[..8]
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        answer.output.contains(&format!("Merged side into routingworker at {}", &tip[..8])),
+        "{}",
+        answer.output
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_integrate_reports_conflicts_and_changes_nothing() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    std::fs::write(settled.worktree.join("README.md"), "the worker's readme\n").expect("edit");
+    run_git(&settled.worktree, &["add", "README.md"]);
+    run_git(&settled.worktree, &["commit", "-q", "-m", "worker readme"]);
+    let before = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    side_branch(root, "rival", "README.md", "the rival readme\n");
+
+    let answer = integrate(&fixture, "rival").await;
+    assert!(!answer.success, "{}", answer.output);
+    assert!(
+        answer
+            .output
+            .contains("merging rival into routingworker conflicts in: README.md; nothing changed."),
+        "{}",
+        answer.output
+    );
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git_stdout(&settled.worktree, &["status", "--porcelain"]), "");
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert!(record.integrations.is_empty());
+    assert!(record.integration_note.is_none());
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_integrate_refuses_a_busy_or_dirty_worker() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    side_branch(root, "side", "side.txt", "from the side\n");
+    let before = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+
+    // Busy: its turn has not ended.
+    let busy = fixture
+        .team
+        .live
+        .lock()
+        .await
+        .get("routingworker")
+        .expect("live worker")
+        .busy
+        .clone();
+    busy.store(true, std::sync::atomic::Ordering::SeqCst);
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.output.contains("routingworker is busy"), "{}", answer.output);
+    busy.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Dirty: an uncommitted change in its checkout.
+    std::fs::write(settled.worktree.join("scratch.txt"), "uncommitted\n").expect("dirty");
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.output.contains("uncommitted changes"), "{}", answer.output);
+    std::fs::remove_file(settled.worktree.join("scratch.txt")).expect("clean again");
+
+    // Its own branch, and a branch that does not exist.
+    let answer = integrate(&fixture, &settled.branch).await;
+    assert!(answer.output.contains("own branch"), "{}", answer.output);
+    let answer = integrate(&fixture, "no-such-branch").await;
+    assert!(
+        answer.output.contains("there is no local branch named no-such-branch"),
+        "{}",
+        answer.output
+    );
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), before);
+    assert!(fixture.team.worker("routingworker").await.expect("record").integrations.is_empty());
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_next_prompt_names_the_integration() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    side_branch(root, "side", "side.txt", "from the side\n");
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.success, "{}", answer.output);
+    let tip = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the worker");
+    let expected = format!(
+        "[From Mnemo2] Mnemo merged side into your branch at {}; read git log -1 --stat to see what came in.",
+        &tip[..8]
+    );
+    eventually(|| async {
+        transcript_text(&fixture.team, "routingworker")
+            .await
+            .contains(&expected)
+            .then_some(())
+    })
+    .await;
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert!(record.integration_note.is_none(), "the note is consumed");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn integrating_the_lead_branch_clears_stale_base() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    std::fs::write(settled.worktree.join("work.txt"), "work\n").expect("worker file");
+    run_git(&settled.worktree, &["add", "work.txt"]);
+    run_git(&settled.worktree, &["commit", "-q", "-m", "worker commit"]);
+    lead_commit(root, "lead.txt", "lead moves on");
+    let worker = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(fixture.team.stale_base(&worker).await, Some(1));
+
+    let lead = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let answer = integrate(&fixture, &lead).await;
+    assert!(answer.success, "{}", answer.output);
+    let worker = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(fixture.team.stale_base(&worker).await, None);
+    assert!(settled.worktree.join("lead.txt").is_file());
+    fixture.team.shutdown().await;
 }

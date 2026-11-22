@@ -176,6 +176,11 @@ impl TeamRuntime {
         let mut delivered_text = format!("{}\n{text}", sender.header());
         // A prompt to an idle implementation worker first brings a checkout
         // that has no commits of its own up to the lead tip.
+        // Branches team_integrate merged in since the last message come
+        // next, after that fast-forward note (plan ca7f2177 decision 6).
+        if let Some(note) = record.integration_note.as_deref() {
+            delivered_text = format!("{note}\n{delivered_text}");
+        }
         if let Some(note) = self.fast_forward_note(worker_id, kind).await {
             delivered_text = format!("{note}\n{delivered_text}");
         }
@@ -261,6 +266,10 @@ impl TeamRuntime {
             // A delivered message starts the worker over: a stale failure is
             // no longer the record's truth.
             worker.error = None;
+            // The integration note went out with this message.
+            if worker.integration_note == record.integration_note {
+                worker.integration_note = None;
+            }
         })
         .await;
         self.persist().await?;

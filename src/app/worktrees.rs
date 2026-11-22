@@ -789,6 +789,62 @@ pub async fn fast_forward_checkout(
     .map_err(|error| format!("fast-forward task failed: {error}"))?
 }
 
+/// Merge `branch` into a worker's pool `checkout` with a merge commit
+/// (`git merge --no-ff --no-edit -m <message> <branch>`), for
+/// `team_integrate`.
+///
+/// `Ok(Ok(tip))` gives the new HEAD. `Ok(Err(paths))` lists the conflicting
+/// files after `git merge --abort` restored the checkout. `Err` covers a
+/// dirty checkout, a branch the checkout already contains, a failed pool
+/// guard, and any other git failure (a merge that stopped without conflicts
+/// is aborted first). The pool registration guard runs first.
+pub async fn merge_branch_into_checkout(
+    main_root: PathBuf,
+    checkout: PathBuf,
+    branch: String,
+    message: String,
+) -> Result<Result<String, Vec<String>>, String> {
+    tokio::task::spawn_blocking(move || {
+        ensure_registered_pool_checkout(&main_root, &checkout)?;
+        if !git_raw(&checkout, &["status", "--porcelain"])?.trim().is_empty() {
+            return Err("the worker's checkout has uncommitted changes".to_string());
+        }
+        let missing = git_raw(
+            &checkout,
+            &["rev-list", "--count", &format!("HEAD..{branch}")],
+        )?;
+        if missing.trim() == "0" {
+            return Err(format!("the worker's branch already contains {branch}"));
+        }
+        match git_raw(
+            &checkout,
+            &["merge", "--no-ff", "--no-edit", "-m", &message, &branch],
+        ) {
+            Ok(_) => Ok(Ok(git_raw(&checkout, &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string())),
+            Err(error) => {
+                let conflicted: Vec<String> =
+                    git_raw(&checkout, &["diff", "--name-only", "--diff-filter=U"])
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                let aborted = git_raw(&checkout, &["merge", "--abort"]);
+                if conflicted.is_empty() {
+                    return Err(error);
+                }
+                aborted?;
+                Ok(Err(conflicted))
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("merge task failed: {error}"))?
+}
+
 /// How many commits of `lead_ref` the worker `branch` does not contain
 /// (`git rev-list --count <branch>..<lead_ref>`, run in `main_root`).
 pub async fn commits_missing(

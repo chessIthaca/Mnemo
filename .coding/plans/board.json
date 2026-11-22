@@ -3052,6 +3052,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "It renames and extends an internal worker tool and changes how the window renders tool calls; no governed capability's specified behaviour changes (the worker-brief and external-lead specs don't name the job tools)."
+    },
+    {
+      "id": "ebd13a79",
+      "status": "closed",
+      "created_at_ms": 1795321269934,
+      "closed_at_ms": 1795326670031,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-ebd13a79-20261122-055110.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "No governed capability files change; the status line and memory store re-embed are not covered by an OpenSpec capability."
     }
   ]
 }

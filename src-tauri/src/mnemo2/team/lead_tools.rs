@@ -268,6 +268,27 @@ impl TeamRuntime {
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
+                name: "team_agent_started".to_string(),
+                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The agent worker the agent runs."},
+                    "agent_id":{"type":"string","description":"The id of the Claude Code agent (the Agent tool's agent id)."},
+                    "transcript_path":{"type":"string","description":"Optional: the agent's transcript file (agent-<agent_id>.jsonl)."}
+                },"required":["worker_id","agent_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_progress".to_string(),
+                description: "For a worker's Claude Code agent: post a one-line note after each milestone (code read, change in, tests pass, committed). The note goes into the worker's log and reaches the lead as a notice. Only for a Working or Fixing agent worker; the note is not empty and at most 500 characters.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The worker this agent runs (the worker_id in its prompt)."},
+                    "note":{"type":"string","description":"One line, at most 500 characters."}
+                },"required":["worker_id","note"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_quality".to_string(),
                 description: "Whether merged work holds up, per tier and per model: merges, first-pass share, average fix rounds and findings, high findings, reverts, merges a later bug-fix plan changed the same files for, and cost per merge. Read-only; use it when deciding a tier or model on evidence rather than on impressions.".to_string(),
                 parameters: json!({"type":"object","properties":{
@@ -462,6 +483,30 @@ impl TeamRuntime {
             return match self.run_checks_tool(worker_id).await {
                 Ok(text) => ToolResult::success(text),
                 Err(error) => ToolResult::error(error),
+            };
+        }
+        if name == "team_agent_started" || name == "team_progress" {
+            let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
+                return ToolResult::error(format!("{name} requires a 'worker_id' string"));
+            };
+            if name == "team_progress" {
+                let Some(note) = args.get("note").and_then(Value::as_str) else {
+                    return team_tool_error("team_progress requires a 'note' string".to_string());
+                };
+                return match Box::pin(self.agent_progress(worker_id, note)).await {
+                    Ok(worker) => ToolResult::success(format!("Posted the note for {worker_id}."))
+                        .with_data(serde_json::to_value(&worker).unwrap_or(Value::Null)),
+                    Err(error) => team_tool_error(error),
+                };
+            }
+            let Some(agent_id) = args.get("agent_id").and_then(Value::as_str) else {
+                return team_tool_error("team_agent_started requires an 'agent_id' string".to_string());
+            };
+            let transcript = args.get("transcript_path").and_then(Value::as_str);
+            return match Box::pin(self.agent_started(worker_id, agent_id, transcript)).await {
+                Ok((worker, text)) => ToolResult::success(text)
+                    .with_data(serde_json::to_value(&worker).unwrap_or(Value::Null)),
+                Err(error) => team_tool_error(error),
             };
         }
         if name == "team_quality" {
@@ -699,6 +744,11 @@ impl TeamRuntime {
             let mut views = Vec::with_capacity(workers.len());
             for worker in workers {
                 let mut view = worker_status_view(worker, detail);
+                if let (Some(agent), Some(object)) =
+                    (self.agent_view(worker).await, view.as_object_mut())
+                {
+                    object.insert("agent".to_string(), agent.to_json());
+                }
                 if let (Some(missing), Some(object)) =
                     (self.stale_base(worker).await, view.as_object_mut())
                 {
@@ -872,8 +922,12 @@ fn without_transcripts(value: &mut Value) {
             object.remove("transcript");
             object.remove("transcript_revs");
             object.remove("omitted_transcripts");
-            for nested in object.values_mut() {
-                without_transcripts(nested);
+            for (key, nested) in object.iter_mut() {
+                // The `agent` object's `transcript` is the agent's file path,
+                // not a conversation.
+                if key != "agent" {
+                    without_transcripts(nested);
+                }
             }
         }
         Value::Array(items) => {

@@ -103,6 +103,8 @@ pub enum MessageSender {
     User,
     /// Mnemo2 itself, for a generated repair or route-fix brief or a plan-changed notice.
     Mnemo,
+    /// The worker's own Claude Code agent, posting a progress note.
+    ClaudeAgent,
 }
 
 impl MessageSender {
@@ -112,6 +114,7 @@ impl MessageSender {
             Self::Lead => "[From the built-in lead]",
             Self::User => "[From the user in mission control]",
             Self::Mnemo => "[From Mnemo2]",
+            Self::ClaudeAgent => "[From the worker's Claude Code agent]",
         }
     }
 }
@@ -128,6 +131,8 @@ pub enum InboxKind {
     Brief,
     /// A generated review-fix brief.
     Fix,
+    /// A one-line progress note from a Claude Code agent (`team_progress`).
+    Progress,
 }
 
 /// One durable lead-to-worker or system-to-worker message.
@@ -387,6 +392,13 @@ pub struct WorkerRecord {
     /// `medium`, `high`, `xhigh`, or `max`); `None` when its tier sets none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_agent_effort: Option<String>,
+    /// The id of the Claude Code agent the lead launched for this worker,
+    /// recorded by `team_agent_started`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_agent_id: Option<String>,
+    /// The agent's transcript file (`agent-<id>.jsonl`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_agent_transcript: Option<String>,
     /// The full sha of the lead commit this worker's checkout started from
     /// (advanced when an idle worker without commits is fast-forwarded).
     /// `None` for workers recorded before it existed.
@@ -455,11 +467,12 @@ pub(super) fn agent_prompt(record: &WorkerRecord) -> String {
         AGENT_KICKOFF
     };
     format!(
-        "{}\n\nYour task:\n\n{}\n\nThis step runs as a Claude Code agent, outside Mnemo's worker sessions:\n- Work only inside {}: run every shell command there (cd there first), and read and edit files only by absolute paths under it. Never touch the project's main checkout or any other checkout.\n- Commit your work on the branch {}.\n- Never push, never use git stash, never merge.\n- Where the task tells you to message the lead, end your turn with that message instead; the lead answers and continues you.\n- Leave Mnemo's team_* and plan_* tools to the lead; plan_show is the only one you may use.\n- Run the commands in .coding/checks.toml exactly as written before your last commit.\n- End with a report of the commit hash, the checks you ran and their results, and anything left open.",
-        kickoff,
-        pinned,
-        record.worktree.display(),
-        record.branch,
+        "{kickoff}\n\nYour task:\n\n{pinned}\n\nThis step runs as a Claude Code agent, outside Mnemo's worker sessions:\n- Work only inside {worktree}. Claude Code doesn't keep your working directory between shell calls, so start every shell command with cd \"{worktree}\" && (in PowerShell: Set-Location \"{worktree}\"; ), and read and edit files only by absolute paths under it. Never touch the project's main checkout or any other checkout.\n- Run shell commands in the foreground. Start one in the background only when it will run longer than about two minutes (a full build or test suite).\n- Commit your work on the branch {branch}.\n- Never push, never use git stash, never merge.\n- Where the task tells you to message the lead, end your turn with that message instead; the lead answers and continues you.\n- After each milestone (you have read the code, the change is in, the tests pass, you committed), post a one-line note with the Mnemo tool team_progress (worker_id {id}).\n- Leave Mnemo's team_* and plan_* tools to the lead; plan_show and team_progress are the only ones you may use.\n- Run the commands in .coding/checks.toml exactly as written before your last commit.\n- End with a report of the commit hash, the checks you ran and their results, and anything left open.",
+        kickoff = kickoff,
+        pinned = pinned,
+        worktree = record.worktree.display(),
+        branch = record.branch,
+        id = record.id,
     )
 }
 

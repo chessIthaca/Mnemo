@@ -395,6 +395,8 @@ impl TeamRuntime {
             report_delivered: false,
             claude_agent: None,
             claude_agent_effort: None,
+            claude_agent_id: None,
+            claude_agent_transcript: None,
             base_commit: None,
             report: None,
             reasoning_effort,

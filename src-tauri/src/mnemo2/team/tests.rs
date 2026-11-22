@@ -1767,6 +1767,8 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         reasoning_effort: None,
         claude_agent: None,
         claude_agent_effort: None,
+        claude_agent_id: None,
+        claude_agent_transcript: None,
         base_commit: None,
         report: None,
         branch,
@@ -16611,4 +16613,262 @@ async fn a_panicking_check_run_still_notifies() {
         .await
         .expect("the claim was released, so a new run is accepted");
     team.shutdown().await;
+}
+
+
+// --- Claude Code agent workers are observable (plan ca7f2177, step 1) -------
+
+/// A transcript with two tool_use blocks across two assistant lines, one
+/// garbage line, and usage that sums to 1125 tokens.
+const AGENT_TRANSCRIPT: &str = concat!(
+    "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"do the step\"}}\n",
+    "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":1000}}}\n",
+    "this line is not json\n",
+    "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Read\",\"input\":{}}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}}\n",
+);
+
+/// A started agent worker, a projects folder to find its transcript in, and
+/// the transcript path it will have.
+async fn agent_watch_fixture(
+    worker_id: &str,
+) -> (RoutingFixture, tempfile::TempDir, std::path::PathBuf) {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            worker_id,
+        ))
+        .await
+        .expect("the agent dispatch");
+    let projects = tempfile::tempdir().expect("projects folder");
+    fixture
+        .team
+        .agent_watch
+        .set_projects_root_for_test(projects.path().to_path_buf());
+    let transcript = projects
+        .path()
+        .join("D--proj")
+        .join("session1")
+        .join("subagents")
+        .join("agent-a1b2c3.jsonl");
+    (fixture, projects, transcript)
+}
+
+fn write_agent_transcript(path: &std::path::Path, text: &str) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("folders");
+    std::fs::write(path, text).expect("write the transcript");
+}
+
+async fn start_agent(team: &TeamRuntime, worker_id: &str, extra: serde_json::Value) -> ToolResult {
+    let mut args = serde_json::json!({"worker_id": worker_id, "agent_id": "a1b2c3"});
+    if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            args.insert(key.clone(), value.clone());
+        }
+    }
+    team.handle_lead_host_tool("team_agent_started", args).await
+}
+
+async fn status_agent(team: &TeamRuntime, worker_id: &str) -> serde_json::Value {
+    let result = team
+        .handle_lead_host_tool("team_status", serde_json::json!({"worker_id": worker_id}))
+        .await;
+    assert!(result.success, "{}", result.output);
+    let parsed: serde_json::Value = serde_json::from_str(&result.output).expect("status json");
+    parsed["result"][0]["agent"].clone()
+}
+
+fn count_notices(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    while let Ok(signal) = receiver.try_recv() {
+        if let BoardSignal::Notice { text, .. } = signal {
+            if text.contains(needle) {
+                found.push(text);
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn team_agent_started_records_the_agent_and_its_transcript() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch01").await;
+    let team = &fixture.team;
+    // The documented location is searched when no path is given; a missing
+    // file stores the id and says so.
+    let early = start_agent(team, "agentWatch01", serde_json::json!({})).await;
+    assert!(early.success, "{}", early.output);
+    assert!(early.output.contains("not found yet"), "{}", early.output);
+    let worker = team.worker("agentWatch01").await.expect("worker");
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert_eq!(worker.claude_agent_transcript, None);
+    // The file appears: a later read finds it and keeps it on the record.
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let agent = status_agent(team, "agentWatch01").await;
+    assert_eq!(agent["transcript"], transcript.to_string_lossy().as_ref());
+    let worker = team.worker("agentWatch01").await.expect("worker");
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    // A given path wins, and an unknown worker is refused.
+    let named = start_agent(
+        team,
+        "agentWatch01",
+        serde_json::json!({"transcript_path": transcript.to_string_lossy()}),
+    )
+    .await;
+    assert!(named.success, "{}", named.output);
+    assert!(named.output.contains("follows its transcript"), "{}", named.output);
+    let missing = start_agent(team, "noSuchWorker1", serde_json::json!({})).await;
+    assert!(!missing.success);
+    // The watcher runs while the registered worker works, and stops on shutdown.
+    assert!(team.agent_watch.running_for_test());
+    team.shutdown().await;
+    assert!(!team.agent_watch.running_for_test());
+}
+
+#[tokio::test]
+async fn team_status_shows_agent_activity_from_the_transcript() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch02").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch02", serde_json::json!({})).await.success);
+    let agent = status_agent(team, "agentWatch02").await;
+    assert_eq!(agent["id"], "a1b2c3");
+    assert_eq!(agent["tool_calls"], 2, "{agent}");
+    assert_eq!(agent["tokens"], 1125, "{agent}");
+    assert_eq!(agent["finished"], false);
+    assert_eq!(agent["stalled"], false);
+    assert!(agent["last_activity_ms"].as_u64().unwrap_or(0) > 0, "{agent}");
+    // Reading is incremental: a second look counts nothing twice, and an
+    // appended line counts once.
+    let again = status_agent(team, "agentWatch02").await;
+    assert_eq!(again["tool_calls"], 2);
+    let mut text = AGENT_TRANSCRIPT.to_string();
+    text.push_str("{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"Bash\",\"input\":{}}],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n");
+    write_agent_transcript(&transcript, &text);
+    let more = status_agent(team, "agentWatch02").await;
+    assert_eq!(more["tool_calls"], 3, "{more}");
+    assert_eq!(more["tokens"], 1130, "{more}");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_silent_agent_is_flagged_stalled() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch03").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch03", serde_json::json!({})).await.success);
+    let mut notices = team.subscribe_board();
+    team.agent_watch_tick().await;
+    assert!(count_notices(&mut notices, "has written nothing").is_empty());
+    assert_eq!(status_agent(team, "agentWatch03").await["stalled"], false);
+
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .expect("open")
+        .set_modified(old)
+        .expect("set mtime");
+    assert_eq!(status_agent(team, "agentWatch03").await["stalled"], true);
+    team.agent_watch_tick().await;
+    team.agent_watch_tick().await;
+    let sent = count_notices(&mut notices, "has written nothing");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("agentWatch03's Claude Code agent has written nothing for 11 minutes; it may have stalled or stopped. Check it, then continue it with SendMessage or call team_agent_done."),
+        "{}",
+        sent[0]
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_finished_agent_prompts_team_agent_done() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch04").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch04", serde_json::json!({})).await.success);
+    let mut notices = team.subscribe_board();
+    team.agent_watch_tick().await;
+    assert!(count_notices(&mut notices, "finished").is_empty());
+    std::fs::write(
+        transcript.with_extension("meta.json"),
+        "{\"agentType\":\"general-purpose\",\"finished\":true}",
+    )
+    .expect("meta");
+    assert_eq!(status_agent(team, "agentWatch04").await["finished"], true);
+    team.agent_watch_tick().await;
+    team.agent_watch_tick().await;
+    let sent = count_notices(&mut notices, "finished");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("agentWatch04's Claude Code agent finished; call team_agent_done with its report."),
+        "{}",
+        sent[0]
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_progress_lands_in_the_log_and_notifies() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentWatch05").await;
+    let team = &fixture.team;
+    let mut notices = team.subscribe_board();
+    let posted = team
+        .handle_lead_host_tool(
+            "team_progress",
+            serde_json::json!({"worker_id": "agentWatch05", "note": "  the change is in  "}),
+        )
+        .await;
+    assert!(posted.success, "{}", posted.output);
+    let worker = team.worker("agentWatch05").await.expect("worker");
+    let entry = worker.inbox.last().expect("the note is in the log");
+    assert_eq!(entry.sender, MessageSender::ClaudeAgent);
+    assert_eq!(entry.kind, InboxKind::Progress);
+    assert_eq!(entry.text, "the change is in");
+    let sent = count_notices(&mut notices, "progress:");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0], "worker_id=agentWatch05\nagentWatch05 progress: the change is in");
+    for note in ["   ".to_string(), "x".repeat(501)] {
+        let refused = team
+            .handle_lead_host_tool(
+                "team_progress",
+                serde_json::json!({"worker_id": "agentWatch05", "note": note}),
+            )
+            .await;
+        assert!(!refused.success, "{}", refused.output);
+    }
+    assert_eq!(team.worker("agentWatch05").await.expect("worker").inbox.len(), worker.inbox.len());
+    team.shutdown().await;
+}
+
+#[test]
+fn agent_prompt_carries_the_cd_foreground_and_progress_rules() {
+    let mut record = worker(std::path::Path::new("D:/proj"), "agentWatch06");
+    record.claude_agent = Some("opus".into());
+    let prompt = super::record::agent_prompt(&record);
+    let worktree = record.worktree.display();
+    assert!(
+        prompt.contains(&format!("- Work only inside {worktree}. Claude Code doesn't keep your working directory between shell calls, so start every shell command with cd \"{worktree}\" && (in PowerShell: Set-Location \"{worktree}\"; ), and read and edit files only by absolute paths under it. Never touch the project's main checkout or any other checkout.")),
+        "{prompt}"
+    );
+    assert!(prompt.contains("- Run shell commands in the foreground. Start one in the background only when it will run longer than about two minutes (a full build or test suite)."), "{prompt}");
+    assert!(prompt.contains("- After each milestone (you have read the code, the change is in, the tests pass, you committed), post a one-line note with the Mnemo tool team_progress (worker_id agentWatch06)."), "{prompt}");
+    assert!(prompt.contains("- Leave Mnemo's team_* and plan_* tools to the lead; plan_show and team_progress are the only ones you may use."), "{prompt}");
 }

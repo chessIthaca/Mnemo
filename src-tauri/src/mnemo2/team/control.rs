@@ -37,7 +37,7 @@ use super::pump::{pump_worker, snapshot_model};
 use super::spawn::load_check_commands;
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
-    agent_continue_prompt, agent_worker_refusal, audit_finished, audit_finished_error,
+    agent_continue_prompt, agent_resume_refusal, agent_worker_refusal, audit_finished, audit_finished_error,
     kickoff_message, note_model, session_model_spec,
 };
 use super::routing::{
@@ -76,12 +76,66 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
-        // A Claude Code agent worker has no session to message: the lead
-        // continues it with its own agent and closes it with team_agent_done.
-        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+        let record = self.worker(worker_id).await?;
+        // A Claude Code agent worker has no session to message: the external
+        // lead continues its agent with SendMessage, so the message is only
+        // recorded here (plan ca7f2177 decision 5). Anyone else is refused.
+        if record.claude_agent.is_some() && sender == MessageSender::ExternalLead {
+            return self.message_agent_locked(&record, text, sender).await;
+        }
+        if let Some(refusal) = agent_worker_refusal(&record) {
             return Err(refusal);
         }
         self.message_inner(worker_id, text, sender).await
+    }
+
+    /// `team_message` on a worker that runs as a Claude Code agent: record
+    /// the inbox entry as for a Mnemo worker and move an idle worker back to
+    /// work (Fixing while a fix round is open), without any session. The
+    /// lead's answer carries the SendMessage instruction. A worker that has
+    /// ended or merged keeps its refusal. The caller holds the merge lock.
+    async fn message_agent_locked(
+        &self,
+        record: &WorkerRecord,
+        text: String,
+        sender: MessageSender,
+    ) -> Result<WorkerRecord, String> {
+        if text.trim().is_empty() {
+            return Err("the worker message is empty".to_string());
+        }
+        let idle = match record.status {
+            WorkerStatus::Working | WorkerStatus::Fixing => false,
+            WorkerStatus::Interrupted
+            | WorkerStatus::Completed
+            | WorkerStatus::InReview
+            | WorkerStatus::Conflict => true,
+            _ => return Err(agent_worker_refusal(record).unwrap_or_default()),
+        };
+        self.update_worker(&record.id, |worker| {
+            append_inbox(
+                worker,
+                InboxEntry {
+                    sender,
+                    kind: InboxKind::Prompt,
+                    text: text.clone(),
+                    at_ms: now_key(),
+                },
+            );
+            if idle {
+                worker.status = if worker.fixer_finding_id.is_some() {
+                    WorkerStatus::Fixing
+                } else {
+                    WorkerStatus::Working
+                };
+                worker.pending = None;
+                worker.error = None;
+            }
+        })
+        .await;
+        self.persist().await?;
+        // A registered agent back at work is watched again.
+        self.ensure_agent_watch().await;
+        self.worker(&record.id).await
     }
 
     pub(super) async fn message_inner(
@@ -464,7 +518,7 @@ impl TeamRuntime {
         self.proving_guard(worker_id)?;
         // A Claude Code agent worker has no session to reattach: the lead
         // continues it with its own agent and closes it with team_agent_done.
-        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+        if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
         self.resume_inner(worker_id).await
@@ -495,7 +549,7 @@ impl TeamRuntime {
         self.proving_guard(worker_id)?;
         // A Claude Code agent worker has no session to reroute: the lead
         // continues it with its own agent and closes it with team_agent_done.
-        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+        if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
         if let (false, Some(tier)) = (pinned, tier) {
@@ -973,7 +1027,7 @@ impl TeamRuntime {
         let mut record = self.worker(worker_id).await?;
         // A Claude Code agent worker has no session to compact: the lead
         // continues it with its own agent and closes it with team_agent_done.
-        if let Some(refusal) = agent_worker_refusal(&record) {
+        if let Some(refusal) = agent_resume_refusal(&record) {
             return Err(refusal);
         }
         if record.compacting {

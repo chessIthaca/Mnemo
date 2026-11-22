@@ -474,14 +474,17 @@ impl TeamRuntime {
         let records = self.records.lock().await;
         records
             .iter()
-            .find(|worker| worker.claude_agent.is_some() && worker.status == WorkerStatus::Working)
+            .find(|worker| {
+                worker.claude_agent.is_some()
+                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+            })
             .map(|worker| (worker.id.clone(), worker.tier.clone().unwrap_or_default()))
     }
 
     /// Finish a Claude Code agent worker (`team_agent_done`): record its
     /// final report, mark it completed or failed, and bump the turn as the
     /// pump's Finished handling does. Only a worker that runs as a Claude
-    /// Code agent, in status Working or Interrupted, can be closed this
+    /// Code agent, in status Working, Fixing or Interrupted, can be closed this
     /// way; anything else is refused with the reason. The finished (or
     /// failed) notice then reaches the lead through
     /// [`TeamRuntime::push_agent_done_notice`].
@@ -512,13 +515,18 @@ impl TeamRuntime {
                 "{worker_id} does not run as a Claude Code agent: team_agent_done only finishes agent workers"
             ));
         }
-        if !matches!(record.status, WorkerStatus::Working | WorkerStatus::Interrupted) {
+        // Called once per agent run: the first run, a continuation after
+        // team_message, or a fix round after team_route_fix.
+        if !matches!(
+            record.status,
+            WorkerStatus::Working | WorkerStatus::Interrupted | WorkerStatus::Fixing
+        ) {
             let status = serde_json::to_value(record.status)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_string))
                 .unwrap_or_else(|| "not working".to_string());
             return Err(format!(
-                "{worker_id} is {status}: team_agent_done needs a Working or Interrupted agent worker"
+                "{worker_id} is {status}: team_agent_done needs a Working, Fixing or Interrupted agent worker"
             ));
         }
         // Serialize the whole mutation/write/rollback section. Other savers
@@ -535,6 +543,9 @@ impl TeamRuntime {
             worker.pending = None;
             worker.compacting = false;
             worker.report = Some(report);
+            // A finished fix round closes, as a Mnemo worker's does when its
+            // fix turn ends.
+            worker.fixer_finding_id = None;
         })
         .await;
         if let Err(error) = save_workers_now_locked(
@@ -556,6 +567,7 @@ impl TeamRuntime {
                 worker.pending = previous.pending.clone();
                 worker.compacting = previous.compacting;
                 worker.report = previous.report.clone();
+                worker.fixer_finding_id = previous.fixer_finding_id.clone();
             }
             return Err(error);
         }

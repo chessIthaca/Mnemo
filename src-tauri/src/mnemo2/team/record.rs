@@ -515,6 +515,28 @@ pub(super) fn agent_worker_refusal(worker: &WorkerRecord) -> Option<String> {
     })
 }
 
+/// The refusal `team_resume` and `team_compact` give a worker that runs as a
+/// Claude Code agent (plan ca7f2177 decision 5): Mnemo has no session to
+/// drive, so the lead continues it through `team_message`. `None` for an
+/// ordinary worker.
+pub(super) fn agent_resume_refusal(worker: &WorkerRecord) -> Option<String> {
+    worker.claude_agent.as_ref().map(|_| {
+        let id = &worker.id;
+        match worker.status {
+            WorkerStatus::Merged | WorkerStatus::Merging => format!(
+                "{id} ran as a Claude Code agent and is merged: there is nothing left to continue."
+            ),
+            // team_message refuses these too, so point at a new dispatch.
+            WorkerStatus::Failed | WorkerStatus::Stopped | WorkerStatus::Cancelled => format!(
+                "{id} runs as a Claude Code agent and has ended: dispatch the step again with a new worker_id."
+            ),
+            _ => format!(
+                "{id} runs as a Claude Code agent: Mnemo can't resume or compact it. Continue it with team_message (which gives you the SendMessage instruction) or start a new Agent."
+            ),
+        }
+    })
+}
+
 /// The refusal checks, review and merge give while a Claude Code agent
 /// worker is still Working or Interrupted. Unlike session-driving tools,
 /// these operations become valid as soon as `team_agent_done` closes it.

@@ -23,15 +23,15 @@ use crate::mnemo2::phase3::{Finding, ReviewEvidence, ReviewRecord};
 use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::usage::ProjectUsage;
 
-use super::{TeamRuntime, unix_ms};
+use super::{TeamRuntime, now_key, unix_ms};
 use super::audit::validate_audit_linkage;
 use super::findings_ledger;
 use super::nudge::{claim_nudge, deliver_nudge, pending_fix_downshift, route_fix_brief};
 use super::persistence::TeamPersistence;
 use super::pump::save_workers;
 use super::record::{
-    agent_worker_refusal, unfinished_agent_error, ChangeSource, InboxKind, MessageSender,
-    WorkerCheck, WorkerRecord, WorkerStatus,
+    agent_worker_refusal, append_inbox, unfinished_agent_error, ChangeSource, InboxEntry,
+    InboxKind, MessageSender, WorkerCheck, WorkerRecord, WorkerStatus,
 };
 use super::routing::NUDGE_LADDER;
 
@@ -819,11 +819,13 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         let worker = self.worker(worker_id).await?;
-        // A Claude Code agent worker has no session to route a fix into:
-        // the lead continues it with its own agent and closes it with
-        // team_agent_done.
-        if let Some(refusal) = agent_worker_refusal(&worker) {
-            return Err(refusal);
+        // A Claude Code agent worker has no session to route a fix into: the
+        // round is recorded as for a Mnemo worker, and the lead's answer
+        // tells it to SendMessage the fix brief to its agent (plan ca7f2177
+        // decision 5). A tier choice does not apply: the agent keeps its
+        // model.
+        if worker.claude_agent.is_some() {
+            return self.route_fix_to_agent_locked(&worker, finding_id).await;
         }
         // Audits only ever produce findings; they never receive them.
         debug_assert_ne!(
@@ -897,6 +899,59 @@ impl TeamRuntime {
             return Err(err);
         }
         self.worker(worker_id).await
+    }
+
+    /// `team_route_fix` on a worker that runs as a Claude Code agent: the
+    /// same round bookkeeping as the Mnemo path (Fixing, the fixer finding,
+    /// one more fix round, checks and review cleared, the brief in the inbox
+    /// as a fix from Mnemo), and no session. The caller holds the merge lock.
+    async fn route_fix_to_agent_locked(
+        &self,
+        worker: &WorkerRecord,
+        finding_id: &str,
+    ) -> Result<WorkerRecord, String> {
+        if let Some(error) = unfinished_agent_error(worker) {
+            return Err(error);
+        }
+        match worker.status {
+            WorkerStatus::Completed | WorkerStatus::InReview | WorkerStatus::Conflict => {}
+            WorkerStatus::Fixing => {
+                return Err(format!(
+                    "{} is already fixing a finding: call team_agent_done when its agent finishes",
+                    worker.id
+                ));
+            }
+            _ => return Err(agent_worker_refusal(worker).unwrap_or_default()),
+        }
+        let finding = worker
+            .findings
+            .iter()
+            .find(|finding| finding.id == finding_id && finding.status == "open")
+            .ok_or_else(|| format!("unknown open finding '{finding_id}'"))?
+            .clone();
+        let brief = route_fix_brief(worker, &finding);
+        self.update_worker(&worker.id, |worker| {
+            worker.status = WorkerStatus::Fixing;
+            worker.fixer_finding_id = Some(finding_id.to_string());
+            worker.checks.clear();
+            worker.fix_rounds += 1;
+            worker.review = None;
+            worker.pending = None;
+            worker.error = None;
+            append_inbox(
+                worker,
+                InboxEntry {
+                    sender: MessageSender::Mnemo,
+                    kind: InboxKind::Fix,
+                    text: brief.clone(),
+                    at_ms: now_key(),
+                },
+            );
+        })
+        .await;
+        self.persist().await?;
+        self.ensure_agent_watch().await;
+        self.worker(&worker.id).await
     }
 }
 

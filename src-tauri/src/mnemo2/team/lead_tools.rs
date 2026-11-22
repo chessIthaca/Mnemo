@@ -258,7 +258,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_agent_done".to_string(),
-                description: "Finish a worker that runs as a Claude Code agent: record its final report and mark it completed (or failed, with failed=true). Call it after your Claude Code agent for that worker finished its step; then team_check, team_review and team_merge work as for any worker.".to_string(),
+                description: "Finish a worker that runs as a Claude Code agent: record its final report and mark it completed (or failed, with failed=true). Call it each time your Claude Code agent for that worker finishes a run (the step, a continuation after team_message, or a fix round after team_route_fix); then team_check, team_review and team_merge work as for any worker.".to_string(),
                 parameters: json!({"type":"object","properties":{
                     "worker_id":{"type":"string","description":"The agent worker to close."},
                     "report":{"type":"string","description":"The agent's final report: the commit hash, the checks it ran and their results, and anything left open."},
@@ -731,6 +731,12 @@ impl TeamRuntime {
         let reviewed = result.as_ref().ok().cloned();
         let mut answer = match (result, handoff_block) {
             (Ok(worker), Some(block)) => agent_handoff_answer(&worker, block),
+            (Ok(worker), None)
+                if worker.claude_agent.is_some()
+                    && matches!(name, "team_message" | "team_route_fix") =>
+            {
+                continue_agent_answer(&worker, name)
+            }
             (result, _) => worker_result(result, name),
         };
         if let (true, Some(missing)) = (answer.success, stale) {
@@ -1141,6 +1147,45 @@ fn agent_handoff_answer(worker: &WorkerRecord, block: Value) -> ToolResult {
     );
     let data = serde_json::to_value(worker).unwrap_or(Value::Null);
     ToolResult::success(output).with_data(json!({"worker": data, "claude_agent": block}))
+}
+
+/// The `team_message` or `team_route_fix` answer for a worker that runs as a
+/// Claude Code agent (plan ca7f2177 decision 5): Mnemo recorded the message
+/// or the fix round, and the lead passes the text on to its agent. The
+/// `continue_agent` block `{agent_id, worktree, message}` is in the result
+/// and in `data`; the text says how to continue, with the message below it.
+fn continue_agent_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
+    let message = worker
+        .inbox
+        .last()
+        .map(|entry| entry.text.clone())
+        .unwrap_or_default();
+    let block = json!({
+        "agent_id": worker.claude_agent_id,
+        "worktree": worker.worktree,
+        "message": message,
+    });
+    let mut reported = worker_status_view(worker, false);
+    without_transcripts(&mut reported);
+    let output = serde_json::to_string(&json!({
+        "action": action,
+        "result": {"worker": reported, "continue_agent": block},
+    }))
+    .unwrap_or_else(|_| action.to_string());
+    let how = match worker.claude_agent_id.as_deref() {
+        Some(agent_id) => format!(
+            "Continue {}'s Claude Code agent with SendMessage to {agent_id}, sending the message below; call team_agent_done when it finishes.",
+            worker.id
+        ),
+        None => format!(
+            "No agent is registered for {}: start a new Agent in {} with this message, then call team_agent_started.",
+            worker.id,
+            worker.worktree.display()
+        ),
+    };
+    let data = serde_json::to_value(worker).unwrap_or(Value::Null);
+    ToolResult::success(format!("{output}\n{how}\n\n{message}"))
+        .with_data(json!({"worker": data, "continue_agent": block}))
 }
 
 /// A team tool answer for one worker.

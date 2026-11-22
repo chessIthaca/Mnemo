@@ -15620,38 +15620,52 @@ async fn session_tools_refuse_an_agent_worker() {
         .expect("the agent dispatch");
 
     // Every tool that would drive a Mnemo session refuses, pointing at the
-    // lead's own agent instead.
-    for refusal in [
-        fixture
-            .team
-            .message("agenttier10", "status?".into(), MessageSender::ExternalLead)
-            .await
-            .expect_err("team_message refuses"),
-        fixture
-            .team
-            .resume("agenttier10")
-            .await
-            .expect_err("team_resume refuses"),
-        fixture
-            .team
-            .change_model("agenttier10", Some("test/scripted-average".into()), None, ChangeSource::Lead)
-            .await
-            .expect_err("team_resume with a model refuses"),
-        fixture
-            .team
-            .compact("agenttier10")
-            .await
-            .expect_err("team_compact refuses"),
-        fixture
-            .team
-            .route_fix_with_tier("agenttier10", "finding1", None)
-            .await
-            .expect_err("team_route_fix refuses"),
+    // lead's own agent instead (team_message from Claude Code is recorded
+    // and answered with the SendMessage instruction: plan ca7f2177 step 2).
+    let guidance = "agenttier10 runs as a Claude Code agent: Mnemo can't resume or compact it. Continue it with team_message (which gives you the SendMessage instruction) or start a new Agent.";
+    for (refusal, expected) in [
+        (
+            fixture
+                .team
+                .message("agenttier10", "status?".into(), MessageSender::Lead)
+                .await
+                .expect_err("the in-app lead's team_message refuses"),
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done.",
+        ),
+        (
+            fixture
+                .team
+                .resume("agenttier10")
+                .await
+                .expect_err("team_resume refuses"),
+            guidance,
+        ),
+        (
+            fixture
+                .team
+                .change_model("agenttier10", Some("test/scripted-average".into()), None, ChangeSource::Lead)
+                .await
+                .expect_err("team_resume with a model refuses"),
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done.",
+        ),
+        (
+            fixture
+                .team
+                .compact("agenttier10")
+                .await
+                .expect_err("team_compact refuses"),
+            guidance,
+        ),
+        (
+            fixture
+                .team
+                .route_fix_with_tier("agenttier10", "finding1", None)
+                .await
+                .expect_err("team_route_fix refuses while the agent runs"),
+            "agenttier10 runs as a Claude Code agent: call team_agent_done when it has finished",
+        ),
     ] {
-        assert_eq!(
-            refusal,
-            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done."
-        );
+        assert_eq!(refusal, expected);
     }
 
     fixture
@@ -15661,7 +15675,7 @@ async fn session_tools_refuse_an_agent_worker() {
         .expect("finish the agent worker");
     let refusal = fixture
         .team
-        .message("agenttier10", "fix the finding".into(), MessageSender::ExternalLead)
+        .message("agenttier10", "fix the finding".into(), MessageSender::Lead)
         .await
         .expect_err("a finished agent worker is fixed through the lead's agent");
     assert_eq!(
@@ -18135,4 +18149,197 @@ async fn audits_never_move_to_an_agent() {
     );
     assert!(fixture.team.worker("handFour1").await.expect("worker").claude_agent.is_none());
     fixture.team.shutdown().await;
+}
+
+// --- plan ca7f2177 step 2: lifecycle tools speak agent ---
+
+/// `team_route_fix` from Claude Code on `finding_id`, after the worker's
+/// first run closed and its review left that finding open.
+async fn route_agent_fix(team: &TeamRuntime, worker_id: &str, finding_id: &str) -> ToolResult {
+    team.agent_done(worker_id, "first run done".into(), false)
+        .await
+        .expect("the first run closes");
+    team.update_worker(worker_id, |worker| {
+        worker.status = WorkerStatus::InReview;
+        worker.findings.push(open_finding(finding_id));
+        worker.review_rounds = 1;
+    })
+    .await;
+    team.handle_lead_host_tool_from(
+        "team_route_fix",
+        json!({"worker_id": worker_id, "finding_id": finding_id}),
+        MessageSender::ExternalLead,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn team_message_on_an_agent_worker_returns_the_sendmessage_instruction() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentMsg01").await;
+    let team = &fixture.team;
+    team.agent_done("agentMsg01", "first run done".into(), false)
+        .await
+        .expect("the first run closes");
+
+    // No agent is registered: start a new one with the message.
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "agentMsg01", "text": "Also add the doc comment."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let worker = team.worker("agentMsg01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert!(
+        answer.output.contains(&format!(
+            "No agent is registered for agentMsg01: start a new Agent in {} with this message, then call team_agent_started.",
+            worker.worktree.display()
+        )),
+        "{}",
+        answer.output
+    );
+    assert_eq!(
+        answer.data.expect("data")["continue_agent"],
+        json!({"agent_id": null, "worktree": worker.worktree, "message": "Also add the doc comment."})
+    );
+    let entry = worker.inbox.last().expect("the inbox entry");
+    assert_eq!(entry.sender, MessageSender::ExternalLead);
+    assert_eq!(entry.text, "Also add the doc comment.");
+    assert!(!team.live.lock().await.contains_key("agentMsg01"), "no session starts");
+
+    // A registered agent: continue it with SendMessage.
+    let started = start_agent(team, "agentMsg01", json!({})).await;
+    assert!(started.success, "{}", started.output);
+    team.agent_done("agentMsg01", "second run done".into(), false)
+        .await
+        .expect("the second run closes");
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "agentMsg01", "text": "Run the tests again."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert!(
+        answer.output.ends_with(
+            "Continue agentMsg01's Claude Code agent with SendMessage to a1b2c3, sending the message below; call team_agent_done when it finishes.\n\nRun the tests again."
+        ),
+        "{}",
+        answer.output
+    );
+    assert_eq!(answer.data.expect("data")["continue_agent"]["agent_id"], "a1b2c3");
+
+    // The in-app lead has no agent to continue: it is still refused.
+    let refused = team
+        .handle_lead_host_tool(
+            "team_message",
+            json!({"worker_id": "agentMsg01", "text": "From the in-app lead."}),
+        )
+        .await;
+    assert!(!refused.success, "{}", refused.output);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_route_fix_on_an_agent_worker_records_the_round_and_returns_the_fix_text() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentFix01").await;
+    let team = &fixture.team;
+    let answer = route_agent_fix(team, "agentFix01", "fixMe01").await;
+    assert!(answer.success, "{}", answer.output);
+
+    let worker = team.worker("agentFix01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Fixing);
+    assert_eq!(worker.fixer_finding_id.as_deref(), Some("fixMe01"));
+    assert_eq!(worker.fix_rounds, 1);
+    assert_eq!(worker.review_rounds, 1);
+    assert!(worker.checks.is_empty());
+    assert!(worker.review.is_none());
+    let entry = worker.inbox.last().expect("the fix brief");
+    assert_eq!(entry.sender, MessageSender::Mnemo);
+    assert_eq!(entry.kind, InboxKind::Fix);
+    assert!(entry.text.contains("the unchecked path"), "{}", entry.text);
+    let block = &answer.data.as_ref().expect("data")["continue_agent"];
+    assert_eq!(block["message"], json!(entry.text));
+    assert!(
+        answer.output.contains("No agent is registered for agentFix01"),
+        "{}",
+        answer.output
+    );
+    assert!(answer.output.ends_with(&entry.text), "{}", answer.output);
+    assert!(!team.live.lock().await.contains_key("agentFix01"), "no session starts");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_agent_done_closes_a_fix_round() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentFix02").await;
+    let team = &fixture.team;
+    let answer = route_agent_fix(team, "agentFix02", "fixMe02").await;
+    assert!(answer.success, "{}", answer.output);
+    let turns = team.worker("agentFix02").await.expect("worker").turns;
+
+    let closed = team
+        .agent_done("agentFix02", "fixed at abc1234".into(), false)
+        .await
+        .expect("the fix round closes");
+    assert_eq!(closed.status, WorkerStatus::Completed);
+    assert_eq!(closed.fixer_finding_id, None);
+    assert_eq!(closed.turns, turns + 1);
+    assert_eq!(closed.report.as_deref(), Some("fixed at abc1234"));
+    // Once per run: a closed worker cannot be closed again.
+    assert!(team.agent_done("agentFix02", "again".into(), false).await.is_err());
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn gate_allows_agents_while_an_agent_worker_fixes() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentGate1").await;
+    let team = &fixture.team;
+    team.agent_done("agentGate1", "first run done".into(), false)
+        .await
+        .expect("the first run closes");
+    assert_eq!(team.claude_agent_working().await, None, "nothing runs while it is reviewed");
+    team.update_worker("agentGate1", |worker| {
+        worker.status = WorkerStatus::InReview;
+        worker.findings.push(open_finding("gateFix1"));
+    })
+    .await;
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_route_fix",
+            json!({"worker_id": "agentGate1", "finding_id": "gateFix1"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert_eq!(
+        team.claude_agent_working().await,
+        Some(("agentGate1".to_string(), "high".to_string()))
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn resume_and_compact_still_refuse_agent_workers_with_guidance() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentRes01").await;
+    let team = &fixture.team;
+    team.agent_done("agentRes01", "done".into(), false)
+        .await
+        .expect("the run closes");
+    let guidance = "agentRes01 runs as a Claude Code agent: Mnemo can't resume or compact it. Continue it with team_message (which gives you the SendMessage instruction) or start a new Agent.";
+    for (tool, args) in [
+        ("team_resume", json!({"worker_id": "agentRes01"})),
+        ("team_resume", json!({"worker_id": "agentRes01", "tier": "routine"})),
+        ("team_compact", json!({"worker_id": "agentRes01"})),
+    ] {
+        let answer = team
+            .handle_lead_host_tool_from(tool, args, MessageSender::ExternalLead)
+            .await;
+        assert!(!answer.success, "{tool}: {}", answer.output);
+        assert!(answer.output.contains(guidance), "{tool}: {}", answer.output);
+    }
+    team.shutdown().await;
 }

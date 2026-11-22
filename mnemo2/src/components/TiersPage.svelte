@@ -705,11 +705,6 @@
                     <option value={option.value}>{option.label}</option>
                   {/each}
                 </select>
-                {#if tier.claude_agent !== null}
-                  <p class="micro hint">
-                    When Claude Code leads, this tier runs on your Claude Code agent; the models above are used otherwise.
-                  </p>
-                {/if}
               </div>
             {/if}
             {#if tier.id === "trivial"}
@@ -718,6 +713,11 @@
               <p class="micro hint">only after a lower tier failed</p>
             {:else if tier.models.length === 0}
               <p class="micro hint">uses {foldTargetOf(tier.id) ?? tier.resolves_to}'s model</p>
+            {/if}
+            {#if tier.role !== "escalate" && tier.claude_agent !== null}
+              <p class="micro hint tier-run-as-hint">
+                When Claude Code leads, this tier runs on your Claude Code agent; the models above are used otherwise.
+              </p>
             {/if}
           </div>
         </section>
@@ -845,7 +845,7 @@
   .tier-effort input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
   .tier-run-as { display: grid; gap: 2px; }
   .tier-run-as select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
-  .tier-run-as .hint { padding-bottom: 0; }
+  .tier-run-as-hint { flex-basis: 100%; }
   .hint { margin: 0; padding-bottom: 6px; }
 
   /* The dispatch text preview */

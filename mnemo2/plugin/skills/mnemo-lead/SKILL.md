@@ -51,6 +51,16 @@ Rules:
 - Those five ids are the only tier names. `simple`, `average` and `difficult` are refused, and the error lists the five ids.
 - With no tiers configured (Mnemo2 Settings > Tiers), omit `tier`. The default model runs, or pass a `model` from the tool's enum.
 
+### Tiers that run as a Claude Code agent
+
+In Mnemo2 Settings > Tiers, any tier except `escalate` can run as a Claude Code agent (Opus, Sonnet, Haiku or Fable). Its line in the `tier` parameter of `team_dispatch` then ends with "runs as a Claude Code agent (<model>) when Claude Code leads". When you lead and a dispatch settles on such a tier, Mnemo2 prepares the worktree and branch but starts no worker session. The dispatch result carries a `claude_agent` block with `model`, `worktree`, `branch` and `prompt`, and you run the step:
+
+1. Start your `Agent` tool in the background, with `model` set to `claude_agent.model` and `prompt` set to `claude_agent.prompt`, unchanged. The prompt already holds the plan, the step, your brief, the worktree, the branch and the rules. While the worker is working, the Mnemo gate lets this agent run without a permission prompt.
+2. When the agent returns, call `team_agent_done` with the `worker_id` and the agent's report, adding `failed: true` if it could not finish. The usual "finished its turn" notice follows.
+3. Review it like any other worker, with the `mnemo-review` skill. Run the checks yourself and record them with `team_check`, because Mnemo2 does not see the agent's own runs. Then `team_review`, an audit when the work is high risk, and `team_merge`.
+
+With `read_back: true`, the agent's first run ends with its questions, or "No questions.". Record the answers with `plan_update`, then continue the agent with `SendMessage`. Call `team_agent_done` only after it has finished the step. To fix findings, continue the same agent with `SendMessage`. A new `Agent` gets a permission prompt, because the gate lets agents through only while an agent worker is working. Once the fix is committed, run the checks and `team_review` again on the new tip; `team_agent_done` is called only once per worker. `review_fix` works as usual, but `team_message`, `team_resume`, `team_route_fix` and `team_compact` refuse these workers. `team_stop` clears the worker record; stop your own agent separately. A failed agent worker cannot be resumed: dispatch the step again with a new `worker_id`, or `team_stop` it to clear it. Passing `model` to `team_dispatch` always starts a Mnemo worker. When Mnemo2's own lead leads, the tier runs on its models as usual.
+
 ## Briefs
 
 The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. The design belongs in the step text, written as a spec as the `mnemo-plan` skill describes, because the brief is not saved in the plan: a later worker on the same step never sees it. If you notice while writing a brief that the step lacks signatures, rules or test names, add them to the plan first, with `plan_update` `add_steps` or `decision`. Your `brief` then carries only what is specific to this dispatch:
@@ -205,7 +215,7 @@ The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one w
 
 ## Claude Code's own agents are a last resort
 
-Mnemo workers do the delegated work. Do not use `Agent`, `Task` or `Workflow` to implement, research or review while a Mnemo worker could. They run on the user's Claude subscription and bypass the team's tiers, review and merge gates. The lookup agents `Explore` and `claude-code-guide` pass without a prompt.
+Mnemo workers do the delegated work. Do not use `Agent`, `Task` or `Workflow` to implement, research or review while a Mnemo worker could. They run on the user's Claude subscription and bypass the team's tiers, review and merge gates. The one exception is a dispatch that returns a `claude_agent` block: run that agent as "Tiers that run as a Claude Code agent" above describes. The lookup agents `Explore` and `claude-code-guide` pass without a prompt.
 
 If Mnemo truly cannot do the job (Mnemo2 is down, or the task needs Claude-only capabilities), say why in chat and ask the user first. A PreToolUse hook then shows a permission prompt for the call, and the user's answer is final. Do not look for ways around it.
 

@@ -146,13 +146,24 @@ impl UsageLimits {
     }
 
     /// The inventory without the models a usage limit took out at `now_ms`.
-    pub(super) fn available(&self, models: &[LeadModel], now_ms: u64) -> Vec<LeadModel> {
+    fn available(&self, models: &[LeadModel], now_ms: u64) -> Vec<LeadModel> {
         let map = self.unavailable.read().unwrap_or_else(|e| e.into_inner());
         models
             .iter()
             .filter(|model| map.get(&model.spec).is_none_or(|until| *until <= now_ms))
             .cloned()
             .collect()
+    }
+
+    /// The refusal for naming `spec` explicitly while a usage limit has it
+    /// out, so the lead reads why instead of "not configured".
+    pub(super) fn refusal(&self, spec: &str) -> Option<String> {
+        self.until(spec, unix_ms()).map(|until| {
+            format!(
+                "'{spec}' is unavailable until {} after a usage limit; choose another model or dispatch by tier.",
+                local_hh_mm(until)
+            )
+        })
     }
 
     /// Take the model a worker's failed turn ran on out of the tiers for
@@ -170,6 +181,34 @@ impl UsageLimits {
         }
         self.mark_model_unavailable(spec, unix_ms().saturating_add(USAGE_LIMIT_WINDOW_MS));
         Some(spec.to_string())
+    }
+}
+
+/// The model inventory as routing reads it: the configured models less the
+/// ones a usage limit took out. Tier resolution, the escalation and nudge
+/// paths in the worker pumps, and [`TeamRuntime::current_models`] all read
+/// the inventory through this, and its fields are private, so none of them
+/// can pick an exhausted model by reading the raw list.
+#[derive(Clone, Copy)]
+pub(super) struct ModelInventory<'a> {
+    models: &'a std::sync::RwLock<Vec<LeadModel>>,
+    limits: &'a UsageLimits,
+}
+
+impl<'a> ModelInventory<'a> {
+    pub(super) fn new(
+        models: &'a std::sync::RwLock<Vec<LeadModel>>,
+        limits: &'a UsageLimits,
+    ) -> Self {
+        Self { models, limits }
+    }
+
+    /// The available models right now.
+    pub(super) fn current(&self) -> Vec<LeadModel> {
+        self.limits.available(
+            &self.models.read().unwrap_or_else(|e| e.into_inner()),
+            unix_ms(),
+        )
     }
 }
 
@@ -472,10 +511,12 @@ impl TeamRuntime {
     /// tier resolution, fold-down, tier guidance and audits all read this, so
     /// they skip a limited model until its window passes.
     pub(super) fn current_models(&self) -> Vec<LeadModel> {
-        self.usage_limits.available(
-            &self.models.read().unwrap_or_else(|e| e.into_inner()),
-            unix_ms(),
-        )
+        self.model_inventory().current()
+    }
+
+    /// The model inventory the escalation and nudge paths read.
+    pub(super) fn model_inventory(&self) -> ModelInventory<'_> {
+        ModelInventory::new(&self.models, &self.usage_limits)
     }
 
     /// The handles a worker pump shares for usage limits.
@@ -600,6 +641,11 @@ impl TeamRuntime {
             (None, Some(tier)) => Some(self.resolve_tier_choice(tier)?.1.spec),
             (model, _) => model,
         };
+        // A model a usage limit took out is still configured: say why it is
+        // refused before the tier check calls it unknown.
+        if let Some(refusal) = model.as_deref().and_then(|spec| self.usage_limits.refusal(spec)) {
+            return Err(refusal);
+        }
         let tiered = self.tiered_models();
         match &model {
             Some(spec) if !tiered.is_empty() && !tiered.iter().any(|m| &m.spec == spec) => {

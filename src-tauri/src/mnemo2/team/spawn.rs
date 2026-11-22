@@ -107,6 +107,11 @@ impl TeamRuntime {
         model: &Option<String>,
         reasoning_effort: &Option<String>,
     ) -> Result<(), String> {
+        // A model a usage limit took out is still configured: say why it is
+        // refused instead of calling it unknown.
+        if let Some(refusal) = model.as_deref().and_then(|spec| self.usage_limits.refusal(spec)) {
+            return Err(refusal);
+        }
         let models = self.current_models();
         let configured = match model {
             Some(spec) => Some(

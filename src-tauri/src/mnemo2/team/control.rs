@@ -41,6 +41,9 @@ use super::routing::{
     reroute_destination,
 };
 
+/// The refusal of a resume while Mnemo2 shuts the team down.
+const CLOSING_RESUME_ERROR: &str = "Mnemo2 is closing; the worker cannot be resumed now";
+
 impl TeamRuntime {
     /// Send a message to a worker with its sender attached. A busy worker gets
     /// it as a steer; an idle worker starts a new turn with it.
@@ -462,13 +465,35 @@ impl TeamRuntime {
         source: ChangeSource,
     ) -> Result<WorkerRecord, String> {
         let model = self.lead_model_choice(tier, model)?;
+        let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
+        // A Claude Code agent worker has no session to reroute: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+            return Err(refusal);
+        }
+        self.resume_on_tier_locked(worker_id, tier, model, reasoning_effort, source)
+            .await
+    }
+
+    /// [`Self::resume_on_tier`] for a caller that holds the merge lock, has
+    /// asked the proving guard and refused agent workers, with `model`
+    /// already resolved from the choice by `lead_model_choice`.
+    pub(super) async fn resume_on_tier_locked(
+        &self,
+        worker_id: &str,
+        tier: Option<&str>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+    ) -> Result<WorkerRecord, String> {
         // An effort alone keeps the worker's model.
         let model = match model {
             Some(model) => Some(model),
             None => self.worker(worker_id).await.ok().and_then(|w| w.model),
         };
         let changed = self
-            .change_model(worker_id, model, reasoning_effort, source)
+            .change_model_locked(worker_id, model, reasoning_effort, source)
             .await;
         match (changed, tier) {
             (Ok(_), Some(tier)) => {
@@ -480,6 +505,9 @@ impl TeamRuntime {
     }
 
     pub(super) async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        if self.persistence.closed.load(Ordering::SeqCst) {
+            return Err(CLOSING_RESUME_ERROR.to_string());
+        }
         let live_idle = {
             let live = self.live.lock().await;
             match live.get(worker_id) {
@@ -590,17 +618,29 @@ impl TeamRuntime {
             self.proof_ctx(),
             self.usage_limits(),
         ));
-        self.live.lock().await.insert(
-            worker_id.to_string(),
-            LiveWorker {
-                session,
-                busy,
-                pump,
-                cleanup_retry_only: false,
-                strikes,
-                steer_pending,
-            },
-        );
+        {
+            // Decided under the live lock: `shutdown` marks the runtime closed
+            // before it takes this lock to close every session, so a session
+            // that lands here after the mark would never be closed.
+            let mut live = self.live.lock().await;
+            if self.persistence.closed.load(Ordering::SeqCst) {
+                drop(live);
+                pump.abort();
+                let _ = session.close().await;
+                return Err(CLOSING_RESUME_ERROR.to_string());
+            }
+            live.insert(
+                worker_id.to_string(),
+                LiveWorker {
+                    session,
+                    busy,
+                    pump,
+                    cleanup_retry_only: false,
+                    strikes,
+                    steer_pending,
+                },
+            );
+        }
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Idle;
             worker.generation = generation;

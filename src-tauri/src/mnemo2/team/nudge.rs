@@ -15,12 +15,11 @@ use crate::mnemo2::dispatch_routing::{
     DispatchRoutingRow, EnabledTiers, RoutingMode, RoutingSettings,
 };
 use crate::mnemo2::phase3::Finding;
-use crate::mnemo2::runtime::LeadModel;
 
 use super::record::{ChangeSource, MessageSender, ToolErrorNote, WorkerRecord};
 use super::routing::{
     direct_tiers_over, final_tier, logs_routing, next_tier_above, tier_is_above,
-    NUDGE_LADDER,
+    ModelInventory, NUDGE_LADDER,
 };
 use super::{unix_ms, BoardSignal};
 
@@ -234,7 +233,9 @@ pub(super) fn nudge_ignored_row(record: &WorkerRecord) -> Option<DispatchRouting
 /// log, and the settings in force.
 pub(super) struct StrikeNudges<'a> {
     pub(super) records: &'a Arc<Mutex<Vec<WorkerRecord>>>,
-    pub(super) models: &'a Arc<std::sync::RwLock<Vec<LeadModel>>>,
+    /// The available models: never the raw list, so a nudge never suggests
+    /// a tier whose model a usage limit took out.
+    pub(super) models: ModelInventory<'a>,
     pub(super) tiers: &'a Arc<std::sync::RwLock<mnemo::headless::TiersDto>>,
     pub(super) signals: &'a broadcast::Sender<BoardSignal>,
     pub(super) routing_log_path: &'a Path,
@@ -259,7 +260,7 @@ pub(super) async fn try_strike_nudge(worker_id: &str, nudges: StrikeNudges<'_>, 
         (worker.model.clone(), tool_errors_text(worker))
     };
     let enabled = direct_tiers_over(
-        &nudges.models.read().unwrap_or_else(|e| e.into_inner()),
+        &nudges.models.current(),
         &nudges.tiers.read().unwrap_or_else(|e| e.into_inner()),
         current_model.as_deref(),
     );

@@ -36,7 +36,7 @@ use super::record::{
     InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox, kickoff_message,
 };
 use super::review::{CheckRecorder, clear_review_for_a_newer_tip};
-use super::routing::{logs_label, outcome_row, UsageLimits};
+use super::routing::{logs_label, outcome_row, ModelInventory, UsageLimits};
 
 /// The plan coordinate a worker may read: its own plan, or for an audit the
 /// plan of the worker it audits. The step stays 0-based, like the record.
@@ -1419,7 +1419,7 @@ pub(super) async fn pump_worker(
                     &worker_id,
                     StrikeNudges {
                         records: &records,
-                        models: &models,
+                        models: ModelInventory::new(&models, &usage_limits),
                         tiers: &tiers,
                         signals: &signals,
                         routing_log_path: &routing_log_path,
@@ -1442,7 +1442,7 @@ pub(super) async fn pump_worker(
                 AutoEscalation {
                     records: &records,
                     live: &live,
-                    models: &models,
+                    models: ModelInventory::new(&models, &usage_limits),
                     tiers: &tiers,
                     signals: &signals,
                     routing_log_path: &routing_log_path,

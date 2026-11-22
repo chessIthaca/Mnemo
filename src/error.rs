@@ -352,25 +352,31 @@ pub fn retry_backoff_ms(attempt: u32) -> u64 {
 /// spend — a usage limit, quota, credit or billing cap — rather than a
 /// passing overload.
 ///
-/// Such a limit holds for hours (Ollama Cloud's weekly glm limit, OpenAI's
-/// `insufficient_quota`), so retrying the same model soon cannot help, while
-/// an overloaded or "temporarily" unavailable endpoint recovers on its own.
+/// Such a limit holds for hours (Ollama Cloud's weekly glm limit, GLM's
+/// "Weekly/Monthly Limit Exhausted", OpenAI's `insufficient_quota`), so
+/// retrying the same model soon cannot help, while an overloaded or
+/// "temporarily" unavailable endpoint recovers on its own.
 /// Mnemo2 takes a model whose worker failed this way out of its tiers until
 /// the limit resets. Matched case-insensitively on the text alone, because
 /// the failure reaches the team as the worker's final error string.
+///
+/// The limit phrases count on their own. The bare words quota, credit and
+/// billing count only beside a limit signal (a 429, "limit", "exceeded",
+/// "exhausted"), so a 400 about an unsupported `credit` field is not a
+/// spent account.
 pub fn is_usage_limit(error: &str) -> bool {
     let text = error.to_lowercase();
-    let limited = [
+    let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    if has(&["overloaded", "temporarily"]) {
+        return false;
+    }
+    has(&[
         "usage limit",
-        "quota",
+        "limit exhausted",
         "insufficient_quota",
-        "credit",
-        "billing",
         "exceeded your current",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle));
-    limited && !text.contains("overloaded") && !text.contains("temporarily")
+    ]) || (has(&["quota", "credit", "billing"])
+        && has(&["429", "limit", "exceeded", "exhausted"]))
 }
 
 #[cfg(test)]
@@ -603,6 +609,8 @@ mod tests {
             "stream request: HTTP 429 from https://api.openai.com/v1/chat/completions — \
              {\"error\":{\"message\":\"You exceeded your current quota, please check your plan \
              and billing details.\",\"type\":\"insufficient_quota\"}}",
+            // GLM's own quota body on a 429.
+            "HTTP 429 — Weekly/Monthly Limit Exhausted",
         ];
         for text in limits {
             assert!(super::is_usage_limit(text), "a usage limit: {text}");
@@ -619,6 +627,10 @@ mod tests {
             // an overload, not a spent account.
             "engine_overloaded_error: the engine is overloaded; your quota is untouched",
             "the service is temporarily over its request quota, retry shortly",
+            // A request field named credit is no spent account.
+            "stream request: HTTP 400 from https://api.example.com/v1/chat/completions — \
+             {\"error\":{\"message\":\"Unsupported parameter: 'credit' is not supported with \
+             this model.\",\"type\":\"invalid_request_error\"}}",
         ];
         for text in passing {
             assert!(!super::is_usage_limit(text), "not a usage limit: {text}");

@@ -10967,6 +10967,264 @@ async fn unavailable_models_return_after_their_window() {
     fixture.team.shutdown().await;
 }
 
+/// The local `HH:MM` of an epoch-milliseconds instant, formatted
+/// independently of the code under test.
+fn local_hh_mm_for_test(epoch_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(epoch_ms as i64)
+        .expect("a valid instant")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string()
+}
+
+#[tokio::test]
+async fn auto_escalation_skips_an_unavailable_model() {
+    let responses = (1..=3)
+        .map(|attempt| {
+            tool_call_batch(
+                &format!("limited-call-{attempt}"),
+                "not_a_real_tool",
+                &format!("{{\"attempt\":{attempt}}}"),
+            )
+        })
+        .chain([vec![
+            mnemo::provider::LlmEvent::TextDelta { text: "done".into() },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            },
+        ]])
+        .collect::<Vec<_>>();
+    let (fixture, _notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+        std::time::Duration::ZERO,
+        responses,
+    )
+    .await;
+    // High's only model is out of its usage limit.
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms() + 600_000);
+    let dispatched = fixture.dispatch(Some("routine"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        (worker.status == WorkerStatus::Completed).then_some(())
+    })
+    .await;
+    // The strike nudge offers no tier whose model is out: with medium empty
+    // and high limited, nothing above routine is a candidate.
+    assert!(
+        !fixture.team.direct_nudge_tiers(Some("test/scripted-average")).high,
+        "high is no nudge candidate while its model is out"
+    );
+    assert!(
+        fixture
+            .rows()
+            .iter()
+            .all(|row| !matches!(row, DispatchRoutingRow::Nudge { .. })),
+        "the strikes nudged nobody onto the limited model: {:?}",
+        fixture.rows()
+    );
+    // Settle any escalation still owed, then check the worker stayed put.
+    let _ = fixture.team.auto_escalate_worker("routingworker").await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-average"));
+    assert!(worker.routing.as_ref().expect("routing").nudged.is_none());
+    // A nudge already pending for high folds past the limited model instead
+    // of switching onto it.
+    fixture
+        .team
+        .update_worker("routingworker", |worker| {
+            if let Some(routing) = worker.routing.as_mut() {
+                routing.nudged = Some("high".into());
+            }
+        })
+        .await;
+    let _ = fixture
+        .team
+        .auto_escalate_worker("routingworker")
+        .await
+        .expect("auto escalation");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_ne!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-average"));
+    fixture.team.shutdown().await;
+}
+
+/// The worker a usage-limited failure left Failed (shadow mode, so nothing
+/// resumed it), with its failed generation.
+async fn usage_limited_failed_worker() -> (RoutingFixture, broadcast::Receiver<BoardSignal>, u64) {
+    let (fixture, notices) = nudge_fixture(vec![glm_weekly_limit_turn()]).await;
+    let dispatched = fixture.dispatch(Some("high"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    let failed = eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        (worker.status == WorkerStatus::Failed).then_some(worker)
+    })
+    .await;
+    let generation = failed.generation;
+    (fixture, notices, generation)
+}
+
+/// No usage-limit resume reached the worker: no Mnemo message, no notice.
+fn assert_no_usage_limit_resume(
+    worker: &WorkerRecord,
+    notices: &mut broadcast::Receiver<BoardSignal>,
+) {
+    assert!(
+        worker
+            .inbox
+            .iter()
+            .all(|entry| entry.sender != MessageSender::Mnemo),
+        "Mnemo never told the worker it moved: {:?}",
+        worker.inbox
+    );
+    while let Ok(signal) = notices.try_recv() {
+        if let BoardSignal::Notice { key, text } = signal {
+            assert!(!key.starts_with("usage-limit:"), "no resume notice: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_resume_yields_to_a_lead_resume_or_stop() {
+    let (fixture, mut notices, generation) = usage_limited_failed_worker().await;
+    // The lead's stop wins the merge lock while the automatic resume for the
+    // failed generation waits on it.
+    let guard = fixture.team.merge_lock.lock().await;
+    let auto = tokio::spawn({
+        let team = fixture.team.clone();
+        async move {
+            team.resume_usage_limited("routingworker", generation, "test/scripted-difficult")
+                .await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    fixture
+        .team
+        .stop_inner("routingworker")
+        .await
+        .expect("the lead stops the worker");
+    drop(guard);
+    auto.await.expect("the automatic resume task");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Stopped);
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_no_usage_limit_resume(&worker, &mut notices);
+    // Failed again at the same generation, the lead's own resume wins the
+    // lock and moves the worker to a new generation first.
+    fixture
+        .team
+        .update_worker("routingworker", |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    let guard = fixture.team.merge_lock.lock().await;
+    let auto = tokio::spawn({
+        let team = fixture.team.clone();
+        async move {
+            team.resume_usage_limited("routingworker", generation, "test/scripted-difficult")
+                .await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let led = fixture
+        .team
+        .resume_on_tier_locked(
+            "routingworker",
+            Some("routine"),
+            Some("test/scripted-average".into()),
+            None,
+            ChangeSource::Lead,
+        )
+        .await
+        .expect("the lead resumes the worker");
+    drop(guard);
+    auto.await.expect("the automatic resume task");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_ne!(led.generation, generation);
+    assert_eq!(worker.generation, led.generation, "no second resume followed");
+    assert_no_usage_limit_resume(&worker, &mut notices);
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_resume_does_nothing_after_shutdown() {
+    let (fixture, mut notices, generation) = usage_limited_failed_worker().await;
+    fixture.team.shutdown().await;
+    // The detached task acting late finds Mnemo closed.
+    fixture
+        .team
+        .resume_usage_limited("routingworker", generation, "test/scripted-difficult")
+        .await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Failed);
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_eq!(worker.generation, generation);
+    assert_no_usage_limit_resume(&worker, &mut notices);
+    // And the resume path itself refuses while closing.
+    let refused = fixture
+        .team
+        .resume("routingworker")
+        .await
+        .expect_err("no resume after shutdown");
+    assert!(refused.contains("closing"), "{refused}");
+}
+
+#[tokio::test]
+async fn naming_an_unavailable_model_says_why() {
+    let fixture = routing_fixture(
+        crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+        None,
+        false,
+    )
+    .await;
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms() + 600_000);
+    let until = fixture
+        .team
+        .usage_limits
+        .until("test/scripted-difficult", unix_ms())
+        .expect("marked");
+    let expected = format!(
+        "'test/scripted-difficult' is unavailable until {} after a usage limit; choose another model or dispatch by tier.",
+        local_hh_mm_for_test(until)
+    );
+    assert_eq!(
+        fixture
+            .team
+            .lead_model_choice(None, Some("test/scripted-difficult".into())),
+        Err(expected.clone())
+    );
+    assert_eq!(
+        fixture
+            .team
+            .lead_model_choice(Some("high"), Some("test/scripted-difficult".into())),
+        Err(expected.clone())
+    );
+    assert_eq!(
+        fixture
+            .team
+            .validate_model(&Some("test/scripted-difficult".into()), &None),
+        Err(expected.clone())
+    );
+    let dispatched = fixture.dispatch(None, Some("test/scripted-difficult")).await;
+    assert!(!dispatched.success);
+    assert!(dispatched.output.contains(&expected), "{}", dispatched.output);
+    // Another model is still refused for what it is.
+    let unknown = fixture
+        .team
+        .validate_model(&Some("test/not-configured".into()), &None)
+        .expect_err("an unknown model");
+    assert!(unknown.contains("is not a configured model"), "{unknown}");
+    fixture.team.shutdown().await;
+}
+
 #[tokio::test]
 async fn worker_host_tools_offer_plan_read() {
     let root = tempfile::tempdir().expect("workspace");

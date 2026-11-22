@@ -44,8 +44,9 @@ Rules:
 - Choose the cheapest tier that fits the step. The tier's first available model runs the worker.
 - A step with a complete spec goes on `routine` or `trivial`, even when it spans several files: the spec already made the design decisions, and the cheap tier follows them at a fraction of the cost. Move up only when the spec leaves real decisions to the worker, or when Laya names a higher tier at about 0.75 confidence or more. A Laya answer below that is not a reason to move up.
 - An empty tier runs on the nearest tier below it that has a model, and the dispatch result says so ("medium has no model; ran on routine"). Fix rounds and audits fold the same way.
-- The `tier` parameter of `team_dispatch` lists each tier's name, definition, models and prices. Read it before choosing.
-- Pass `model` only when the tier's first model does not fit. It must be a model some tier names; anything else is refused with the allowed list.
+- `team_tiers` gives the live setup: each tier's models in order with their health (available, unavailable until a time after a usage limit, or not configured), its effort, whether it runs as a Claude Code agent, and the tier and model a dispatch would run on now. Read it before choosing a tier or pinning a model, and again whenever a result says the tiers changed. The `tier` parameter of `team_dispatch` carries the same ladder with prices, but Claude Code may still show you an older copy of it.
+- Pass `model` only when the tier's first model does not fit. It must be a model some tier names; anything else is refused with the allowed list. A model pinned on a tier that runs as a Claude Code agent bypasses the agent and starts a Mnemo worker. The result warns, so pin one there only on purpose.
+- A model whose worker hit a provider usage limit (quota, credits, billing) is out for six hours. The tiers skip it and fold to the next available model, and naming it is refused with the time it comes back. The failure notice says what Mnemo marked and where the tier runs now. In "Auto" routing mode Mnemo resumes the worker there itself; otherwise the notice ends with the `team_resume` call to make.
 - `reasoning_effort` is optional and must be one the chosen model supports; without it the tier's default effort applies.
 - Tiers are enforced server-side. With tiers configured, a dispatch with neither `tier` nor `model` is refused.
 - Those five ids are the only tier names. `simple`, `average` and `difficult` are refused, and the error lists the five ids.
@@ -53,17 +54,26 @@ Rules:
 
 ### Tiers that run as a Claude Code agent
 
-In Mnemo2 Settings > Tiers, any tier except `escalate` can run as a Claude Code agent (Opus, Sonnet, Haiku or Fable). Its line in the `tier` parameter of `team_dispatch` then ends with "runs as a Claude Code agent (<model>) when Claude Code leads". When you lead and a dispatch settles on such a tier, Mnemo2 prepares the worktree and branch but starts no worker session. The dispatch result carries a `claude_agent` block with `model`, `worktree`, `branch` and `prompt`, and you run the step:
+In Mnemo2 Settings > Tiers, any tier except `escalate` can run as a Claude Code agent (Opus, Sonnet, Haiku or Fable), optionally at a set effort. `team_tiers` shows such a tier with `run_as` kind `claude_agent`, and its line in the `tier` parameter of `team_dispatch` ends with "runs as a Claude Code agent (<model>) when Claude Code leads". When you lead and a dispatch settles on such a tier, Mnemo2 prepares the worktree and branch but starts no worker session. The dispatch result carries a `claude_agent` block with `model`, `effort`, `worktree`, `branch` and `prompt`, and you run the step:
 
-1. Start your `Agent` tool in the background, with `model` set to `claude_agent.model` and `prompt` set to `claude_agent.prompt`, unchanged. The prompt already holds the plan, the step, your brief, the worktree, the branch and the rules. While the worker is working, the Mnemo gate lets this agent run without a permission prompt.
-2. When the agent returns, call `team_agent_done` with the `worker_id` and the agent's report, adding `failed: true` if it could not finish. The usual "finished its turn" notice follows.
-3. Review it like any other worker, with the `mnemo-review` skill. Run the checks yourself and record them with `team_check`, because Mnemo2 does not see the agent's own runs. Then `team_review`, an audit when the work is high risk, and `team_merge`.
+1. Start your `Agent` tool in the background with `model` set to `claude_agent.model`, its effort set to `claude_agent.effort` when that is not null, and `prompt` set to `claude_agent.prompt`, unchanged. The prompt already holds the plan, the step, your brief, the worktree, the branch and the rules. While an agent worker is Working or Fixing, the Mnemo gate lets this agent run without a permission prompt.
+2. Right after launching it, call `team_agent_started` with the `worker_id` and the agent's id, plus `transcript_path` when you know it. Mnemo then follows the agent's transcript: `team_status` shows its last activity, tool calls and tokens, mission control shows its log, and a notice comes when it has been silent for ten minutes or has finished. The agent posts one-line `team_progress` notes at its milestones, and they reach you as notices.
+3. When the agent returns, call `team_agent_done` with the `worker_id` and the agent's report, adding `failed: true` if it could not finish. The usual "finished its turn" notice follows.
+4. Review it like any other worker, with the `mnemo-review` skill. Mnemo2 does not see the agent's own check runs, so call `team_run_checks` with the `worker_id`, or run the checks yourself and record them with `team_check`. Then `team_review`, an audit when the work is high risk, and `team_merge`.
 
-With `read_back: true`, the agent's first run ends with its questions, or "No questions.". Record the answers with `plan_update`, then continue the agent with `SendMessage`. Call `team_agent_done` only after it has finished the step.
+With `read_back: true`, the agent's first run ends with its questions, or "No questions.". Record the answers with `plan_update`, then continue the agent with `SendMessage`, and call `team_agent_done` once it has finished the step.
 
-To fix findings, continue the same agent with `SendMessage`. A new `Agent` gets a permission prompt, because the gate lets agents through only while an agent worker is working. Once the fix is committed, run the checks and `team_review` again on the new tip; `team_agent_done` is called only once per worker. `review_fix` works as usual, but `team_message`, `team_resume`, `team_route_fix` and `team_compact` refuse these workers. `team_stop` clears the worker record; stop your own agent separately. A failed agent worker cannot be resumed: dispatch the step again with a new `worker_id`, or `team_stop` it to clear it.
+To continue an agent worker, go through the Mnemo tools so its record stays true, then pass their text on:
 
-Passing `model` to `team_dispatch` always starts a Mnemo worker. When Mnemo2's own lead leads, the tier runs on its models as usual.
+- `team_message` records your message, moves an idle worker back to work, and answers with a `continue_agent` block (`agent_id`, `worktree`, `message`). Send `message` to that agent with `SendMessage`. With no registered agent, the answer tells you to start a new `Agent` in the worktree with the message, then call `team_agent_started`.
+- `team_route_fix` records the fix round exactly as for a Mnemo worker and answers the same way, with the fix brief as the message.
+- Call `team_agent_done` once per agent run: after the step, after each continuation and after each fix round. Then check and review the new tip.
+
+`review_fix` works as usual. `team_resume` and `team_compact` refuse agent workers. `team_stop` clears the worker record; stop your own agent separately. A failed or stopped agent worker cannot be continued: dispatch the step again with a new `worker_id`.
+
+A Mnemo worker can move onto an agent tier mid-step. While you lead, `team_resume` with that `tier` and no `model`, an auto escalation onto it, or Mnemo's usage-limit resume onto it stops the Mnemo session, keeps the worker's record, branch and commits, and hands the step to your agent. `team_resume` answers with the `claude_agent` block; the automatic moves send a notice that ends with the block as JSON. Launch your `Agent` with it as in step 1 and go on from step 2. The prompt tells the agent which model worked on the step before it, and to read `git status`, the log since the base commit and the diff before changing anything.
+
+Passing `model` always means a Mnemo worker: `team_dispatch` starts one on it, and `team_resume` switches a Mnemo worker to it. When Mnemo2's own lead leads, the tier runs on its models as usual.
 
 ## Briefs
 
@@ -86,7 +96,15 @@ Give whole, self-contained implementation tasks. Never send read-only, content-o
 - The same ID with a different brief, model or step is refused.
 - A dispatch also fails when all worker slots are busy, or when the board refuses it: unknown or closed plan, step already done, or a file shared with a step in flight that has no recorded interface.
 
-Parallel steps need disjoint files. If two steps share a file or module boundary, record the contract first with `plan_update` `interface`. When steps run in parallel Mnemo2 appends an "Integration check" step to the plan. Run the combined result yourself, then `plan_step_done`.
+Parallel steps need disjoint files. If two steps share a file or module boundary, record the contract first with `plan_update` `interface`. When steps run in parallel Mnemo2 appends an "Integration check" step to the plan. Run the combined result yourself (`team_run_checks` with no `worker_id` runs the checks in the lead checkout), then `plan_step_done`.
+
+A dispatch result's `warnings` names uncommitted `.coding/` files in the lead checkout that the worker's checkout will not contain; commit them first if the worker needs them. It also carries the tier warnings above.
+
+### Fresh bases and other branches
+
+Every worker starts from the lead branch's current tip, and its prompt names that commit. An idle worker with no commits of its own is fast-forwarded to the lead tip before your next message reaches it, and the message says so. A worker that already has commits is never rewritten: `team_status`, `team_check` and `team_merge` report `stale_base`, the number of lead commits its branch lacks.
+
+When those commits matter (the worker needs code that landed meanwhile, or its checks ran without it), merge the lead branch into the worker with `team_integrate`. It merges any existing local branch into a worker's branch, in the worker's checkout, so use it too when a step needs another worker's branch. A conflict aborts the merge, changes nothing and lists the files. A Mnemo worker hears about the merge with its next message; for an agent worker, pass on the note in the result. The merge commit is a new tip, so checks and review start over.
 
 ## Review and merge cycle
 
@@ -94,15 +112,16 @@ A worker's turn ends with a "finished its turn" notice. Then:
 
 1. `team_status` with the exact `worker_id`: status, `branch`, `worktree`, findings, checks.
 2. Read the diff yourself before the worker's summary.
-3. Check what the worker already proved. When a worker ran the commands listed in `.coding/checks.toml` exactly as written in its checkout root and committed exactly the tree it tested, Mnemo2 records them as passed checks on that tip (their detail says the worker ran them). Run only what is missing, what the change needs beyond them, or what you doubt, in the worker's worktree, and record each command you really ran with `team_check` (`name`, `status` passed or failed, `detail`). Checks are bound to the tip; any later commit invalidates them.
+3. Check what the worker already proved. When a worker ran the commands listed in `.coding/checks.toml` exactly as written in its checkout root and committed exactly the tree it tested, Mnemo2 records them as passed checks on that tip (their detail says the worker ran them). Run only what is missing, what the change needs beyond them, or what you doubt, in the worker's worktree, and record each command you really ran with `team_check` (`name`, `status` passed or failed, `detail`). Or let Mnemo run them: `team_run_checks` with the `worker_id` runs every `.coding/checks.toml` command in the worker's checkout, records each on the tip it started at, and sends a notice with the results. Until that notice, the tools that would move the checkout refuse the worker. Checks are bound to the tip; any later commit invalidates them.
 4. `team_review` with `summary`, the complete `findings` list and `evidence`.
    - `evidence` needs `unanchored_pass` true and non-empty `intent`, `execution`, `integration`, `test_quality` and `residual_risk`.
    - Exception, a light change: `unanchored_pass` true and `intent` are enough. Mnemo2 decides from the diff and the `team_review` result says which applied. A change is light when it is not high risk and either it changes at most 60 lines in total, or every changed file is Markdown (`.md`) or a test file (a `tests` folder, or `.test.`, `.spec.`, `_test.` or `_tests.` in the file name). A test module inside a normal source file does not make it a test file. A light review still reads the diff and records at least one check.
    - The worker must be idle. A passing test count alone is not a review.
    - Each review replaces the finding list: send every finding every time, and reuse finding ids when re-reviewing.
+   - A review with no open findings at a tip that lacks a passed check for some `.coding/checks.toml` command starts `team_run_checks` on its own, and the result says so. Merge after its notice.
 5. Every open finding (`title`, `detail`, `file`, `line`, `severity` high or low) blocks the merge, whatever its severity. Close them:
    - Tiny exact fix: `review_fix`. One `old_string` that occurs exactly once in the finding's file, at most 100 lines in total, not in test files or `.coding`. It commits on the worker branch, marks the finding fixed, and clears checks and review, so re-check and re-review.
-   - Larger fix: `team_route_fix` hands the finding to the same worker and clears checks and review. The fix prompt carries every open finding in full (id, severity, title, detail, file, line), so one round fixes them together. A new "finished its turn" notice arrives when it is done. Do a delta review: re-run checks, `team_review` again.
+   - Larger fix: `team_route_fix` hands the finding to the same worker and clears checks and review. The fix prompt carries every open finding in full (id, severity, title, detail, file, line), so one round fixes them together. It asks the worker to verify with the narrowest tests that cover the fix, not the full checks: Mnemo runs those once at the reviewed tip. A new "finished its turn" notice arrives when it is done. Do a delta review: read the fix diff, `team_review` again, and let the full checks run then.
      - It takes an optional `tier`: a ladder id runs the round on that tier's model in the same session (transcript, worktree and branch kept) — a cheaper tier is enough for a small exact fix; `auto` lets the routing question classify the findings' text. With `auto`, a `high`-severity finding, or one in a file the plan lists as an interface, never steps down; name the tier yourself if it must.
      - If the review after that round leaves the finding open, the worker is moved back to its previous tier at once, and the escalation notice below fires.
    - Fixed or not a problem: `team_resolve_finding` with `status` fixed plus `evidence`, or wontfix plus a written `justification`. It does not move the tip, so the review stays valid.
@@ -160,6 +179,10 @@ Mnemo2 sends lead notices that start with "[TeamManager notice — not the human
 - "failed: ...": it includes the last tool errors, so read them before choosing. A tool problem is not fixed by a stronger model. See Failures below.
 - "has cost about $N so far": one worker passed the cost alert ($2.00 by default, then at each doubling; `cost_notice_usd` in `[routing]` of mnemo2.toml, 0 turns it off). The worker keeps running: check it is not stuck, and steer or stop it if the spend is not justified.
 - "Laya nudge: ..." or "Auto escalation switched worker ...": escalation advice, see Escalation notices above.
+- "Mnemo ran the checks for <id>": the result of `team_run_checks`, one line per command. Merge when all passed; otherwise route the failures with `team_route_fix`.
+- "<id> moved to tier <tier>, which runs as a Claude Code agent": Mnemo handed a worker's step to your agent. Launch your `Agent` with the block at the end of the notice, then `team_agent_started`.
+- "<id> progress: ...", "<id>'s Claude Code agent finished" and "has written nothing for N minutes": an agent worker's progress note, its end (call `team_agent_done` with its report), and a silence worth checking.
+- "Laya reads <id>'s step as <tier>, which runs as a Claude Code agent": the model you pinned bypassed that tier's agent. Nothing changes unless you dispatch the step again by tier.
 - "finished its read-only audit": adjudicate it, see High-risk work.
 - "Plan this backlog item <id>": the user handed you a backlog idea. Write the plan with `plan_create` and pass that item's `backlog_id`; the item is marked done with the new plan's id.
 - "Plan X step N is done", "Plan X is closed", "cannot close yet", "could not be ticked": board events. Read them, then `plan_show`. A "cannot close yet" can name a spec change that no longer applies to the current spec: fix it with `plan_update`, then tick the last step again.
@@ -210,7 +233,7 @@ The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one w
 
 ## Failures and course changes
 
-- Worker failed: read the tool errors in the notice or team_status (`tool_errors`). To continue on the same model, team_message it, or team_resume with no tier to set it idle first. To move it, team_resume with `worker_id` and a `tier` or `model` (optionally `reasoning_effort`). An idle worker restarts on it with its transcript kept; a working one must be stopped first. The resumed worker is idle, so `team_message` it to continue. Without a `tier`, `model` or effort, `team_resume` restarts a stopped, interrupted or failed worker as it was.
+- Worker failed: read the tool errors in the notice or team_status (`tool_errors`). To continue on the same model, team_message it, or team_resume with no tier to set it idle first. To move it, team_resume with `worker_id` and a `tier` or `model` (optionally `reasoning_effort`). An idle worker restarts on it with its transcript kept; a working one must be stopped first. The resumed worker is idle, so `team_message` it to continue. A `tier` that runs as a Claude Code agent hands the step to your agent instead (see Tiers that run as a Claude Code agent). Without a `tier`, `model` or effort, `team_resume` restarts a stopped, interrupted or failed worker as it was.
 - Wrong direction or new information: `team_message` steers a busy worker and prompts an idle one.
 - Cancel: `team_stop` ends the live session and keeps the record, branch, worktree and commits. `team_resume` can bring it back.
 - Heavy worker context: `team_compact` on a quiescent worker. A "working" result means requested, not finished. Check `team_status`.
@@ -219,7 +242,7 @@ The Mnemo tools are deferred `mcp__plugin_mnemo_mnemo__<name>` tools: load one w
 
 ## Claude Code's own agents are a last resort
 
-Mnemo workers do the delegated work. Do not use `Agent`, `Task` or `Workflow` to implement, research or review while a Mnemo worker could. They run on the user's Claude subscription and bypass the team's tiers, review and merge gates. The one exception is a dispatch that returns a `claude_agent` block: run that agent as "Tiers that run as a Claude Code agent" above describes. The lookup agents `Explore` and `claude-code-guide` pass without a prompt.
+Mnemo workers do the delegated work. Do not use `Agent`, `Task` or `Workflow` to implement, research or review while a Mnemo worker could. They run on the user's Claude subscription and bypass the team's tiers, review and merge gates. The one exception is a `claude_agent` block, from a dispatch, a `team_resume` or a hand-off notice: run that agent as "Tiers that run as a Claude Code agent" above describes. The lookup agents `Explore` and `claude-code-guide` pass without a prompt.
 
 If Mnemo truly cannot do the job (Mnemo2 is down, or the task needs Claude-only capabilities), say why in chat and ask the user first. A PreToolUse hook then shows a permission prompt for the call, and the user's answer is final. Do not look for ways around it.
 

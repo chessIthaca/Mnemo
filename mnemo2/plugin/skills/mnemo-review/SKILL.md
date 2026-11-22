@@ -11,7 +11,8 @@ The review is yours; the worker's summary is a claim, not evidence. The merge ga
 ## 1. Orient
 
 - `team_status` with the exact `worker_id` from the notice. Note `status`, `branch`, `worktree`, `plan_id` and step, `review_risk`, any open findings and recorded checks. A worker is reviewable when it is idle (completed or in review). If it is still working, wait for its notice.
-- A worker whose `model` is `claude-code/<model>` runs as a Claude Code agent and has no Mnemo session. Review it the same way, but run the checks yourself, since Mnemo2 does not see the agent's runs. For a fix larger than `review_fix`, continue the agent with `SendMessage` instead of `team_route_fix`, then check and review the new tip.
+- A worker whose `model` is `claude-code/<model>` runs as a Claude Code agent and has no Mnemo session. Review it the same way, but Mnemo2 does not see the agent's own check runs: start `team_run_checks` or run them yourself. For a fix larger than `review_fix`, call `team_route_fix`, send the `continue_agent` message to the agent with `SendMessage`, and call `team_agent_done` when it returns; then check and review the new tip.
+- A `stale_base` count means the lead branch has commits the worker's branch lacks. If the change or its checks depend on them, merge the lead branch in with `team_integrate` before you check and review.
 - `plan_show` for the plan: the step's text, the decisions and the interfaces are the intent you review against.
 
 ## 2. Read the diff unanchored
@@ -34,7 +35,7 @@ Look for:
 
 Run the verification commands from the plan and the brief inside the worker's `worktree`, so the exact tip is tested. Add the project's usual build, test and lint commands when the brief did not name them.
 
-Checks the worker ran from `.coding/checks.toml` on its final tree arrive already recorded (their detail says so); do not rerun them unless you doubt them. Workers record checks with `run_checks`, which runs every check in one call and records the passing ones. Record each command you really ran with `team_check`: a short `name` (for example "cargo test"), `status` passed or failed, and the relevant output in `detail`. Never record a command you did not run. A failed check goes in as failed, and its failure becomes a finding or goes back to the worker. Checks belong to the tip; after any new commit run them again.
+Checks the worker ran from `.coding/checks.toml` on its final tree arrive already recorded (their detail says so); do not rerun them unless you doubt them. `team_run_checks` has Mnemo run every checks.toml command in the worker's checkout and record the results on that tip, with a notice when it is done; a review with no open findings starts it on its own for any command still missing. During a fix round the worker runs only the narrowest tests that cover its fix, so the full checks run once, at the reviewed tip. Workers record checks with `run_checks`, which runs every check in one call and records the passing ones. Record each command you really ran with `team_check`: a short `name` (for example "cargo test"), `status` passed or failed, and the relevant output in `detail`. Never record a command you did not run. A failed check goes in as failed, and its failure becomes a finding or goes back to the worker. Checks belong to the tip; after any new commit run them again.
 
 Mnemo2 runs two proofs itself, so you do not have to take them on trust. After a `bug_fixing` worker's turn whose diff adds the plan's `regression_test`, it reverses only the change's source hunks, runs that test again and records the outcome: the check `regression test fails without the fix` when the test fails without the fix, the finding `regression-not-red` (high) when it still passes, or `regression-proof-inconclusive` when the run could not decide. For a high-risk worker with a `[mutation]` table configured it also reports the changed lines no test catches as `No test catches: ...` findings. An automatic mutation run is skipped when this session already mutated that tip or the change touches only test files, and a missing mutation tool arrives once as a notice, not as a worker error. Both results arrive as checks and findings like any other; `team_prove_regression` and `team_mutation_check` rerun them on demand, and the merge gate refuses a bug fix whose regression test has not been proven red at the tip being merged — the only waiver is a proof finding resolved `wontfix` with a written reason; a finding closed `fixed` never waives.
 
@@ -58,7 +59,7 @@ A change is light when it is not high risk and either it changes at most 60 line
 ## 5. Close findings
 
 - Tiny and exact: `review_fix`. Then re-run the checks and re-review, since it moves the tip.
-- Larger: `team_route_fix`. Wait for the worker's next "finished its turn" notice, review the delta, re-run the checks, and `team_review` again.
+- Larger: `team_route_fix`. Wait for the worker's next "finished its turn" notice, review the delta, and `team_review` again; with no finding left open, the review starts the full checks itself, so merge after their notice.
 - Verified fixed without moving the tip, or deliberately not changed: `team_resolve_finding` with `fixed` plus evidence, or `wontfix` plus a written justification.
 
 ## 6. Independent audit when the risk is high

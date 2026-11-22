@@ -27,6 +27,8 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
+use mnemo::app::worktrees::is_link_or_junction;
+
 use crate::mnemo2::phase3;
 
 use super::pump::save_workers;
@@ -81,6 +83,8 @@ struct Observed {
     tail: Vec<u8>,
     /// A line longer than the cap is being skipped up to its newline.
     skipping: bool,
+    /// The longest line kept; 0 means [`TAIL_CAP`]. Tests set a small one.
+    cap: usize,
     /// Length and hash of the file's first bytes when last read: a changed
     /// hash means the file was replaced.
     fingerprint: Option<(u64, u64)>,
@@ -135,6 +139,14 @@ impl AgentWatch {
         }
     }
 
+    /// Lower a worker's line cap. Tests only.
+    #[cfg(test)]
+    pub(super) fn set_line_cap_for_test(&self, worker_id: &str, cap: usize) {
+        if let Some(observed) = self.lock().states.get_mut(worker_id) {
+            observed.cap = cap;
+        }
+    }
+
     /// The bytes of an unfinished line kept for a worker. Tests only.
     #[cfg(test)]
     pub(super) fn tail_len_for_test(&self, worker_id: &str) -> Option<usize> {
@@ -181,9 +193,9 @@ fn locate(root: &Path, agent_id: &str) -> Option<PathBuf> {
         };
         for session in sessions.flatten() {
             let candidate = session.path().join("subagents").join(&file);
-            if confined(root, &candidate, agent_id).is_none() {
+            let Some(candidate) = confined(root, &candidate, agent_id) else {
                 continue;
-            }
+            };
             let Ok(meta) = std::fs::metadata(&candidate) else {
                 continue;
             };
@@ -194,23 +206,6 @@ fn locate(root: &Path, agent_id: &str) -> Option<PathBuf> {
         }
     }
     newest.map(|(_, path)| path)
-}
-
-/// Whether a directory entry is a symlink or a Windows junction (or other
-/// reparse point).
-fn is_link(meta: &std::fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & REPARSE_POINT != 0 {
-            return true;
-        }
-    }
-    false
 }
 
 /// The path when it is an existing file named exactly
@@ -226,29 +221,30 @@ fn confined(root: &Path, path: &Path, agent_id: &str) -> Option<PathBuf> {
     }
     let canonical = std::fs::canonicalize(path).ok()?;
     let canonical_root = std::fs::canonicalize(root).ok()?;
-    let below = canonical.strip_prefix(&canonical_root).ok()?;
-    if canonical.file_name()?.to_str()? != expected || !std::fs::metadata(&canonical).ok()?.is_file()
+    if !canonical.starts_with(&canonical_root)
+        || canonical.file_name()?.to_str()? != expected
+        || !std::fs::metadata(&canonical).ok()?.is_file()
     {
         return None;
     }
-    // The last `below` components of the given spelling are the ones under
-    // the root: none of them may be a link.
-    let given: Vec<_> = path.components().collect();
-    let depth = below.components().count();
-    if given.len() < depth {
-        return None;
-    }
-    let mut walked = PathBuf::new();
-    for (index, component) in given.iter().enumerate() {
-        walked.push(component);
-        if index + depth >= given.len() {
-            let meta = std::fs::symlink_metadata(&walked).ok()?;
-            if is_link(&meta) {
-                return None;
-            }
+    // Walk the given spelling upward from the file to the projects root:
+    // the file and every folder strictly below the root must not be a link,
+    // and the walk must reach the root.
+    let mut current = path;
+    loop {
+        if current == root {
+            return Some(canonical);
         }
+        let meta = std::fs::symlink_metadata(current).ok()?;
+        if is_link_or_junction(&meta) {
+            return None;
+        }
+        if std::fs::canonicalize(current).ok()? == canonical_root {
+            // Another spelling of the root itself.
+            return Some(canonical);
+        }
+        current = current.parent()?;
     }
-    Some(path.to_path_buf())
 }
 
 /// What a transcript search found.
@@ -367,13 +363,25 @@ impl Observed {
         self.fingerprint = None;
     }
 
+    /// The longest line that is parsed.
+    fn line_cap(&self) -> usize {
+        if self.cap == 0 {
+            TAIL_CAP
+        } else {
+            self.cap
+        }
+    }
+
     /// Count the complete lines in `tail`, keeping the unfinished rest.
     fn drain_lines(&mut self) {
+        let cap = self.line_cap();
         let mut start = 0;
         while let Some(found) = self.tail[start..].iter().position(|byte| *byte == 10) {
             let end = start + found;
             if self.skipping {
                 self.skipping = false;
+            } else if end - start > cap {
+                // A line over the cap is skipped, though it is complete.
             } else if end > start {
                 let line = self.tail[start..end].to_vec();
                 read_line(self, &line);
@@ -383,8 +391,8 @@ impl Observed {
         self.tail.drain(..start);
         if self.skipping {
             self.tail.clear();
-        } else if self.tail.len() > TAIL_CAP {
-            // A line longer than the cap: skip it up to its newline.
+        } else if self.tail.len() > cap {
+            // An unfinished line longer than the cap: skip it up to its newline.
             self.tail.clear();
             self.skipping = true;
         }
@@ -663,6 +671,23 @@ async fn tick(
 /// both reach the lead.
 static PROGRESS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The clock progress notes are stamped with. Tests pin it (non-zero) to
+/// post two notes in the same millisecond.
+#[cfg(test)]
+pub(super) static PROGRESS_CLOCK_FIXED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn progress_now() -> u128 {
+    #[cfg(test)]
+    {
+        let fixed = PROGRESS_CLOCK_FIXED.load(std::sync::atomic::Ordering::SeqCst);
+        if fixed != 0 {
+            return u128::from(fixed);
+        }
+    }
+    phase3::now_ms()
+}
+
 /// The longest progress note, in characters.
 const PROGRESS_NOTE_CHARS: usize = 500;
 
@@ -757,7 +782,7 @@ impl TeamRuntime {
         }
         let worker = self.worker(worker_id).await?;
         agent_worker_in_work(&worker, "team_progress")?;
-        let at_ms = phase3::now_ms();
+        let at_ms = progress_now();
         self.update_worker(worker_id, |worker| {
             append_inbox(
                 worker,

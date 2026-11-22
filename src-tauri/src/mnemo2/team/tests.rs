@@ -16655,8 +16655,9 @@ async fn agent_watch_fixture(
         .team
         .agent_watch
         .set_projects_root_for_test(projects.path().to_path_buf());
-    let transcript = projects
-        .path()
+    // The transcript path is stored canonical, so the tests compare to it.
+    let transcript = std::fs::canonicalize(projects.path())
+        .expect("canonical projects folder")
         .join("D--proj")
         .join("session1")
         .join("subagents")
@@ -16995,7 +16996,9 @@ async fn two_progress_notes_in_one_tick_both_notify() {
     let (fixture, _projects, _transcript) = agent_watch_fixture("agentWatch11").await;
     let team = &fixture.team;
     let mut notices = team.subscribe_board();
-    for note in ["read the code", "wrote the code"] {
+    // Two notes of equal length in the same millisecond.
+    super::agent_watch::PROGRESS_CLOCK_FIXED.store(1_700_000_000_000, std::sync::atomic::Ordering::SeqCst);
+    for note in ["read the code", "made the code"] {
         let posted = team
             .handle_lead_host_tool(
                 "team_progress",
@@ -17004,8 +17007,85 @@ async fn two_progress_notes_in_one_tick_both_notify() {
             .await;
         assert!(posted.success, "{}", posted.output);
     }
+    super::agent_watch::PROGRESS_CLOCK_FIXED.store(0, std::sync::atomic::Ordering::SeqCst);
     let keys = notice_keys(&mut notices, "progress:");
     assert_eq!(keys.len(), 2, "{keys:?}");
-    assert_ne!(keys[0], keys[1]);
+    assert_ne!(keys[0], keys[1], "the lead pump drops a repeated key");
+    team.shutdown().await;
+}
+
+/// Link `link` to the folder `target`: a junction on Windows, a symlink
+/// elsewhere. `false` when the machine cannot make one.
+fn make_dir_link(link: &std::path::Path, target: &std::path::Path) -> bool {
+    let status = if std::env::consts::OS == "windows" {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+    } else {
+        std::process::Command::new("ln")
+            .arg("-s")
+            .arg(target)
+            .arg(link)
+            .output()
+    };
+    status.is_ok_and(|out| out.status.success()) && link.exists()
+}
+
+#[tokio::test]
+async fn a_link_below_the_projects_root_is_rejected() {
+    let (fixture, projects, transcript) = agent_watch_fixture("agentWatch12").await;
+    let team = &fixture.team;
+    let root = projects.path();
+    // R/link points back at R: R/link/D--proj/session1/subagents/... is the
+    // same file, one link deeper than the canonical path is.
+    let link = root.join("link");
+    if !make_dir_link(&link, root) {
+        eprintln!("skipped: this machine cannot create a directory link");
+        team.shutdown().await;
+        return;
+    }
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let through_link = link
+        .join("D--proj")
+        .join("session1")
+        .join("subagents")
+        .join("agent-a1b2c3.jsonl");
+    assert!(through_link.is_file());
+    let result = start_agent(
+        team,
+        "agentWatch12",
+        serde_json::json!({"transcript_path": through_link.to_string_lossy()}),
+    )
+    .await;
+    assert!(result.output.contains("was ignored"), "{}", result.output);
+    // The glob finds the real file; the stored path is the canonical one.
+    let worker = team.worker("agentWatch12").await.expect("worker");
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_over_cap_line_is_skipped() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch13").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, "");
+    assert!(start_agent(team, "agentWatch13", serde_json::json!({})).await.success);
+    // The first look creates the reading state; then the cap drops to 100.
+    status_agent(team, "agentWatch13").await;
+    team.agent_watch.set_line_cap_for_test("agentWatch13", 100);
+    let small = "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\"}]}}";
+    let big = format!(
+        "{{\"message\":{{\"role\":\"assistant\",\"pad\":\"{}\",\"content\":[{{\"type\":\"tool_use\"}}]}}}}",
+        "x".repeat(150)
+    );
+    assert!(small.len() <= 100 && big.len() > 100);
+    write_agent_transcript(&transcript, &format!("{small}\n{big}\n{small}\n"));
+    let agent = status_agent(team, "agentWatch13").await;
+    assert_eq!(agent["tool_calls"], 2, "the over-cap line is skipped: {agent}");
     team.shutdown().await;
 }

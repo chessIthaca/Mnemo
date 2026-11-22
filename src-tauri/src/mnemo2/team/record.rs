@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use mnemo::app::plan_board::PLAN_READ_TOOL_GUIDANCE;
 use mnemo::headless::{PendingInteraction, Transcript};
 use serde::{Deserialize, Serialize};
 
@@ -402,6 +403,13 @@ pub(crate) const KICKOFF: &str = "Your task is pinned in your instructions under
 /// answers.
 pub(crate) const READ_BACK_KICKOFF: &str = "Your task is pinned in your instructions under \"Your task (pinned)\". Before changing any file, read the spec and every file it names. Then send the lead one message (message_parent) listing each ambiguity, contradiction with the code, or decision the spec leaves open, numbered, with file and line, or exactly \"No questions.\" Then stop and wait. Start implementing only after the lead replies.";
 
+/// The opening prompt of a Claude Code agent that implements its inline task.
+pub(crate) const AGENT_KICKOFF: &str = "Your task is below under \"Your task\": the plan, your step's spec and the lead's brief. Implement it exactly as specified. If the spec contradicts the code or leaves a decision open, end your turn with the question instead of guessing; the lead answers and continues you.";
+
+/// The opening prompt of a read-back Claude Code agent: it asks its questions
+/// by ending its turn, not through a Mnemo worker tool it does not have.
+pub(crate) const AGENT_READ_BACK_KICKOFF: &str = "Your task is below under \"Your task\". Before changing any file, read the spec and every file it names. Then end your turn with one message that lists each ambiguity, contradiction with the code, or decision the spec leaves open, numbered, with file and line, or exactly \"No questions.\" Change nothing until the lead replies.";
+
 /// The first user message a worker's session receives: the short kickoff that
 /// points at the task pinned in the system head.
 pub(super) fn kickoff_message(record: &WorkerRecord) -> &'static str {
@@ -423,9 +431,23 @@ pub(super) fn agent_prompt(record: &WorkerRecord) -> String {
         .opening_prompt
         .clone()
         .unwrap_or_else(|| record.brief.clone());
+    let pinned = match &record.plan_id {
+        Some(plan_id) => pinned.replace(
+            PLAN_READ_TOOL_GUIDANCE,
+            &format!(
+                "Re-read this plan at any time with the Mnemo plan_show tool (plan_id {plan_id}), if you have it: the lead may record decisions or interfaces after you start."
+            ),
+        ),
+        None => pinned.replace(PLAN_READ_TOOL_GUIDANCE, ""),
+    };
+    let kickoff = if record.read_back {
+        AGENT_READ_BACK_KICKOFF
+    } else {
+        AGENT_KICKOFF
+    };
     format!(
-        "{}\n\nYour pinned task:\n\n{}\n\nThis step runs as a Claude Code agent, outside Mnemo's worker sessions:\n- Work only inside {} (cd there first; never touch the project's main checkout or any other checkout).\n- Commit your work on the branch {}.\n- Never push, never use git stash, never merge.\n- Run the commands in .coding/checks.toml exactly as written before your last commit.\n- End with a report of the commit hash, the checks you ran and their results, and anything left open.",
-        kickoff_message(record),
+        "{}\n\nYour task:\n\n{}\n\nThis step runs as a Claude Code agent, outside Mnemo's worker sessions:\n- Work only inside {}: run every shell command there (cd there first), and read and edit files only by absolute paths under it. Never touch the project's main checkout or any other checkout.\n- Commit your work on the branch {}.\n- Never push, never use git stash, never merge.\n- Where the task tells you to message the lead, end your turn with that message instead; the lead answers and continues you.\n- Leave Mnemo's team_* and plan_* tools to the lead; plan_show is the only one you may use.\n- Run the commands in .coding/checks.toml exactly as written before your last commit.\n- End with a report of the commit hash, the checks you ran and their results, and anything left open.",
+        kickoff,
         pinned,
         record.worktree.display(),
         record.branch,
@@ -438,10 +460,18 @@ pub(super) fn agent_prompt(record: &WorkerRecord) -> String {
 /// ordinary worker.
 pub(super) fn agent_worker_refusal(worker: &WorkerRecord) -> Option<String> {
     worker.claude_agent.as_ref().map(|_| {
-        format!(
-            "{} runs as a Claude Code agent: continue it with your own Agent (SendMessage to it, or a new Agent with the fix), then call team_agent_done.",
-            worker.id
-        )
+        let id = &worker.id;
+        match worker.status {
+            WorkerStatus::Working | WorkerStatus::Interrupted => format!(
+                "{id} runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done."
+            ),
+            WorkerStatus::Failed | WorkerStatus::Stopped | WorkerStatus::Cancelled => format!(
+                "{id} runs as a Claude Code agent and has ended: dispatch the step again with a new worker_id."
+            ),
+            _ => format!(
+                "{id} runs as a Claude Code agent: fix it with your own Agent (SendMessage to it), then run team_check and team_review on the new tip."
+            ),
+        }
     })
 }
 

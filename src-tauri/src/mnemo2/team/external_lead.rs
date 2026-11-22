@@ -543,11 +543,16 @@ impl TeamRuntime {
         )
         .await
         {
-            // No notice has been queued yet. Restore the exact pre-done
-            // record so memory and the durable ledger both stay retryable.
+            // No notice has been queued yet. Restore only the fields this
+            // completion changed; a concurrent routing classification or
+            // other independent update must survive the rollback.
             let mut records = self.records.lock().await;
             if let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) {
-                *worker = previous;
+                worker.status = previous.status;
+                worker.turns = previous.turns;
+                worker.pending = previous.pending.clone();
+                worker.compacting = previous.compacting;
+                worker.report = previous.report.clone();
             }
             return Err(error);
         }
@@ -595,11 +600,17 @@ impl TeamRuntime {
             },
         )
         .suffix();
-        let text = format!(
-            "{TEAM_NOTICE_PREFIX} worker_id={}{}\n{detail}\nUse team_status with this exact worker_id. Reply with team_message, or use team_stop/team_compact as appropriate. Never infer lifecycle from Git, files, timestamps, or team.json.",
-            worker.id,
-            tag,
-        );
+        let text = {
+            use std::fmt::Write as _;
+            let mut text = String::new();
+            let _ = writeln!(text, "{TEAM_NOTICE_PREFIX} worker_id={}{}", worker.id, tag);
+            let _ = writeln!(text, "{detail}");
+            let _ = write!(
+                text,
+                "Use team_status with this exact worker_id. Fix findings through your own agent (SendMessage to it); team_stop clears the worker. Never infer lifecycle from Git, files, timestamps, or team.json."
+            );
+            text
+        };
         if !self.push_external_notice(text.clone()) {
             self.restore_undelivered_notices(vec![text]);
         }

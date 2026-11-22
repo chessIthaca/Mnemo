@@ -37,6 +37,10 @@ use crate::codegraph::CodeGraph;
 use crate::memory::knowledge::KnowledgeStore;
 use crate::memory::{plan_scope, Memory, MemoryFilter, MemoryRecordType, MemoryStoreTrait};
 
+/// The plan-refresh sentence included in every worker brief. Agent prompts
+/// replace this exact text with the tool available to a Claude Code agent.
+pub const PLAN_READ_TOOL_GUIDANCE: &str = "Re-read this plan at any time with the plan_read tool: the lead may record decisions or interfaces after you start.";
+
 /// The board file name inside the plans dir.
 const BOARD_FILE: &str = "board.json";
 
@@ -737,9 +741,8 @@ impl PlanBoard {
         if let Some(bug) = &plan.bug_symptom {
             out.push_str(&format!("Bug symptom: {bug}\n"));
         }
-        out.push_str(
-            "Re-read this plan at any time with the plan_read tool: the lead may record decisions or interfaces after you start.\n",
-        );
+        out.push_str(PLAN_READ_TOOL_GUIDANCE);
+        out.push('\n');
         out.push_str(&format!("\n## Context\n{}\n", plan.context));
         if let Some(decisions) = &plan.decisions {
             out.push_str(&format!("\n## Decisions\n{decisions}\n"));
@@ -2410,7 +2413,7 @@ mod tests {
         let board = board(dir.path());
         let plan = create(&board, "Importer");
         let brief = board.brief_for(&plan.id, 1).unwrap();
-        let reference = "Re-read this plan at any time with the plan_read tool: the lead may record decisions or interfaces after you start.";
+        let reference = PLAN_READ_TOOL_GUIDANCE;
         assert!(brief.contains(reference), "{brief}");
         assert!(brief.find(reference).unwrap() < brief.find("## Context").unwrap());
     }

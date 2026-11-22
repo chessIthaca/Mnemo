@@ -14918,6 +14918,12 @@ async fn team_agent_done_finishes_the_worker_and_notifies_the_lead() {
         .expect("the finished notice reached the external lead");
     assert!(notice.contains("finished its turn"), "{notice}");
     assert!(notice.contains("Review it now"), "{notice}");
+    assert!(
+        notice.ends_with(
+            "Use team_status with this exact worker_id. Fix findings through your own agent (SendMessage to it); team_stop clears the worker. Never infer lifecycle from Git, files, timestamps, or team.json."
+        ),
+        "{notice}"
+    );
 
     // team_check, team_review and team_merge then work as for any worker.
     fixture
@@ -15108,9 +15114,24 @@ async fn session_tools_refuse_an_agent_worker() {
     ] {
         assert_eq!(
             refusal,
-            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it, or a new Agent with the fix), then call team_agent_done."
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done."
         );
     }
+
+    fixture
+        .team
+        .agent_done("agenttier10", "finished".into(), false)
+        .await
+        .expect("finish the agent worker");
+    let refusal = fixture
+        .team
+        .message("agenttier10", "fix the finding".into(), MessageSender::ExternalLead)
+        .await
+        .expect_err("a finished agent worker is fixed through the lead's agent");
+    assert_eq!(
+        refusal,
+        "agenttier10 runs as a Claude Code agent: fix it with your own Agent (SendMessage to it), then run team_check and team_review on the new tip."
+    );
 
     // team_stop still works: the lead cancels the record itself.
     let stopped = fixture
@@ -15119,6 +15140,15 @@ async fn session_tools_refuse_an_agent_worker() {
         .await
         .expect("team_stop still works on an agent worker");
     assert_eq!(stopped.status, WorkerStatus::Stopped);
+    let refusal = fixture
+        .team
+        .resume("agenttier10")
+        .await
+        .expect_err("an ended agent worker cannot be resumed");
+    assert_eq!(
+        refusal,
+        "agenttier10 runs as a Claude Code agent and has ended: dispatch the step again with a new worker_id."
+    );
 }
 
 #[tokio::test]
@@ -15185,7 +15215,7 @@ async fn agent_dispatch_read_back_uses_the_updated_record_and_reuses_the_same_bl
     assert!(
         first["prompt"]
             .as_str()
-            .is_some_and(|prompt| prompt.starts_with(super::record::READ_BACK_KICKOFF)),
+            .is_some_and(|prompt| prompt.starts_with(super::record::AGENT_READ_BACK_KICKOFF)),
         "the prompt uses the READ_BACK kickoff"
     );
 
@@ -15604,4 +15634,136 @@ async fn agent_workers_count_against_audit_slots() {
         .await
         .expect("audit dispatch succeeds once the agent is done");
     assert!(!reused);
+}
+
+
+#[tokio::test]
+async fn agent_prompt_names_only_tools_a_claude_agent_has() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "use only the tools available to a Claude Code agent",
+            "promptNorm1",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    let prompt = block["prompt"].as_str().expect("the agent prompt");
+    assert!(!prompt.contains("message_parent"), "{prompt}");
+    assert!(!prompt.contains("plan_read"), "{prompt}");
+    assert!(!prompt.contains("(pinned)"), "{prompt}");
+    assert!(prompt.contains("plan_show"), "{prompt}");
+    assert!(prompt.contains("end your turn"), "{prompt}");
+    assert!(
+        prompt.contains(record.worktree.to_str().expect("a utf-8 worktree")),
+        "{prompt}"
+    );
+
+    let mut read_back = agent_dispatch_request(
+        &fixture.plan_id,
+        "read the task back without Mnemo worker tools",
+        "promptRead1",
+    );
+    read_back.read_back = true;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(read_back)
+        .await
+        .expect("the read-back agent dispatch");
+    let block = claude_agent_block(&record).expect("the read-back agent block");
+    let prompt = block["prompt"].as_str().expect("the read-back prompt");
+    assert!(prompt.contains("No questions."), "{prompt}");
+    assert!(!prompt.contains("message_parent"), "{prompt}");
+    assert!(!prompt.contains("plan_read"), "{prompt}");
+}
+
+
+#[tokio::test]
+async fn team_agent_done_rollback_keeps_a_concurrent_routing_update() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "a concurrent routing classification must survive rollback",
+            "agentRb0001",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let transcript = fixture
+        .state
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join("agentRb0001.json");
+    std::fs::create_dir(&transcript).expect("inject the transcript rename failure");
+    let mut snapshot = fixture
+        .team
+        .worker("agentRb0001")
+        .await
+        .expect("the working snapshot");
+    snapshot.transcript = std::sync::Arc::new(Transcript::default());
+
+    let save_guard = fixture.team.save_lock.lock().await;
+    let done_team = fixture.team.clone();
+    let done = tokio::spawn(async move {
+        done_team
+            .agent_done_with_snapshot(
+                "agentRb0001",
+                "the failed completion must not erase routing".into(),
+                false,
+                Some(snapshot),
+            )
+            .await
+    });
+    // agent_done captures its rollback snapshot before waiting for this lock.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let routing = super::record::WorkerRouting {
+        laya_tier: Some("high".into()),
+        confidence: Some(0.91),
+        cleared: true,
+        lead_tier: Some("high".into()),
+        routed_by: "laya".into(),
+        ran_tier: Some("high".into()),
+        nudged: None,
+    };
+    fixture
+        .team
+        .update_worker("agentRb0001", |worker| {
+            worker.routing = Some(routing.clone());
+        })
+        .await;
+    drop(save_guard);
+    let error = done
+        .await
+        .expect("join the failed completion")
+        .expect_err("the injected save fails");
+    assert!(error.contains("could not replace the transcript"), "{error}");
+
+    let current = fixture
+        .team
+        .worker("agentRb0001")
+        .await
+        .expect("the rolled-back worker");
+    assert_eq!(current.status, WorkerStatus::Working);
+    assert_eq!(current.turns, 0);
+    assert!(current.report.is_none());
+    assert_eq!(current.routing.as_ref(), Some(&routing));
 }

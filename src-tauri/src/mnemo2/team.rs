@@ -717,14 +717,9 @@ impl TeamRuntime {
         ledger::live_turns(&self.records.lock().await)
     }
 
-    /// Persist a new live-session cap without dropping active workers.
-    pub async fn set_slots(&self, slots: usize) -> Result<TeamSnapshot, String> {
-        if !(1..=MAX_WORKER_SLOTS).contains(&slots) {
-            return Err(format!(
-                "worker slots must be between 1 and {MAX_WORKER_SLOTS}"
-            ));
-        }
-        let _operation = self.merge_lock.lock().await;
+    /// Active workers for every slot gate: live Mnemo sessions plus
+    /// session-free Claude Code agents in Working or Interrupted.
+    pub(super) async fn active_workers_for_slots(&self) -> usize {
         let active_agents = self
             .records
             .lock()
@@ -735,7 +730,18 @@ impl TeamRuntime {
                     && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Interrupted)
             })
             .count();
-        let active = self.live.lock().await.len() + active_agents;
+        self.live.lock().await.len() + active_agents
+    }
+
+    /// Persist a new live-session cap without dropping active workers.
+    pub async fn set_slots(&self, slots: usize) -> Result<TeamSnapshot, String> {
+        if !(1..=MAX_WORKER_SLOTS).contains(&slots) {
+            return Err(format!(
+                "worker slots must be between 1 and {MAX_WORKER_SLOTS}"
+            ));
+        }
+        let _operation = self.merge_lock.lock().await;
+        let active = self.active_workers_for_slots().await;
         if slots < active {
             return Err(format!(
                 "stop {} worker(s) before reducing slots to {slots}",

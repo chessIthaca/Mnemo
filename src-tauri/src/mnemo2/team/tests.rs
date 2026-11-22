@@ -15393,23 +15393,65 @@ async fn agent_done_persist_failure_rolls_back_and_can_retry() {
         .path()
         .join(TRANSCRIPTS_DIR)
         .join("agenttier15.json");
-    std::fs::create_dir(&transcript).expect("inject the transcript rename failure");
     let mut snapshot = fixture
         .team
         .worker("agenttier15")
         .await
         .expect("the working snapshot");
+    // Record the original transcript Arc as written. The ordinary concurrent
+    // saver then skips the transcript directory and races only the ledger,
+    // while the snapshot override's fresh Arc still forces the failure.
+    std::fs::write(
+        &transcript,
+        serde_json::to_vec(&*snapshot.transcript).expect("encode the empty transcript"),
+    )
+    .expect("seed the transcript");
+    fixture.team.persist().await.expect("record the transcript write");
+    std::fs::remove_file(&transcript).expect("replace the transcript with a directory");
+    std::fs::create_dir(&transcript).expect("inject the transcript rename failure");
     snapshot.transcript = std::sync::Arc::new(Transcript::default());
-    let error = fixture
-        .team
-        .agent_done_with_snapshot(
-            "agenttier15",
-            "this completion must not become durable".into(),
-            false,
-            Some(snapshot),
-        )
+
+    let save_guard = fixture.team.save_lock.lock().await;
+    let saver_team = fixture.team.clone();
+    let saver = tokio::spawn(async move { saver_team.persist().await });
+    tokio::task::yield_now().await;
+    let done_team = fixture.team.clone();
+    let done = tokio::spawn(async move {
+        done_team
+            .agent_done_with_snapshot(
+                "agenttier15",
+                "this completion must not become durable".into(),
+                false,
+                Some(snapshot),
+            )
+            .await
+    });
+    // Before the fix the shared record becomes Completed while the first
+    // saver is queued. With the fix it stays Working until the save lock is
+    // available, so the timeout is what lets the test proceed.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            let worker = fixture
+                .team
+                .worker("agenttier15")
+                .await
+                .expect("the worker while completion races a save");
+            if worker.status == WorkerStatus::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop(save_guard);
+    let error = done
         .await
+        .expect("join the completion")
         .expect_err("the injected transcript write fails");
+    saver
+        .await
+        .expect("join the concurrent saver")
+        .expect("the concurrent ledger save");
     assert!(error.contains("could not replace the transcript"), "{error}");
 
     let current = fixture
@@ -15455,4 +15497,111 @@ async fn agent_done_persist_failure_rolls_back_and_can_retry() {
         .expect("the persisted completed agent");
     assert_eq!(saved_worker.status, WorkerStatus::Completed);
     assert_eq!(saved_worker.report.as_deref(), Some("the clean retry completes"));
+}
+
+
+#[tokio::test]
+async fn agent_workers_count_against_resume_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    fixture.team.set_slots(1).await.expect("one worker slot");
+    assert!(fixture.team.attach_external_lead());
+    let mut normal = agent_dispatch_request(
+        &fixture.plan_id,
+        "a stopped Mnemo worker will later need the only slot",
+        "resumeB01",
+    );
+    normal.sender = MessageSender::Lead;
+    fixture
+        .team
+        .dispatch_request(normal)
+        .await
+        .expect("dispatch the Mnemo worker");
+    fixture.team.stop("resumeB01").await.expect("stop the worker");
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the agent now owns the only worker slot",
+            "agentRsum01",
+        ))
+        .await
+        .expect("dispatch the agent");
+
+    let error = fixture
+        .team
+        .resume("resumeB01")
+        .await
+        .expect_err("resume must not run alongside the active agent");
+    assert_eq!(error, "all 1 worker slots are busy");
+    fixture
+        .team
+        .agent_done("agentRsum01", "finished".into(), false)
+        .await
+        .expect("release the agent slot");
+    fixture
+        .team
+        .resume("resumeB01")
+        .await
+        .expect("resume succeeds once the agent is done");
+}
+
+
+#[tokio::test]
+async fn agent_workers_count_against_audit_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    fixture.team.set_slots(1).await.expect("one worker slot");
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the active agent occupies the audit's only possible slot",
+            "agentAud001",
+        ))
+        .await
+        .expect("dispatch the agent");
+
+    let mut target = worker(fixture._root.path(), "auditTarget");
+    target.plan_id = Some(fixture.plan_id.clone());
+    target.plan_step = Some(0);
+    provision_agent_worktree(
+        fixture._root.path().to_path_buf(),
+        target.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the audit target");
+    fixture.team.records.lock().await.push(target.clone());
+
+    let error = fixture
+        .team
+        .audit_dispatch(&target.id, "auditSlot01", None, None, None)
+        .await
+        .expect_err("audit dispatch must not run alongside the active agent");
+    assert_eq!(error, "all 1 worker slots are busy");
+    fixture
+        .team
+        .agent_done("agentAud001", "finished".into(), false)
+        .await
+        .expect("release the agent slot");
+    let (_, reused) = fixture
+        .team
+        .audit_dispatch(&target.id, "auditSlot01", None, None, None)
+        .await
+        .expect("audit dispatch succeeds once the agent is done");
+    assert!(!reused);
 }

@@ -16,6 +16,7 @@ use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
 use crate::mnemo2::runtime::{finished_notice, TEAM_NOTICE_PREFIX};
 
 use super::lead_tools::TeamLeadStatus;
+use super::pump::save_workers_now_locked;
 use super::record::{audit_finished, WorkerRecord, WorkerStatus};
 use super::{unix_ms, TeamRuntime};
 
@@ -517,6 +518,10 @@ impl TeamRuntime {
                 "{worker_id} is {status}: team_agent_done needs a Working or Interrupted agent worker"
             ));
         }
+        // Serialize the whole mutation/write/rollback section. Other savers
+        // take this guard before cloning records, so none can observe or
+        // persist the transient Completed state.
+        let save_guard = self.save_lock.lock().await;
         self.update_worker(worker_id, |worker| {
             worker.status = if failed {
                 WorkerStatus::Failed
@@ -529,7 +534,15 @@ impl TeamRuntime {
             worker.report = Some(report);
         })
         .await;
-        if let Err(error) = self.persist_with_snapshot(snapshot_override).await {
+        if let Err(error) = save_workers_now_locked(
+            &self.records,
+            &self.usage,
+            &self.persistence,
+            snapshot_override,
+            &save_guard,
+        )
+        .await
+        {
             // No notice has been queued yet. Restore the exact pre-done
             // record so memory and the durable ledger both stay retryable.
             let mut records = self.records.lock().await;
@@ -538,6 +551,7 @@ impl TeamRuntime {
             }
             return Err(error);
         }
+        drop(save_guard);
         let worker = self.worker(worker_id).await?;
         self.push_agent_done_notice(&worker, failed);
         Ok(worker)

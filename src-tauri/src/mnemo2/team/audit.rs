@@ -338,7 +338,7 @@ impl TeamRuntime {
             depth_hint.as_deref(),
         )
         .await?;
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));

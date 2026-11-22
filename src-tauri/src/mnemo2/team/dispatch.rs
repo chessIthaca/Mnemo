@@ -747,17 +747,7 @@ impl TeamRuntime {
                 ));
             }
         }
-        let active_agents = self
-            .records
-            .lock()
-            .await
-            .iter()
-            .filter(|worker| {
-                worker.claude_agent.is_some()
-                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Interrupted)
-            })
-            .count();
-        let active = self.live.lock().await.len() + active_agents;
+        let active = self.active_workers_for_slots().await;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));

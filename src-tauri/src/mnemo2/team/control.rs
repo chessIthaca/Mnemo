@@ -476,7 +476,7 @@ impl TeamRuntime {
                 "worker '{worker_id}' is already running; team_message it to continue"
             ));
         }
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));

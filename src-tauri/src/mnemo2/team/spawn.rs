@@ -308,7 +308,7 @@ impl TeamRuntime {
 
 
     pub(super) async fn start_worker(&self, record: WorkerRecord) -> Result<WorkerRecord, String> {
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));

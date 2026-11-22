@@ -3829,6 +3829,142 @@
       ],
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "4d920eec",
+      "status": "open",
+      "created_at_ms": 1795386932135,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "Agent workers get their warm checkout through Claude Code's worktree isolation",
+              "text": "When Claude Code leads and launches an agent worker's Agent with isolation \"worktree\", Mnemo's WorktreeCreate hook SHALL hand Claude Code the worker's Mnemo pool checkout and SHALL register the agent with the worker. Outside Mnemo work the hook SHALL create the folder Claude Code would create itself.",
+              "scenarios": [
+                {
+                  "name": "Isolated agent worker",
+                  "when": [
+                    "an agent worker waits for its agent",
+                    "the lead launches an Agent with isolation \"worktree\""
+                  ],
+                  "then": [
+                    "the agent runs in the worker's pool checkout on its branch"
+                  ],
+                  "and": [
+                    "the worker records the agent's id"
+                  ]
+                },
+                {
+                  "name": "Other isolated agent",
+                  "when": [
+                    "no agent worker waits for its agent",
+                    "an Agent starts with isolation \"worktree\""
+                  ],
+                  "then": [
+                    "the hook creates a folder under .claude/worktrees"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Agent worker dispatches wait for the previous launch and are capped",
+              "text": "A dispatch or hand-off that would leave a second agent worker waiting for its agent SHALL be refused, and so SHALL one that would make more than three agent workers run at once.",
+              "scenarios": [
+                {
+                  "name": "Second waiting agent",
+                  "when": [
+                    "one agent worker waits for its agent",
+                    "the lead dispatches another agent-tier step"
+                  ],
+                  "then": [
+                    "the dispatch is refused and names the waiting worker"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Cap of three",
+                  "when": [
+                    "three agent workers are Working or Fixing",
+                    "another agent-tier dispatch arrives"
+                  ],
+                  "then": [
+                    "it is refused"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "worker-brief",
+          "added": [
+            {
+              "requirement": "Agent prompts use no Mnemo tools",
+              "text": "The prompt of an agent worker SHALL tell the agent to commit on its branch in its own checkout and SHALL NOT ask it to use Mnemo tools or to change directory into a checkout.",
+              "scenarios": [
+                {
+                  "name": "Plain agent prompt",
+                  "when": [
+                    "an agent-tier step is dispatched"
+                  ],
+                  "then": [
+                    "the claude_agent prompt names the branch"
+                  ],
+                  "and": [
+                    "it names no team_* or plan_* tool and no cd rule"
+                  ]
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "tier-ladder",
+          "added": [
+            {
+              "requirement": "Pools return to the ladder's workers when no worker needs them",
+              "text": "A pool checkout held by an audit that has reported, or by a stopped or failed worker whose plan step is done, SHALL be released with its build output kept, so a later dispatch on any tier can reuse it warm.",
+              "scenarios": [
+                {
+                  "name": "Reported audit",
+                  "when": [
+                    "an audit worker delivers its report"
+                  ],
+                  "then": [
+                    "its pool is released and its record keeps the report"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

@@ -46,6 +46,7 @@ function rung(id: string, overrides: Partial<TierDto> = {}): TierDto {
     effort: null,
     role: id === "escalate" ? "escalate" : null,
     resolves_to: { trivial: "trivial", routine: "trivial", medium: "routine", high: "medium", escalate: "high" }[id] ?? "trivial",
+    claude_agent: null,
     ...overrides,
   };
 }
@@ -308,6 +309,69 @@ describe("TiersPage", () => {
     expect(within(medium).getByText("uses Routine's model")).toBeTruthy();
     const escalate = screen.getByRole("region", { name: "Escalate tier" });
     expect(within(escalate).getByText("only after a lower tier failed")).toBeTruthy();
+  });
+
+  it("offers Run as on every tier but escalate, with the agent choices in order", async () => {
+    renderPage();
+    for (const name of ["Trivial", "Routine", "Medium", "High"]) {
+      const tier = await screen.findByRole("region", { name: `${name} tier` });
+      expect(within(tier).getByLabelText("Run as")).toBeTruthy();
+    }
+    const high = screen.getByRole("region", { name: "High tier" });
+    const select = within(high).getByLabelText("Run as") as HTMLSelectElement;
+    expect(select.value).toBe("");
+    expect(Array.from(select.options).map((option) => option.textContent?.trim())).toEqual([
+      "Mnemo models",
+      "Claude Code agent — Opus",
+      "Claude Code agent — Sonnet",
+      "Claude Code agent — Haiku",
+      "Claude Code agent — Fable",
+    ]);
+    const escalate = screen.getByRole("region", { name: "Escalate tier" });
+    expect(within(escalate).queryByLabelText("Run as")).toBeNull();
+    expect(within(escalate).queryByText("Run as")).toBeNull();
+  });
+
+  it("picks Opus on High: hint, preview suffix, and the saved wire", async () => {
+    const saveTiers = vi.fn(async (next: TiersDto) => structuredClone(next));
+    const page = renderPage({ saveTiers });
+    const high = await screen.findByRole("region", { name: "High tier" });
+    const select = within(high).getByLabelText("Run as") as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "opus" } });
+    // The hint under the select explains when the choice applies.
+    expect(
+      within(high).getByText(
+        "When Claude Code leads, this tier runs on your Claude Code agent; the models above are used otherwise.",
+      ),
+    ).toBeTruthy();
+    // The preview line carries the same suffix the backend's tier_guidance adds.
+    expect(page.container.textContent).toContain(
+      "high (High) - high work: alpha/m1 ($1.5/$2.5); runs as a Claude Code agent (opus) when Claude Code leads",
+    );
+    // With an effort set, the suffix stays at the very end of the line.
+    await fireEvent.input(within(high).getByLabelText("Effort"), { target: { value: "high" } });
+    expect(page.container.textContent).toContain(
+      "high (High) - high work: alpha/m1 ($1.5/$2.5); effort high; runs as a Claude Code agent (opus) when Claude Code leads",
+    );
+
+    await fireEvent.click(screen.getByRole("button", { name: "Save tiers" }));
+    await waitFor(() => expect(saveTiers).toHaveBeenCalledTimes(1));
+    const sent = saveTiers.mock.calls[0][0];
+    expect(sent.tiers.find((tier) => tier.id === "high")?.claude_agent).toBe("opus");
+    expect(sent.tiers.filter((tier) => tier.id !== "high").every((tier) => tier.claude_agent === null)).toBe(true);
+  });
+
+  it("Discard drops the Run as pick back to Mnemo models", async () => {
+    const page = renderPage();
+    const high = await screen.findByRole("region", { name: "High tier" });
+    await fireEvent.change(within(high).getByLabelText("Run as"), { target: { value: "opus" } });
+    expect(within(high).getByText(/When Claude Code leads/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() =>
+      expect((within(high).getByLabelText("Run as") as HTMLSelectElement).value).toBe(""),
+    );
+    expect(within(high).queryByText(/When Claude Code leads/)).toBeNull();
+    expect(page.container.textContent).not.toContain("runs as a Claude Code agent");
   });
 
   it("shows the Laya label chips only while Laya helps pick", async () => {

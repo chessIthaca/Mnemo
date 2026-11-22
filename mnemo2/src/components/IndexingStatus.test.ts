@@ -97,6 +97,49 @@ describe("indexing status", () => {
     expect(screen.getByText("Laya check failed").getAttribute("title")).toBe("Laya stopped answering");
   });
 
+  it("shows the memory re-embed with its count and a progress bar", () => {
+    setIndexing(snapshot({ embeddings: { state: "running", done: 3200, total: 12444, detail: null } }));
+    render(IndexingStatus);
+    const done = (3200).toLocaleString();
+    const total = (12444).toLocaleString();
+    expect(screen.getByText(`Re-embedding memories · ${done}/${total} memories`)).toBeTruthy();
+    const bar = screen.getByRole("progressbar", { name: "Memory re-embed progress" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("26");
+  });
+
+  it("shows the memory re-embed before its total is known", () => {
+    setIndexing(snapshot({ embeddings: { state: "running", done: 0, total: 0, detail: null } }));
+    render(IndexingStatus);
+    expect(screen.getByText("Re-embedding memories")).toBeTruthy();
+  });
+
+  it("confirms the memory re-embed when it finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      setIndexing(snapshot({ revision: 1, embeddings: { state: "running", done: 3200, total: 12444, detail: null } }));
+      render(IndexingStatus);
+      setIndexing(snapshot({ revision: 2, embeddings: { state: "done", done: 12444, total: 12444, detail: "12,444 memories re-embedded for jina-embeddings-v2-base-code" } }));
+      await tick();
+      expect(screen.getByText("Memories re-embedded").getAttribute("title")).toBe("12,444 memories re-embedded for jina-embeddings-v2-base-code");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names a failed memory re-embed", () => {
+    setIndexing(snapshot({ embeddings: { state: "failed", done: 0, total: 12444, detail: "store closed" } }));
+    render(IndexingStatus);
+    expect(screen.getByText("Memory re-embed failed").getAttribute("title")).toBe("store closed");
+  });
+
+  it("renders a snapshot from an older host without an embeddings key", () => {
+    setIndexing({ revision: 1, firstRun: false, code: null, memory: { state: "running", done: 1, total: 2, detail: null } });
+    render(IndexingStatus);
+    expect(screen.getByText("Updating memory · 1/2 sources")).toBeTruthy();
+    expect(screen.queryByText("Memory re-embed failed")).toBeNull();
+    expect(screen.queryByRole("progressbar", { name: "Memory re-embed progress" })).toBeNull();
+  });
+
   it("holds the project only during a first run's code index", () => {
     setIndexing(snapshot({ firstRun: true, code: { state: "running", done: 0, total: 0, detail: null } }));
     const { unmount } = render(FirstIndexOverlay);

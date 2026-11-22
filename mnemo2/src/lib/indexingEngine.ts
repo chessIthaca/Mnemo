@@ -5,10 +5,10 @@ import { isTauriRuntime } from "./runtime";
 /** The channel carrying each new indexing snapshot from the native host. */
 export const INDEXING_EVENT_CHANNEL = "mnemo2://indexing";
 
-/** One startup pass: the code index, the memory reconcile, or the Laya check. */
+/** One startup pass: the code index, the memory reconcile, the Laya check, or the memory re-embed. */
 export interface IndexPass {
   state: "running" | "done" | "failed";
-  /** Units processed so far (files for code, sources for memory, tasks for the Laya check). */
+  /** Units processed so far (files for code, sources for memory, tasks for the Laya check, memories for the re-embed). */
   done: number;
   /** Units the pass will process; 0 while it is still counting. */
   total: number;
@@ -26,6 +26,8 @@ export interface IndexingSnapshot {
   memory: IndexPass | null;
   /** The Laya routing check; absent until a check has run. */
   laya?: IndexPass | null;
+  /** The automatic memory re-embed after an embedding-model change; absent until one runs. */
+  embeddings?: IndexPass | null;
 }
 
 export interface IndexingTransportBindings {
@@ -66,13 +68,14 @@ export function indexingHoldsProject(snapshot: IndexingSnapshot | null): boolean
 }
 
 /** The startup passes a status entry can describe. */
-export type PassKind = "code" | "memory" | "laya";
+export type PassKind = "code" | "memory" | "laya" | "embeddings";
 
-/** The passes still running, code first and the Laya check last. */
+/** The passes still running, code first, the memory re-embed last. */
 export function runningPasses(snapshot: IndexingSnapshot | null): { kind: PassKind; pass: IndexPass }[] {
   const passes: { kind: PassKind; pass: IndexPass }[] = [];
   if (snapshot?.code?.state === "running") passes.push({ kind: "code", pass: snapshot.code });
   if (snapshot?.memory?.state === "running") passes.push({ kind: "memory", pass: snapshot.memory });
   if (snapshot?.laya?.state === "running") passes.push({ kind: "laya", pass: snapshot.laya });
+  if (snapshot?.embeddings?.state === "running") passes.push({ kind: "embeddings", pass: snapshot.embeddings });
   return passes;
 }

@@ -221,6 +221,8 @@ describe("preview scenes", () => {
     expect(state.leadEntries.some((entry) => entry.kind === "message")).toBe(true);
     expect(state.leadEntries.some((entry) => entry.kind === "tool")).toBe(true);
     expect(state.leadEntries.length).toBeGreaterThan(4);
+    // The composer's status line carries the running memory re-embed.
+    expect(state.indexing?.embeddings).toMatchObject({ state: "running", done: 3200, total: 12444 });
   });
 
   it("lead-idle marks the external lead idle without attaching it", () => {

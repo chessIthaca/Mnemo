@@ -1268,6 +1268,15 @@ function leadChat(): AppState {
   return {
     ...state,
     route: "lead",
+    // The status line under the composer: the code index rebuilding with the
+    // memory re-embed an embedding-model change started beside it.
+    indexing: {
+      revision: 1,
+      firstRun: false,
+      code: { state: "running", done: 1200, total: 2400, detail: null },
+      memory: null,
+      embeddings: { state: "running", done: 3200, total: 12444, detail: null },
+    },
     leadEntries: [...state.leadEntries, ...extra],
     selectedWorkerId: null,
     workerPanelId: null,

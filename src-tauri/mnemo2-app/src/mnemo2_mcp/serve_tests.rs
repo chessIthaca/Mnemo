@@ -1132,3 +1132,120 @@ fn an_error_answer_to_a_tool_call_does_not_use_the_note_up() {
     assert!(messages[0].get("result").is_none());
     assert!(setup_note(&messages[1]).is_some(), "the next fitting result carries it: {messages:?}");
 }
+
+// ---- live tool-list revisions ---------------------------------------------
+
+/// A fake app whose every `/mcp` reply carries `_mnemo_tools_revision`, the
+/// value read from `revision` at the time of the request.
+fn revision_server(project: &str, pid: u32, revision: Arc<Mutex<String>>) -> FakeServer {
+    let project = project.to_string();
+    FakeServer::start("tok", move |req| match req.path.as_str() {
+        "/health" => health(pid, Some(&project)),
+        "/lead/detach" => Reply::Status(200, "{}".to_string()),
+        "/mcp" => {
+            let message = req.json();
+            let Some(id) = message.get("id").cloned() else {
+                return Reply::Status(202, String::new());
+            };
+            let result = match message["method"].as_str().unwrap_or("") {
+                "tools/list" => json!({ "tools": [{ "name": "team_status" }] }),
+                _ => json!({}),
+            };
+            let reply = json!({
+                "jsonrpc": "2.0", "id": id, "result": result,
+                "_mnemo_tools_revision": revision.lock().unwrap().clone(),
+            });
+            Reply::Status(200, reply.to_string())
+        }
+        _ => Reply::Status(404, String::new()),
+    })
+}
+
+fn list_changed_count(out: &SharedBuf) -> usize {
+    out.messages()
+        .iter()
+        .filter(|message| message["method"] == "notifications/tools/list_changed")
+        .count()
+}
+
+#[test]
+fn helper_notifies_list_changed_once_per_revision() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let revision = Arc::new(Mutex::new("A".to_string()));
+    let server = revision_server(&sandbox.project_str(), 77, revision.clone());
+    attach(&sandbox, &server);
+    let (bridge, out) = test_bridge(sandbox.env());
+
+    process(&bridge, &request(1, "tools/list"));
+    process(&bridge, &request(2, "ping"));
+    assert_eq!(list_changed_count(&out), 0, "{:?}", out.messages());
+
+    *revision.lock().unwrap() = "B".to_string();
+    process(&bridge, &request(3, "ping"));
+    process(&bridge, &request(4, "ping"));
+
+    // Replies A (list), A, B, B: one notification, right after the first B.
+    let messages = out.messages();
+    let ids: Vec<Value> = messages
+        .iter()
+        .map(|message| {
+            if message["method"] == "notifications/tools/list_changed" {
+                json!("notification")
+            } else {
+                message["id"].clone()
+            }
+        })
+        .collect();
+    assert_eq!(ids, vec![json!(1), json!(2), json!(3), json!("notification"), json!(4)]);
+    assert!(!out.text().contains("_mnemo_tools_revision"), "{}", out.text());
+}
+
+#[test]
+fn helper_notifies_after_reconnecting_to_a_new_revision() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let first = revision_server(&project, 77, Arc::new(Mutex::new("A".to_string())));
+    attach(&sandbox, &first);
+
+    // The rebuilt Mnemo2 that "starting" brings up serves another revision.
+    let second: Arc<Mutex<Option<FakeServer>>> = Arc::new(Mutex::new(None));
+    let mut env = sandbox.env();
+    env.spawner = {
+        let second = second.clone();
+        let (run_dir, project) = (sandbox.run_dir.clone(), project.clone());
+        Arc::new(move |_| {
+            let server = revision_server(&project, 78, Arc::new(Mutex::new("B".to_string())));
+            write_run_file(&run_dir, 78, server.port, "tok", Some(&project), 9);
+            *second.lock().unwrap() = Some(server);
+            Ok(None)
+        })
+    };
+    let (bridge, out) = test_bridge(env);
+
+    process(&bridge, &request(1, "tools/list"));
+    let first_port = first.port;
+    drop(first);
+    wait_until_connect_fails(first_port);
+    process(&bridge, &request(2, "ping"));
+    process(&bridge, &request(3, "ping"));
+
+    let messages = out.messages();
+    assert_eq!(list_changed_count(&out), 1, "{messages:?}");
+    assert_eq!(messages[1]["id"], 2);
+    assert_eq!(messages[2]["method"], "notifications/tools/list_changed");
+    assert!(!out.text().contains("_mnemo_tools_revision"));
+}
+
+#[test]
+fn a_reply_without_a_revision_never_notifies() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+    let (bridge, out) = test_bridge(sandbox.env());
+    process(&bridge, &request(1, "tools/list"));
+    process(&bridge, &request(2, "ping"));
+    assert_eq!(list_changed_count(&out), 0);
+}

@@ -567,6 +567,14 @@ fn restore_now(checkout: &Path, tip: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a program and leading arguments that run the apply as
+    /// `<program> <args...> git apply -R ...`, to make the apply slow.
+    static APPLY_SEAM: std::cell::RefCell<Option<(String, Vec<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Puts the checkout back when the proof future is dropped before its own
 /// restore ran.
 ///
@@ -582,6 +590,23 @@ struct RestoreGuard<'a> {
     tip: &'a str,
     /// Whether a restore is still owed.
     armed: bool,
+    /// The git child the proof is awaiting right now, if any. [`Drop`] kills
+    /// and reaps it BEFORE restoring, so an orphaned child cannot change the
+    /// checkout after the restore.
+    inflight: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+}
+
+type Pipe = Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>;
+
+/// Drain one child pipe on its own task, so a full pipe cannot stall the child.
+fn drain(pipe: Pipe) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut pipe, &mut bytes).await;
+        }
+        bytes
+    })
 }
 
 impl<'a> RestoreGuard<'a> {
@@ -591,6 +616,89 @@ impl<'a> RestoreGuard<'a> {
             checkout,
             tip,
             armed: false,
+            inflight: Default::default(),
+        }
+    }
+
+    /// Run `git <args>` in the checkout like [`git`], but with the child
+    /// registered where [`Drop`] can reach it (and `kill_on_drop` as a second
+    /// net). Never blocks the runtime: the child is polled with short sleeps.
+    async fn run_git(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        #[cfg(test)]
+        let seam = APPLY_SEAM.with(|seam| seam.borrow().clone());
+        #[cfg(not(test))]
+        let seam: Option<(String, Vec<String>)> = None;
+        let mut command = match seam {
+            Some((program, prefix)) => {
+                let mut command = tokio::process::Command::new(program);
+                command.args(prefix).arg("git");
+                command
+            }
+            None => tokio::process::Command::new("git"),
+        };
+        command
+            .args(args)
+            .current_dir(self.checkout)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let fail = |error: std::io::Error| {
+            format!("could not run git in {}: {error}", self.checkout.display())
+        };
+        let mut child = command.spawn().map_err(fail)?;
+        let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+        let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+        *self.inflight.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+        let status = loop {
+            let polled = {
+                let mut slot = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                match slot.as_mut().map(|child| child.try_wait()) {
+                    Some(Ok(Some(status))) => {
+                        slot.take();
+                        Ok(status)
+                    }
+                    Some(Ok(None)) => Err(None),
+                    Some(Err(error)) => {
+                        slot.take();
+                        Err(Some(error))
+                    }
+                    None => Err(Some(std::io::Error::other("git child vanished"))),
+                }
+            };
+            match polled {
+                Ok(status) => break status,
+                Err(Some(error)) => return Err(fail(error)),
+                Err(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: stdout.await.unwrap_or_default(),
+            stderr: stderr.await.unwrap_or_default(),
+        })
+    }
+
+    /// Kill the in-flight child and wait for it to exit (bounded).
+    fn reap_inflight(&self) {
+        let child = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut child) = child {
+            let _ = child.start_kill();
+            for _ in 0..500 {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -607,6 +715,8 @@ impl<'a> RestoreGuard<'a> {
 
 impl Drop for RestoreGuard<'_> {
     fn drop(&mut self) {
+        // A child still running would apply after the restore below.
+        self.reap_inflight();
         if !self.armed {
             return;
         }
@@ -720,7 +830,7 @@ pub async fn prove_regression(
     // future dropped) still puts the checkout back.
     let mut guard = RestoreGuard::new(&checkout, &tip);
     guard.arm();
-    let applied = match git(&checkout, &apply_args).await {
+    let applied = match guard.run_git(&apply_args).await {
         Ok(applied) => applied,
         Err(error) => {
             // An apply that could not even run is not an error of the proof:
@@ -1467,6 +1577,75 @@ mod tests {
             waited.is_err(),
             "the proof must still be in flight when it is dropped"
         );
+        assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
+        assert_eq!(git_in(&root, &["status", "--porcelain", "-uall"]), "");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.txt")).expect("source"),
+            "fixed\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_proof_mid_apply_restores_the_checkout() {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path().to_path_buf();
+        let (base, tip) = demo_repo(&root);
+        let tools = tempfile::tempdir().expect("tools");
+        // A wrapper that copies the patch away (the proof's own patch
+        // directory goes with the dropped future), sleeps 3 s, then runs the
+        // same `git apply -R` on the copy: the apply is slow by construction,
+        // not by machine load.
+        let copy = tools.path().join("patch.copy");
+        let seam = if cfg!(windows) {
+            let script = tools.path().join("slow.ps1");
+            std::fs::write(
+                &script,
+                format!(
+                    "Copy-Item -LiteralPath $args[5] -Destination '{copy}'
+Start-Sleep -Seconds 3
+& $args[0] $args[1] $args[2] $args[3] $args[4] '{copy}'
+",
+                    copy = copy.display()
+                ),
+            )
+            .expect("script");
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-File".to_string(),
+                    script.to_string_lossy().into_owned(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        "cp \"$6\" '{copy}'; sleep 3; exec \"$1\" \"$2\" \"$3\" \"$4\" \"$5\" '{copy}'",
+                        copy = copy.display()
+                    ),
+                    "sh".to_string(),
+                ],
+            )
+        };
+        APPLY_SEAM.with(|cell| *cell.borrow_mut() = Some(seam));
+        let proof = prove_regression(
+            root.clone(),
+            base,
+            tip.clone(),
+            cfg_for(slow_second_run_script()),
+            "demo".to_string(),
+            None,
+        );
+        let waited = tokio::time::timeout(Duration::from_secs(1), proof).await;
+        APPLY_SEAM.with(|cell| *cell.borrow_mut() = None);
+        assert!(
+            waited.is_err(),
+            "the proof must still be applying when dropped"
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
         assert_eq!(git_in(&root, &["rev-parse", "HEAD"]), tip);
         assert_eq!(git_in(&root, &["status", "--porcelain", "-uall"]), "");
         assert_eq!(

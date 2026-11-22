@@ -476,6 +476,21 @@ pub(super) fn agent_prompt(record: &WorkerRecord) -> String {
     )
 }
 
+/// [`agent_prompt`] for a step a Mnemo worker on `previous_model` already
+/// worked on in this checkout (plan e52e0be1 decision 5): the same prompt,
+/// then where to look before changing anything. A record from before base
+/// commits were recorded gets a plain `git log --oneline`.
+pub(super) fn agent_continue_prompt(record: &WorkerRecord, previous_model: &str) -> String {
+    let log = match record.base_commit.as_deref() {
+        Some(base) => format!("git log --oneline {base}..HEAD"),
+        None => "git log --oneline".to_string(),
+    };
+    format!(
+        "{}\n\nA Mnemo worker on {previous_model} already worked on this step in this checkout. Before you change anything, run git status, {log} and git diff to see where it stopped, then finish the step.",
+        agent_prompt(record)
+    )
+}
+
 /// The refusal the tools that drive a Mnemo session give for a worker that
 /// runs as a Claude Code agent: its step lives on the lead's own agent, so
 /// Mnemo cannot message, resume, compact or route-fix it. `None` for an

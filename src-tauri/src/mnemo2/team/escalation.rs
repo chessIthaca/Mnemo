@@ -24,7 +24,9 @@ use super::record::{
     agent_worker_refusal, note_model, session_model_spec, ChangeSource, MessageSender,
     WorkerRecord, WorkerStatus,
 };
-use super::routing::{final_tier, resolve_tier_over, tier_ladder_from_dto, ModelInventory};
+use super::routing::{
+    final_tier, local_hh_mm, resolve_tier_over, tier_ladder_from_dto, ModelInventory,
+};
 use super::pump::save_workers;
 use super::{status_name, unix_ms, BoardSignal, LiveWorker, TeamRuntime};
 
@@ -189,10 +191,38 @@ impl TeamRuntime {
                 return;
             };
             let (marked, tier) = self.usage_limit_marked(&record, failed_spec, until_ms);
+            let key = format!("usage-limit:{worker_id}:{generation}");
+            // A tier that runs as a Claude Code agent while Claude Code leads
+            // takes the step to the lead's agent instead (plan e52e0be1
+            // decision 5), whether or not a Mnemo model is left on it.
+            if let Some((tier, _)) = &tier {
+                let lead_in = format!(
+                    "Mnemo marked {failed_spec} unavailable until {} after a usage limit.",
+                    local_hh_mm(until_ms)
+                );
+                match self
+                    .hand_to_agent_locked(worker_id, tier, ChangeSource::Lead)
+                    .await
+                {
+                    Ok(Some(handed)) => {
+                        self.notify_agent_handoff(&handed, Some(&lead_in));
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.notify_lead(
+                            key,
+                            format!(
+                                "{lead_in} Mnemo could not hand {worker_id} to your Claude Code agent: {error}"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
             let Some((tier, Some(_))) = tier else {
                 return;
             };
-            let key = format!("usage-limit:{worker_id}:{generation}");
             let resumed = match self.lead_model_choice(Some(&tier), None) {
                 Ok(model) => {
                     self.resume_on_tier_locked(
@@ -239,7 +269,59 @@ It could not be told to continue ({error}); team_message it to continue."
         })
     }
 
+    /// Whether an idle worker's pending nudge points at a tier that hands its
+    /// step to the lead's Claude Code agent: the pump then runs
+    /// [`Self::escalate_to_agent`] in its own task instead of switching the
+    /// session's model.
+    pub(super) async fn nudged_to_agent(&self, worker_id: &str) -> bool {
+        let Ok(record) = self.worker(worker_id).await else {
+            return false;
+        };
+        let Some(to_tier) = record.routing.as_ref().and_then(|r| r.nudged.as_deref()) else {
+            return false;
+        };
+        self.agent_handoff_target(&record, to_tier).is_some()
+            && !self.worker_is_busy(worker_id).await
+    }
+
+    /// [`Self::escalate_to_agent_locked`] under the merge lock, for the pump.
+    pub(super) async fn escalate_to_agent(&self, worker_id: &str) -> Result<bool, String> {
+        let _guard = self.merge_lock.lock().await;
+        self.escalate_to_agent_locked(worker_id).await
+    }
+
+    /// Auto escalation onto a tier that runs as a Claude Code agent while
+    /// Claude Code leads (plan e52e0be1 decision 5): hand the worker's step
+    /// to the lead's agent instead of switching its model, and send the lead
+    /// the block to launch. `Ok(false)` when the nudged tier is no hand-off
+    /// or the worker is busy (never mid-turn: a later idle moment tries
+    /// again). The caller holds the merge lock.
+    pub(super) async fn escalate_to_agent_locked(&self, worker_id: &str) -> Result<bool, String> {
+        let record = self.worker(worker_id).await?;
+        let Some(to_tier) = record.routing.as_ref().and_then(|r| r.nudged.clone()) else {
+            return Ok(false);
+        };
+        if self.agent_handoff_target(&record, &to_tier).is_none()
+            || self.worker_is_busy(worker_id).await
+        {
+            return Ok(false);
+        }
+        match self
+            .hand_to_agent_locked(worker_id, &to_tier, ChangeSource::Escalation)
+            .await?
+        {
+            Some(handed) => {
+                self.notify_agent_handoff(&handed, None);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub(super) async fn auto_escalate_worker(&self, worker_id: &str) -> Result<bool, String> {
+        if self.escalate_to_agent_locked(worker_id).await? {
+            return Ok(true);
+        }
         auto_escalate_idle(
             worker_id,
             AutoEscalation {

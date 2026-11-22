@@ -21,10 +21,14 @@ use crate::mnemo2::dispatch_routing::{
     DispatchRoutingRow, RoutingMode, TEXT_MAX_CHARS, classify_dispatch,
 };
 
+use serde_json::{Value, json};
+
 use super::deletion::{CheckoutKind, validated_checkout, worker_checkout};
+use super::dispatch::claude_agent_block;
 use super::{
     LiveWorker, RECOVERED_WORKTREE_CLEANUP_ERROR, TeamRuntime, WorkerSessionSpec,
-    cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key,
+    cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key, status_name,
+    unix_ms,
 };
 use super::nudge::{
     NUDGE_STRIKE_LIMIT, claim_nudge, deliver_nudge, message_can_show_drift, nudge_ignored_row,
@@ -33,8 +37,8 @@ use super::pump::{pump_worker, snapshot_model};
 use super::spawn::load_check_commands;
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
-    agent_worker_refusal, audit_finished, audit_finished_error, kickoff_message, note_model,
-    session_model_spec,
+    agent_continue_prompt, agent_worker_refusal, audit_finished, audit_finished_error,
+    kickoff_message, note_model, session_model_spec,
 };
 use super::routing::{
     NUDGE_LADDER, final_tier, logs_label, logs_routing, next_tier_above, outcome_row,
@@ -43,6 +47,23 @@ use super::routing::{
 
 /// The refusal of a resume while Mnemo2 shuts the team down.
 const CLOSING_RESUME_ERROR: &str = "Mnemo2 is closing; the worker cannot be resumed now";
+
+/// What a resume onto a tier did: the worker, and the `claude_agent` block
+/// when the move handed its step to the external lead's Claude Code agent
+/// (plan e52e0be1 decision 5) instead of switching its model.
+pub(super) struct TierResume {
+    pub(super) worker: WorkerRecord,
+    pub(super) claude_agent: Option<Value>,
+}
+
+impl TierResume {
+    fn switched(worker: WorkerRecord) -> Self {
+        Self {
+            worker,
+            claude_agent: None,
+        }
+    }
+}
 
 impl TeamRuntime {
     /// Send a message to a worker with its sender attached. A busy worker gets
@@ -456,6 +477,10 @@ impl TeamRuntime {
     /// or unavailable tier folds down); an effort alone keeps the worker's
     /// model; the tier the choice resolved to is stamped once the switch is
     /// made.
+    ///
+    /// A tier (with no pinned model) that runs as a Claude Code agent while
+    /// Claude Code leads hands the step to the lead's agent instead, through
+    /// [`Self::hand_to_agent_locked`].
     pub(super) async fn resume_on_tier(
         &self,
         worker_id: &str,
@@ -463,8 +488,9 @@ impl TeamRuntime {
         model: Option<String>,
         reasoning_effort: Option<String>,
         source: ChangeSource,
-    ) -> Result<WorkerRecord, String> {
-        let model = self.lead_model_choice(tier, model)?;
+    ) -> Result<TierResume, String> {
+        let pinned = model.is_some();
+        let model = self.lead_model_choice(tier, model);
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         // A Claude Code agent worker has no session to reroute: the lead
@@ -472,8 +498,115 @@ impl TeamRuntime {
         if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
-        self.resume_on_tier_locked(worker_id, tier, model, reasoning_effort, source)
+        if let (false, Some(tier)) = (pinned, tier) {
+            if let Some(handed) = self.hand_to_agent_locked(worker_id, tier, source).await? {
+                return Ok(handed);
+            }
+        }
+        self.resume_on_tier_locked(worker_id, tier, model?, reasoning_effort, source)
             .await
+            .map(TierResume::switched)
+    }
+
+    /// The Claude Code agent `tier` hands a worker to, with the tier's agent
+    /// effort: `Some` only while Claude Code is the attached external lead,
+    /// for a Mnemo implementation worker (never an audit, never a worker that
+    /// already runs as an agent), on a tier that carries `claude_agent`.
+    pub(super) fn agent_handoff_target(
+        &self,
+        record: &WorkerRecord,
+        tier: &str,
+    ) -> Option<(String, Option<String>)> {
+        if record.kind == "audit" || record.claude_agent.is_some() || !self.external_lead_attached()
+        {
+            return None;
+        }
+        let ladder = self.tier_ladder();
+        let rung = ladder.get(tier)?;
+        Some((rung.claude_agent.clone()?, rung.claude_agent_effort.clone()))
+    }
+
+    /// Hand a Mnemo worker's step to the external lead's Claude Code agent
+    /// as it moves onto `tier` (plan e52e0be1 decision 5): stop its session
+    /// through the stop path, keep its record, branch, worktree, commits,
+    /// findings and review history, make it an agent worker on `tier`
+    /// (Working), and return the `claude_agent` block whose prompt says where
+    /// the previous worker stopped. `Ok(None)` when the move is no hand-off
+    /// ([`Self::agent_handoff_target`]), so the caller switches models as
+    /// before. The caller holds the merge lock; closing is re-checked here.
+    pub(super) async fn hand_to_agent_locked(
+        &self,
+        worker_id: &str,
+        tier: &str,
+        source: ChangeSource,
+    ) -> Result<Option<TierResume>, String> {
+        if self.persistence.closed.load(Ordering::SeqCst) {
+            return Err(CLOSING_RESUME_ERROR.to_string());
+        }
+        let record = self.worker(worker_id).await?;
+        let Some((agent, effort)) = self.agent_handoff_target(&record, tier) else {
+            return Ok(None);
+        };
+        let previous = session_model_spec(&record).to_string();
+        let row = DispatchRoutingRow::LeadReroute {
+            ts: unix_ms(),
+            worker_id: worker_id.to_string(),
+            plan_id: record.plan_id.clone().unwrap_or_default(),
+            step: record.plan_step.map_or(0, |step| step + 1),
+            from_tier: final_tier(&record),
+            to_tier: tier.to_string(),
+            from_model: record.model.clone(),
+            to_model: Some(format!("claude-code/{agent}")),
+            status: status_name(record.status),
+            review_rounds: record.review_rounds,
+            fix_rounds: record.fix_rounds,
+            nudged: source == ChangeSource::Escalation,
+        };
+        self.stop_inner(worker_id).await?;
+        self.update_worker(worker_id, |worker| {
+            worker.claude_agent = Some(agent.clone());
+            worker.claude_agent_effort = effort.clone();
+            worker.tier = Some(tier.to_string());
+            worker.status = WorkerStatus::Working;
+            worker.error = None;
+            worker.reroutes.push(row.clone());
+            if let Some(routing) = worker.routing.as_mut() {
+                routing.nudged = None;
+            }
+        })
+        .await;
+        self.persist().await?;
+        self.append_reroute_row(&row, source, None);
+        let worker = self.worker(worker_id).await?;
+        let mut block = claude_agent_block(&worker)
+            .ok_or_else(|| format!("worker '{worker_id}' has no Claude Code agent"))?;
+        block["prompt"] = json!(agent_continue_prompt(&worker, &previous));
+        Ok(Some(TierResume {
+            worker,
+            claude_agent: Some(block),
+        }))
+    }
+
+    /// Tell the external lead that Mnemo moved a worker onto a tier that runs
+    /// as a Claude Code agent on its own (auto escalation, usage-limit
+    /// resume), with the block to launch. `lead_in` opens the notice, when
+    /// the cause has more to say.
+    pub(super) fn notify_agent_handoff(&self, handed: &TierResume, lead_in: Option<&str>) {
+        let worker = &handed.worker;
+        let tier = worker.tier.as_deref().unwrap_or("its tier");
+        let block = handed
+            .claude_agent
+            .as_ref()
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let opening = lead_in.map(|text| format!("{text}\n")).unwrap_or_default();
+        self.notify_lead(
+            format!("agent-handoff:{}:{}", worker.id, worker.generation),
+            format!(
+                "{opening}{id} moved to tier {tier}, which runs as a Claude Code agent: launch your Agent with this block, then call team_agent_done.\n{block}",
+                id = worker.id
+            ),
+        );
     }
 
     /// [`Self::resume_on_tier`] for a caller that holds the merge lock, has

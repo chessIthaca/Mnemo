@@ -17925,3 +17925,214 @@ async fn laya_label_on_an_agent_tier_notifies_the_pinned_dispatch() {
     assert_eq!(notices(), 1);
     fixture.team.shutdown().await;
 }
+
+// --- plan e52e0be1 step 3: a move onto an agent tier hands the step to the lead's agent ---
+
+/// The continuation paragraph an agent block's prompt ends with.
+fn continuation(previous: &str, base: &str) -> String {
+    format!(
+        "A Mnemo worker on {previous} already worked on this step in this checkout. Before you change anything, run git status, git log --oneline {base}..HEAD and git diff to see where it stopped, then finish the step."
+    )
+}
+
+#[tokio::test]
+async fn resume_onto_an_agent_tier_returns_a_claude_agent_block() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let started = external_dispatch(&fixture, "handOne01", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    let before = fixture.team.worker("handOne01").await.expect("worker");
+    assert!(before.claude_agent.is_none(), "routine runs a Mnemo worker");
+    let previous = super::record::session_model_spec(&before).to_string();
+    let base = before.base_commit.clone().expect("the dispatch records its base");
+
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "handOne01", "tier": "high"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let data = answer.data.clone().expect("resume data");
+    let block = &data["claude_agent"];
+    assert_eq!(block["model"], "opus", "{data}");
+    assert_eq!(block["branch"], json!(before.branch));
+    let prompt = block["prompt"].as_str().expect("prompt");
+    assert!(prompt.ends_with(&continuation(&previous, &base)), "{prompt}");
+    assert!(prompt.contains("This step runs as a Claude Code agent"), "{prompt}");
+    let output: Value = serde_json::from_str(answer.output.lines().next().unwrap()).expect("json");
+    assert_eq!(output["result"]["claude_agent"], *block);
+
+    let worker = fixture.team.worker("handOne01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(worker.tier.as_deref(), Some("high"));
+    assert_eq!(worker.branch, before.branch);
+    assert_eq!(worker.worktree, before.worktree);
+    assert!(!fixture.team.live.lock().await.contains_key("handOne01"), "no Mnemo session");
+    assert!(matches!(
+        worker.reroutes.last(),
+        Some(DispatchRoutingRow::LeadReroute { to_tier, to_model, nudged: false, .. })
+            if to_tier == "high" && to_model.as_deref() == Some("claude-code/opus")
+    ));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_escalation_onto_an_agent_tier_notifies_the_lead_with_a_block() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let started = external_dispatch(&fixture, "handTwo01", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handTwo01").await.expect("stop");
+    let before = fixture.team.worker("handTwo01").await.expect("worker");
+    let previous = super::record::session_model_spec(&before).to_string();
+    let base = before.base_commit.clone().expect("base");
+    fixture
+        .team
+        .update_worker("handTwo01", |worker| {
+            worker.routing = Some(WorkerRouting {
+                laya_tier: None,
+                confidence: None,
+                cleared: false,
+                lead_tier: Some("routine".into()),
+                routed_by: "lead".into(),
+                ran_tier: Some("routine".into()),
+                nudged: Some("high".into()),
+            });
+        })
+        .await;
+    let mut notices = fixture.team.signals.subscribe();
+
+    assert!(fixture.team.auto_escalate_worker("handTwo01").await.expect("escalate"));
+    let notice = drain_notice(
+        &mut notices,
+        "handTwo01 moved to tier high, which runs as a Claude Code agent: launch your Agent with this block, then call team_agent_done.",
+    )
+    .await
+    .expect("the hand-off notice");
+    let block: Value =
+        serde_json::from_str(notice.lines().last().expect("block line")).expect("block json");
+    assert_eq!(block["model"], "opus");
+    assert!(
+        block["prompt"].as_str().unwrap().ends_with(&continuation(&previous, &base)),
+        "{block}"
+    );
+
+    let worker = fixture.team.worker("handTwo01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(worker.routing.as_ref().and_then(|r| r.nudged.as_deref()), None);
+    assert!(matches!(
+        worker.reroutes.last(),
+        Some(DispatchRoutingRow::LeadReroute { to_tier, nudged: true, .. }) if to_tier == "high"
+    ));
+    // A second try finds nothing left to hand over.
+    assert!(!fixture.team.auto_escalate_worker("handTwo01").await.expect("again"));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_an_external_lead_resume_switches_models() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let started = fixture
+        .team
+        .handle_lead_host_tool(
+            "team_dispatch",
+            json!({
+                "worker_id": "handThree1",
+                "plan_id": fixture.plan_id,
+                "step": 1,
+                "tier": "routine",
+                "brief": "Implement the step exactly and run its focused regression tests.",
+            }),
+        )
+        .await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handThree1").await.expect("stop");
+
+    let answer = fixture
+        .team
+        .handle_lead_host_tool("team_resume", json!({"worker_id": "handThree1", "tier": "high"}))
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert!(!answer.data.as_ref().expect("data")["claude_agent"].is_object());
+    assert!(!answer.output.contains("runs as a Claude Code agent"), "{}", answer.output);
+    let worker = fixture.team.worker("handThree1").await.expect("worker");
+    assert!(worker.claude_agent.is_none());
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_eq!(worker.tier.as_deref(), Some("high"));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn audits_never_move_to_an_agent() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let started = external_dispatch(&fixture, "handFour1", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handFour1").await.expect("stop");
+    let implementation = fixture.team.worker("handFour1").await.expect("worker");
+    assert!(fixture.team.agent_handoff_target(&implementation, "high").is_some());
+
+    fixture
+        .team
+        .update_worker("handFour1", |worker| worker.kind = "audit".into())
+        .await;
+    let audit = fixture.team.worker("handFour1").await.expect("worker");
+    assert!(fixture.team.agent_handoff_target(&audit, "high").is_none());
+    let handed = {
+        let _guard = fixture.team.merge_lock.lock().await;
+        fixture
+            .team
+            .hand_to_agent_locked("handFour1", "high", ChangeSource::Lead)
+            .await
+            .expect("no error")
+    };
+    assert!(handed.is_none());
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "handFour1", "tier": "high"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(
+        answer.data.as_ref().is_none_or(|data| !data["claude_agent"].is_object()),
+        "{}",
+        answer.output
+    );
+    assert!(fixture.team.worker("handFour1").await.expect("worker").claude_agent.is_none());
+    fixture.team.shutdown().await;
+}

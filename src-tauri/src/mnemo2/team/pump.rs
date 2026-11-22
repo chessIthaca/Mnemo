@@ -1434,7 +1434,24 @@ pub(super) async fn pump_worker(
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if settings.nudges && settings.mode == RoutingMode::Auto {
+        // A nudge onto a tier that runs as a Claude Code agent while Claude
+        // Code leads hands the step to the lead's agent (plan e52e0be1
+        // decision 5), in its own task: the hand-off stops this session,
+        // which aborts this pump.
+        let to_agent = if settings.nudges && settings.mode == RoutingMode::Auto {
+            match usage_limits.team() {
+                Some(team) if team.nudged_to_agent(&worker_id).await => Some(team),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(team) = to_agent {
+            let worker_id = worker_id.clone();
+            tokio::spawn(async move {
+                let _ = team.escalate_to_agent(&worker_id).await;
+            });
+        } else if settings.nudges && settings.mode == RoutingMode::Auto {
             // A strike fires during a busy turn. Trying on every event makes
             // the first idle event apply the pending nudge without a restart.
             let _ = auto_escalate_idle(

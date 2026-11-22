@@ -603,6 +603,9 @@ impl TeamRuntime {
         } else {
             None
         };
+        // A team_resume that handed the step to the lead's Claude Code agent
+        // (plan e52e0be1 decision 5) answers with the block to launch.
+        let mut handoff_block: Option<Value> = None;
         let result = match name {
             "team_message" => match args.get("text").and_then(Value::as_str) {
                 Some(text) => self.message(worker_id, text.to_string(), sender).await,
@@ -638,6 +641,10 @@ impl TeamRuntime {
                         ChangeSource::Lead,
                     )
                     .await
+                    .map(|resumed| {
+                        handoff_block = resumed.claude_agent;
+                        resumed.worker
+                    })
                 }
             }
             "team_compact" => self.compact(worker_id).await,
@@ -722,7 +729,10 @@ impl TeamRuntime {
             _ => Err(format!("unknown team host tool '{name}'")),
         };
         let reviewed = result.as_ref().ok().cloned();
-        let mut answer = worker_result(result, name);
+        let mut answer = match (result, handoff_block) {
+            (Ok(worker), Some(block)) => agent_handoff_answer(&worker, block),
+            (result, _) => worker_result(result, name),
+        };
         if let (true, Some(missing)) = (answer.success, stale) {
             answer.output = format!("{}\n{}", answer.output, stale_base_line(missing));
         }
@@ -1112,6 +1122,25 @@ fn worker_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
         .unwrap_or_else(|_| action.to_string());
     let data = serde_json::to_value(worker).unwrap_or(Value::Null);
     ToolResult::success(output).with_data(data)
+}
+
+/// The `team_resume` answer when the move handed the worker's step to the
+/// lead's Claude Code agent: the worker entry beside the `claude_agent` block,
+/// in the result and in `data`, the way a dispatch answers.
+fn agent_handoff_answer(worker: &WorkerRecord, block: Value) -> ToolResult {
+    let mut reported = worker_status_view(worker, false);
+    without_transcripts(&mut reported);
+    let output = serde_json::to_string(&json!({
+        "action": "team_resume",
+        "result": {"worker": reported, "claude_agent": block},
+    }))
+    .unwrap_or_else(|_| "team_resume".to_string());
+    let output = format!(
+        "{output}\n{} now runs as a Claude Code agent: launch your Agent with the claude_agent block (prompt unchanged), then call team_agent_done.",
+        worker.id
+    );
+    let data = serde_json::to_value(worker).unwrap_or(Value::Null);
+    ToolResult::success(output).with_data(json!({"worker": data, "claude_agent": block}))
 }
 
 /// A team tool answer for one worker.

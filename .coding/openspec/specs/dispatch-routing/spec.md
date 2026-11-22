@@ -152,3 +152,52 @@ Whether a dispatch goes to a Claude Code agent SHALL be decided from the tier ro
 - **WHEN** the high tier has claude_agent opus and no models
 - **WHEN** Claude Code leads and dispatches on high
 - **THEN** the step is handed to the Claude Code agent
+
+### Requirement: Fix rounds on agent workers are recorded
+team_route_fix on a Claude Code agent worker SHALL record the fix round as for a Mnemo worker and return the fix text with the SendMessage instruction for the registered agent; team_agent_done SHALL close the round.
+
+#### Scenario: Routed fix
+- **WHEN** the lead routes a finding to an agent worker
+- **THEN** the worker is Fixing with the round recorded
+- **AND** the answer carries the SendMessage instruction and the fix text
+
+### Requirement: Usage-limited models are skipped
+When a worker fails because its model hit a provider usage limit, Mnemo SHALL treat that model as unavailable for six hours, so tier resolution and fold-down skip it. In routing mode auto Mnemo SHALL resume the worker on its re-resolved tier; otherwise the failure notice SHALL name the resume call. Fix-round prompts SHALL ask for the narrowest covering tests instead of the full checks.
+
+#### Scenario: Weekly limit
+- **WHEN** a worker fails with a weekly usage limit error
+- **THEN** its model is unavailable
+- **AND** the next dispatch on that tier folds to the next model
+
+#### Scenario: Auto mode continues
+- **WHEN** routing mode is auto
+- **WHEN** a worker fails with a usage limit
+- **WHEN** its tier folds to another model
+- **THEN** the worker is resumed on that model with its transcript
+
+#### Scenario: Narrow fix rounds
+- **WHEN** a finding is routed to its worker
+- **THEN** the fix prompt asks for the narrowest covering tests, not run_checks
+
+### Requirement: Pinned models that bypass an agent tier are flagged
+A dispatch from the external lead that pins a model on a tier which runs as a Claude Code agent SHALL warn that the model bypasses the agent, and SHALL still start the Mnemo worker.
+
+#### Scenario: Pinned model on an agent tier
+- **WHEN** high runs as a Claude Code agent opus
+- **WHEN** the lead dispatches with tier high and an explicit model
+- **THEN** the result warns that the model bypasses the agent
+- **AND** a Mnemo worker starts on the pinned model
+
+### Requirement: Escalation honours run as
+When Claude Code leads, moving an implementation worker onto a tier that runs as a Claude Code agent, by team_resume, auto escalation or usage-limit auto-resume, SHALL stop its Mnemo session and hand the step to the lead's agent with a claude_agent block. Without an external lead the move SHALL switch models as before.
+
+#### Scenario: Resume onto an agent tier
+- **WHEN** Claude Code leads
+- **WHEN** the lead resumes a worker on a tier that runs as a Claude Code agent
+- **THEN** the result carries a claude_agent block
+- **AND** the worker has no Mnemo session
+
+#### Scenario: In-app lead
+- **WHEN** no external lead is attached
+- **WHEN** a worker is resumed on that tier
+- **THEN** it switches to the tier's model

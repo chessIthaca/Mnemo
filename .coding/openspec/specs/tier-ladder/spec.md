@@ -71,3 +71,30 @@ Every tier except escalate MAY carry `claude_agent` set to opus, sonnet, haiku o
 #### Scenario: Escalate cannot be an agent tier
 - **WHEN** a ladder sets claude_agent on escalate
 - **THEN** saving the ladder fails with a validation error
+
+### Requirement: An agent tier's worker is tracked
+A worker that runs on an agent tier SHALL be tracked through its agent's transcript once registered, so its activity counts like a Mnemo worker's.
+
+#### Scenario: Registered agent
+- **WHEN** the lead registers the agent of an agent-tier worker
+- **THEN** the worker's activity comes from the agent's transcript
+
+### Requirement: An agent tier can carry an effort
+A tier with claude_agent MAY carry claude_agent_effort set to low, medium, high, xhigh or max. The dispatch claude_agent block SHALL carry that effort, and the tier guidance line SHALL name it. A claude_agent_effort without claude_agent MUST fail validation.
+
+#### Scenario: Opus at xhigh
+- **WHEN** the high tier runs as a Claude Code agent opus with effort xhigh
+- **WHEN** Claude Code leads and dispatches on high
+- **THEN** the claude_agent block carries effort xhigh
+
+#### Scenario: Effort without an agent
+- **WHEN** a ladder sets claude_agent_effort on a tier without claude_agent
+- **THEN** saving the ladder fails with a validation error
+
+### Requirement: Tier model health is reported
+For each tier, Mnemo SHALL report each configured model as available, unavailable until a time after a usage limit, or not configured, and the tier and model a dispatch would resolve to now.
+
+#### Scenario: Unavailable first model
+- **WHEN** a tier's first model is unavailable after a usage limit
+- **THEN** the tier resolves to its next available model, or folds down
+- **AND** team_tiers shows the first model unavailable until its time

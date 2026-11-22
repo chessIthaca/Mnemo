@@ -3235,6 +3235,600 @@
       ],
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "e5d93df3",
+      "status": "closed",
+      "created_at_ms": 1795366994881,
+      "closed_at_ms": 1795383010677,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e5d93df3-20261122-213010.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "worker-brief",
+          "added": [
+            {
+              "requirement": "Workers know the commit they start from",
+              "text": "Every worker SHALL record the lead commit its checkout was forked from, and its opening prompt SHALL name that commit. A worker with no commits of its own and a clean checkout SHALL be fast-forwarded to the lead branch tip before its next prompt when the lead branch has moved, and that prompt SHALL say so. A worker with commits MUST NOT be rebased or reset.",
+              "scenarios": [
+                {
+                  "name": "Dispatch after a lead commit",
+                  "when": [
+                    "the lead commits",
+                    "the lead dispatches a worker"
+                  ],
+                  "then": [
+                    "the worker's base commit is the new lead tip",
+                    "its opening prompt names that commit"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Waiting worker follows the lead",
+                  "when": [
+                    "a worker has no commits and a clean checkout",
+                    "the lead branch moves",
+                    "the worker receives a prompt"
+                  ],
+                  "then": [
+                    "its checkout is fast-forwarded to the lead tip"
+                  ],
+                  "and": [
+                    "the prompt says it was fast-forwarded"
+                  ]
+                },
+                {
+                  "name": "Worker with commits is left alone",
+                  "when": [
+                    "a worker has commits",
+                    "the lead branch moves",
+                    "the worker receives a prompt"
+                  ],
+                  "then": [
+                    "the worker's tip is unchanged"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "The lead sees stale bases and uncommitted lead files",
+              "text": "team_status SHALL report, for an unmerged implementation worker, how many lead-branch commits its branch lacks, and team_check and team_merge SHALL repeat that report without refusing. A dispatch SHALL warn when the lead checkout has uncommitted files under .coding/ outside the plans, reviews, knowledge and laya folders.",
+              "scenarios": [
+                {
+                  "name": "Stale worker",
+                  "when": [
+                    "a worker has commits",
+                    "the lead branch has two commits the worker lacks"
+                  ],
+                  "then": [
+                    "team_status shows stale_base 2"
+                  ],
+                  "and": [
+                    "team_merge still merges"
+                  ]
+                },
+                {
+                  "name": "Uncommitted lead notes",
+                  "when": [
+                    "the lead checkout has an untracked .coding/notes.md",
+                    "the lead dispatches"
+                  ],
+                  "then": [
+                    "the dispatch result warns and names .coding/notes.md"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "Mnemo runs the full checks for the lead",
+              "text": "The lead tool team_run_checks SHALL run every .coding/checks.toml command in a worker's checkout, or in the lead checkout, through the machine heavy-command slots, record each result on the worker's tip and report through a notice. Mnemo SHALL start this run itself after a review with no open findings whose tip lacks passing checks, and team_merge SHALL refuse while it runs.",
+              "scenarios": [
+                {
+                  "name": "Clean review triggers the checks",
+                  "when": [
+                    "the lead records a review with no open findings",
+                    "the tip has no passing checks"
+                  ],
+                  "then": [
+                    "Mnemo runs the checks and sends a notice"
+                  ],
+                  "and": [
+                    "team_merge succeeds once they passed"
+                  ]
+                },
+                {
+                  "name": "Merge waits",
+                  "when": [
+                    "Mnemo is running a worker's checks",
+                    "the lead calls team_merge"
+                  ],
+                  "then": [
+                    "the merge is refused until the notice"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Usage-limited models are skipped",
+              "text": "When a worker fails because its model hit a provider usage limit, Mnemo SHALL treat that model as unavailable for six hours, so tier resolution and fold-down skip it. In routing mode auto Mnemo SHALL resume the worker on its re-resolved tier; otherwise the failure notice SHALL name the resume call. Fix-round prompts SHALL ask for the narrowest covering tests instead of the full checks.",
+              "scenarios": [
+                {
+                  "name": "Weekly limit",
+                  "when": [
+                    "a worker fails with a weekly usage limit error"
+                  ],
+                  "then": [
+                    "its model is unavailable",
+                    "the next dispatch on that tier folds to the next model"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Auto mode continues",
+                  "when": [
+                    "routing mode is auto",
+                    "a worker fails with a usage limit",
+                    "its tier folds to another model"
+                  ],
+                  "then": [
+                    "the worker is resumed on that model with its transcript"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Narrow fix rounds",
+                  "when": [
+                    "a finding is routed to its worker"
+                  ],
+                  "then": [
+                    "the fix prompt asks for the narrowest covering tests, not run_checks"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "tier-ladder",
+          "added": [
+            {
+              "requirement": "An agent tier can carry an effort",
+              "text": "A tier with claude_agent MAY carry claude_agent_effort set to low, medium, high, xhigh or max. The dispatch claude_agent block SHALL carry that effort, and the tier guidance line SHALL name it. A claude_agent_effort without claude_agent MUST fail validation.",
+              "scenarios": [
+                {
+                  "name": "Opus at xhigh",
+                  "when": [
+                    "the high tier runs as a Claude Code agent opus with effort xhigh",
+                    "Claude Code leads and dispatches on high"
+                  ],
+                  "then": [
+                    "the claude_agent block carries effort xhigh"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Effort without an agent",
+                  "when": [
+                    "a ladder sets claude_agent_effort on a tier without claude_agent"
+                  ],
+                  "then": [
+                    "saving the ladder fails with a validation error"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "The Tiers page offers an agent effort",
+              "text": "When a tier runs as a Claude Code agent, its card SHALL offer an Agent effort choice of Default, low, medium, high, xhigh or max, saved with the ladder; choosing Mnemo models SHALL clear it.",
+              "scenarios": [
+                {
+                  "name": "Choose xhigh",
+                  "when": [
+                    "the user picks Claude Code agent Opus and Agent effort xhigh on High and saves"
+                  ],
+                  "then": [
+                    "endpoints.toml stores claude_agent_effort xhigh on the high tier"
+                  ],
+                  "and": [
+                    "the lead preview names the effort"
+                  ]
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "48ef0678",
+      "status": "closed",
+      "created_at_ms": 1795367029172,
+      "closed_at_ms": 1795370332198,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-48ef0678-20261122-175852.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "e52e0be1",
+      "status": "closed",
+      "created_at_ms": 1795370728826,
+      "closed_at_ms": 1795383011713,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e52e0be1-20261122-213011.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "The lead can read the live tier setup",
+              "text": "The lead tool team_tiers SHALL return every tier's models in order with their health, effort, run as and current resolution. Mnemo SHALL tell the external lead when the tiers changed since it last read them, and its tool descriptions SHALL refresh through a tools/list_changed notification when the tool list changes, including after Mnemo2 restarts.",
+              "scenarios": [
+                {
+                  "name": "Tier change reaches the lead",
+                  "when": [
+                    "Claude Code leads",
+                    "the user sets High to run as a Claude Code agent and saves"
+                  ],
+                  "then": [
+                    "the lead receives tools/list_changed"
+                  ],
+                  "and": [
+                    "the next dispatch result says the tiers changed"
+                  ]
+                },
+                {
+                  "name": "Health is visible",
+                  "when": [
+                    "a model hit its usage limit"
+                  ],
+                  "then": [
+                    "team_tiers shows it unavailable until a time"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Pinned models that bypass an agent tier are flagged",
+              "text": "A dispatch from the external lead that pins a model on a tier which runs as a Claude Code agent SHALL warn that the model bypasses the agent, and SHALL still start the Mnemo worker.",
+              "scenarios": [
+                {
+                  "name": "Pinned model on an agent tier",
+                  "when": [
+                    "high runs as a Claude Code agent opus",
+                    "the lead dispatches with tier high and an explicit model"
+                  ],
+                  "then": [
+                    "the result warns that the model bypasses the agent"
+                  ],
+                  "and": [
+                    "a Mnemo worker starts on the pinned model"
+                  ]
+                }
+              ]
+            },
+            {
+              "requirement": "Escalation honours run as",
+              "text": "When Claude Code leads, moving an implementation worker onto a tier that runs as a Claude Code agent, by team_resume, auto escalation or usage-limit auto-resume, SHALL stop its Mnemo session and hand the step to the lead's agent with a claude_agent block. Without an external lead the move SHALL switch models as before.",
+              "scenarios": [
+                {
+                  "name": "Resume onto an agent tier",
+                  "when": [
+                    "Claude Code leads",
+                    "the lead resumes a worker on a tier that runs as a Claude Code agent"
+                  ],
+                  "then": [
+                    "the result carries a claude_agent block",
+                    "the worker has no Mnemo session"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "In-app lead",
+                  "when": [
+                    "no external lead is attached",
+                    "a worker is resumed on that tier"
+                  ],
+                  "then": [
+                    "it switches to the tier's model"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "tier-ladder",
+          "added": [
+            {
+              "requirement": "Tier model health is reported",
+              "text": "For each tier, Mnemo SHALL report each configured model as available, unavailable until a time after a usage limit, or not configured, and the tier and model a dispatch would resolve to now.",
+              "scenarios": [
+                {
+                  "name": "Unavailable first model",
+                  "when": [
+                    "a tier's first model is unavailable after a usage limit"
+                  ],
+                  "then": [
+                    "the tier resolves to its next available model, or folds down"
+                  ],
+                  "and": [
+                    "team_tiers shows the first model unavailable until its time"
+                  ]
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "worker-brief",
+          "added": [
+            {
+              "requirement": "A worker handed to an agent mid-step continues from its checkout",
+              "text": "When a worker moves to a Claude Code agent tier mid-step, the agent prompt SHALL carry the worker brief plus where the previous worker left off: its previous model, and the instruction to read git status, the log since the base commit and the diff before changing anything.",
+              "scenarios": [
+                {
+                  "name": "Continuation prompt",
+                  "when": [
+                    "a worker on a Mnemo model is resumed onto an agent tier"
+                  ],
+                  "then": [
+                    "the agent prompt names the previous model and the base commit"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "Saving tiers updates what the lead sees",
+              "text": "Saving a changed tier ladder in Settings SHALL bump the tier revision, so an attached Claude Code lead's tool descriptions refresh and its next dispatch says the tiers changed.",
+              "scenarios": [
+                {
+                  "name": "Save tiers",
+                  "when": [
+                    "the user changes a tier and clicks Save tiers",
+                    "Claude Code leads"
+                  ],
+                  "then": [
+                    "the lead's next dispatch says the tiers changed"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
+    },
+    {
+      "id": "ca7f2177",
+      "status": "closed",
+      "created_at_ms": 1795372732906,
+      "closed_at_ms": 1795381891073,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-ca7f2177-20261122-211131.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "Agent workers are observable",
+              "text": "The lead SHALL be able to register a running Claude Code agent for a worker with team_agent_started. Mnemo SHALL then report the agent's transcript, last activity, tool calls, tokens and finish state in team_status, flag it stalled after ten silent minutes, and notify the lead once per stall and once when the agent finishes without team_agent_done. The agent MAY post progress notes with team_progress, which land in the worker's log and as notices.",
+              "scenarios": [
+                {
+                  "name": "Stalled agent",
+                  "when": [
+                    "an agent worker is registered",
+                    "its transcript has not changed for ten minutes"
+                  ],
+                  "then": [
+                    "team_status shows it stalled"
+                  ],
+                  "and": [
+                    "the lead gets one notice"
+                  ]
+                },
+                {
+                  "name": "Progress note",
+                  "when": [
+                    "the agent calls team_progress with a note"
+                  ],
+                  "then": [
+                    "the note is in the worker's log and reaches the lead"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "TeamManager integrates branches into workers",
+              "text": "The lead tool team_integrate SHALL merge an existing local branch into a worker's branch in its checkout. A conflict SHALL abort the merge, leave the checkout unchanged and list the conflicting files.",
+              "scenarios": [
+                {
+                  "name": "Conflict",
+                  "when": [
+                    "the named branch conflicts with the worker's branch"
+                  ],
+                  "then": [
+                    "the merge is aborted and the conflicting files are listed"
+                  ],
+                  "and": [
+                    "the worker's tip is unchanged"
+                  ]
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Fix rounds on agent workers are recorded",
+              "text": "team_route_fix on a Claude Code agent worker SHALL record the fix round as for a Mnemo worker and return the fix text with the SendMessage instruction for the registered agent; team_agent_done SHALL close the round.",
+              "scenarios": [
+                {
+                  "name": "Routed fix",
+                  "when": [
+                    "the lead routes a finding to an agent worker"
+                  ],
+                  "then": [
+                    "the worker is Fixing with the round recorded",
+                    "the answer carries the SendMessage instruction and the fix text"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "worker-brief",
+          "added": [
+            {
+              "requirement": "The agent prompt sets the working rules",
+              "text": "The prompt handed to a Claude Code agent SHALL tell it to start every shell command with a cd into its worktree, to keep shell commands in the foreground unless they run long, and to post a one-line team_progress note after each milestone.",
+              "scenarios": [
+                {
+                  "name": "Prompt rules",
+                  "when": [
+                    "a step is handed to a Claude Code agent"
+                  ],
+                  "then": [
+                    "the prompt carries the cd, foreground and progress rules"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "tier-ladder",
+          "added": [
+            {
+              "requirement": "An agent tier's worker is tracked",
+              "text": "A worker that runs on an agent tier SHALL be tracked through its agent's transcript once registered, so its activity counts like a Mnemo worker's.",
+              "scenarios": [
+                {
+                  "name": "Registered agent",
+                  "when": [
+                    "the lead registers the agent of an agent-tier worker"
+                  ],
+                  "then": [
+                    "the worker's activity comes from the agent's transcript"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "settings-dialog",
+          "added": [
+            {
+              "requirement": "The Run as hint says how agents are followed",
+              "text": "When a tier runs as a Claude Code agent, the Tiers page hint SHALL say that Mnemo follows the agent through its transcript and that the tier's models are used otherwise.",
+              "scenarios": [
+                {
+                  "name": "Hint",
+                  "when": [
+                    "the user picks a Claude Code agent in Run as"
+                  ],
+                  "then": [
+                    "the hint says Mnemo follows the agent through its transcript"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {}
     }
   ]
 }

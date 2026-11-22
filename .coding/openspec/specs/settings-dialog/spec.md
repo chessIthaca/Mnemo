@@ -117,3 +117,26 @@ Each tier card except escalate SHALL offer a Run as choice between Mnemo models 
 - **WHEN** the user picks Claude Code agent — Opus on the High card and saves
 - **THEN** endpoints.toml stores claude_agent opus on the high tier
 - **AND** the lead preview shows the agent suffix on the High line
+
+### Requirement: The Run as hint says how agents are followed
+When a tier runs as a Claude Code agent, the Tiers page hint SHALL say that Mnemo follows the agent through its transcript and that the tier's models are used otherwise.
+
+#### Scenario: Hint
+- **WHEN** the user picks a Claude Code agent in Run as
+- **THEN** the hint says Mnemo follows the agent through its transcript
+
+### Requirement: The Tiers page offers an agent effort
+When a tier runs as a Claude Code agent, its card SHALL offer an Agent effort choice of Default, low, medium, high, xhigh or max, saved with the ladder; choosing Mnemo models SHALL clear it.
+
+#### Scenario: Choose xhigh
+- **WHEN** the user picks Claude Code agent Opus and Agent effort xhigh on High and saves
+- **THEN** endpoints.toml stores claude_agent_effort xhigh on the high tier
+- **AND** the lead preview names the effort
+
+### Requirement: Saving tiers updates what the lead sees
+Saving a changed tier ladder in Settings SHALL bump the tier revision, so an attached Claude Code lead's tool descriptions refresh and its next dispatch says the tiers changed.
+
+#### Scenario: Save tiers
+- **WHEN** the user changes a tier and clicks Save tiers
+- **WHEN** Claude Code leads
+- **THEN** the lead's next dispatch says the tiers changed

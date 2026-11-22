@@ -16872,3 +16872,140 @@ fn agent_prompt_carries_the_cd_foreground_and_progress_rules() {
     assert!(prompt.contains("- After each milestone (you have read the code, the change is in, the tests pass, you committed), post a one-line note with the Mnemo tool team_progress (worker_id agentWatch06)."), "{prompt}");
     assert!(prompt.contains("- Leave Mnemo's team_* and plan_* tools to the lead; plan_show and team_progress are the only ones you may use."), "{prompt}");
 }
+
+// --- Audit fixes for the agent watch (plan ca7f2177, step 1) ----------------
+
+fn notice_keys(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    while let Ok(signal) = receiver.try_recv() {
+        if let BoardSignal::Notice { key, text } = signal {
+            if text.contains(needle) {
+                found.push(key);
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn team_agent_started_ignores_a_path_outside_claude_projects() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch07").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let outside = tempfile::tempdir().expect("outside folder");
+    let stray = outside.path().join("agent-a1b2c3.jsonl");
+    std::fs::write(&stray, AGENT_TRANSCRIPT).expect("stray file");
+    let result = start_agent(
+        team,
+        "agentWatch07",
+        serde_json::json!({"transcript_path": stray.to_string_lossy()}),
+    )
+    .await;
+    assert!(result.success, "{}", result.output);
+    assert!(result.output.contains("was ignored"), "{}", result.output);
+    let worker = team.worker("agentWatch07").await.expect("worker");
+    // The documented location is used instead.
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    // A file under the projects folder with another agent's name is ignored too.
+    let other = transcript.with_file_name("agent-zzz.jsonl");
+    std::fs::write(&other, AGENT_TRANSCRIPT).expect("other file");
+    let result = start_agent(
+        team,
+        "agentWatch07",
+        serde_json::json!({"transcript_path": other.to_string_lossy()}),
+    )
+    .await;
+    assert!(result.output.contains("was ignored"), "{}", result.output);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_replaced_transcript_resets_the_counts() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch08").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch08", serde_json::json!({})).await.success);
+    assert_eq!(status_agent(team, "agentWatch08").await["tool_calls"], 2);
+    // Same length, different content.
+    let replaced = AGENT_TRANSCRIPT.replace("tool_use", "tool_xyz");
+    assert_eq!(replaced.len(), AGENT_TRANSCRIPT.len());
+    write_agent_transcript(&transcript, &replaced);
+    let agent = status_agent(team, "agentWatch08").await;
+    assert_eq!(agent["tool_calls"], 0, "{agent}");
+    assert_eq!(agent["tokens"], 1125, "{agent}");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_partial_line_is_read_once() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch09").await;
+    let team = &fixture.team;
+    let lines: Vec<&str> = AGENT_TRANSCRIPT.lines().collect();
+    let (first, second) = (lines[1], lines[3]);
+    let cut = second.len() / 2;
+    write_agent_transcript(
+        &transcript,
+        &format!("{first}\n{}", &second[..cut]),
+    );
+    assert!(start_agent(team, "agentWatch09", serde_json::json!({})).await.success);
+    let agent = status_agent(team, "agentWatch09").await;
+    assert_eq!(agent["tool_calls"], 1, "{agent}");
+    // The unfinished half is kept, not reread.
+    assert_eq!(team.agent_watch.tail_len_for_test("agentWatch09"), Some(cut));
+    write_agent_transcript(&transcript, &format!("{first}\n{second}\n"));
+    let agent = status_agent(team, "agentWatch09").await;
+    assert_eq!(agent["tool_calls"], 2, "{agent}");
+    assert_eq!(agent["tokens"], 1125, "{agent}");
+    assert_eq!(team.agent_watch.tail_len_for_test("agentWatch09"), Some(0));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_second_finish_notifies_again() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch10").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch10", serde_json::json!({})).await.success);
+    let meta = transcript.with_extension("meta.json");
+    let mut notices = team.subscribe_board();
+    std::fs::write(&meta, "{\"finished\":true}").expect("meta");
+    team.agent_watch_tick().await;
+    let first = notice_keys(&mut notices, "finished");
+    assert_eq!(first.len(), 1, "{first:?}");
+    // The lead closed the run (a turn counted) and continued the agent.
+    team.update_worker("agentWatch10", |worker| worker.turns += 1).await;
+    std::fs::write(&meta, "{\"finished\":false}").expect("meta");
+    team.agent_watch_tick().await;
+    std::fs::write(&meta, "{\"finished\":true}").expect("meta");
+    team.agent_watch_tick().await;
+    let second = notice_keys(&mut notices, "finished");
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_ne!(first[0], second[0], "the lead pump drops a repeated key");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_progress_notes_in_one_tick_both_notify() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentWatch11").await;
+    let team = &fixture.team;
+    let mut notices = team.subscribe_board();
+    for note in ["read the code", "wrote the code"] {
+        let posted = team
+            .handle_lead_host_tool(
+                "team_progress",
+                serde_json::json!({"worker_id": "agentWatch11", "note": note}),
+            )
+            .await;
+        assert!(posted.success, "{}", posted.output);
+    }
+    let keys = notice_keys(&mut notices, "progress:");
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_ne!(keys[0], keys[1]);
+    team.shutdown().await;
+}

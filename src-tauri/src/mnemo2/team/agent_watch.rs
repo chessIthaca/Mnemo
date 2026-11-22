@@ -75,8 +75,15 @@ struct Observed {
     agent_id: String,
     /// The file the counters were read from.
     path: Option<PathBuf>,
-    /// Bytes consumed: the end of the last complete line read.
+    /// Bytes read from the file, including the unfinished `tail`.
     offset: u64,
+    /// The unfinished last line, kept so nothing is read twice.
+    tail: Vec<u8>,
+    /// A line longer than the cap is being skipped up to its newline.
+    skipping: bool,
+    /// Length and hash of the file's first bytes when last read: a changed
+    /// hash means the file was replaced.
+    fingerprint: Option<(u64, u64)>,
     tool_calls: u64,
     tokens: u64,
     /// When Mnemo first saw this registration: the silence clock before a
@@ -128,6 +135,12 @@ impl AgentWatch {
         }
     }
 
+    /// The bytes of an unfinished line kept for a worker. Tests only.
+    #[cfg(test)]
+    pub(super) fn tail_len_for_test(&self, worker_id: &str) -> Option<usize> {
+        self.lock().states.get(worker_id).map(|o| o.tail.len())
+    }
+
     /// Whether a watcher task is running. Tests only.
     #[cfg(test)]
     pub(super) fn running_for_test(&self) -> bool {
@@ -168,12 +181,12 @@ fn locate(root: &Path, agent_id: &str) -> Option<PathBuf> {
         };
         for session in sessions.flatten() {
             let candidate = session.path().join("subagents").join(&file);
+            if confined(root, &candidate, agent_id).is_none() {
+                continue;
+            }
             let Ok(meta) = std::fs::metadata(&candidate) else {
                 continue;
             };
-            if !meta.is_file() {
-                continue;
-            }
             let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
             if newest.as_ref().is_none_or(|(best, _)| modified > *best) {
                 newest = Some((modified, candidate));
@@ -183,24 +196,100 @@ fn locate(root: &Path, agent_id: &str) -> Option<PathBuf> {
     newest.map(|(_, path)| path)
 }
 
-/// Find an agent's transcript: the file the lead named when it exists, else
-/// the documented location.
+/// Whether a directory entry is a symlink or a Windows junction (or other
+/// reparse point).
+fn is_link(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// The path when it is an existing file named exactly
+/// `agent-<agent_id>.jsonl` whose canonical form lies under `root` and
+/// whose own components below the root are not symlinks or junctions.
+fn confined(root: &Path, path: &Path, agent_id: &str) -> Option<PathBuf> {
+    if !valid_agent_id(agent_id) {
+        return None;
+    }
+    let expected = format!("agent-{agent_id}.jsonl");
+    if path.file_name()?.to_str()? != expected {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let below = canonical.strip_prefix(&canonical_root).ok()?;
+    if canonical.file_name()?.to_str()? != expected || !std::fs::metadata(&canonical).ok()?.is_file()
+    {
+        return None;
+    }
+    // The last `below` components of the given spelling are the ones under
+    // the root: none of them may be a link.
+    let given: Vec<_> = path.components().collect();
+    let depth = below.components().count();
+    if given.len() < depth {
+        return None;
+    }
+    let mut walked = PathBuf::new();
+    for (index, component) in given.iter().enumerate() {
+        walked.push(component);
+        if index + depth >= given.len() {
+            let meta = std::fs::symlink_metadata(&walked).ok()?;
+            if is_link(&meta) {
+                return None;
+            }
+        }
+    }
+    Some(path.to_path_buf())
+}
+
+/// What a transcript search found.
+pub(super) struct Found {
+    pub(super) path: Option<String>,
+    /// The lead named a path that was not accepted.
+    pub(super) ignored_given: bool,
+}
+
+/// Find an agent's transcript: the file the lead named when it is confined
+/// to `~/.claude/projects` and named for the agent, else the documented
+/// location.
 pub(super) fn find_transcript(
     watch: &AgentWatch,
     agent_id: &str,
     given: Option<&str>,
-) -> Option<String> {
+) -> Found {
     let given = given
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
+    let root = watch.projects_root();
+    let mut ignored_given = false;
     if let Some(path) = given {
-        if path.is_file() {
-            return Some(path.to_string_lossy().into_owned());
+        match root.as_deref().and_then(|root| confined(root, &path, agent_id)) {
+            Some(path) => {
+                return Found {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    ignored_given: false,
+                }
+            }
+            None => ignored_given = true,
         }
     }
-    let root = watch.projects_root()?;
-    locate(&root, agent_id).map(|path| path.to_string_lossy().into_owned())
+    let path = root
+        .and_then(|root| locate(&root, agent_id))
+        .map(|path| path.to_string_lossy().into_owned());
+    Found {
+        path,
+        ignored_given,
+    }
 }
 
 fn epoch_ms(time: std::time::SystemTime) -> u128 {
@@ -243,38 +332,102 @@ fn read_line(observed: &mut Observed, line: &[u8]) {
     }
 }
 
-/// Read what the file gained since the last look.
+/// The longest unfinished line kept between looks; a longer line is skipped.
+const TAIL_CAP: usize = 4 * 1024 * 1024;
+
+/// How many leading bytes fingerprint a transcript file.
+const FINGERPRINT_BYTES: u64 = 512;
+
+/// How many bytes one read takes.
+const CHUNK_BYTES: usize = 64 * 1024;
+
+/// A hash of the file's first `len` bytes, `None` when they cannot be read.
+fn fingerprint(file: &mut std::fs::File, len: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(len).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 != len {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+impl Observed {
+    /// Forget everything read: the file is new or was replaced.
+    fn reset_reading(&mut self) {
+        self.offset = 0;
+        self.tool_calls = 0;
+        self.tokens = 0;
+        self.tail.clear();
+        self.skipping = false;
+        self.fingerprint = None;
+    }
+
+    /// Count the complete lines in `tail`, keeping the unfinished rest.
+    fn drain_lines(&mut self) {
+        let mut start = 0;
+        while let Some(found) = self.tail[start..].iter().position(|byte| *byte == 10) {
+            let end = start + found;
+            if self.skipping {
+                self.skipping = false;
+            } else if end > start {
+                let line = self.tail[start..end].to_vec();
+                read_line(self, &line);
+            }
+            start = end + 1;
+        }
+        self.tail.drain(..start);
+        if self.skipping {
+            self.tail.clear();
+        } else if self.tail.len() > TAIL_CAP {
+            // A line longer than the cap: skip it up to its newline.
+            self.tail.clear();
+            self.skipping = true;
+        }
+    }
+}
+
+/// Read what the file gained since the last look: only new bytes, in
+/// chunks, and only complete lines are parsed.
 fn read_new(observed: &mut Observed, path: &Path, length: u64) {
     use std::io::{Read, Seek, SeekFrom};
-    if length < observed.offset {
-        // The file shrank: it is a different file now.
-        observed.offset = 0;
-        observed.tool_calls = 0;
-        observed.tokens = 0;
-    }
-    if length == observed.offset {
-        return;
-    }
     let Ok(mut file) = std::fs::File::open(path) else {
         return;
     };
-    if file.seek(SeekFrom::Start(observed.offset)).is_err() {
-        return;
+    // Shrunk, or its first bytes changed: a different file now.
+    let replaced = length < observed.offset
+        || observed
+            .fingerprint
+            .is_some_and(|(len, hash)| fingerprint(&mut file, len) != Some(hash));
+    if replaced {
+        observed.reset_reading();
     }
-    let mut bytes = Vec::new();
-    if file.take(length - observed.offset).read_to_end(&mut bytes).is_err() {
-        return;
-    }
-    // Only complete lines count: the writer may be mid-line.
-    let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-        return;
-    };
-    for line in bytes[..end].split(|byte| *byte == b'\n') {
-        if !line.is_empty() {
-            read_line(observed, line);
+    if length > observed.offset {
+        if file.seek(SeekFrom::Start(observed.offset)).is_err() {
+            return;
+        }
+        let mut remaining = length - observed.offset;
+        let mut chunk = vec![0u8; CHUNK_BYTES];
+        while remaining > 0 {
+            let want = remaining.min(CHUNK_BYTES as u64) as usize;
+            let Ok(got) = file.read(&mut chunk[..want]) else {
+                break;
+            };
+            if got == 0 {
+                break;
+            }
+            observed.tail.extend_from_slice(&chunk[..got]);
+            observed.offset += got as u64;
+            remaining -= got as u64;
+            observed.drain_lines();
         }
     }
-    observed.offset += end as u64 + 1;
+    let len = observed.offset.min(FINGERPRINT_BYTES);
+    observed.fingerprint = fingerprint(&mut file, len).map(|hash| (len, hash));
 }
 
 /// Whether the agent's meta file says it ended.
@@ -299,16 +452,17 @@ pub(super) struct Looked {
 pub(super) fn look(watch: &AgentWatch, worker: &WorkerRecord, now: u128) -> Option<Looked> {
     let agent_id = worker.claude_agent_id.clone()?;
     // The recorded file, or a fresh search when it is missing or gone.
+    let root = watch.projects_root();
     let recorded = worker
         .claude_agent_transcript
         .as_deref()
         .map(PathBuf::from)
-        .filter(|path| path.is_file());
+        .and_then(|path| confined(root.as_deref()?, &path, &agent_id));
     let mut found = None;
     let path = match recorded {
         Some(path) => Some(path),
         None => {
-            let path = find_transcript(watch, &agent_id, None).map(PathBuf::from);
+            let path = find_transcript(watch, &agent_id, None).path.map(PathBuf::from);
             if let Some(path) = &path {
                 found = Some(path.to_string_lossy().into_owned());
             }
@@ -326,9 +480,7 @@ pub(super) fn look(watch: &AgentWatch, worker: &WorkerRecord, now: u128) -> Opti
     }
     if observed.path != path {
         observed.path = path.clone();
-        observed.offset = 0;
-        observed.tool_calls = 0;
-        observed.tokens = 0;
+        observed.reset_reading();
     }
     let mut last_activity = None;
     let mut finished = false;
@@ -475,7 +627,7 @@ async fn tick(
                 if !observed.finish_noticed {
                     observed.finish_noticed = true;
                     notice = Some((
-                        format!("agent-finished:{}:{}", worker.id, view.id),
+                        format!("agent-finished:{}:{}:{}", worker.id, view.id, worker.turns),
                         format!(
                             "worker_id={id}\n{id}'s Claude Code agent finished; call team_agent_done with its report.",
                             id = worker.id
@@ -506,6 +658,10 @@ async fn tick(
     }
     true
 }
+
+/// Makes every progress notice key unique, so two notes in one millisecond
+/// both reach the lead.
+static PROGRESS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The longest progress note, in characters.
 const PROGRESS_NOTE_CHARS: usize = 500;
@@ -546,7 +702,8 @@ impl TeamRuntime {
         }
         let worker = self.worker(worker_id).await?;
         agent_worker_in_work(&worker, "team_agent_started")?;
-        let transcript = find_transcript(&self.agent_watch, agent_id, transcript_path);
+        let search = find_transcript(&self.agent_watch, agent_id, transcript_path);
+        let transcript = search.path;
         {
             let mut records = self.records.lock().await;
             let Some(record) = records.iter_mut().find(|record| record.id == worker_id) else {
@@ -565,12 +722,17 @@ impl TeamRuntime {
         )
         .await?;
         self.ensure_agent_watch().await;
+        let ignored = if search.ignored_given {
+            "The transcript_path you gave was ignored: only agent-<agent_id>.jsonl under ~/.claude/projects, reached without links, is accepted. "
+        } else {
+            ""
+        };
         let text = match &transcript {
             Some(path) => format!(
-                "Registered Claude Code agent {agent_id} for {worker_id}; Mnemo follows its transcript {path}."
+                "{ignored}Registered Claude Code agent {agent_id} for {worker_id}; Mnemo follows its transcript {path}."
             ),
             None => format!(
-                "Registered Claude Code agent {agent_id} for {worker_id}; its transcript was not found yet, so Mnemo keeps looking for it under ~/.claude/projects."
+                "{ignored}Registered Claude Code agent {agent_id} for {worker_id}; its transcript was not found yet, so Mnemo keeps looking for it under ~/.claude/projects."
             ),
         };
         let worker = self.worker(worker_id).await?;
@@ -616,7 +778,10 @@ impl TeamRuntime {
         )
         .await?;
         let _ = self.signals.send(BoardSignal::Notice {
-            key: format!("progress:{worker_id}:{at_ms}:{}", note.len()),
+            key: format!(
+                "progress:{worker_id}:{at_ms}:{}",
+                PROGRESS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
             text: format!("worker_id={worker_id}\n{worker_id} progress: {note}"),
         });
         self.worker(worker_id).await

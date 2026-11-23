@@ -445,32 +445,6 @@ mod download_core_tests {
         }
     }
 
-    /// Collect every value the store's re-embed watch publishes: the install
-    /// path must emit `Started` … `Done` there (a `watch` keeps only the last
-    /// value, so a plain after-the-fact read would only prove `Done`).
-    #[cfg(feature = "embeddings")]
-    fn collect_events(
-        mut rx: tokio::sync::watch::Receiver<Option<ReembedEvent>>,
-    ) -> (
-        Arc<std::sync::Mutex<Vec<ReembedEvent>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let seen: Arc<std::sync::Mutex<Vec<ReembedEvent>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = seen.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                if let Some(event) = rx.borrow_and_update().clone() {
-                    sink.lock().unwrap().push(event);
-                }
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-        (seen, handle)
-    }
-
     /// Review finding 1 (2026-08-21): a background startup load that
     /// lands AFTER the user switched models in Settings must not
     /// clobber the newer selection.
@@ -502,7 +476,6 @@ mod download_core_tests {
             .write(Memory::new(MemoryTier::Semantic, "fact", "content", 1000))
             .await
             .expect("write");
-        let (seen, collector) = collect_events(store.reembed_events());
         install_embedder(store.clone(), Arc::new(OtherEmbedder)).await;
 
         assert_eq!(
@@ -515,9 +488,9 @@ mod download_core_tests {
             vec![("test-other".to_string(), 768)],
             "the stale row was re-embedded before the swap"
         );
-        drop(store);
-        collector.await.unwrap();
-        let events = seen.lock().unwrap().clone();
+        // Every published event, in order: sampling the watch raced the
+        // publisher and could miss `Started` (it failed under a loaded full run).
+        let events = store.reembed_history();
         assert_eq!(
             events.first(),
             Some(&ReembedEvent::Started {

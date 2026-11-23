@@ -51,31 +51,6 @@ impl Embedder for AnchorEmbedder {
     }
 }
 
-/// Collect every value the store's re-embed watch publishes while a test runs,
-/// so the event sequence can be asserted once the pass is over. The collector
-/// ends when the store — and with it the channel's sender — is dropped.
-fn collect_reembed_events(
-    mut rx: tokio::sync::watch::Receiver<Option<ReembedEvent>>,
-) -> (
-    Arc<std::sync::Mutex<Vec<ReembedEvent>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    let seen: Arc<std::sync::Mutex<Vec<ReembedEvent>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = seen.clone();
-    let handle = tokio::spawn(async move {
-        loop {
-            if let Some(event) = rx.borrow_and_update().clone() {
-                sink.lock().unwrap().push(event);
-            }
-            if rx.changed().await.is_err() {
-                break;
-            }
-        }
-    });
-    (seen, handle)
-}
-
 /// Open an in-memory store with an [`AnchorEmbedder`] and the standard
 /// test clock.
 fn make_anchor_store(model_id: &'static str) -> MemoryStore {
@@ -1513,7 +1488,6 @@ async fn reembed_if_needed_only_touches_stale_rows() {
     }
 
     calls.store(0, Ordering::SeqCst);
-    let (seen, collector) = collect_reembed_events(store.reembed_events());
     reembed_if_needed(&store, &other).await;
 
     assert_eq!(
@@ -1527,9 +1501,7 @@ async fn reembed_if_needed_only_touches_stale_rows() {
         vec![("test-other".to_string(), 768)],
         "every row carries the new fingerprint afterwards"
     );
-    drop(store);
-    collector.await.unwrap();
-    let events = seen.lock().unwrap().clone();
+    let events = store.reembed_history();
     assert!(
         events
             .iter()
@@ -1559,12 +1531,9 @@ async fn reembed_if_needed_publishes_started_progress_done() {
         model_id: "test-other",
         calls: Arc::new(AtomicUsize::new(0)),
     });
-    let (seen, collector) = collect_reembed_events(store.reembed_events());
     reembed_if_needed(&store, &other).await;
-    drop(store);
-    collector.await.unwrap();
 
-    let events = seen.lock().unwrap().clone();
+    let events = store.reembed_history();
     assert_eq!(
         events.first(),
         Some(&ReembedEvent::Started {

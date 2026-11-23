@@ -757,6 +757,11 @@ pub struct MemoryStore {
     /// starts only after the brain built the store — reads the current state
     /// instead of missing a pass that ran during startup.
     reembed_tx: tokio::sync::watch::Sender<Option<ReembedEvent>>,
+    /// Tests only: every re-embed event in publish order. The watch keeps
+    /// just the last value, so a test that sampled it raced the publisher and
+    /// missed `Started` whenever a later event replaced it first.
+    #[cfg(test)]
+    reembed_log: Arc<std::sync::Mutex<Vec<ReembedEvent>>>,
 }
 
 /// The outcome of an FTS5 candidate lookup, distinguishing "FTS unavailable"
@@ -840,6 +845,8 @@ impl MemoryStore {
             })),
             embedding_cache_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reembed_tx: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            reembed_log: Arc::default(),
         })
     }
 
@@ -866,7 +873,21 @@ impl MemoryStore {
     /// no receivers it simply stores the value, which is exactly the late
     /// subscriber case this channel exists for (`send` would error).
     fn publish_reembed(&self, event: ReembedEvent) {
+        #[cfg(test)]
+        self.reembed_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event.clone());
         self.reembed_tx.send_replace(Some(event));
+    }
+
+    /// Tests only: every re-embed event published so far, in order.
+    #[cfg(test)]
+    pub(crate) fn reembed_history(&self) -> Vec<ReembedEvent> {
+        self.reembed_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The live retrieval/indexing scale knobs (the Phase 2 `[memory]`
@@ -1265,6 +1286,8 @@ impl MemoryStore {
             })),
             embedding_cache_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reembed_tx: tokio::sync::watch::channel(None).0,
+            #[cfg(test)]
+            reembed_log: Arc::default(),
         })
     }
 

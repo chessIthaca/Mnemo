@@ -93,8 +93,21 @@ export const workerStatusLabel: Record<WorkerStatus, string> = {
   cancelled: "Cancelled",
 };
 
-/** A worker's status as shown: a landed merge that was later reverted reads "Reverted". */
-export function workerStatusText(worker: Pick<Worker, "status" | "merge">): string {
+/**
+ * A worker's status as shown: a landed merge that was later reverted reads
+ * "Reverted". An audit's report ends its job: while the lead adjudicates it the
+ * status reads "Reported", and once Mnemo closes the used audit (it stops the
+ * session) it reads "Audit used" instead of a bare "Stopped". A ledger written
+ * before `report_delivered` existed records a finished audit as `completed`
+ * (record.rs `audit_finished`), so that status counts as reported too.
+ */
+export function workerStatusText(
+  worker: Pick<Worker, "status" | "merge" | "kind" | "reportDelivered">,
+): string {
+  const reportedAudit =
+    worker.kind === "audit" && (worker.reportDelivered === true || worker.status === "completed");
+  if (reportedAudit && worker.status === "completed") return "Reported";
+  if (reportedAudit && worker.status === "stopped") return "Audit used";
   return worker.status === "merged" && worker.merge?.revertCommit ? "Reverted" : workerStatusLabel[worker.status];
 }
 

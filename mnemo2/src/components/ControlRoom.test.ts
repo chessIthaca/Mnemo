@@ -1,8 +1,9 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, within } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
-import { fixtureState } from "../test/fixtures";
+import type { Worker } from "../lib/types";
+import { createAuditWorker, createWorkers, fixtureState } from "../test/fixtures";
 import ControlRoom from "./ControlRoom.svelte";
 
 const workerRows = () => screen.getAllByRole("button", { name: /Open .* worker thread/ });
@@ -182,5 +183,64 @@ describe("Mission Control", () => {
     expect(get(app).workbenchTab).toBe("diff");
     expect(get(app).diffWorkerId).toBe("theo");
     expect(get(app).route).toBe("team");
+  });
+
+  describe("audit workers", () => {
+    /** The Mission Control group section whose heading starts with `label`. */
+    const group = (label: string): HTMLElement => {
+      const section = screen.getByRole("heading", { name: new RegExp(`^${label}`) }).closest("section");
+      if (!section) throw new Error(`Mission Control group ${label} is not rendered`);
+      return section;
+    };
+
+    const reportedAudit: Worker = { ...createAuditWorker(), status: "completed", reportDelivered: true };
+    const usedAudit: Worker = {
+      ...createAuditWorker(),
+      id: "ada-used",
+      name: "Ada Used",
+      status: "stopped",
+      reportDelivered: true,
+    };
+
+    it("keeps a reported audit and a used audit in Done, never Needs you or Active", () => {
+      const implementation = createWorkers().find((worker) => worker.id === "kai")!;
+      app.set({
+        ...fixtureState(),
+        workers: [implementation, reportedAudit, usedAudit],
+        selectedWorkerId: implementation.id,
+      });
+      render(ControlRoom);
+
+      const done = group("Done");
+      expect(within(done).getByRole("button", { name: /Open Ada worker thread/ })).toBeTruthy();
+      expect(within(done).getByRole("button", { name: /Open Ada Used worker thread/ })).toBeTruthy();
+      expect(within(done).getByText("Reported")).toBeTruthy();
+      expect(within(done).getByText("Audit used")).toBeTruthy();
+
+      const active = group("Active");
+      expect(within(active).getByRole("button", { name: /Open Kai worker thread/ })).toBeTruthy();
+      expect(within(active).queryByText("Reported")).toBeNull();
+      expect(within(active).queryByText("Audit used")).toBeNull();
+      expect(screen.queryByRole("heading", { name: /^Needs you/ })).toBeNull();
+    });
+
+    it("renders implementation workers exactly as before", () => {
+      const implementation = createWorkers().find((worker) => worker.id === "kai")!;
+      app.set({
+        ...fixtureState(),
+        workers: [
+          { ...implementation, status: "completed", reportDelivered: true },
+          { ...implementation, id: "kai-stopped", name: "Kai Stopped", status: "stopped", reportDelivered: true },
+        ],
+        selectedWorkerId: implementation.id,
+      });
+      render(ControlRoom);
+
+      const done = group("Done");
+      expect(within(done).getByText("Completed")).toBeTruthy();
+      expect(within(done).getByText("Stopped")).toBeTruthy();
+      expect(within(done).queryByText("Reported")).toBeNull();
+      expect(within(done).queryByText("Audit used")).toBeNull();
+    });
   });
 });

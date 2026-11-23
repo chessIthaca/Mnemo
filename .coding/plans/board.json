@@ -4210,6 +4210,28 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Internal pool housekeeping; no OpenSpec capability covers pool folder lifetime (it is recorded in the .coding/knowledge spec record, which the step updates)."
+    },
+    {
+      "id": "b1251d3c",
+      "status": "closed",
+      "created_at_ms": 1795469514175,
+      "closed_at_ms": 1795471270419,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-b1251d3c-20261123-220110.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Display-only change in the Mnemo2 window; the host record and the lead-facing team_status contract are unchanged."
+    },
+    {
+      "id": "0fa5cad0",
+      "status": "closed",
+      "created_at_ms": 1795470881532,
+      "closed_at_ms": 1795471788169,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-0fa5cad0-20261123-220948.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Developer install script only; no product behavior or governed capability changes."
     }
   ]
 }

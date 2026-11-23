@@ -15,8 +15,10 @@ use crate::mnemo2::ledger;
 use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
 use crate::mnemo2::runtime::{finished_notice, TEAM_NOTICE_PREFIX};
 
+use super::agent_log;
+use super::agent_watch::{self, FinishedRun, NO_FINAL_MESSAGE};
 use super::lead_tools::TeamLeadStatus;
-use super::pump::save_workers_now_locked;
+use super::pump::{save_workers, save_workers_now_locked};
 use super::record::{audit_finished, WorkerRecord, WorkerStatus};
 use super::{unix_ms, TeamRuntime};
 
@@ -265,6 +267,97 @@ impl TeamRuntime {
         was_attached
     }
 
+    /// The external lead leaves (its session ended, it idled out, or the
+    /// project closes): detach it as [`TeamRuntime::detach_external_lead`]
+    /// does, then hand back the agent workers it can no longer run
+    /// ([`TeamRuntime::hand_back_agent_workers`]). Returns `true` when an
+    /// external lead was attached; nothing is handed back otherwise.
+    pub async fn leave_external_lead(&self) -> bool {
+        let was_attached = self.detach_external_lead();
+        if was_attached {
+            if let Err(error) = self.hand_back_agent_workers().await {
+                eprintln!("team: could not hand back agent workers after the lead left: {error}");
+            }
+        }
+        was_attached
+    }
+
+    /// Hand back every agent worker no Claude Code lead runs any more: one
+    /// that waits for its agent to be launched, or whose agent stalled. Each
+    /// becomes an ordinary interrupted Mnemo worker with the reason (record,
+    /// branch, checkout and commits kept), and the next lead gets one notice
+    /// per worker. A running agent is left alone: its transcript may still be
+    /// written. Does nothing while an external lead is attached (it came back
+    /// before this ran). Returns the ids handed back.
+    pub(super) async fn hand_back_agent_workers(&self) -> Result<Vec<String>, String> {
+        let _guard = self.merge_lock.lock().await;
+        if self.external_lead_attached() {
+            return Ok(Vec::new());
+        }
+        let candidates: Vec<WorkerRecord> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| {
+                worker.claude_agent.is_some()
+                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+            })
+            .cloned()
+            .collect();
+        let mut due = Vec::new();
+        for worker in candidates {
+            let view = self.agent_view(&worker).await;
+            if agent_watch::hand_back_due(&worker, view.as_ref()) {
+                due.push(worker);
+            }
+        }
+        if due.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut handed = Vec::new();
+        {
+            let mut records = self.records.lock().await;
+            for seen in &due {
+                // Re-checked: the agent may have been registered meanwhile.
+                let Some(worker) = records.iter_mut().find(|worker| worker.id == seen.id) else {
+                    continue;
+                };
+                if worker.claude_agent.is_none()
+                    || worker.claude_agent_id != seen.claude_agent_id
+                    || worker.status != seen.status
+                {
+                    continue;
+                }
+                agent_watch::hand_back(worker);
+                handed.push(worker.id.clone());
+            }
+        }
+        for id in &handed {
+            self.agent_watch.forget(id);
+        }
+        if handed.is_empty() {
+            return Ok(handed);
+        }
+        // The records changed either way: a failed save is reported, and the
+        // next save writes them.
+        let saved = save_workers(
+            &self.records,
+            &self.usage,
+            &self.save_lock,
+            &self.persistence,
+        )
+        .await;
+        let held: Vec<String> = handed
+            .iter()
+            .map(|id| agent_watch::handed_back_notice(id))
+            .filter(|notice| !self.push_external_notice(notice.clone()))
+            .collect();
+        self.restore_undelivered_notices(held);
+        let _ = self.signals.send(super::BoardSignal::Changed);
+        saved.map(|()| handed)
+    }
+
     /// Whether an external lead currently leads this team.
     pub fn external_lead_attached(&self) -> bool {
         self.external_state().since_ms.is_some()
@@ -500,6 +593,11 @@ impl TeamRuntime {
 
     /// `agent_done` with an optional saved-worker override for the
     /// persistence regression seam.
+    ///
+    /// On a run Mnemo already finished itself (the agent's transcript said
+    /// it ended, [`TeamRuntime::auto_finish_agent`]) the call succeeds
+    /// without a second notice: a non-empty report replaces the agent's last
+    /// message, and `failed` marks the worker Failed with the failed notice.
     pub(super) async fn agent_done_with_snapshot(
         &self,
         worker_id: &str,
@@ -509,11 +607,20 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let record = self.worker(worker_id).await?;
-        let previous = record.clone();
         if record.claude_agent.is_none() {
             return Err(format!(
                 "{worker_id} does not run as a Claude Code agent: team_agent_done only finishes agent workers"
             ));
+        }
+        if self.agent_watch.auto_finished(&record) {
+            let worker = self
+                .close_agent_run_locked(&record, report, failed, true, snapshot_override)
+                .await?;
+            if failed {
+                self.agent_watch.clear_auto_finished(worker_id);
+                self.push_agent_done_notice(&worker, true, false);
+            }
+            return Ok(worker);
         }
         // Called once per agent run: the first run, a continuation after
         // team_message, or a fix round after team_route_fix.
@@ -529,11 +636,78 @@ impl TeamRuntime {
                 "{worker_id} is {status}: team_agent_done needs a Working, Fixing or Interrupted agent worker"
             ));
         }
+        let worker = self
+            .close_agent_run_locked(&record, report, failed, false, snapshot_override)
+            .await?;
+        self.push_agent_done_notice(&worker, failed, false);
+        Ok(worker)
+    }
+
+    /// Finish the worker of an agent run whose transcript says it ended, as
+    /// `team_agent_done` with `failed=false` would: the agent's last message
+    /// (or [`NO_FINAL_MESSAGE`]) is the report, the worker is Completed, a
+    /// fix round closes, and the lead gets the ordinary finished notice with
+    /// the report. Only while the worker still runs that same run (same
+    /// agent, same turn, Working or Fixing), re-checked under the merge lock,
+    /// so a lead's `team_agent_done` that got there first is not doubled.
+    /// Returns whether it finished the worker.
+    pub(super) async fn auto_finish_agent(&self, run: &FinishedRun) -> Result<bool, String> {
+        // Read before the lock: the transcript can be long.
+        let report = run
+            .transcript
+            .as_deref()
+            .and_then(|path| agent_log::last_assistant_text_of(std::path::Path::new(path)))
+            .unwrap_or_else(|| NO_FINAL_MESSAGE.to_string());
+        let _guard = self.merge_lock.lock().await;
+        let Ok(record) = self.worker(&run.worker_id).await else {
+            return Ok(false);
+        };
+        let same_run = record.claude_agent.is_some()
+            && record.claude_agent_id.as_deref() == Some(run.agent_id.as_str())
+            && record.turns == run.turns
+            && matches!(record.status, WorkerStatus::Working | WorkerStatus::Fixing);
+        if !same_run {
+            return Ok(false);
+        }
+        let worker = self
+            .close_agent_run_locked(&record, report, false, false, None)
+            .await?;
+        // Marked before the merge lock is released, so a team_agent_done
+        // waiting on it finds the run finished.
+        self.agent_watch.mark_auto_finished(&worker);
+        self.push_agent_done_notice(&worker, false, true);
+        Ok(true)
+    }
+
+    /// Close one agent run on `previous` (the record the caller checked
+    /// under the merge lock it holds) and save it. A run closes Completed or
+    /// Failed with `report`, a counted turn, and its fix round closed. With
+    /// `after_auto` the run was already closed by Mnemo: only a non-empty
+    /// `report` replaces the stored one and `failed` marks it Failed. A
+    /// failed save restores what this changed and returns the error.
+    async fn close_agent_run_locked(
+        &self,
+        previous: &WorkerRecord,
+        report: String,
+        failed: bool,
+        after_auto: bool,
+        snapshot_override: Option<WorkerRecord>,
+    ) -> Result<WorkerRecord, String> {
+        let worker_id = previous.id.as_str();
         // Serialize the whole mutation/write/rollback section. Other savers
         // take this guard before cloning records, so none can observe or
         // persist the transient Completed state.
         let save_guard = self.save_lock.lock().await;
         self.update_worker(worker_id, |worker| {
+            if after_auto {
+                if failed {
+                    worker.status = WorkerStatus::Failed;
+                }
+                if !report.trim().is_empty() {
+                    worker.report = Some(report);
+                }
+                return;
+            }
             worker.status = if failed {
                 WorkerStatus::Failed
             } else {
@@ -572,9 +746,7 @@ impl TeamRuntime {
             return Err(error);
         }
         drop(save_guard);
-        let worker = self.worker(worker_id).await?;
-        self.push_agent_done_notice(&worker, failed);
-        Ok(worker)
+        self.worker(worker_id).await
     }
 
     /// Deliver the finished (or failed) notice for a Claude Code agent
@@ -585,7 +757,10 @@ impl TeamRuntime {
     /// the notice. It rides the external-lead queue when one is attached
     /// (the tool answer drains it); otherwise it parks on the undelivered
     /// list for whoever leads next.
-    fn push_agent_done_notice(&self, worker: &WorkerRecord, failed: bool) {
+    /// `with_report` quotes the stored report after the finished line: the
+    /// lead did not write it (Mnemo finished the run from the agent's
+    /// transcript).
+    fn push_agent_done_notice(&self, worker: &WorkerRecord, failed: bool, with_report: bool) {
         let step = match (&worker.plan_id, worker.plan_step) {
             (Some(plan), Some(step)) => format!(" on plan {plan} step {}", step + 1),
             _ => String::new(),
@@ -601,6 +776,13 @@ impl TeamRuntime {
             format!(
                 "{} could not finish its turn{step}: the Claude Code agent failed.{report}\nTo try again, dispatch the step again (a fresh worker id), or team_stop this worker to clear it.",
                 worker.name
+            )
+        } else if with_report {
+            let report = worker.report.as_deref().unwrap_or(NO_FINAL_MESSAGE);
+            format!(
+                "{}\nIts Claude Code agent ended; its last message is the report:\n{}",
+                finished_notice(worker),
+                agent_watch::clip_report(report)
             )
         } else {
             finished_notice(worker)

@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use crate::mnemo2::dispatch_routing::RoutingMode;
 use crate::mnemo2::phase3::{self, ReviewEvidence};
 
+use super::agent_watch;
 use super::findings_ledger;
 use super::record::{ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
@@ -824,10 +825,15 @@ impl TeamRuntime {
             let mut views = Vec::with_capacity(workers.len());
             for worker in workers {
                 let mut view = worker_status_view(worker, detail);
-                if let (Some(agent), Some(object)) =
-                    (self.agent_view(worker).await, view.as_object_mut())
-                {
-                    object.insert("agent".to_string(), agent.to_json());
+                let agent = self.agent_view(worker).await;
+                if let Some(object) = view.as_object_mut() {
+                    if let Some(agent) = &agent {
+                        object.insert("agent".to_string(), agent.to_json());
+                    }
+                    // Derived, never stored: the record has no such field.
+                    if let Some(phase) = agent_watch::agent_phase(worker, agent.as_ref()) {
+                        object.insert("agent_phase".to_string(), json!(phase));
+                    }
                 }
                 if let (Some(missing), Some(object)) =
                     (self.stale_base(worker).await, view.as_object_mut())

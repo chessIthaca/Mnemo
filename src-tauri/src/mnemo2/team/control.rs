@@ -1125,6 +1125,7 @@ pub(super) async fn recover_worker(
     root: &std::path::Path,
     worker: &mut WorkerRecord,
     other_worktrees: &[PathBuf],
+    state_dir: &std::path::Path,
 ) -> Result<(), String> {
     worker.brief_sent = true;
     worker.compacting = false;
@@ -1213,7 +1214,7 @@ pub(super) async fn recover_worker(
             worker.merge = Some(record);
             worker.error = None;
             let pool = matches!(worker_checkout(root, worker), Some(CheckoutKind::Pool(_)));
-            match cleanup_agent_worktree(root, worker, other_worktrees).await {
+            match cleanup_agent_worktree(root, worker, other_worktrees, state_dir).await {
                 Ok(()) if pool => worker.worktree = PathBuf::new(),
                 Ok(()) => {}
                 Err(err) => {

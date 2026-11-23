@@ -1367,8 +1367,18 @@ pub async fn workbench_screenshot(
     path: String,
 ) -> Result<String, String> {
     let runtime = current(&state).await?;
-    let worker = current_team(&state).await?.worker(&worker_id).await?;
-    workbench::worker_screenshot(runtime.workspace_root(), &worker, &path).await
+    let team = current_team(&state).await?;
+    let worker = team.worker(&worker_id).await?;
+    // The copy Mnemo kept when the worker's checkout was released: a Landed
+    // worker no longer holds one.
+    let archive = workbench::screenshot_archive_dir(team.state_dir(), &worker.id);
+    workbench::worker_screenshot(
+        runtime.workspace_root(),
+        &worker,
+        &path,
+        archive.as_deref(),
+    )
+    .await
 }
 
 /// Read an image a lead or worker tool call took or looked at, for the tool
@@ -1382,8 +1392,16 @@ pub async fn workbench_tool_image(
     let runtime = current(&state).await?;
     let checkout = match worker_id {
         Some(id) => {
-            let worker = current_team(&state).await?.worker(&id).await?;
-            workbench::worker_checkout(runtime.workspace_root(), &worker)?
+            let team = current_team(&state).await?;
+            let worker = team.worker(&id).await?;
+            let archive = workbench::screenshot_archive_dir(team.state_dir(), &worker.id);
+            return workbench::worker_tool_image(
+                runtime.workspace_root(),
+                &worker,
+                &path,
+                archive.as_deref(),
+            )
+            .await;
         }
         None => dunce::canonicalize(runtime.workspace_root())
             .map_err(|err| format!("could not resolve the project root: {err}"))?,

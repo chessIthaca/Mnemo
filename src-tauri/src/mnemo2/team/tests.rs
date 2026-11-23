@@ -11185,11 +11185,18 @@ async fn auto_resume_does_nothing_after_shutdown() {
     assert!(refused.contains("closing"), "{refused}");
 }
 
-#[tokio::test]
+// The current-thread runtime is load-bearing: the spawned resume runs only
+// while this test awaits, and runs on to its next pending lock each time.
+#[tokio::test(flavor = "current_thread")]
 async fn resume_refuses_an_idle_live_worker_once_closing() {
     // A failed worker whose session is still alive and idle: the resume fast
     // path recovers it in place.
     let (fixture, _notices, _generation) = usage_limited_failed_worker().await;
+    // The fixture saw Failed in memory, but the pump marks the record before
+    // its save lands (that write runs on the blocking pool). Persisting here
+    // waits out every earlier save under the save lock and writes the
+    // failed record itself, so the ledger on disk reads Failed from now on.
+    fixture.team.persist().await.expect("persist the failed worker");
     let persisted_status = || {
         TeamPersistence::new(fixture.state.path())
             .load()
@@ -11207,11 +11214,25 @@ async fn resume_refuses_an_idle_live_worker_once_closing() {
     // check and waits on the live map.
     let live = fixture.team.live.lock().await;
     assert!(live.contains_key("routingworker"), "the session is still live");
+    assert!(
+        fixture.team.merge_lock.try_lock().is_ok(),
+        "nothing else holds the merge lock"
+    );
     let resume = tokio::spawn({
         let team = fixture.team.clone();
         async move { team.resume("routingworker").await }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait until the resume holds the merge lock: its first step.
+    while fixture.team.merge_lock.try_lock().is_ok() {
+        assert!(!resume.is_finished(), "the resume ended before its entry check");
+        tokio::task::yield_now().await;
+    }
+    // Between the merge lock and the live map the resume awaits only the
+    // records lock (reading the worker). That lock is fair: once this test
+    // gets it, the resume has read the record, passed the closed check while
+    // Mnemo was still open, and parked on the live map this test holds.
+    drop(fixture.team.records.lock().await);
+    assert!(!resume.is_finished(), "the resume waits on the live map");
     fixture.team.persistence.closed.store(true, Ordering::SeqCst);
     drop(live);
     let refused = resume
@@ -13248,6 +13269,31 @@ async fn drain_notice_within(
     }
 }
 
+/// The next lead notice whose text contains `needle`, for a background run
+/// (a check run, a proof) whose notice always comes. It wakes on the board
+/// event itself, not on a poll. The 120 s bound only turns a run that never
+/// sends its notice into a failure instead of a hung suite; it is no
+/// estimate of how long the run takes on a loaded machine.
+async fn next_notice(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> String {
+    let wait = async {
+        loop {
+            match receiver.recv().await {
+                Ok(BoardSignal::Notice { text, .. }) if text.contains(needle) => return text,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("the board closed before a notice containing {needle:?}")
+                }
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), wait)
+        .await
+        .unwrap_or_else(|_| panic!("no notice containing {needle:?} within 120 s"))
+}
+
 /// A team whose board holds a `bug_fixing` plan naming `regression_proves_red`
 /// as its regression test, with a provisioned worker whose checkout carries a
 /// commit that adds that name in `fix.rs`.
@@ -13439,9 +13485,7 @@ async fn red_outcome_records_a_passed_check_and_notice() {
     team.prove_regression_tool(&worker_id)
         .await
         .expect("start the red proof");
-    let notice = drain_notice(&mut notices, "regression proof for")
-        .await
-        .expect("the proof finishes with a notice");
+    let notice = next_notice(&mut notices, "regression proof for").await;
     assert!(notice.contains("red (fails without the fix)"), "{notice}");
     let check = eventually(|| async {
         team.worker(&worker_id).await.ok().and_then(|worker| {
@@ -13478,9 +13522,7 @@ async fn not_red_outcome_opens_a_high_finding() {
     team.prove_regression_tool(&worker_id)
         .await
         .expect("start the red proof");
-    let notice = drain_notice(&mut notices, "regression proof for")
-        .await
-        .expect("the proof finishes with a notice");
+    let notice = next_notice(&mut notices, "regression proof for").await;
     assert!(
         notice.contains("NOT red, finding regression-not-red opened"),
         "{notice}"
@@ -17209,9 +17251,9 @@ async fn mnemo_check_run_refuses_a_configured_core_operation() {
     team.run_checks_tool(Some(&worker_id))
         .await
         .expect("the run starts");
-    let notice = drain_notice(&mut notices, "Mnemo ran the checks for")
-        .await
-        .expect("the run ends with a notice");
+    // The run's git processes take as long as the machine's load makes them:
+    // wait for its notice itself, not for a fixed budget.
+    let notice = next_notice(&mut notices, "Mnemo ran the checks for").await;
     assert!(notice.contains("1 passed, 1 failed"), "{notice}");
     assert!(
         notice.contains("FAIL git status (refused: core git operation)"),

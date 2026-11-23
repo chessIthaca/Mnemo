@@ -180,8 +180,9 @@ static TRANSCRIPT_REVS: AtomicU64 = AtomicU64::new(1);
 /// is detected by pointer identity alone.
 type TranscriptRevisionCache = HashMap<String, (Arc<Transcript>, u64)>;
 
-/// The team's public snapshot.
-#[derive(Clone, Debug, Serialize)]
+/// The team's public snapshot. Each serialized worker also carries its
+/// derived `agent_phase` (see [`TeamSnapshot::agent_phases`]).
+#[derive(Clone, Debug)]
 pub struct TeamSnapshot {
     /// Every worker, including completed/stopped ones.
     pub workers: Vec<WorkerRecord>,
@@ -197,13 +198,58 @@ pub struct TeamSnapshot {
     pub transcript_revs: HashMap<String, u64>,
     /// Workers whose transcript was left out (sent empty) because the caller
     /// already holds that revision.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub omitted_transcripts: Vec<String>,
     /// What Mnemo knows about each registered Claude Code agent, by worker
     /// id (the `agent` object of `team_status`). Such a worker's transcript
     /// above is the agent's own log, converted.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub agents: HashMap<String, serde_json::Value>,
+    /// Each Claude Code agent worker's phase, by worker id: `awaiting_launch`,
+    /// `running`, `stalled` or `finished`. Serialized onto the worker as
+    /// `agent_phase`, never onto the record, so it never reaches team.json.
+    pub agent_phases: HashMap<String, &'static str>,
+}
+
+/// One worker as the snapshot sends it: the record and its derived phase.
+#[derive(Serialize)]
+struct SnapshotWorker<'a> {
+    #[serde(flatten)]
+    record: &'a WorkerRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_phase: Option<&'static str>,
+}
+
+impl Serialize for TeamSnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            workers: Vec<SnapshotWorker<'a>>,
+            slots: usize,
+            active: usize,
+            usage: &'a ProjectUsageView,
+            transcript_revs: &'a HashMap<String, u64>,
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            omitted_transcripts: &'a [String],
+            #[serde(skip_serializing_if = "HashMap::is_empty")]
+            agents: &'a HashMap<String, serde_json::Value>,
+        }
+        Wire {
+            workers: self
+                .workers
+                .iter()
+                .map(|record| SnapshotWorker {
+                    record,
+                    agent_phase: self.agent_phases.get(&record.id).copied(),
+                })
+                .collect(),
+            slots: self.slots,
+            active: self.active,
+            usage: &self.usage,
+            transcript_revs: &self.transcript_revs,
+            omitted_transcripts: &self.omitted_transcripts,
+            agents: &self.agents,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// One event forwarded from a worker session, tagged with its worker id.
@@ -494,6 +540,30 @@ impl TeamRuntime {
             .map(|team| team.usage.clone())
             .unwrap_or_default();
         let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
+        // Mnemo2 starts with no external lead: an agent worker whose agent
+        // was never launched, or has stalled (judged by the record's last
+        // activity when its transcript is gone), goes back to Mnemo (plan
+        // a2b8ee89 decision 3). A running agent stays an agent worker at
+        // work; recovery leaves it so and the agent watch follows it.
+        let agent_watch = agent_watch::AgentWatch::default();
+        let handed_back = {
+            let now = phase3::now_ms();
+            let mut handed_back = Vec::new();
+            for worker in &mut workers {
+                if worker.claude_agent.is_none()
+                    || !matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+                {
+                    continue;
+                }
+                let view = agent_watch::look(&agent_watch, worker, now).map(|looked| looked.view);
+                if agent_watch::hand_back_due(worker, view.as_ref()) {
+                    agent_watch::hand_back(worker);
+                    agent_watch.forget(&worker.id);
+                    handed_back.push(worker.id.clone());
+                }
+            }
+            handed_back
+        };
         let held: Vec<(String, PathBuf)> = workers
             .iter()
             .filter(|worker| !worker.worktree.as_os_str().is_empty())
@@ -563,13 +633,20 @@ impl TeamRuntime {
             board: std::sync::Mutex::new(None),
             proving: proving::Proving::default(),
             check_runs: check_run::CheckRuns::default(),
-            agent_watch: agent_watch::AgentWatch::default(),
+            agent_watch,
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
             external: std::sync::Mutex::new(ExternalLead::default()),
             external_wake: tokio::sync::Notify::new(),
         };
+        // The in-app lead (or the next external lead) learns of each one.
+        runtime.restore_undelivered_notices(
+            handed_back
+                .iter()
+                .map(|id| agent_watch::handed_back_notice(id))
+                .collect(),
+        );
         runtime.persist().await?;
         // App start: sweep checkouts a previous run renamed into the
         // trash folder but could not remove yet (something held them).
@@ -577,7 +654,9 @@ impl TeamRuntime {
         // App start: a checkout a previous run could not remove (something
         // held it) is retried now, and the branch it was blocking goes with it.
         runtime.retry_leftover_cleanups().await;
-        // A registered agent that was running when the app closed is watched again.
+        // A registered agent that still runs (recovery kept its worker at
+        // work) is watched again: its finish is processed, and a later stall
+        // with no lead attached hands it back.
         runtime.ensure_agent_watch().await;
         Ok(runtime)
     }
@@ -1000,9 +1079,18 @@ impl TeamRuntime {
             workers
         };
         let mut agents = HashMap::new();
-        for worker in workers.iter().filter(|worker| worker.claude_agent_id.is_some()) {
-            if let Some(view) = self.agent_view(worker).await {
+        let mut agent_phases = HashMap::new();
+        for worker in workers.iter().filter(|worker| worker.claude_agent.is_some()) {
+            let view = if worker.claude_agent_id.is_some() {
+                self.agent_view(worker).await
+            } else {
+                None
+            };
+            if let Some(view) = &view {
                 agents.insert(worker.id.clone(), view.to_json());
+            }
+            if let Some(phase) = agent_watch::agent_phase(worker, view.as_ref()) {
+                agent_phases.insert(worker.id.clone(), phase);
             }
         }
         let active = self.live.lock().await.len();
@@ -1020,6 +1108,7 @@ impl TeamRuntime {
             transcript_revs,
             omitted_transcripts,
             agents,
+            agent_phases,
         }
     }
 

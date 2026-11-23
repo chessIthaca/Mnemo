@@ -52,3 +52,56 @@ The system SHALL configure the ladder, the Laya routing choice (shown on top) an
 #### Scenario: Laya not configured
 - **WHEN** Laya is not running and the user picks a routing choice that needs Laya
 - **THEN** the Tiers page says the choice needs Laya and the lead's tier stands until then
+
+### Requirement: A tier can run as a Claude Code agent
+Every tier except escalate MAY carry `claude_agent` set to opus, sonnet, haiku or fable. When an external Claude Code lead is attached and a dispatch settles on such a tier, the step SHALL be handed to the lead's own Claude Code agent with that model instead of a Mnemo worker session; without an external lead the tier SHALL resolve to its models exactly as before.
+
+#### Scenario: Agent tier with Claude Code leading
+- **WHEN** Claude Code is attached as lead
+- **WHEN** the high tier has claude_agent opus
+- **WHEN** the lead dispatches a step on high
+- **THEN** the result carries a claude_agent block with the worktree, branch and prompt
+- **AND** no Mnemo worker session is started
+
+#### Scenario: Agent tier with the in-app lead
+- **WHEN** no external lead is attached
+- **WHEN** the high tier has claude_agent opus and a model
+- **THEN** the dispatch starts a Mnemo worker on that model
+
+#### Scenario: Escalate cannot be an agent tier
+- **WHEN** a ladder sets claude_agent on escalate
+- **THEN** saving the ladder fails with a validation error
+
+### Requirement: An agent tier's worker is tracked
+A worker that runs on an agent tier SHALL be tracked through its agent's transcript once registered, so its activity counts like a Mnemo worker's.
+
+#### Scenario: Registered agent
+- **WHEN** the lead registers the agent of an agent-tier worker
+- **THEN** the worker's activity comes from the agent's transcript
+
+### Requirement: An agent tier can carry an effort
+A tier with claude_agent MAY carry claude_agent_effort set to low, medium, high, xhigh or max. The dispatch claude_agent block SHALL carry that effort, and the tier guidance line SHALL name it. A claude_agent_effort without claude_agent MUST fail validation.
+
+#### Scenario: Opus at xhigh
+- **WHEN** the high tier runs as a Claude Code agent opus with effort xhigh
+- **WHEN** Claude Code leads and dispatches on high
+- **THEN** the claude_agent block carries effort xhigh
+
+#### Scenario: Effort without an agent
+- **WHEN** a ladder sets claude_agent_effort on a tier without claude_agent
+- **THEN** saving the ladder fails with a validation error
+
+### Requirement: Tier model health is reported
+For each tier, Mnemo SHALL report each configured model as available, unavailable until a time after a usage limit, or not configured, and the tier and model a dispatch would resolve to now.
+
+#### Scenario: Unavailable first model
+- **WHEN** a tier's first model is unavailable after a usage limit
+- **THEN** the tier resolves to its next available model, or folds down
+- **AND** team_tiers shows the first model unavailable until its time
+
+### Requirement: Pools return to the ladder's workers when no worker needs them
+A pool checkout held by an audit that has reported, or by a stopped or failed worker whose plan step is done, SHALL be released with its build output kept, so a later dispatch on any tier can reuse it warm.
+
+#### Scenario: Reported audit
+- **WHEN** an audit worker delivers its report
+- **THEN** its pool is released and its record keeps the report

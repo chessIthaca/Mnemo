@@ -296,7 +296,7 @@ fn same_checkout_path(left: &Path, right: &Path) -> bool {
 /// checkout guard). Windows junctions do not always report `is_symlink()`,
 /// so the reparse-point attribute is checked as well.
 #[cfg(windows)]
-fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+pub fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
     metadata.file_type().is_symlink() || metadata.file_attributes() & 0x400 != 0
@@ -305,7 +305,7 @@ fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
 /// Whether `metadata` describes a symlink — a pool path that is a link is
 /// refused rather than followed.
 #[cfg(not(windows))]
-fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
+pub fn is_link_or_junction(metadata: &std::fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
@@ -751,6 +751,119 @@ pub async fn ensure_pool_checkout_registered(
     })
     .await
     .map_err(|error| format!("pool checkout guard task failed: {error}"))?
+}
+
+/// Fast-forward a worker's pool `checkout` to `lead_ref` (the lead branch).
+///
+/// Returns `Ok(true)` after `git merge --ff-only <lead_ref>` ran in the
+/// checkout. Returns `Ok(false)` without touching anything when the checkout
+/// has uncommitted or untracked changes, when `lead_ref` is HEAD itself, or
+/// when `lead_ref` does not descend from HEAD. It never rebases, resets or
+/// merges non-fast-forward. The pool registration guard runs first; a git
+/// failure is an `Err` and leaves the checkout as git left it.
+pub async fn fast_forward_checkout(
+    main_root: PathBuf,
+    checkout: PathBuf,
+    lead_ref: String,
+) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || {
+        ensure_registered_pool_checkout(&main_root, &checkout)?;
+        if !git_raw(&checkout, &["status", "--porcelain"])?.trim().is_empty() {
+            return Ok(false);
+        }
+        let behind = git_raw(
+            &checkout,
+            &["rev-list", "--count", &format!("HEAD..{lead_ref}")],
+        )?;
+        let ahead = git_raw(
+            &checkout,
+            &["rev-list", "--count", &format!("{lead_ref}..HEAD")],
+        )?;
+        if behind.trim() == "0" || ahead.trim() != "0" {
+            return Ok(false);
+        }
+        git_raw(&checkout, &["merge", "--ff-only", &lead_ref])?;
+        Ok(true)
+    })
+    .await
+    .map_err(|error| format!("fast-forward task failed: {error}"))?
+}
+
+/// Merge `branch` into a worker's pool `checkout` with a merge commit
+/// (`git merge --no-ff --no-edit -m <message> <branch>`), for
+/// `team_integrate`.
+///
+/// `Ok(Ok(tip))` gives the new HEAD. `Ok(Err(paths))` lists the conflicting
+/// files after `git merge --abort` restored the checkout. `Err` covers a
+/// dirty checkout, a branch the checkout already contains, a failed pool
+/// guard, and any other git failure (a merge that stopped without conflicts
+/// is aborted first). The pool registration guard runs first.
+pub async fn merge_branch_into_checkout(
+    main_root: PathBuf,
+    checkout: PathBuf,
+    branch: String,
+    message: String,
+) -> Result<Result<String, Vec<String>>, String> {
+    tokio::task::spawn_blocking(move || {
+        ensure_registered_pool_checkout(&main_root, &checkout)?;
+        if !git_raw(&checkout, &["status", "--porcelain"])?.trim().is_empty() {
+            return Err("the worker's checkout has uncommitted changes".to_string());
+        }
+        let missing = git_raw(
+            &checkout,
+            &["rev-list", "--count", &format!("HEAD..{branch}")],
+        )?;
+        if missing.trim() == "0" {
+            return Err(format!("the worker's branch already contains {branch}"));
+        }
+        match git_raw(
+            &checkout,
+            &["merge", "--no-ff", "--no-edit", "-m", &message, &branch],
+        ) {
+            Ok(_) => Ok(Ok(git_raw(&checkout, &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string())),
+            Err(error) => {
+                let conflicted: Vec<String> =
+                    git_raw(&checkout, &["diff", "--name-only", "--diff-filter=U"])
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                let aborted = git_raw(&checkout, &["merge", "--abort"]);
+                if conflicted.is_empty() {
+                    return Err(error);
+                }
+                aborted?;
+                Ok(Err(conflicted))
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("merge task failed: {error}"))?
+}
+
+/// How many commits of `lead_ref` the worker `branch` does not contain
+/// (`git rev-list --count <branch>..<lead_ref>`, run in `main_root`).
+pub async fn commits_missing(
+    main_root: PathBuf,
+    branch: String,
+    lead_ref: String,
+) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || {
+        let count = git_raw(
+            &main_root,
+            &["rev-list", "--count", &format!("{branch}..{lead_ref}")],
+        )?;
+        count
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("unreadable commit count '{}': {error}", count.trim()))
+    })
+    .await
+    .map_err(|error| format!("commit count task failed: {error}"))?
 }
 
 /// Release a finished worker's pool checkout back to the pool WITHOUT

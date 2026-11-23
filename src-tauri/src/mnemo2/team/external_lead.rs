@@ -12,9 +12,12 @@ use mnemo::app::plan_board::BoardStatus;
 use mnemo::headless::SessionId;
 
 use crate::mnemo2::ledger;
+use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
+use crate::mnemo2::runtime::{finished_notice, TEAM_NOTICE_PREFIX};
 
 use super::lead_tools::TeamLeadStatus;
-use super::record::{audit_finished, WorkerStatus};
+use super::pump::save_workers_now_locked;
+use super::record::{audit_finished, WorkerRecord, WorkerStatus};
 use super::{unix_ms, TeamRuntime};
 
 /// How long an attached external lead may go without calling in before it is
@@ -180,6 +183,9 @@ impl TeamRuntime {
         state.memory_search_since_plan_create = false;
         state.bug_search_since_plan_create = false;
         drop(state);
+        // A new lead reads the tier setup in its fresh tool list, so nothing
+        // has changed since it last read it.
+        self.tier_changes().mark_seen();
         if let Some(board) = self.board() {
             board.set_external_lead_attached(true);
         }
@@ -458,6 +464,170 @@ impl TeamRuntime {
         }
         while state.undelivered.len() > EXTERNAL_QUEUE_CAP {
             state.undelivered.pop_front();
+        }
+    }
+
+    /// A working Claude Code agent worker, for the agent gate: its id and
+    /// the settled tier it runs on, so the gate names what runs while the
+    /// lead's own Agent does the step.
+    pub async fn claude_agent_working(&self) -> Option<(String, String)> {
+        let records = self.records.lock().await;
+        records
+            .iter()
+            .find(|worker| {
+                worker.claude_agent.is_some()
+                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+            })
+            .map(|worker| (worker.id.clone(), worker.tier.clone().unwrap_or_default()))
+    }
+
+    /// Finish a Claude Code agent worker (`team_agent_done`): record its
+    /// final report, mark it completed or failed, and bump the turn as the
+    /// pump's Finished handling does. Only a worker that runs as a Claude
+    /// Code agent, in status Working, Fixing or Interrupted, can be closed this
+    /// way; anything else is refused with the reason. The finished (or
+    /// failed) notice then reaches the lead through
+    /// [`TeamRuntime::push_agent_done_notice`].
+    pub async fn agent_done(
+        &self,
+        worker_id: &str,
+        report: String,
+        failed: bool,
+    ) -> Result<WorkerRecord, String> {
+        self.agent_done_with_snapshot(worker_id, report, failed, None)
+            .await
+    }
+
+    /// `agent_done` with an optional saved-worker override for the
+    /// persistence regression seam.
+    pub(super) async fn agent_done_with_snapshot(
+        &self,
+        worker_id: &str,
+        report: String,
+        failed: bool,
+        snapshot_override: Option<WorkerRecord>,
+    ) -> Result<WorkerRecord, String> {
+        let _guard = self.merge_lock.lock().await;
+        let record = self.worker(worker_id).await?;
+        let previous = record.clone();
+        if record.claude_agent.is_none() {
+            return Err(format!(
+                "{worker_id} does not run as a Claude Code agent: team_agent_done only finishes agent workers"
+            ));
+        }
+        // Called once per agent run: the first run, a continuation after
+        // team_message, or a fix round after team_route_fix.
+        if !matches!(
+            record.status,
+            WorkerStatus::Working | WorkerStatus::Interrupted | WorkerStatus::Fixing
+        ) {
+            let status = serde_json::to_value(record.status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "not working".to_string());
+            return Err(format!(
+                "{worker_id} is {status}: team_agent_done needs a Working, Fixing or Interrupted agent worker"
+            ));
+        }
+        // Serialize the whole mutation/write/rollback section. Other savers
+        // take this guard before cloning records, so none can observe or
+        // persist the transient Completed state.
+        let save_guard = self.save_lock.lock().await;
+        self.update_worker(worker_id, |worker| {
+            worker.status = if failed {
+                WorkerStatus::Failed
+            } else {
+                WorkerStatus::Completed
+            };
+            worker.turns = worker.turns.saturating_add(1);
+            worker.pending = None;
+            worker.compacting = false;
+            worker.report = Some(report);
+            // A finished fix round closes, as a Mnemo worker's does when its
+            // fix turn ends.
+            worker.fixer_finding_id = None;
+        })
+        .await;
+        if let Err(error) = save_workers_now_locked(
+            &self.records,
+            &self.usage,
+            &self.persistence,
+            snapshot_override,
+            &save_guard,
+        )
+        .await
+        {
+            // No notice has been queued yet. Restore only the fields this
+            // completion changed; a concurrent routing classification or
+            // other independent update must survive the rollback.
+            let mut records = self.records.lock().await;
+            if let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) {
+                worker.status = previous.status;
+                worker.turns = previous.turns;
+                worker.pending = previous.pending.clone();
+                worker.compacting = previous.compacting;
+                worker.report = previous.report.clone();
+                worker.fixer_finding_id = previous.fixer_finding_id.clone();
+            }
+            return Err(error);
+        }
+        drop(save_guard);
+        let worker = self.worker(worker_id).await?;
+        self.push_agent_done_notice(&worker, failed);
+        Ok(worker)
+    }
+
+    /// Deliver the finished (or failed) notice for a Claude Code agent
+    /// worker `team_agent_done` closed: the pump's exact notice shape, so
+    /// the review skill applies to it unchanged. The tag is built from the
+    /// completed record — an agent worker's generation is 0 (it never had
+    /// a session) and its turn was just bumped, so `current_notices` keeps
+    /// the notice. It rides the external-lead queue when one is attached
+    /// (the tool answer drains it); otherwise it parks on the undelivered
+    /// list for whoever leads next.
+    fn push_agent_done_notice(&self, worker: &WorkerRecord, failed: bool) {
+        let step = match (&worker.plan_id, worker.plan_step) {
+            (Some(plan), Some(step)) => format!(" on plan {plan} step {}", step + 1),
+            _ => String::new(),
+        };
+        let detail = if failed {
+            // A failed agent worker is never reviewed: name the failure,
+            // quote the agent's report, and offer the ways forward.
+            let report = worker
+                .report
+                .as_deref()
+                .map(|report| format!("\n\nIts report: {report}"))
+                .unwrap_or_default();
+            format!(
+                "{} could not finish its turn{step}: the Claude Code agent failed.{report}\nTo try again, dispatch the step again (a fresh worker id), or team_stop this worker to clear it.",
+                worker.name
+            )
+        } else {
+            finished_notice(worker)
+        };
+        let tag = TurnTag::of(
+            worker,
+            worker.generation,
+            if failed {
+                NoticeState::Failed
+            } else {
+                NoticeState::Finished
+            },
+        )
+        .suffix();
+        let text = {
+            use std::fmt::Write as _;
+            let mut text = String::new();
+            let _ = writeln!(text, "{TEAM_NOTICE_PREFIX} worker_id={}{}", worker.id, tag);
+            let _ = writeln!(text, "{detail}");
+            let _ = write!(
+                text,
+                "Use team_status with this exact worker_id. Fix findings through your own agent (SendMessage to it); team_stop clears the worker. Never infer lifecycle from Git, files, timestamps, or team.json."
+            );
+            text
+        };
+        if !self.push_external_notice(text.clone()) {
+            self.restore_undelivered_notices(vec![text]);
         }
     }
 

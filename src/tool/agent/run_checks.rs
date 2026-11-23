@@ -36,7 +36,7 @@
 //! become a way around the `never_auto_for` gate `shell` and `git` enforce. The
 //! remaining checks still run.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -79,7 +79,7 @@ struct RunChecksArgs {
     ///
     /// Consumed by the frontend from the raw tool-call args (Mnemo2's
     /// `argLabel` helper), so it is never read in Rust — it is kept here so
-    /// serde parses and validates it, like `shell`'s and `job_start`'s.
+    /// serde parses and validates it, like `shell`'s and `job`'s.
     #[expect(dead_code, reason = "consumed by the frontend from raw tool-call args")]
     purpose: String,
 }
@@ -245,6 +245,43 @@ impl Tool for RunChecksTool {
         let mut entries: Vec<Value> = Vec::new();
         let mut passed = 0usize;
         let mut failed = 0usize;
+        // A fresh pool checkout has no installed npm dependencies, so every npm
+        // check would fail on a missing module, not on the change. Install them
+        // first; the block reports the install only when it fails.
+        if needs_npm_install(&cwd, &self.check_commands) {
+            let slots = self.heavy_slots();
+            let started = Instant::now();
+            let (outcome, _) = run_command(
+                NPM_INSTALL,
+                &cwd,
+                self.limits,
+                None,
+                None,
+                slots.as_ref(),
+            )
+            .await;
+            if !matches!(outcome, RunOutcome::Exited { code: 0, .. }) {
+                let detail = match outcome {
+                    RunOutcome::Exited { code, stdout, stderr, .. } => format!(
+                        "exit {code}, {}
+{}",
+                        seconds(started.elapsed()),
+                        last_lines(
+                            &combine_streams(
+                                &String::from_utf8_lossy(&stdout),
+                                &String::from_utf8_lossy(&stderr)
+                            ),
+                            FALLBACK_TAIL_LINES
+                        )
+                    ),
+                    RunOutcome::SpawnFailed(message) => format!("could not start: {message}"),
+                    _ => format!("timed out, {}", seconds(started.elapsed())),
+                };
+                blocks.push(format!(
+                    "NOTE {NPM_INSTALL} (installing the missing npm dependencies failed: {detail})"
+                ));
+            }
+        }
         for command in &self.check_commands {
             if self.is_core_git_operation(command) {
                 failed += 1;
@@ -354,6 +391,32 @@ impl Tool for RunChecksTool {
             output: cap_tool_output(text),
             data: Some(json!({ "checks": entries })),
         }
+    }
+}
+
+/// The install a checkout without its npm dependencies gets before its npm
+/// checks run.
+const NPM_INSTALL: &str = "npm ci --no-audit --no-fund";
+
+/// Whether `cwd` must install its npm dependencies before `commands` run: some
+/// command runs npm, the checkout has a `package-lock.json`, and npm's own
+/// record of the last install (`node_modules/.package-lock.json`) is missing
+/// or older than that lockfile. A pool checkout keeps `node_modules/` between
+/// workers, so a warm pool skips the install.
+fn needs_npm_install(cwd: &Path, commands: &[String]) -> bool {
+    let runs_npm = commands
+        .iter()
+        .any(|command| command.split_whitespace().next() == Some("npm"));
+    if !runs_npm {
+        return false;
+    }
+    let modified = |path: PathBuf| std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
+    let Some(lockfile) = modified(cwd.join("package-lock.json")) else {
+        return false;
+    };
+    match modified(cwd.join("node_modules").join(".package-lock.json")) {
+        Some(installed) => installed < lockfile,
+        None => true,
     }
 }
 
@@ -486,8 +549,39 @@ fn last_lines(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    fn commands(list: &[&str]) -> Vec<String> {
+        list.iter().map(|command| command.to_string()).collect()
+    }
+
+    /// Regression: a fresh pool checkout had no `node_modules`, so every npm
+    /// check failed on a missing module and blocked the merge.
+    #[test]
+    fn a_checkout_without_installed_npm_dependencies_needs_an_install() {
+        let dir = TempDir::new().unwrap();
+        let npm = commands(&["cargo test", "npm test --workspace app"]);
+        // No lockfile: nothing to install from.
+        assert!(!needs_npm_install(dir.path(), &npm));
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        assert!(needs_npm_install(dir.path(), &npm), "never installed");
+        // No npm command: the install is not this run's business.
+        assert!(!needs_npm_install(dir.path(), &commands(&["cargo test"])));
+        assert!(!needs_npm_install(dir.path(), &commands(&["cargo test --features npm"])));
+        let record = dir.path().join("node_modules").join(".package-lock.json");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, "{}").unwrap();
+        let lockfile = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("package-lock.json"))
+            .unwrap();
+        let now = std::time::SystemTime::now();
+        lockfile.set_modified(now - Duration::from_secs(60)).unwrap();
+        assert!(!needs_npm_install(dir.path(), &npm), "a warm pool skips it");
+        // The lockfile changed after the last install: install again.
+        lockfile.set_modified(now + Duration::from_secs(60)).unwrap();
+        assert!(needs_npm_install(dir.path(), &npm), "stale install");
+    }
 
     fn tool_in(root: &Path) -> RunChecksTool {
         let sandbox = Sandbox::new(root.to_path_buf()).expect("sandbox");

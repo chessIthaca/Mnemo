@@ -188,7 +188,7 @@ mod tests {
 #[cfg(feature = "embeddings")]
 use crate::memory::embedder::{is_model_installed, BundledEmbedder, Embedder};
 #[cfg(feature = "embeddings")]
-use crate::memory::{MemoryStore, MemoryStoreTrait};
+use crate::memory::MemoryStore;
 
 /// The status write + sink push (the moved write + `app.emit` pair).
 #[cfg(feature = "embeddings")]
@@ -229,9 +229,9 @@ pub enum DownloadOutcome {
     /// live embedder is swapped by the next settings save, when the
     /// model is on disk and `build_embedder` loads it synchronously).
     StatusOnly,
-    /// Install the embedder into the live memory store + re-embed all
-    /// rows (first-run startup, where the store currently runs the
-    /// hash embedder).
+    /// Install the embedder into the live memory store + re-embed the stale
+    /// rows (first-run startup, where the store currently runs the hash
+    /// embedder).
     SwapIntoStore(Arc<MemoryStore>),
 }
 
@@ -250,10 +250,13 @@ fn install_allowed(current_model: &str, loaded_model: &str) -> bool {
 }
 
 /// Install a freshly downloaded embedder into the live memory store and
-/// re-embed all rows when the stored vectors don't already match (first
-/// run: hash vectors; or a model change). Mirrors the rewire fingerprint
-/// semantics. The store keeps its standing (hash) embedder on any
-/// failure — memory degrades gracefully rather than dying.
+/// re-embed the rows still on another model/dim (first run: hash vectors; or
+/// a model change). The fingerprint gate + the re-embed are NOT duplicated
+/// here: they live in [`crate::memory::reembed_if_needed`] (plan ebd13a79),
+/// the one path the rewire uses too, which also publishes the pass on the
+/// store's watch channel so the window's status line shows it. The store
+/// keeps its standing (hash) embedder on any failure — memory degrades
+/// gracefully rather than dying.
 ///
 /// Late-arrival guard (review finding, 2026-08-21): both startup paths
 /// (download and local load) install from a background task that can
@@ -275,23 +278,10 @@ pub async fn install_embedder(store: Arc<MemoryStore>, embedder: Arc<dyn Embedde
         );
         return;
     }
-    let expected_dim = embedder.dim();
-    // Re-embed unless the stored set is EXACTLY the expected fingerprint
-    // (same rationale as the rewire: cross-machine or interrupted
-    // re-embed states also mismatch).
-    match store.stored_model_fingerprints().await {
-        Ok(fps) if fps.len() == 1 && fps[0].0 == expected_model && fps[0].1 == expected_dim => {}
-        Ok(_) => {
-            eprintln!(
-                "info: re-embedding memories for model '{expected_model}' (dim {expected_dim})"
-            );
-            match store.reembed_all(embedder.clone(), None).await {
-                Ok(n) => eprintln!("info: re-embedded {n} memories"),
-                Err(e) => eprintln!("warning: reembed_all failed: {e}"),
-            }
-        }
-        Err(e) => eprintln!("warning: stored_model_fingerprints failed: {e}"),
-    }
+    // Re-embed the stale rows only (a pass interrupted by a window close
+    // resumes instead of restarting) and publish the pass on the store's watch
+    // channel. The same call the Settings rewire runs — one gate, one path.
+    crate::memory::reembed_if_needed(&store, &embedder).await;
     // Swap the live embedder either way — the model is on disk + loaded now.
     store.set_embedder(embedder);
     eprintln!("info: bundled embedding model '{expected_model}' active");
@@ -430,7 +420,30 @@ pub fn spawn_download(
 #[cfg(test)]
 mod download_core_tests {
     #[cfg(feature = "embeddings")]
-    use super::install_allowed;
+    use super::{install_allowed, install_embedder};
+    #[cfg(feature = "embeddings")]
+    use crate::memory::embedder::HashEmbedder;
+    #[cfg(feature = "embeddings")]
+    use crate::memory::{Embedder, Memory, MemoryStore, MemoryStoreTrait, MemoryTier, ReembedEvent};
+    #[cfg(feature = "embeddings")]
+    use std::sync::Arc;
+
+    /// A test embedder with a different `model_id`, so installing it is a
+    /// model change without needing the ONNX runtime.
+    #[cfg(feature = "embeddings")]
+    struct OtherEmbedder;
+
+    #[cfg(feature = "embeddings")]
+    #[async_trait::async_trait]
+    impl Embedder for OtherEmbedder {
+        async fn embed(&self, text: &str) -> Vec<f32> {
+            HashEmbedder::new().embed(text).await
+        }
+
+        fn model_id(&self) -> &str {
+            "test-other"
+        }
+    }
 
     /// Review finding 1 (2026-08-21): a background startup load that
     /// lands AFTER the user switched models in Settings must not
@@ -446,5 +459,51 @@ mod download_core_tests {
         // A DIFFERENT bundled model already installed → a newer
         // selection won; the late-arriving load must not replace it.
         assert!(!install_allowed("all-MiniLM-L12-v2", "all-MiniLM-L6-v2"));
+    }
+
+    /// The install path — Models page Install (`spawn_download` →
+    /// `install_embedder`), `Setup::reembed` and the startup load — must
+    /// re-embed through the ONE shared path (`reembed_if_needed`, plan
+    /// ebd13a79), so the pass is published on the store's watch channel and
+    /// the window's status line shows it instead of a silent sweep.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn install_embedder_publishes_the_reembed_on_the_store_watch() {
+        let store = Arc::new(
+            MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).expect("in-memory store"),
+        );
+        store
+            .write(Memory::new(MemoryTier::Semantic, "fact", "content", 1000))
+            .await
+            .expect("write");
+        install_embedder(store.clone(), Arc::new(OtherEmbedder)).await;
+
+        assert_eq!(
+            store.embedder_handle().model_id(),
+            "test-other",
+            "the installed model is live"
+        );
+        assert_eq!(
+            store.stored_model_fingerprints().await.unwrap(),
+            vec![("test-other".to_string(), 768)],
+            "the stale row was re-embedded before the swap"
+        );
+        // Every published event, in order: sampling the watch raced the
+        // publisher and could miss `Started` (it failed under a loaded full run).
+        let events = store.reembed_history();
+        assert_eq!(
+            events.first(),
+            Some(&ReembedEvent::Started {
+                model: "test-other".to_string()
+            }),
+            "the install path publishes Started: {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&ReembedEvent::Done {
+                summary: "1 memories re-embedded for test-other".to_string()
+            }),
+            "the install path publishes Done: {events:?}"
+        );
     }
 }

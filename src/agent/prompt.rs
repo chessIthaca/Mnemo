@@ -47,9 +47,11 @@ and multi_edit edits need no re-read: read receipts follow them.
 whole block. Several small edits beat one large one. If an edit misses near \
 the right spot, the error shows the current text there with a read receipt: \
 cite that instead of re-reading.
-- For a build or test that may run longer than a few minutes, or to work on \
-while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
-Never poll with sleep or Start-Sleep, and never start detached processes.
+- For a build or test that may run longer than a few minutes, run it with \
+job: it waits for the result (wait_s, default 600). If it is still running when \
+the wait ends, job_wait on its id; to keep working while it runs, start it with \
+wait_s 0. Never poll with sleep or Start-Sleep, and never start detached \
+processes.
 - Run the project checks with run_checks before you report: it runs every \
 check and records the passing ones; a check typed into shell counts only when \
 it is the exact command from the checkout root.
@@ -275,6 +277,8 @@ search for those.
 - search / search_read: FIRST choice for non-symbol text (literals, config \
 keys, comments) and FALLBACK when the graph comes up empty; when a hit \
 surfaces a symbol, switch to graph_context.
+- When you don't know a name yet, describe what you're looking for in words \
+with find_code; use search or graph_search once you have the name.
 - spawn_agent: parallel review/investigation; role:\"reviewer\" is read-only.
 - ask_user: a concrete choice between ≥2 options — never open-ended.
 - image_* tools: task-specific image analysis; image_analysis is the generic \
@@ -498,9 +502,11 @@ and multi_edit edits need no re-read: read receipts follow them.
 whole block. Several small edits beat one large one. If an edit misses near \
 the right spot, the error shows the current text there with a read receipt: \
 cite that instead of re-reading.
-- For a build or test that may run longer than a few minutes, or to work on \
-while it runs: job_start it, then job_wait (with a pattern to stop at a line). \
-Never poll with sleep or Start-Sleep, and never start detached processes.
+- For a build or test that may run longer than a few minutes, run it with \
+job: it waits for the result (wait_s, default 600). If it is still running when \
+the wait ends, job_wait on its id; to keep working while it runs, start it with \
+wait_s 0. Never poll with sleep or Start-Sleep, and never start detached \
+processes.
 - Run the project checks with run_checks before you report: it runs every \
 check and records the passing ones; a check typed into shell counts only when \
 it is the exact command from the checkout root.
@@ -1132,11 +1138,15 @@ mod tests {
         // Bumped 2026-11-19 (plan 5b85ab61 step 2): the job-tool bullet —
         // job_start a long build, then job_wait; never poll with sleep and
         // never start detached processes.
+        // Bumped 2026-11-21 (plan 5b498359 step 1): the same bullet now names
+        // `job`, which starts and waits in one call (wait_s, default 600).
         // Bumped 2026-11-19 (plan 5b85ab61 step 3): the run_checks bullet —
         // run every project check in one call, and only the exact command from
         // the checkout root counts in `shell`.
+        // Bumped 2026-11-20 (plan d3336a8a step 11): the find_code bullet —
+        // describe what you look for in words before you know a name.
         const GOLDEN_HEAD: &str =
-            "len=13730|sha256=5e6084c3b152dccda5c3a40d04925119a16cba94799d08f6e4b06017ef4b6794";
+            "len=13962|sha256=0719497d9c8306d9d3702806e6e051264459ae8dbfc7605408720c2adb80aa64";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",
@@ -2392,9 +2402,11 @@ near the right spot, the error shows the current text there with a read \
 receipt: cite that instead of re-reading.",
             "- Send files, ops and lines as real JSON arrays, never as a quoted \
 string. For a change to one file, use file_edit.",
-            "- For a build or test that may run longer than a few minutes, or to \
-work on while it runs: job_start it, then job_wait (with a pattern to stop at a \
-line). Never poll with sleep or Start-Sleep, and never start detached processes.",
+            "- For a build or test that may run longer than a few minutes, run it \
+ with job: it waits for the result (wait_s, default 600). If it is still running \
+ when the wait ends, job_wait on its id; to keep working while it runs, start it \
+ with wait_s 0. Never poll with sleep or Start-Sleep, and never start detached \
+ processes.",
             "- Run the project checks with run_checks before you report: it runs \
 every check and records the passing ones; a check typed into shell counts only \
 when it is the exact command from the checkout root.",

@@ -5375,8 +5375,15 @@ async fn dispatch_composes_the_plan_brief_and_stamps_the_worker() {
     assert!(opening.starts_with("# Plan: Board plan"), "{opening}");
     assert!(opening.contains("## Your step (2)"), "{opening}");
     assert!(opening.contains("edit src/main.rs"), "{opening}");
+    // The brief, then the line naming the lead commit the worker starts from.
+    let (body, base_line) = opening
+        .trim_end()
+        .rsplit_once("\n\n")
+        .expect("the base line is its own paragraph");
+    assert!(body.ends_with("do the second thing"), "{opening}");
     assert!(
-        opening.trim_end().ends_with("do the second thing"),
+        base_line.starts_with("You start at ")
+            && base_line.ends_with(" when you were dispatched."),
         "{opening}"
     );
     wait_for_worker_status(
@@ -5473,8 +5480,11 @@ async fn manual_dispatch_requires_a_plan_step_and_stamps_the_worker() {
         .clone()
         .expect("composed opening prompt");
     assert!(opening.contains("## Your step (2)"), "{opening}");
+    assert!(opening.contains("do the second thing"), "{opening}");
     assert!(
-        opening.trim_end().ends_with("do the second thing"),
+        opening
+            .trim_end()
+            .ends_with(" when you were dispatched."),
         "{opening}"
     );
     assert!(signals.try_recv().is_ok(), "board signalled");

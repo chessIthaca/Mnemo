@@ -88,11 +88,11 @@ function makeTransport(overrides: Partial<SettingsTransport> = {}) {
   /** The loaded ladder: trivial keeps its required model; medium and escalate are empty. */
   const tiers: TiersDto = {
     tiers: [
-      { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["alpha/m1"], effort: null, role: null, resolves_to: "trivial" },
-      { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["alpha/m1", "alpha/m2"], effort: null, role: null, resolves_to: "trivial" },
-      { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: [], effort: null, role: null, resolves_to: "routine" },
-      { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["alpha/m1"], effort: null, role: null, resolves_to: "medium" },
-      { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high" },
+      { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["alpha/m1"], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+      { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["alpha/m1", "alpha/m2"], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+      { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: [], effort: null, role: null, resolves_to: "routine", claude_agent: null, claude_agent_effort: null },
+      { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["alpha/m1"], effort: null, role: null, resolves_to: "medium", claude_agent: null, claude_agent_effort: null },
+      { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high", claude_agent: null, claude_agent_effort: null },
     ],
   };
   const base = {
@@ -498,11 +498,11 @@ describe("SettingsDialog", () => {
     await waitFor(() =>
       expect(transport.saveTiers).toHaveBeenCalledWith({
         tiers: [
-          { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["alpha/m1"], effort: null, role: null, resolves_to: "trivial" },
-          { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["alpha/m2"], effort: null, role: null, resolves_to: "trivial" },
-          { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: ["beta/m1"], effort: null, role: null, resolves_to: "routine" },
-          { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["alpha/m1"], effort: null, role: null, resolves_to: "medium" },
-          { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high" },
+          { id: "trivial", name: "Trivial", definition: "Single-file edits, checks, lookups, scaffolding", models: ["alpha/m1"], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+          { id: "routine", name: "Routine", definition: "Typical implementation steps", models: ["alpha/m2"], effort: null, role: null, resolves_to: "trivial", claude_agent: null, claude_agent_effort: null },
+          { id: "medium", name: "Medium", definition: "Multi-file change with a clear spec", models: ["beta/m1"], effort: null, role: null, resolves_to: "routine", claude_agent: null, claude_agent_effort: null },
+          { id: "high", name: "High", definition: "Design, debugging, bug fixes, shared contracts", models: ["alpha/m1"], effort: null, role: null, resolves_to: "medium", claude_agent: null, claude_agent_effort: null },
+          { id: "escalate", name: "Escalate", definition: "Only after a lower tier failed", models: [], effort: null, role: "escalate", resolves_to: "high", claude_agent: null, claude_agent_effort: null },
         ],
       }),
     );
@@ -550,6 +550,7 @@ describe("SettingsDialog", () => {
       save: vi.fn(async () => undefined),
       install: vi.fn(async () => undefined),
       onEmbedderEvent: vi.fn(async () => () => {}),
+      hostStatus: vi.fn(async () => ({ running: false, port: null, models: [], windows: 0 })),
     };
     await openDialog();
     await fireEvent.click(screen.getByRole("button", { name: "Models" }));
@@ -685,6 +686,7 @@ describe("unsaved edits", () => {
       save: vi.fn(async () => undefined),
       install: vi.fn(async () => undefined),
       onEmbedderEvent: vi.fn(async () => () => {}),
+      hostStatus: vi.fn(async () => ({ running: false, port: null, models: [], windows: 0 })),
     };
   }
 

@@ -56,6 +56,22 @@ describe("WorkerInbox", () => {
     expect(container.querySelectorAll(".inbox-meta time")).toHaveLength(4);
   });
 
+  it("labels the worker's agent and tags its progress notes", () => {
+    const { container } = render(WorkerInbox, {
+      worker: worker([
+        {
+          sender: "claude_agent",
+          kind: "progress",
+          text: "[From the worker's Claude Code agent] Tests pass.",
+          atMs: 1_787_400_000_000,
+        },
+      ]),
+    });
+
+    expect(container.querySelector(".inbox-meta strong")?.textContent).toBe("Worker's agent");
+    expect(container.querySelector(".kind-tag")?.textContent).toBe("progress note");
+  });
+
   it("renders each delivered text as Markdown inside the ledger", () => {
     const { container } = render(WorkerInbox, { worker: worker() });
 

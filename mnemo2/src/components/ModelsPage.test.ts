@@ -105,6 +105,12 @@ function makeTransport(overrides: Partial<ModelSettingsTransport> = {}) {
       handlers.push(handler);
       return () => {};
     }),
+    hostStatus: vi.fn(async () => ({
+      running: true,
+      port: 8080,
+      models: ["all-MiniLM-L6-v2", "jina-embeddings-v2-base-code"],
+      windows: 2,
+    })),
   };
   return { settings, handlers, transport: { ...base, ...overrides } as typeof base };
 }
@@ -140,7 +146,7 @@ describe("ModelsPage", () => {
     }
     expect(screen.getByText(/The per-task model slots in config\.toml \(planning, executing, bug fixing, reviewing\) are not used by Mnemo2\./)).toBeTruthy();
     expect(screen.getByRole("region", { name: "Vision" })).toBeTruthy();
-    expect(screen.getByRole("region", { name: "Code indexing" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Embeddings" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "Budget" })).toBeTruthy();
   });
 
@@ -202,13 +208,29 @@ describe("ModelsPage", () => {
     expect(within(screen.getByRole("region", { name: "Vision" })).queryByRole("status")).toBeNull();
   });
 
-  it("saves the code-indexing selection and names the reopen note", async () => {
+  it("saves the embeddings selection and names the reopen note", async () => {
     const made = page();
-    await screen.findByText("Code indexing");
+    await screen.findByText("Embeddings");
     await fireEvent.click(screen.getByRole("radio", { name: "Nomic embed text v1.5 273 MB" }));
-    await fireEvent.click(screen.getByRole("button", { name: "Save indexing" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Save embeddings" }));
     await waitFor(() => expect(made.transport.save).toHaveBeenCalledWith("embedding", "nomic-embed-text-v1.5"));
     expect(await screen.findByText(/a fresh download is used from the next reopen/)).toBeTruthy();
+  });
+
+  it("names what each embedding model is for and shows the shared host", async () => {
+    page();
+    const embeddings = await screen.findByRole("region", { name: "Embeddings" });
+    expect(
+      within(embeddings).getByText(/Memory model: finds related memory by meaning — specs, decisions, bugs and HOW records, plan, review and backlog summaries; also matches routing and failure-triage examples\./),
+    ).toBeTruthy();
+    expect(
+      within(embeddings).getByText(/Code-search model: jina-embeddings-v2-base-code — finds code by meaning for find_code\./),
+    ).toBeTruthy();
+    expect(
+      within(embeddings).getByText(
+        "Shared model host: running on port 8080, serving all-MiniLM-L6-v2, jina-embeddings-v2-base-code, used by 2 windows",
+      ),
+    ).toBeTruthy();
   });
 
   it("installs the drafted model, streams the progress bar and turns the status Ready", async () => {

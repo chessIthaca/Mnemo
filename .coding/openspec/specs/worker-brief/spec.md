@@ -37,3 +37,55 @@ The system SHALL send each worker that is working on a plan a short notice namin
 - **WHEN** a worker finished its turn and awaits review
 - **WHEN** the lead records a decision
 - **THEN** the worker receives nothing
+
+### Requirement: The agent prompt carries the worker brief
+The prompt handed to a Claude Code agent SHALL contain the same plan, step and brief a Mnemo worker receives, plus the worktree it must work in, the branch to commit on, and the rules never push, never git stash, never merge, and run the project checks before the last commit.
+
+#### Scenario: Prompt contents
+- **WHEN** a step is handed to a Claude Code agent
+- **THEN** the prompt names the worktree path and branch
+- **AND** the prompt contains the step text and the brief
+
+### Requirement: The agent prompt sets the working rules
+The prompt handed to a Claude Code agent SHALL tell it to start every shell command with a cd into its worktree, to keep shell commands in the foreground unless they run long, and to post a one-line team_progress note after each milestone.
+
+#### Scenario: Prompt rules
+- **WHEN** a step is handed to a Claude Code agent
+- **THEN** the prompt carries the cd, foreground and progress rules
+
+### Requirement: Workers know the commit they start from
+Every worker SHALL record the lead commit its checkout was forked from, and its opening prompt SHALL name that commit. A worker with no commits of its own and a clean checkout SHALL be fast-forwarded to the lead branch tip before its next prompt when the lead branch has moved, and that prompt SHALL say so. A worker with commits MUST NOT be rebased or reset.
+
+#### Scenario: Dispatch after a lead commit
+- **WHEN** the lead commits
+- **WHEN** the lead dispatches a worker
+- **THEN** the worker's base commit is the new lead tip
+- **AND** its opening prompt names that commit
+
+#### Scenario: Waiting worker follows the lead
+- **WHEN** a worker has no commits and a clean checkout
+- **WHEN** the lead branch moves
+- **WHEN** the worker receives a prompt
+- **THEN** its checkout is fast-forwarded to the lead tip
+- **AND** the prompt says it was fast-forwarded
+
+#### Scenario: Worker with commits is left alone
+- **WHEN** a worker has commits
+- **WHEN** the lead branch moves
+- **WHEN** the worker receives a prompt
+- **THEN** the worker's tip is unchanged
+
+### Requirement: A worker handed to an agent mid-step continues from its checkout
+When a worker moves to a Claude Code agent tier mid-step, the agent prompt SHALL carry the worker brief plus where the previous worker left off: its previous model, and the instruction to read git status, the log since the base commit and the diff before changing anything.
+
+#### Scenario: Continuation prompt
+- **WHEN** a worker on a Mnemo model is resumed onto an agent tier
+- **THEN** the agent prompt names the previous model and the base commit
+
+### Requirement: Agent prompts use no Mnemo tools
+The prompt of an agent worker SHALL tell the agent to commit on its branch in its own checkout and SHALL NOT ask it to use Mnemo tools or to change directory into a checkout.
+
+#### Scenario: Plain agent prompt
+- **WHEN** an agent-tier step is dispatched
+- **THEN** the claude_agent prompt names the branch
+- **AND** it names no team_* or plan_* tool and no cd rule

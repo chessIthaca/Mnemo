@@ -7,6 +7,12 @@
 //! Tables:
 //! - `cg_files` — one row per indexed source file (path, content hash, mtime)
 //! - `cg_symbols` — one row per defined symbol (functions, structs, …)
+//! - `cg_symbol_text` — one row per real symbol: its signature + doc
+//!   comment and the hash of the embedding chunk built from them (plan
+//!   d3336a8a step 9; the synthetic module rows carry none)
+//! - `cg_symbol_vec` — one row per embedded symbol: the vector, the
+//!   embedding model that produced it, and the text hash it was built
+//!   from — a model or text change re-embeds lazily
 //! - `cg_edges` — resolved relationships between symbols (calls / imports /
 //!   contains), indexed in both directions for neighborhood queries
 //! - `cg_refs` — unresolved per-file references. Persisting these lets
@@ -22,8 +28,12 @@
 //! - `cg_extract_meta` — one row per file (path → [`EXTRACTOR_VERSION`]),
 //!   the extractor-semantics backfill detector: files stamped with an
 //!   older (or missing) version predate a change in what the extractor
-//!   persists (v1: refs carry the method-call shape, plan 0d53d659) and
-//!   need one re-parse — their rows cannot be re-derived in place.
+//!   persists (v1: refs carry the method-call shape, plan 0d53d659;
+//!   v2: each symbol persists its signature + doc comment for semantic
+//!   code search, plan d3336a8a step 9; v3: the embedding chunk carries
+//!   the name's split words, the enclosing type and the body excerpt,
+//!   plan d3336a8a step 15) and need one re-parse — their
+//!   rows cannot be re-derived in place.
 //!
 //! The DB is a derivable cache (gitignored, rebuilt from source on startup),
 //! so the schema is applied idempotently with `CREATE TABLE IF NOT EXISTS` and
@@ -38,10 +48,14 @@ use crate::error::Result;
 /// file in `cg_extract_meta` on every upsert. Bump it whenever a change
 /// alters what `extract_file` persists (v1: `RefKind::MethodCall` — refs
 /// record receiver syntax so the resolver can refuse cross-language and
-/// method-call-to-free-fn targets, plan 0d53d659). A plain index pass
-/// re-parses stamped-older files exactly once — same backfill shape as
-/// `cg_content_meta`, never perpetual.
-pub const EXTRACTOR_VERSION: i64 = 1;
+/// method-call-to-free-fn targets, plan 0d53d659; v2: every real symbol
+/// persists its signature + doc comment for the semantic code search's
+/// embedding chunk, plan d3336a8a step 9; v3: the chunk text gains the
+/// name's split words, the enclosing type and the body excerpt, so every
+/// text hash changes and every symbol re-embeds lazily, plan d3336a8a
+/// step 15). A plain index pass re-parses stamped-older files exactly
+/// once — same backfill shape as `cg_content_meta`, never perpetual.
+pub const EXTRACTOR_VERSION: i64 = 3;
 
 /// Enable the same pragmas the memory store relies on: WAL (concurrent readers
 /// never block the background index writer), a busy timeout so a reader waits
@@ -78,6 +92,32 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_cg_symbols_name ON cg_symbols(name);
         CREATE INDEX IF NOT EXISTS idx_cg_symbols_file ON cg_symbols(file);
+
+        -- Symbol text (plan d3336a8a step 9): one row per REAL symbol —
+        -- the signature + doc comment the semantic code search embeds,
+        -- with the embedding chunk's text hash keying incremental
+        -- embedding (the synthetic module rows carry none: no source
+        -- anchor). Keyed by symbol id; written on every upsert, pruned
+        -- when the symbol vanishes.
+        CREATE TABLE IF NOT EXISTS cg_symbol_text (
+            symbol_id TEXT PRIMARY KEY,
+            signature TEXT NOT NULL,
+            doc       TEXT NOT NULL,
+            text_hash TEXT NOT NULL
+        );
+
+        -- Symbol vectors (plan d3336a8a step 9): one row per embedded
+        -- symbol, `model` recording which embedding model produced the
+        -- vector (a model change re-embeds lazily: the pass re-embeds
+        -- rows whose model differs or whose text hash drifted). `vec` is
+        -- raw little-endian f32 bytes, `dim` the model's dimension.
+        CREATE TABLE IF NOT EXISTS cg_symbol_vec (
+            symbol_id TEXT PRIMARY KEY,
+            model     TEXT NOT NULL,
+            dim       INTEGER NOT NULL,
+            vec       BLOB NOT NULL,
+            text_hash TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS cg_edges (
             from_id TEXT NOT NULL,
@@ -148,5 +188,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
+        // The step-9 tables exist and round-trip (schema.rs, plan
+        // d3336a8a): one text row + one vector row keyed by symbol id.
+        conn.execute(
+            "INSERT INTO cg_symbol_text (symbol_id, signature, doc, text_hash)
+             VALUES ('a.rs::helper::1', 'fn helper()', 'Docs it.', 'h1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cg_symbol_vec (symbol_id, model, dim, vec, text_hash)
+             VALUES ('a.rs::helper::1', 'jina-embeddings-v2-base-code', 2, X'0000803F00000040', 'h1')",
+            [],
+        )
+        .unwrap();
+        let stored: (String, i64, Vec<u8>, String) = conn
+            .query_row(
+                "SELECT model, dim, vec, text_hash FROM cg_symbol_vec WHERE symbol_id = 'a.rs::helper::1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "jina-embeddings-v2-base-code");
+        assert_eq!(stored.1, 2);
+        assert_eq!(stored.2, vec![0x0, 0x0, 0x80, 0x3f, 0x0, 0x0, 0x0, 0x40]);
+        assert_eq!(stored.3, "h1");
     }
 }

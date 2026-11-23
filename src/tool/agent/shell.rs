@@ -591,7 +591,7 @@ impl ShellTool {
 
 /// Resolve and sandbox-validate a working directory — the shared contract of
 /// `shell` and the job tools (plan 5b85ab61 step 2 reuses it instead of
-/// copying the rules, so `job_start`'s `cwd` is validated exactly like
+/// copying the rules, so `job`'s `cwd` is validated exactly like
 /// `shell`'s).
 ///
 /// - `None` / empty → the sandbox root.
@@ -746,7 +746,7 @@ impl Tool for ShellTool {
                     format!(
                         "command printed nothing for {label} and was killed (silence \
                          timeout); a command that works silently for long should print \
-                         progress, or run it with job_start"
+                         progress, or run it with job"
                     ),
                     "silence",
                     stdout,
@@ -1911,25 +1911,31 @@ mod tests {
         }
     }
 
-    /// The silence clock starts AFTER the slot is acquired: a command queued for
-    /// longer than its silence window is not killed as "silent" (plan d3336a8a).
+    /// The slot wait is outside the silence clock: a command queued for longer
+    /// than its silence window is not killed as "silent" (plan d3336a8a).
     #[tokio::test]
     async fn slot_wait_is_not_counted_as_silence() {
         let dir = tempdir().unwrap();
         let slots = tempdir().unwrap();
+        // `run_command` starts the clock just before it SPAWNS the child, so a
+        // shell's own start-up counts against the silence window: the window
+        // must clear a boot on THIS host (measured from ~1 s idle to more than
+        // 8 s under load), which a fixed 4 s never does. Both the window and
+        // the wait are sized from the measured boot instead, so the wait still
+        // exceeds the window by construction.
+        let boot = measured_shell_boot(dir.path()).await;
+        let silence = silence_window(boot);
+        let hold = silence + Duration::from_secs(2);
         let held = HeavySlots::new(slots.path().to_path_buf(), 1)
             .try_take()
             .guard()
             .expect("the only slot is free");
         let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(8000));
+            std::thread::sleep(hold);
             drop(held);
         });
-        // A 4 s silence window is generous for PowerShell's own startup on a
-        // loaded machine, and the wait below is longer still: counting the wait
-        // as silence would kill the command before it ever spawned.
         let limits = RunLimits {
-            silence: Some(Duration::from_millis(4000)),
+            silence: Some(silence),
             total: Duration::from_secs(60),
         };
         let slots_for_call = HeavySlots::new(slots.path().to_path_buf(), 1);
@@ -1943,9 +1949,11 @@ mod tests {
         )
         .await;
         release.join().expect("release thread");
+        // The wait outlasted the whole silence window, so a clock that counted
+        // it would have killed the command before it ever spawned.
         assert!(
-            waited >= Duration::from_millis(2500),
-            "the call waited for the slot: {waited:?}"
+            waited > silence,
+            "the call waited out the silence window: {waited:?} vs {silence:?}"
         );
         match outcome {
             RunOutcome::Exited { code, .. } => {
@@ -1960,13 +1968,14 @@ mod tests {
     async fn light_command_never_waits() {
         let dir = tempdir().unwrap();
         let slots = tempdir().unwrap();
-        // The holder's heavy command runs for 8 s, so a light command that
-        // WRONGLY queued would take at least that long; a plain PowerShell
-        // start under full-suite load stays well under the 5 s bound.
+        // The holder keeps the only slot for 60 s, so a light command that
+        // WRONGLY queued would take at least that long. The 20 s bound only
+        // has to clear spawn latency: a bare PowerShell start under full-suite
+        // load has measured up to ~7 s on a busy machine.
         let held_command = if cfg!(target_os = "windows") {
-            "Start-Sleep -Milliseconds 8000".to_string()
+            "Start-Sleep -Milliseconds 60000".to_string()
         } else {
-            "sleep 8".to_string()
+            "sleep 60".to_string()
         };
         let holder_tool = tool_in(dir.path())
             .with_check_commands(vec![held_command.clone()])
@@ -1999,18 +2008,20 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(result.success, "{}", result.output);
         assert!(
-            elapsed < Duration::from_millis(5000),
+            elapsed < Duration::from_millis(20000),
             "a light command never waits for a build slot (the held heavy command \
-             runs for 8 s), took {elapsed:?}"
+             runs for 60 s), took {elapsed:?}"
         );
         assert!(
             !result.output.contains("waited"),
             "a light command reports no wait: {}",
             result.output
         );
-        // The holder outlives the assertion on purpose; drop it instead of
-        // waiting out its 8 s.
+        // The holder outlives the assertion on purpose; abort it and wait for
+        // the future to be dropped (closing its job object kills the child)
+        // instead of waiting out its 60 s, and leave no process behind.
         holder.abort();
+        let _ = holder.await;
 
     }
 

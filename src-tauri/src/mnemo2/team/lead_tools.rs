@@ -22,7 +22,9 @@ use crate::mnemo2::phase3::{self, ReviewEvidence};
 use super::findings_ledger;
 use super::record::{ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
-use super::dispatch::{dispatch_result, DispatchRequest, DispatchSource, PlanRef};
+use super::dispatch::{
+    BoxFuture, DispatchRequest, DispatchSource, PlanRef, dispatch_result, stale_base_line,
+};
 use super::TeamRuntime;
 
 impl TeamRuntime {
@@ -126,6 +128,13 @@ impl TeamRuntime {
                 name: "team_mutation_check".to_string(),
                 description: "Run the project's mutation command over one worker's change diff and report every changed line that no test catches as a low-severity 'No test catches: ...' finding. Refused with 'configure [mutation] in .coding/checks.toml' when the project configured no mutation command, and refused while the worker is busy. Returns at once; the run is expensive (minutes to hours) and finishes with a notice.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_run_checks".to_string(),
+                description: "Run every .coding/checks.toml command in a worker's checkout at its current tip, or in the lead checkout when worker_id is omitted, through the machine's heavy-command slots, and record each result as a check on that tip. Returns at once; a notice reports the results. Mnemo also starts it on its own after a review with no open findings whose tip lacks passing checks. Use it instead of running the full checks yourself.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","description":"The worker whose checkout to check; omit it to check the lead checkout."}}}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -248,6 +257,55 @@ impl TeamRuntime {
                 timeout_ms: Some(120_000),
             },
             HostToolSpec {
+                name: "team_agent_done".to_string(),
+                description: "Finish a worker that runs as a Claude Code agent: record its final report and mark it completed (or failed, with failed=true). Call it each time your Claude Code agent for that worker finishes a run (the step, a continuation after team_message, or a fix round after team_route_fix); then team_check, team_review and team_merge work as for any worker.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The agent worker to close."},
+                    "report":{"type":"string","description":"The agent's final report: the commit hash, the checks it ran and their results, and anything left open."},
+                    "failed":{"type":"boolean","description":"True when the agent could not finish the step."}
+                },"required":["worker_id","report"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_agent_started".to_string(),
+                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The agent worker the agent runs."},
+                    "agent_id":{"type":"string","description":"The id of the Claude Code agent (the Agent tool's agent id)."},
+                    "transcript_path":{"type":"string","description":"Optional: the agent's transcript file (agent-<agent_id>.jsonl)."}
+                },"required":["worker_id","agent_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_progress".to_string(),
+                description: "For a worker's Claude Code agent: post a one-line note after each milestone (code read, change in, tests pass, committed). The note goes into the worker's log and reaches the lead as a notice. Only for a Working or Fixing agent worker; the note is not empty and at most 500 characters.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The worker this agent runs (the worker_id in its prompt)."},
+                    "note":{"type":"string","description":"One line, at most 500 characters."}
+                },"required":["worker_id","note"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_integrate".to_string(),
+                description: "Merge an existing local branch into a worker's branch, in the worker's checkout, done by TeamManager: use it when a step needs another branch's work, or to bring a stale worker up to the lead branch. A conflict aborts the merge, changes nothing and lists the conflicting files. Refused while the worker is busy or its checkout is dirty.".to_string(),
+                parameters: json!({"type":"object","properties":{
+                    "worker_id":{"type":"string","description":"The worker whose branch receives the merge."},
+                    "branch":{"type":"string","description":"An existing local branch to merge in, for example the lead branch or another worker's wt/agent-* branch."}
+                },"required":["worker_id","branch"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(120_000),
+            },
+            HostToolSpec {
+                name: "team_tiers".to_string(),
+                description: "The live tier setup: each tier's models in order with their health (available, unavailable until a time after a usage limit, or not configured), its effort, whether it runs as a Claude Code agent when Claude Code leads, and the tier and model a dispatch would run on now. Read it before choosing a tier or model, and whenever a result says the tiers changed.".to_string(),
+                parameters: json!({"type":"object","properties":{}}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_quality".to_string(),
                 description: "Whether merged work holds up, per tier and per model: merges, first-pass share, average fix rounds and findings, high findings, reverts, merges a later bug-fix plan changed the same files for, and cost per merge. Read-only; use it when deciding a tier or model on evidence rather than on impressions.".to_string(),
                 parameters: json!({"type":"object","properties":{
@@ -293,8 +351,9 @@ impl TeamRuntime {
 
     /// Execute a built-in lead host-tool call.
     pub async fn handle_lead_host_tool(&self, name: &str, args: Value) -> ToolResult {
-        self.handle_lead_host_tool_from(name, args, MessageSender::Lead)
-            .await
+        // Boxed: the future of the whole tool table is large, and callers
+        // (the in-app lead, tests) hold it on their own stack.
+        Box::pin(self.handle_lead_host_tool_from(name, args, MessageSender::Lead)).await
     }
 
     /// Execute a lead host-tool call with its caller's identity attached.
@@ -352,12 +411,27 @@ impl TeamRuntime {
                 .mode;
             let explicit_model = model.is_some();
             let fold_request = if model.is_none() { tier.clone() } else { None };
+            // Read before the dispatch: a deferred classification may already
+            // be waiting on its timer once the worker exists.
+            let mut warnings = self.lead_checkout_warnings().await;
+            if sender == MessageSender::ExternalLead {
+                if let Some(line) = self.tier_changes().changed_line() {
+                    warnings.push(line);
+                }
+                if let Some(line) = model
+                    .as_deref()
+                    .and_then(|model| self.bypass_warning(tier.as_deref(), model))
+                {
+                    warnings.push(line);
+                }
+            }
             let result = self
                 .dispatch_request(DispatchRequest {
                     brief: brief.to_string(),
                     tier,
                     dispatch_routing: true,
                     source: DispatchSource::LeadTool,
+                    sender,
                     model,
                     reasoning_effort,
                     worker_id: Some(worker_id.to_string()),
@@ -375,6 +449,7 @@ impl TeamRuntime {
                 mode,
                 fold_request,
                 explicit_model,
+                warnings,
             );
         }
         if name == "team_audit_dispatch" {
@@ -414,6 +489,7 @@ impl TeamRuntime {
                 RoutingMode::Off,
                 fold_request,
                 explicit_model,
+                Vec::new(),
             );
         }
         if name == "team_prove_regression" || name == "team_mutation_check" {
@@ -429,6 +505,75 @@ impl TeamRuntime {
                 Ok(text) => ToolResult::success(text),
                 Err(error) => ToolResult::error(error),
             };
+        }
+        if name == "team_run_checks" {
+            let worker_id = args.get("worker_id").and_then(Value::as_str);
+            return match self.run_checks_tool(worker_id).await {
+                Ok(text) => ToolResult::success(text),
+                Err(error) => ToolResult::error(error),
+            };
+        }
+        if name == "team_agent_started" || name == "team_progress" {
+            let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
+                return ToolResult::error(format!("{name} requires a 'worker_id' string"));
+            };
+            if name == "team_progress" {
+                let Some(note) = args.get("note").and_then(Value::as_str) else {
+                    return team_tool_error("team_progress requires a 'note' string".to_string());
+                };
+                return match Box::pin(self.agent_progress(worker_id, note)).await {
+                    Ok(worker) => ToolResult::success(format!("Posted the note for {worker_id}."))
+                        .with_data(serde_json::to_value(&worker).unwrap_or(Value::Null)),
+                    Err(error) => team_tool_error(error),
+                };
+            }
+            let Some(agent_id) = args.get("agent_id").and_then(Value::as_str) else {
+                return team_tool_error("team_agent_started requires an 'agent_id' string".to_string());
+            };
+            let transcript = args.get("transcript_path").and_then(Value::as_str);
+            return match Box::pin(self.agent_started(worker_id, agent_id, transcript)).await {
+                Ok((worker, text)) => ToolResult::success(text)
+                    .with_data(serde_json::to_value(&worker).unwrap_or(Value::Null)),
+                Err(error) => team_tool_error(error),
+            };
+        }
+        if name == "team_integrate" {
+            let (Some(worker_id), Some(branch)) = (
+                args.get("worker_id").and_then(Value::as_str),
+                args.get("branch").and_then(Value::as_str),
+            ) else {
+                return ToolResult::error("team_integrate requires 'worker_id' and 'branch' strings");
+            };
+            return match self.integrate(worker_id, branch).await {
+                Ok((worker, agent_note)) => {
+                    let mut answer = worker_answer(&worker, "team_integrate");
+                    if let Some(merged) = worker.integrations.last() {
+                        answer.output = format!(
+                            "{}\nMerged {} into {worker_id} at {}; its checks and review start over on the new tip.",
+                            answer.output,
+                            merged.branch,
+                            super::dispatch::short_sha(&merged.commit)
+                        );
+                    }
+                    if let Some(note) = agent_note {
+                        answer.output = format!(
+                            "{}\nPass this to its Claude Code agent with your next message: {note}",
+                            answer.output
+                        );
+                    }
+                    answer
+                }
+                Err(error) => team_tool_error(error),
+            };
+        }
+        if name == "team_tiers" {
+            if sender == MessageSender::ExternalLead {
+                self.tier_changes().mark_seen();
+            }
+            let view = self.tiers_view();
+            let output = serde_json::to_string(&json!({"action": "team_tiers", "result": view}))
+                .unwrap_or_else(|_| "team_tiers".to_string());
+            return ToolResult::success(output).with_data(view);
         }
         if name == "team_quality" {
             let window_days = args
@@ -478,12 +623,10 @@ impl TeamRuntime {
             // The compact entry is the default because the answer lands in the
             // lead's own context; `detail` asks for the whole record.
             let detail = args.get("detail").and_then(Value::as_bool).unwrap_or(false);
-            let result = result.map(|workers| {
-                workers
-                    .iter()
-                    .map(|worker| worker_status_view(worker, detail))
-                    .collect::<Vec<_>>()
-            });
+            let result = match result {
+                Ok(workers) => Ok(self.status_views(&workers, detail).await),
+                Err(err) => Err(err),
+            };
             return team_status_result(result, self.lead_status());
         }
         if name == "session_search" {
@@ -492,12 +635,33 @@ impl TeamRuntime {
         let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
             return ToolResult::error(format!("{name} requires a 'worker_id' string"));
         };
+        // The stale base is read before a merge, which would add the merge
+        // commit to what the branch lacks.
+        let stale = if matches!(name, "team_check" | "team_merge") {
+            self.stale_base_of(worker_id).await
+        } else {
+            None
+        };
+        // A team_resume that handed the step to the lead's Claude Code agent
+        // (plan e52e0be1 decision 5) answers with the block to launch.
+        let mut handoff_block: Option<Value> = None;
         let result = match name {
             "team_message" => match args.get("text").and_then(Value::as_str) {
                 Some(text) => self.message(worker_id, text.to_string(), sender).await,
                 None => Err("team_message requires a 'text' string".to_string()),
             },
             "team_stop" => self.stop(worker_id).await,
+            "team_agent_done" => {
+                let report = args.get("report").and_then(Value::as_str);
+                let failed = args.get("failed").and_then(Value::as_bool).unwrap_or(false);
+                match report {
+                    Some(report) if !report.trim().is_empty() => {
+                        self.agent_done(worker_id, report.to_string(), failed)
+                            .await
+                    }
+                    _ => Err("team_agent_done requires a non-empty 'report' string".to_string()),
+                }
+            }
             "team_resume" => {
                 let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
                 let model = args.get("model").and_then(Value::as_str).map(str::to_string);
@@ -508,26 +672,18 @@ impl TeamRuntime {
                 if tier.is_none() && model.is_none() && reasoning_effort.is_none() {
                     self.resume(worker_id).await
                 } else {
-                    match self.lead_model_choice(tier.as_deref(), model) {
-                        Err(err) => Err(err),
-                        Ok(model) => {
-                            // An effort alone keeps the worker's model.
-                            let model = match model {
-                                Some(model) => Some(model),
-                                None => self.worker(worker_id).await.ok().and_then(|w| w.model),
-                            };
-                            let changed = self
-                                .change_model(worker_id, model, reasoning_effort, ChangeSource::Lead)
-                                .await;
-                            match (changed, tier) {
-                                (Ok(_), Some(tier)) => {
-                                    self.record_tier(worker_id, &tier).await;
-                                    self.worker(worker_id).await
-                                }
-                                (changed, _) => changed,
-                            }
-                        }
-                    }
+                    self.resume_on_tier(
+                        worker_id,
+                        tier.as_deref(),
+                        model,
+                        reasoning_effort,
+                        ChangeSource::Lead,
+                    )
+                    .await
+                    .map(|resumed| {
+                        handoff_block = resumed.claude_agent;
+                        resumed.worker
+                    })
                 }
             }
             "team_compact" => self.compact(worker_id).await,
@@ -612,7 +768,29 @@ impl TeamRuntime {
             _ => Err(format!("unknown team host tool '{name}'")),
         };
         let reviewed = result.as_ref().ok().cloned();
-        let mut answer = worker_result(result, name);
+        let mut answer = match (result, handoff_block) {
+            (Ok(worker), Some(block)) => agent_handoff_answer(&worker, block),
+            (Ok(worker), None)
+                if worker.claude_agent.is_some()
+                    && matches!(name, "team_message" | "team_route_fix") =>
+            {
+                continue_agent_answer(&worker, name)
+            }
+            (result, _) => worker_result(result, name),
+        };
+        if let (true, Some(missing)) = (answer.success, stale) {
+            answer.output = format!("{}\n{}", answer.output, stale_base_line(missing));
+        }
+        // Resume and route-fix results carry no `warnings` array: the tier
+        // change line follows the JSON, as the stale-base line does.
+        if answer.success
+            && sender == MessageSender::ExternalLead
+            && matches!(name, "team_resume" | "team_route_fix")
+        {
+            if let Some(line) = self.tier_changes().changed_line() {
+                answer.output = format!("{}\n{line}", answer.output);
+            }
+        }
         if name == "team_review" && answer.success {
             if let Some(line) = finding_categories_line(&self.workspace_root) {
                 answer.output = format!("{}\n{line}", answer.output);
@@ -621,6 +799,9 @@ impl TeamRuntime {
             // the lead reads "this is now a proposal" instead of reviewing it
             // for the fourth time.
             if let Some(reviewed) = &reviewed {
+                if let Some(line) = self.start_missing_checks(reviewed).await {
+                    answer.output = format!("{}\n{line}", answer.output);
+                }
                 let lines =
                     findings_ledger::recurrence_lines(&self.workspace_root, &reviewed.findings);
                 for line in lines {
@@ -630,6 +811,41 @@ impl TeamRuntime {
             }
         }
         answer
+    }
+
+    /// The status views `team_status` answers, each with its `stale_base`
+    /// when the branch lacks lead commits.
+    fn status_views<'a>(
+        &'a self,
+        workers: &'a [WorkerRecord],
+        detail: bool,
+    ) -> BoxFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            let mut views = Vec::with_capacity(workers.len());
+            for worker in workers {
+                let mut view = worker_status_view(worker, detail);
+                if let (Some(agent), Some(object)) =
+                    (self.agent_view(worker).await, view.as_object_mut())
+                {
+                    object.insert("agent".to_string(), agent.to_json());
+                }
+                if let (Some(missing), Some(object)) =
+                    (self.stale_base(worker).await, view.as_object_mut())
+                {
+                    object.insert("stale_base".to_string(), json!(missing));
+                }
+                views.push(view);
+            }
+            views
+        })
+    }
+
+    /// The stale base of one worker, `None` when unknown or not worth reporting.
+    fn stale_base_of<'a>(&'a self, worker_id: &'a str) -> BoxFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            let worker = self.worker(worker_id).await.ok()?;
+            self.stale_base(&worker).await
+        })
     }
 
     /// `session_search`: search the past worker and lead transcripts, or read
@@ -786,8 +1002,12 @@ fn without_transcripts(value: &mut Value) {
             object.remove("transcript");
             object.remove("transcript_revs");
             object.remove("omitted_transcripts");
-            for nested in object.values_mut() {
-                without_transcripts(nested);
+            for (key, nested) in object.iter_mut() {
+                // The `agent` object's `transcript` is the agent's file path,
+                // not a conversation.
+                if key != "agent" {
+                    without_transcripts(nested);
+                }
             }
         }
         Value::Array(items) => {
@@ -853,7 +1073,19 @@ pub(super) fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
         })
         .collect::<Vec<_>>();
     // The observed model id beats the selected spec: it is what actually ran.
-    let model = worker.model_id.as_ref().or(worker.model.as_ref());
+    // A Claude Code agent worker shows the agent it runs as: it has no
+    // session, so its selected spec never ran.
+    let model = worker
+        .claude_agent
+        .as_ref()
+        .map(|agent| format!("claude-code/{agent}"))
+        .or_else(|| {
+            worker
+                .model_id
+                .as_ref()
+                .or(worker.model.as_ref())
+                .cloned()
+        });
     let mut view = json!({
         "id": worker.id,
         "name": worker.name,
@@ -935,6 +1167,63 @@ fn worker_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
         .unwrap_or_else(|_| action.to_string());
     let data = serde_json::to_value(worker).unwrap_or(Value::Null);
     ToolResult::success(output).with_data(data)
+}
+
+/// The `team_resume` answer when the move handed the worker's step to the
+/// lead's Claude Code agent: the worker entry beside the `claude_agent` block,
+/// in the result and in `data`, the way a dispatch answers.
+fn agent_handoff_answer(worker: &WorkerRecord, block: Value) -> ToolResult {
+    let mut reported = worker_status_view(worker, false);
+    without_transcripts(&mut reported);
+    let output = serde_json::to_string(&json!({
+        "action": "team_resume",
+        "result": {"worker": reported, "claude_agent": block},
+    }))
+    .unwrap_or_else(|_| "team_resume".to_string());
+    let output = format!(
+        "{output}\n{} now runs as a Claude Code agent: launch your Agent with the claude_agent block (prompt unchanged), then call team_agent_done.",
+        worker.id
+    );
+    let data = serde_json::to_value(worker).unwrap_or(Value::Null);
+    ToolResult::success(output).with_data(json!({"worker": data, "claude_agent": block}))
+}
+
+/// The `team_message` or `team_route_fix` answer for a worker that runs as a
+/// Claude Code agent (plan ca7f2177 decision 5): Mnemo recorded the message
+/// or the fix round, and the lead passes the text on to its agent. The
+/// `continue_agent` block `{agent_id, worktree, message}` is in the result
+/// and in `data`; the text says how to continue, with the message below it.
+fn continue_agent_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
+    let message = worker
+        .inbox
+        .last()
+        .map(|entry| entry.text.clone())
+        .unwrap_or_default();
+    let block = json!({
+        "agent_id": worker.claude_agent_id,
+        "worktree": worker.worktree,
+        "message": message,
+    });
+    let mut reported = worker_status_view(worker, false);
+    without_transcripts(&mut reported);
+    let output = serde_json::to_string(&json!({
+        "action": action,
+        "result": {"worker": reported, "continue_agent": block},
+    }))
+    .unwrap_or_else(|_| action.to_string());
+    let how = match worker.claude_agent_id.as_deref() {
+        Some(agent_id) => format!(
+            "Continue {}'s Claude Code agent with SendMessage to {agent_id}, sending the message below; call team_agent_done when it finishes.",
+            worker.id
+        ),
+        None => format!(
+            "No agent is registered for {}: start a new Agent with isolation \"worktree\" and this message; Mnemo hands it this worker's checkout and registers it.",
+            worker.id
+        ),
+    };
+    let data = serde_json::to_value(worker).unwrap_or(Value::Null);
+    ToolResult::success(format!("{output}\n{how}\n\n{message}"))
+        .with_data(json!({"worker": data, "continue_agent": block}))
 }
 
 /// A team tool answer for one worker.

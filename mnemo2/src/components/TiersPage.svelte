@@ -315,6 +315,35 @@
     ladderSaved = false;
   }
 
+  /** The "Run as" choices: Mnemo's own models, or a Claude Code agent model. */
+  const CLAUDE_AGENT_CHOICES: readonly { value: string; label: string }[] = [
+    { value: "opus", label: "Claude Code agent — Opus" },
+    { value: "sonnet", label: "Claude Code agent — Sonnet" },
+    { value: "haiku", label: "Claude Code agent — Haiku" },
+    { value: "fable", label: "Claude Code agent — Fable" },
+  ];
+
+  /** Write one rung's Run as choice; empty clears it back to Mnemo's models,
+   * which also drops the agent effort (it only means something for an agent). */
+  function setRungClaudeAgent(id: string, value: string): void {
+    const rung = rungOf(id);
+    if (rung === undefined) return;
+    rung.claude_agent = value === "" ? null : value;
+    if (value === "") rung.claude_agent_effort = null;
+    ladderSaved = false;
+  }
+
+  /** The "Agent effort" choices, in the order the select offers them. */
+  const CLAUDE_AGENT_EFFORT_CHOICES: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+
+  /** Write one rung's Claude Code agent effort; empty clears it to the default. */
+  function setRungClaudeAgentEffort(id: string, value: string): void {
+    const rung = rungOf(id);
+    if (rung === undefined) return;
+    rung.claude_agent_effort = value === "" ? null : value;
+    ladderSaved = false;
+  }
+
   const ladderChanged = $derived(JSON.stringify(draft) !== JSON.stringify(tiers));
 
   /** Save the ladder; the lowest tier's model is required. */
@@ -357,8 +386,9 @@
   /**
    * The `tier` text `team_dispatch` shows the lead — generated from the
    * draft exactly as the backend generates it from the stored ladder:
-   * id (name) - definition: models with prices, effort, escalation note;
-   * suggest and auto add the `auto` line (Laya is never offered escalate).
+   * id (name) - definition: models with prices, effort, escalation note,
+   * Claude Code agent suffix; suggest and auto add the `auto` line (Laya is
+   * never offered escalate).
    */
   const dispatchPreview = $derived.by(() => {
     const lines: string[] = [];
@@ -371,7 +401,12 @@
             : "no model";
       const effort = rung.effort === null || rung.effort === "" ? "" : `; effort ${rung.effort}`;
       const escalation = rung.role === "escalate" ? "; escalation only, never a first pick" : "";
-      lines.push(`${rung.id} (${rung.name}) - ${rung.definition}: ${list}${effort}${escalation}`);
+      const claudeAgent = rung.claude_agent
+        ? rung.claude_agent_effort
+          ? `; runs as a Claude Code agent (${rung.claude_agent}, ${rung.claude_agent_effort} effort) when Claude Code leads`
+          : `; runs as a Claude Code agent (${rung.claude_agent}) when Claude Code leads`
+        : "";
+      lines.push(`${rung.id} (${rung.name}) - ${rung.definition}: ${list}${effort}${escalation}${claudeAgent}`);
     }
     if (choice === "suggest" || choice === "auto") {
       lines.push("auto - let Laya choose from the step spec (never escalate)");
@@ -672,12 +707,47 @@
                 oninput={(event) => setRungEffort(tier.id, event.currentTarget.value)}
               />
             </label>
+            {#if tier.role !== "escalate"}
+              <div class="tier-run-as">
+                <label class="micro" for={`tier-run-as-${tier.id}`}>Run as</label>
+                <select
+                  id={`tier-run-as-${tier.id}`}
+                  value={tier.claude_agent ?? ""}
+                  onchange={(event) => setRungClaudeAgent(tier.id, event.currentTarget.value)}
+                >
+                  <option value="">Mnemo models</option>
+                  {#each CLAUDE_AGENT_CHOICES as option (option.value)}
+                    <option value={option.value}>{option.label}</option>
+                  {/each}
+                </select>
+              </div>
+              {#if tier.claude_agent !== null}
+                <div class="tier-agent-effort">
+                  <label class="micro" for={`tier-agent-effort-${tier.id}`}>Agent effort</label>
+                  <select
+                    id={`tier-agent-effort-${tier.id}`}
+                    value={tier.claude_agent_effort ?? ""}
+                    onchange={(event) => setRungClaudeAgentEffort(tier.id, event.currentTarget.value)}
+                  >
+                    <option value="">Default</option>
+                    {#each CLAUDE_AGENT_EFFORT_CHOICES as effort (effort)}
+                      <option value={effort}>{effort}</option>
+                    {/each}
+                  </select>
+                </div>
+              {/if}
+            {/if}
             {#if tier.id === "trivial"}
               <p class="micro hint">required: the default model</p>
             {:else if tier.role === "escalate"}
               <p class="micro hint">only after a lower tier failed</p>
             {:else if tier.models.length === 0}
               <p class="micro hint">uses {foldTargetOf(tier.id) ?? tier.resolves_to}'s model</p>
+            {/if}
+            {#if tier.role !== "escalate" && tier.claude_agent !== null}
+              <p class="micro hint tier-run-as-hint">
+                When Claude Code leads, this tier runs on your Claude Code agent, and Mnemo follows it through its transcript; the models above are used otherwise.
+              </p>
             {/if}
           </div>
         </section>
@@ -803,6 +873,11 @@
   .tier-foot { display: flex; align-items: end; gap: 14px; flex-wrap: wrap; }
   .tier-effort { display: grid; gap: 2px; }
   .tier-effort input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
+  .tier-run-as { display: grid; gap: 2px; }
+  .tier-run-as select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
+  .tier-agent-effort { display: grid; gap: 2px; }
+  .tier-agent-effort select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); color: var(--ink); font-size: var(--text-body); }
+  .tier-run-as-hint { flex-basis: 100%; }
   .hint { margin: 0; padding-bottom: 6px; }
 
   /* The dispatch text preview */

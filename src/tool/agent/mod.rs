@@ -30,6 +30,9 @@
 //!   `model` parameter)
 //! - `graph_search` / `graph_context` / `graph_impact` / `graph_path`
 //!   (read-only queries over the CodeGraph knowledge graph, when enabled)
+//! - `find_code` (finds code by what it does: embeds the words with the code
+//!   model and ranks symbols by meaning blended with text and name matches —
+//!   the meaning-first counterpart of `search`/`graph_search`)
 
 pub mod codegraph;
 pub mod convert_line_endings;
@@ -38,6 +41,8 @@ pub mod expand_result;
 pub mod file_append;
 pub mod file_edit;
 pub mod file_write;
+/// `find_code` — semantic code search (plan d3336a8a step 11).
+pub mod find_code;
 pub mod git;
 pub mod git_diff;
 pub mod git_read;

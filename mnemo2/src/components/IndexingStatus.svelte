@@ -7,47 +7,51 @@
   type Kind = PassKind;
   /** How long a just-finished pass stays visible, so a fast pass is still seen. */
   const FINISHED_MS = 4000;
+  /** Every pass the status line can show, in display order. */
+  const KINDS = ["code", "memory", "laya", "embeddings"] as const;
 
   /** What each pass is doing, as its running line reads it. */
   const RUNNING_TEXT: Record<Kind, string> = {
     code: "Indexing code",
     memory: "Updating memory",
     laya: "Checking Laya",
+    embeddings: "Re-embedding memories",
   };
   /** The unit each pass counts. */
   const UNIT_TEXT: Record<Kind, string> = {
     code: "files",
     memory: "sources",
     laya: "tasks",
+    embeddings: "memories",
   };
   /** Each pass's progress bar name. */
   const PROGRESS_LABEL: Record<Kind, string> = {
     code: "Code index progress",
     memory: "Memory update progress",
     laya: "Laya check progress",
+    embeddings: "Memory re-embed progress",
   };
   /** The confirmation each pass shows for a moment after it ends. */
   const FINISHED_TEXT: Record<Kind, string> = {
     code: "Code index up to date",
     memory: "Memory up to date",
     laya: "Laya checked",
+    embeddings: "Memories re-embedded",
   };
   /** What each pass shows when it fails. */
   const FAILED_TEXT: Record<Kind, string> = {
     code: "Code index failed",
     memory: "Memory update failed",
     laya: "Laya check failed",
+    embeddings: "Memory re-embed failed",
   };
 
   const passes = $derived(runningPasses($app.indexing));
   const failed = $derived(
-    ([
-      ["code", $app.indexing?.code],
-      ["memory", $app.indexing?.memory],
-      ["laya", $app.indexing?.laya],
-    ] as const)
-      .filter(([, pass]) => pass?.state === "failed")
-      .map(([kind, pass]) => ({ kind, error: pass?.detail ?? "unknown error" })),
+    KINDS
+      .map((kind) => ({ kind, pass: $app.indexing?.[kind] }))
+      .filter(({ pass }) => pass?.state === "failed")
+      .map(({ kind, pass }) => ({ kind, error: pass?.detail ?? "unknown error" })),
   );
 
   // A pass that finishes while this is mounted shows "up to date" briefly; one
@@ -62,7 +66,7 @@
   });
 
   function track(indexing: typeof $app.indexing) {
-    for (const kind of ["code", "memory", "laya"] as const) {
+    for (const kind of KINDS) {
       const pass = indexing?.[kind] ?? null;
       if (pass?.state === "running") {
         seenRunning[kind] = true;

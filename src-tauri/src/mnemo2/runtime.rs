@@ -1564,10 +1564,16 @@ async fn pump_team_notifications(
                     worker.id, event.generation, worker.last_activity_ms
                 ),
                 format!(
-                    "{} failed: {error}.{}\nTo continue on the same model, team_message it. To retry on another model, use team_resume with worker_id={} and a `tier` or `model`, then team_message it to continue.",
+                    "{} failed: {error}.{}\n{}",
                     worker.name,
                     crate::mnemo2::team::tool_errors_text(&worker),
-                    worker.id
+                    // A usage-limited model is out of the tiers: say what
+                    // Mnemo marked and the next move instead of the generic
+                    // continue/retry lines (plan e5d93df3 decision 8).
+                    team.usage_limit_notice(&worker, error).unwrap_or_else(|| format!(
+                        "To continue on the same model, team_message it. To retry on another model, use team_resume with worker_id={} and a `tier` or `model`, then team_message it to continue.",
+                        worker.id
+                    ))
                 ),
                 Some(NoticeState::Failed),
             ),
@@ -1623,8 +1629,10 @@ async fn pump_team_notifications(
 }
 
 /// The lead notice for a worker turn that ended Completed: its plan step and
-/// the next move toward a merge (review, close findings, or merge).
-fn finished_notice(worker: &crate::mnemo2::team::WorkerRecord) -> String {
+/// the next move toward a merge (review, close findings, or merge). Shared
+/// with `team_agent_done`, which closes a Claude Code agent worker with the
+/// same notice shape.
+pub(crate) fn finished_notice(worker: &crate::mnemo2::team::WorkerRecord) -> String {
     let step = match (&worker.plan_id, worker.plan_step) {
         (Some(plan), Some(step)) => format!(" on plan {plan} step {}", step + 1),
         _ => String::new(),

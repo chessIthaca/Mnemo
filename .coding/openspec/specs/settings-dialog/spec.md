@@ -94,3 +94,49 @@ The Safety page SHALL show the git subcommands that always make the lead ask bef
 - **WHEN** the user enters push --force and saves
 - **THEN** the page shows an error naming the entry
 - **AND** config.toml is unchanged
+
+### Requirement: Settings has a Machine page
+The Settings dialog SHALL have a Machine page under All projects that edits how many heavy build and test commands may run at once across every Mnemo2 instance on the machine, and SHALL show whether a shared Rust build cache (sccache) was found and the shared model host's status.
+
+#### Scenario: Changing the build limit
+- **WHEN** the user sets Builds and tests at once to 1 and saves
+- **THEN** config.toml carries [general.machine] heavy_commands = 1
+- **AND** every running instance applies it to the next heavy command
+
+### Requirement: The Models page says what the embedding models are for
+The Models page SHALL describe the memory embedding model as serving memory search over specs, decisions, bugs and HOW records, plan, review and backlog summaries, and routing and failure-triage examples, and SHALL describe the code-search model separately.
+
+#### Scenario: Reading the Models page
+- **WHEN** the user opens Settings > Models
+- **THEN** the embedding section names memory search, routing examples and code search with their models
+
+### Requirement: The Tiers page offers Run as a Claude Code agent
+Each tier card except escalate SHALL offer a Run as choice between Mnemo models and a Claude Code agent with Opus, Sonnet, Haiku or Fable, saved with the ladder.
+
+#### Scenario: Choose Opus for high
+- **WHEN** the user picks Claude Code agent — Opus on the High card and saves
+- **THEN** endpoints.toml stores claude_agent opus on the high tier
+- **AND** the lead preview shows the agent suffix on the High line
+
+### Requirement: The Run as hint says how agents are followed
+When a tier runs as a Claude Code agent, the Tiers page hint SHALL say that Mnemo follows the agent through its transcript and that the tier's models are used otherwise.
+
+#### Scenario: Hint
+- **WHEN** the user picks a Claude Code agent in Run as
+- **THEN** the hint says Mnemo follows the agent through its transcript
+
+### Requirement: The Tiers page offers an agent effort
+When a tier runs as a Claude Code agent, its card SHALL offer an Agent effort choice of Default, low, medium, high, xhigh or max, saved with the ladder; choosing Mnemo models SHALL clear it.
+
+#### Scenario: Choose xhigh
+- **WHEN** the user picks Claude Code agent Opus and Agent effort xhigh on High and saves
+- **THEN** endpoints.toml stores claude_agent_effort xhigh on the high tier
+- **AND** the lead preview names the effort
+
+### Requirement: Saving tiers updates what the lead sees
+Saving a changed tier ladder in Settings SHALL bump the tier revision, so an attached Claude Code lead's tool descriptions refresh and its next dispatch says the tiers changed.
+
+#### Scenario: Save tiers
+- **WHEN** the user changes a tier and clicks Save tiers
+- **WHEN** Claude Code leads
+- **THEN** the lead's next dispatch says the tiers changed

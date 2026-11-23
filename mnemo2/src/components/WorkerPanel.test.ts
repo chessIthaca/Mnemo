@@ -2,10 +2,16 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TeamTransport } from "../lib/teamEngine";
-import { emptyProjectUsageView, type TeamEvent, type TeamWorkerRecord } from "../lib/teamState";
+import {
+  emptyProjectUsageView,
+  type TeamAgentView,
+  type TeamEvent,
+  type TeamWorkerRecord,
+} from "../lib/teamState";
 
 const team = vi.hoisted(() => ({
   transport: null as (TeamTransport & { emit: (event: TeamEvent) => void }) | null,
+  agents: {} as Record<string, TeamAgentView>,
 }));
 
 vi.mock("../lib/teamEngine", () => ({
@@ -108,6 +114,7 @@ function makeTeamTransport(records: TeamWorkerRecord[]): TeamTransport & { emit:
       slots: 3,
       active: current.filter((worker) => ["dispatching", "working", "fixing"].includes(worker.status)).length,
       usage: emptyProjectUsageView(),
+      agents: team.agents,
     })),
     dispatch: vi.fn(async () => current[0]),
     message: vi.fn(async () => current[0]),
@@ -217,6 +224,7 @@ function scrollMetrics(
 
 describe("WorkerPanel", () => {
   beforeEach(() => {
+    team.agents = {};
     app.set(fixtureState());
     frames = new Map();
     nextFrame = 1;
@@ -592,5 +600,39 @@ describe("WorkerPanel", () => {
 
     expect(within(panel).getByRole("button", { name: "Continue" })).toBeTruthy();
     expect(within(panel).queryByText("Audit finished; its report is with the lead.")).toBeNull();
+  });
+
+  it("shows a Claude Code agent's transcript path, activity and stalled badge", async () => {
+    team.agents = {
+      kai: {
+        id: "a1b2c3",
+        transcript: "C:/Users/me/.claude/projects/slug/sess/subagents/agent-a1b2c3.jsonl",
+        last_activity_ms: Date.now() - 12 * 60_000,
+        tool_calls: 7,
+        tokens: 12345,
+        finished: false,
+        stalled: true,
+      },
+    };
+    await openAppWith([nativeWorker(), kaiWorker()]);
+    actions.openWorkerPanel("kai");
+    render(App);
+    const panel = document.querySelector(".worker-panel") as HTMLElement;
+    const line = within(panel).getByLabelText("Claude Code agent");
+
+    expect(line.textContent).toContain("agent-a1b2c3.jsonl");
+    expect(line.textContent).toContain("last activity 12m ago");
+    expect(line.textContent).toContain("7 tool calls");
+    expect(line.textContent).toContain("12,345 tokens");
+    expect(within(line).getByText("stalled")).toBeTruthy();
+  });
+
+  it("shows no agent line for a worker without an agent", async () => {
+    await openAppWith([nativeWorker(), kaiWorker()]);
+    actions.openWorkerPanel("kai");
+    render(App);
+    const panel = document.querySelector(".worker-panel") as HTMLElement;
+
+    expect(within(panel).queryByLabelText("Claude Code agent")).toBeNull();
   });
 });

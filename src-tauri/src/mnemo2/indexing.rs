@@ -85,6 +85,9 @@ pub struct IndexingSnapshot {
     pub memory: Option<IndexPass>,
     /// The Laya routing check, started by the app on open (not the engine).
     pub laya: Option<IndexPass>,
+    /// The automatic memory re-embed after an embedding-model change; absent
+    /// until one runs.
+    pub embeddings: Option<IndexPass>,
 }
 
 /// Which pass a host event belongs to.
@@ -93,6 +96,7 @@ pub enum PassKind {
     Code,
     Memory,
     Laya,
+    Embeddings,
 }
 
 /// Fold one pass event (the `"type"`-tagged wire shape the indexing streams
@@ -175,6 +179,7 @@ impl IndexingTracker {
                 PassKind::Code => &mut snapshot.code,
                 PassKind::Memory => &mut snapshot.memory,
                 PassKind::Laya => &mut snapshot.laya,
+                PassKind::Embeddings => &mut snapshot.embeddings,
             };
             *pass = apply_pass_event(pass.take(), event);
         });
@@ -289,6 +294,33 @@ impl IndexingTracker {
         })
     }
 
+    /// Follow the store's automatic re-embed for the project's lifetime (plan
+    /// ebd13a79). A `watch` channel, not a host-event bus: the startup
+    /// re-embed runs inside brain construction, before this tracker exists, so
+    /// the receiver's CURRENT value is folded first. A store that never
+    /// re-embedded reads `None`; a lone `done` folds to nothing, so a pass
+    /// that finished before the window opened stays invisible — intended.
+    fn spawn_reembed_events(
+        self: &Arc<Self>,
+        store: Arc<mnemo::memory::MemoryStore>,
+    ) -> JoinHandle<()> {
+        let tracker = self.clone();
+        tokio::spawn(async move {
+            let mut rx = store.reembed_events();
+            loop {
+                let current = rx.borrow_and_update().clone();
+                if let Some(event) = current {
+                    if let Ok(value) = serde_json::to_value(&event) {
+                        tracker.apply(PassKind::Embeddings, &value);
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
     /// Follow the engine's startup passes until the engine stops.
     pub fn watch(self: &Arc<Self>, engine: Arc<Engine>) {
         let mut host_events = engine.host_events();
@@ -314,6 +346,9 @@ impl IndexingTracker {
         tasks.push(forward);
         if self.code_running() {
             tasks.push(self.spawn_watchdog(engine.clone()));
+        }
+        if let Some(store) = engine.concrete_memory_store() {
+            tasks.push(self.spawn_reembed_events(store));
         }
         tasks.push(self.spawn_memory_health(engine));
     }
@@ -423,6 +458,7 @@ fn health_done(snapshot: &mut IndexingSnapshot, detail: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mnemo::memory::ReembedEvent;
     use serde_json::json;
 
     #[test]
@@ -568,6 +604,64 @@ mod tests {
             pass.detail.as_deref(),
             Some("derived index in sync · health: 0 records cite missing paths")
         );
+    }
+
+    #[test]
+    fn embeddings_pass_folds_reembed_events() {
+        // The automatic re-embed publishes the same tagged pass events as the
+        // other indexing streams, so the window shows a progress line instead
+        // of a silent sweep (plan ebd13a79).
+        let tracker = IndexingTracker::new();
+        tracker.apply(
+            PassKind::Embeddings,
+            &serde_json::to_value(ReembedEvent::Started {
+                model: "jina-embeddings-v2-base-code".into(),
+            })
+            .expect("started as a value"),
+        );
+        tracker.apply(
+            PassKind::Embeddings,
+            &serde_json::to_value(ReembedEvent::Progress {
+                done: 3200,
+                total: 12444,
+            })
+            .expect("progress as a value"),
+        );
+        let pass = tracker
+            .snapshot()
+            .embeddings
+            .clone()
+            .expect("a running embeddings pass");
+        assert_eq!(pass.state, PassState::Running);
+        assert_eq!((pass.done, pass.total), (3200, 12444));
+        assert!(
+            !tracker.snapshot().first_run,
+            "a re-embed never blocks the project"
+        );
+
+        let summary = "12444 memories re-embedded for jina-embeddings-v2-base-code";
+        tracker.apply(
+            PassKind::Embeddings,
+            &serde_json::to_value(ReembedEvent::Done {
+                summary: summary.into(),
+            })
+            .expect("done as a value"),
+        );
+        let pass = tracker.snapshot().embeddings.expect("a done embeddings pass");
+        assert_eq!(pass.state, PassState::Done);
+        assert_eq!(pass.done, 12444);
+        assert_eq!(pass.detail.as_deref(), Some(summary));
+        assert!(!tracker.snapshot().first_run);
+    }
+
+    #[test]
+    fn the_snapshot_serialises_the_embeddings_pass_under_its_key() {
+        let value = serde_json::to_value(IndexingTracker::new().snapshot()).expect("snapshot");
+        assert_eq!(value.get("embeddings"), Some(&Value::Null));
+        let tracker = IndexingTracker::new();
+        tracker.apply(PassKind::Embeddings, &json!({"type": "started"}));
+        let value = serde_json::to_value(tracker.snapshot()).expect("snapshot");
+        assert_eq!(value["embeddings"]["state"], json!("running"));
     }
 
     #[test]

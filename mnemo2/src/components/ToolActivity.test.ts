@@ -223,6 +223,95 @@ describe("ToolActivity expanded bodies", () => {
     expect(container.querySelector(".tool-exit")?.getAttribute("data-ok")).toBe("false");
   });
 
+  it("titles a job call with its purpose and state, and renders it like a shell", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "job",
+        arguments: '{"command":"cargo build","purpose":"build game","cwd":"src-tauri"}',
+        result: {
+          success: true,
+          output: "state: exited 0\nelapsed: 1.2s\ntail (filtered):\n[out] Finished dev profile",
+          data: {
+            job_id: "j1",
+            purpose: "build game",
+            command: "cargo build",
+            state: "exited",
+            exit_code: 0,
+          },
+        },
+      }),
+    });
+    // The collapsed title reads the job's label and state, not the tool name.
+    expect(container.querySelector(".tool-copy strong")?.textContent).toBe("job · build game — exited 0");
+    await expand(container);
+    await waitFor(() => expect(container.querySelector(".tool-command")?.textContent).toBe("cargo build"));
+    expect(container.textContent).toContain("purpose: build game");
+    expect(container.textContent).toContain("cwd: src-tauri");
+    expect(container.textContent).toContain("Finished dev profile");
+    expect(container.querySelector(".tool-exit")?.getAttribute("data-ok")).toBe("true");
+    // the raw JSON call moved behind the Show raw call toggle
+    expect(container.textContent).not.toContain('"command": "cargo build"');
+    await fireEvent.click(container.querySelector<HTMLButtonElement>(".tool-raw-toggle")!);
+    await waitFor(() => expect(container.textContent).toContain('"command": "cargo build"'));
+  });
+
+  it("titles a job_wait call from the purpose and state its result carries", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "job_wait",
+        arguments: '{"job_id":"j3","timeout_s":600}',
+        result: {
+          success: true,
+          output: "state: exited 1\nelapsed: 2.0s\ntail (filtered):\n[err] error: could not compile",
+          data: {
+            job_id: "j3",
+            purpose: "build game",
+            command: "cargo build",
+            state: "exited",
+            exit_code: 1,
+          },
+        },
+      }),
+    });
+    expect(container.querySelector(".tool-copy strong")?.textContent).toBe("job · build game — exited 1");
+    await expand(container);
+    await waitFor(() => expect(container.textContent).toContain("purpose: build game"));
+    expect(container.textContent).toContain("job: j3");
+    expect(container.textContent).toContain("could not compile");
+    expect(container.querySelector(".tool-command")).toBeNull();
+    expect(container.querySelector(".tool-exit")?.getAttribute("data-ok")).toBe("false");
+    // no Arguments JSON until the raw toggle is asked for
+    expect(container.textContent).not.toContain('"job_id": "j3"');
+  });
+
+  it("shows an old job_start transcript's purpose and command from its arguments", async () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "job_start",
+        arguments: '{"command":"cargo build","purpose":"build game"}',
+        // a pre-plan job_start result: no structured data, so no state suffix
+        result: { success: true, output: "started job j1" },
+      }),
+    });
+    expect(container.querySelector(".tool-copy strong")?.textContent).toBe("job · build game");
+    await expand(container);
+    await waitFor(() => expect(container.querySelector(".tool-command")?.textContent).toBe("cargo build"));
+    expect(container.textContent).toContain("purpose: build game");
+    expect(container.textContent).toContain("started job j1");
+    expect(container.textContent).not.toContain('"command": "cargo build"');
+  });
+
+  it("titles a job call whose result has not arrived as running", () => {
+    const { container } = render(ToolActivity, {
+      entry: entry({
+        toolName: "job",
+        arguments: '{"command":"cargo build","purpose":"build game"}',
+        result: null,
+      }),
+    });
+    expect(container.querySelector(".tool-copy strong")?.textContent).toBe("job · build game — running");
+  });
+
   it("keeps the generic Arguments/Result view for other tools", async () => {
     const { container } = render(ToolActivity, {
       entry: entry({

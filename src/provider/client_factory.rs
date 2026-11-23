@@ -419,6 +419,14 @@ pub fn build_vision_client(config: &Config) -> Option<Arc<dyn ImageDescriber>> {
 /// deterministic, in-process [`HashEmbedder`] — offline, dependency-free,
 /// keyword-overlap only — so memory always works (with the shared status set
 /// to `Failed` so the user sees the config issue).
+///
+/// `cache_dir` is the model cache directory under the config dir
+/// (`<config>/models` — every caller passes `embedder_cache_dir`). With
+/// the `embeddings` feature a machine-wide shared models host (plan
+/// d3336a8a step 2) is preferred over loading the model into this process:
+/// the share is derived from `cache_dir` ONLY while its last component is
+/// `models` — any other cache directory has no share and keeps today's
+/// in-process behaviour.
 pub fn build_embedder(
     config: &Config,
     cache_dir: &Path,
@@ -431,7 +439,7 @@ pub fn build_embedder(
             *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
             return Arc::new(HashEmbedder::new());
         }
-        return load_bundled_or_fallback(model_id, cache_dir, &status);
+        return configured_model_embedder(model_id, cache_dir, &status);
     }
     // Hash mode — always ready (no external service).
     *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
@@ -480,6 +488,295 @@ fn load_bundled_or_fallback(
     );
     *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Failed;
     Arc::new(HashEmbedder::new())
+}
+
+/// The configured-model branch of [`build_embedder`] with the `embeddings`
+/// feature on: remote-first — a machine-wide shared models host (plan
+/// d3336a8a step 2) is preferred over loading the model into this process.
+/// No host, or an unusable one, falls back to today's synchronous
+/// in-process load (never a worse state than before).
+///
+/// The acquire retries with the step-17 backoff while a host is serveable
+/// (finding rewireNoRetryAndDoc): every caller of this branch runs on a
+/// background or blocking thread — the settings rewire's off-path build
+/// (rewire.rs), the headless reembed's `spawn_blocking`, never an apply
+/// critical path — and a single attempt could pin an in-process model
+/// after a save during a cold start. Not serveable → the single fast
+/// attempt of today.
+#[cfg(feature = "embeddings")]
+fn configured_model_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: &Arc<RwLock<EmbedderStatus>>,
+) -> Arc<dyn Embedder> {
+    // Remote-first: the retrying acquire itself derives the config dir
+    // from cache_dir (no share when the last component is not "models")
+    // and falls back to None on any failure.
+    if let Some(remote) = acquire_remote_embedder_with_retry(model_id, cache_dir, status.clone()) {
+        return remote;
+    }
+    load_bundled_or_fallback(model_id, cache_dir, status)
+}
+
+/// The configured-model branch of [`build_embedder`] on a light build:
+/// nothing can be shared (no bundled-model machinery compiled in), so
+/// today's in-process shape stands.
+#[cfg(not(feature = "embeddings"))]
+fn configured_model_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: &Arc<RwLock<EmbedderStatus>>,
+) -> Arc<dyn Embedder> {
+    load_bundled_or_fallback(model_id, cache_dir, status)
+}
+
+/// Attach-ONLY to a healthy, published, machine-wide models host serving
+/// `model_id` — the startup leg (brain's installed-model arm). Never spawns
+/// and never waits for a spawn: the health probe is bounded by
+/// [`crate::host::models_host::STARTUP_PROBE`] (at most 1 s), so the startup
+/// path stays as cheap as today's. `Some` is a `RemoteEmbedder` with the
+/// shared status flipped to `Ready`; `None` leaves the caller's status
+/// untouched (the caller falls back to today's hash + deferred-load shape).
+///
+/// `cache_dir` must be the models cache under the config dir (last
+/// component `models`) — any other cache directory has no share and returns
+/// `None` (see [`crate::host::models_host::shared_config_dir`]).
+#[cfg(feature = "embeddings")]
+pub fn build_remote_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: Arc<RwLock<EmbedderStatus>>,
+) -> Option<Arc<dyn Embedder>> {
+    let config_dir = crate::host::models_host::shared_config_dir(cache_dir)?;
+    let client = crate::host::models_host::shared_client(&config_dir);
+    client.attach(model_id, crate::host::models_host::STARTUP_PROBE)?;
+    *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
+    Some(Arc::new(crate::memory::embedder::RemoteEmbedder::new(
+        client, model_id, status,
+    )))
+}
+
+/// Attach-or-spawn a machine-wide models host and return a `RemoteEmbedder`
+/// for `model_id` — the background paths only (the deferred startup load,
+/// the settings rewire's off-path embedder leg, reembed, the code
+/// embedder): spawn budgets are fine there, never on the startup path.
+/// The post-download swap is NOT one of them — embed_download.rs builds
+/// its `BundledEmbedder` in-process once a download finishes (review
+/// finding postDownloadDoc). A host THIS instance
+/// spawns serves `model_id` plus the code-search model (the exact-set
+/// rule: an instance attaches only when its requested model is in the
+/// descriptor's list). `None` on any failure (the caller falls back
+/// in-process).
+#[cfg(feature = "embeddings")]
+pub fn acquire_remote_embedder(
+    model_id: &str,
+    cache_dir: &Path,
+    status: Arc<RwLock<EmbedderStatus>>,
+) -> Option<Arc<dyn Embedder>> {
+    let config_dir = crate::host::models_host::shared_config_dir(cache_dir)?;
+    let client = crate::host::models_host::shared_client(&config_dir);
+    let mut serve = vec![model_id.to_string()];
+    if model_id != crate::memory::embedder::CODE_EMBEDDING_MODEL {
+        serve.push(crate::memory::embedder::CODE_EMBEDDING_MODEL.to_string());
+    }
+    let serve: Vec<&str> = serve.iter().map(String::as_str).collect();
+    client.acquire(model_id, &serve)?;
+    *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
+    Some(Arc::new(crate::memory::embedder::RemoteEmbedder::new(
+        client, model_id, status,
+    )))
+}
+
+/// The code-search embedder (plan d3336a8a step 9's half here):
+/// [`crate::memory::embedder::CODE_EMBEDDING_MODEL`] remote-first — the
+/// shared host serves it alongside the memory model — with today's
+/// in-process load as the fallback. Wired only into the code-graph's
+/// background symbol-embed pass: the code-graph vectors and the
+/// `find_code` ranking own its use, nothing in memory.
+///
+/// `memory_model` is the configured bundled memory model
+/// (`general.bundled_embedding_model`): when THIS side spawns the host,
+/// the serve list includes it too ([`code_serve_models`]), so the
+/// memory side later attaches to the same host instead of spawning a
+/// second one — one host per machine, whichever side starts it. The
+/// list only matters on the spawn leg: the exact-set attach rule takes
+/// any host already serving the code model regardless, and a later
+/// Settings change of the memory model never needs to update a spawned
+/// host.
+///
+/// The in-process fallback drives its OWN fresh status `Arc` — the memory
+/// embedder's shared status is untouched.
+#[cfg(feature = "embeddings")]
+pub fn build_code_embedder(cache_dir: &Path, memory_model: Option<&str>) -> Arc<dyn Embedder> {
+    let status = Arc::new(RwLock::new(EmbedderStatus::Ready));
+    if let Some(config_dir) = crate::host::models_host::shared_config_dir(cache_dir) {
+        let client = crate::host::models_host::shared_client(&config_dir);
+        let serve = code_serve_models(memory_model);
+        // d3336a8a step 17 A: while a host is serveable the code embedder
+        // is remote-ONLY. A failed acquire is retried with the doubling
+        // backoff (the observed failure is the spawn's health wait racing
+        // a slow cold start — the host it spawned is usually healthy
+        // seconds later); when the retries run out the NOT-READY signal
+        // comes back instead of an in-process ONNX session: the slot
+        // parks its retry gate, this pass round is skipped, find_code
+        // falls back to text search. A window that fell back in-process
+        // mid-pass held ~3.5 GB of weights and ONNX arena the host
+        // already serves machine-wide.
+        if retry_while_serveable(cache_dir, |fresh| {
+            if fresh {
+                client
+                    .acquire(crate::memory::embedder::CODE_EMBEDDING_MODEL, &serve)
+            } else {
+                // One spawn per round (finding spawnChurnPerRound): the
+                // retries attach only, to what the fresh leg published.
+                client.attach(
+                    crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                    crate::host::models_host::ATTACH_PROBE,
+                )
+            }
+        })
+        .is_some()
+        {
+            return Arc::new(crate::memory::embedder::RemoteEmbedder::new(
+                client,
+                crate::memory::embedder::CODE_EMBEDDING_MODEL,
+                status,
+            ));
+        }
+        if host_is_serveable(cache_dir) {
+            *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Failed;
+            return Arc::new(crate::memory::embedder::HashEmbedder::new());
+        }
+    }
+    // The truly-offline case (step 17 A): no host binary resolves, no live
+    // descriptor is published, or no share is possible at all — today's
+    // in-process path, exactly as before.
+    #[cfg(test)]
+    CODE_INPROCESS_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    load_bundled_or_fallback(crate::memory::embedder::CODE_EMBEDDING_MODEL, cache_dir, &status)
+}
+
+/// Whether a shared models host is SERVEABLE for `cache_dir` (plan
+/// d3336a8a step 17 A): the `mnemo-models` binary resolves (the env
+/// override, the sibling of this executable, or the config dir's `bin`
+/// install), or a service descriptor is published whose pid is still
+/// alive. While a host is serveable the CODE model must never load its
+/// ONNX session in-process — the in-process load is the offline path's
+/// fallback only, for when nothing can serve at all.
+#[cfg(feature = "embeddings")]
+pub fn host_is_serveable(cache_dir: &Path) -> bool {
+    let Some(config_dir) = crate::host::models_host::shared_config_dir(cache_dir) else {
+        return false;
+    };
+    if crate::host::models_host::host_binary_lookup(&config_dir).is_some() {
+        return true;
+    }
+    let dir = crate::host::shared_service::service_dir(
+        &config_dir,
+        crate::host::models_host::SERVICE_NAME,
+    );
+    crate::host::shared_service::read_service(&dir)
+        .is_some_and(|info| crate::process_tree::pid_alive(info.pid))
+}
+
+/// The acquire-retry cadence (step 17 A): the first attempt runs
+/// immediately, then up to [`ACQUIRE_RETRY_STEPS`] more attempts with a
+/// doubling backoff from [`ACQUIRE_RETRY_BASE_MS`] (2 s → 2, 4, 8, 16 s ≈
+/// 30 s in total) — but only while the host stays serveable. Not
+/// serveable → the single first attempt (today's behaviour, and the
+/// offline case's fast in-process path).
+#[cfg(feature = "embeddings")]
+static ACQUIRE_RETRY_BASE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(2_000);
+
+/// How many backoff retries follow the first acquire attempt.
+#[cfg(feature = "embeddings")]
+const ACQUIRE_RETRY_STEPS: u32 = 4;
+
+/// Tests only: count the code model's in-process constructions — the
+/// step-17 regression asserts the count never moves while a host is
+/// serveable.
+#[cfg(all(test, feature = "embeddings"))]
+static CODE_INPROCESS_LOADS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The shared acquire retry loop (step 17 A): attempt now, then up to
+/// [`ACQUIRE_RETRY_STEPS`] more attempts with the doubling backoff — but
+/// only while the host stays serveable, re-checked before every sleep.
+/// Not serveable → the single first attempt returns immediately.
+///
+/// `attempt(fresh)` receives `true` for the FIRST attempt and `false`
+/// for every retry: a round allows exactly ONE spawn (finding
+/// spawnChurnPerRound, plan d3336a8a step 17) — the `fresh` leg is
+/// attach-or-spawn, the retries attach ONLY to whatever the first leg
+/// left published, so a host that can never become healthy is not
+/// re-spawned by every retry.
+#[cfg(feature = "embeddings")]
+fn retry_while_serveable<T>(
+    cache_dir: &Path,
+    mut attempt: impl FnMut(bool) -> Option<T>,
+) -> Option<T> {
+    if let Some(found) = attempt(true) {
+        return Some(found);
+    }
+    for step in 0..ACQUIRE_RETRY_STEPS {
+        if !host_is_serveable(cache_dir) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            ACQUIRE_RETRY_BASE_MS.load(std::sync::atomic::Ordering::Relaxed) * (1_u64 << step),
+        ));
+        if let Some(found) = attempt(false) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// [`acquire_remote_embedder`] with the step-17 retry: while a host is
+/// serveable, a failed acquire is retried with the doubling backoff (~30 s
+/// total) — the spawn's health wait can race a slow cold start, and the
+/// host it spawned is usually healthy seconds later. Not serveable → the
+/// single attempt of today (the offline case falls back fast). The memory
+/// model keeps its in-process fallback after `None` (recall must keep
+/// working); the code model never loads in-process while serveable (see
+/// [`build_code_embedder`]).
+#[cfg(feature = "embeddings")]
+pub fn acquire_remote_embedder_with_retry(
+    model_id: &str,
+    cache_dir: &Path,
+    status: Arc<RwLock<EmbedderStatus>>,
+) -> Option<Arc<dyn Embedder>> {
+    retry_while_serveable(cache_dir, |fresh| {
+        if fresh {
+            acquire_remote_embedder(model_id, cache_dir, status.clone())
+        } else {
+            // One spawn per round (finding spawnChurnPerRound): the retry
+            // legs attach only, to whatever the fresh leg left published.
+            build_remote_embedder(model_id, cache_dir, status.clone())
+        }
+    })
+}
+
+/// The serve list for a host the code side spawns (plan d3336a8a step 9):
+/// the code model plus the configured memory model, so ONE host serves
+/// both embedders whichever side spawns it. The memory model joins only
+/// when it is a real bundled model — `None`, the `"hash"` opt-out, a
+/// model unknown to the catalog (`model_for_id` refuses it, the same
+/// validation `acquire` applies to its whole list), or the code model
+/// itself all degrade to the code model alone.
+#[cfg(feature = "embeddings")]
+fn code_serve_models(memory_model: Option<&str>) -> Vec<&str> {
+    let mut serve = vec![crate::memory::embedder::CODE_EMBEDDING_MODEL];
+    if let Some(model) = memory_model {
+        let real = !model.eq_ignore_ascii_case(crate::config::EMBEDDING_MODEL_SENTINEL_HASH)
+            && model != crate::memory::embedder::CODE_EMBEDDING_MODEL
+            && crate::memory::embedder::model_for_id(model).is_ok();
+        if real {
+            serve.push(model);
+        }
+    }
+    serve
 }
 
 /// How startup should build the memory embedder for the configured bundled
@@ -1208,5 +1505,228 @@ mod tests {
             embedder_startup_plan(Some("all-MiniLM-L6-v2"), dir.path()),
             EmbedderStartupPlan::HashDefault
         );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_remote_embedder_is_none_and_leaves_status_without_a_host() {
+        // The startup attach-only leg: no descriptor, no spawn, no wait —
+        // the caller's status is untouched and today's shape is kept.
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        let status = Arc::new(RwLock::new(EmbedderStatus::Checking));
+        assert!(build_remote_embedder("all-MiniLM-L6-v2", &cache, status.clone()).is_none());
+        assert_eq!(*status.read().unwrap(), EmbedderStatus::Checking);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_remote_embedder_attaches_to_a_healthy_host() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        crate::host::models_host::spawn_test_host(
+            home.path(),
+            &["all-MiniLM-L6-v2"],
+            crate::host::models_host::HOST_IDLE,
+        );
+        let status = Arc::new(RwLock::new(EmbedderStatus::Checking));
+        let embedder = build_remote_embedder("all-MiniLM-L6-v2", &cache, status.clone())
+            .expect("attach to the healthy host");
+        assert_eq!(embedder.model_id(), "all-MiniLM-L6-v2");
+        assert_eq!(embedder.dim(), 384);
+        assert_eq!(*status.read().unwrap(), EmbedderStatus::Ready);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_embedder_prefers_a_healthy_host_over_in_process() {
+        // build_embedder's remote-first leg: with a healthy host published
+        // under the config dir, the embedder is the remote one (status
+        // Ready) and nothing is loaded or downloaded into this process.
+        use crate::config::{GeneralConfig, GeneralSection};
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        crate::host::models_host::spawn_test_host(
+            home.path(),
+            &["all-MiniLM-L6-v2"],
+            crate::host::models_host::HOST_IDLE,
+        );
+        let config = Config {
+            general: GeneralConfig {
+                general: GeneralSection {
+                    bundled_embedding_model: Some("all-MiniLM-L6-v2".into()),
+                    ..GeneralSection::default()
+                },
+                ..GeneralConfig::default()
+            },
+            ..Config::default()
+        };
+        let status = Arc::new(RwLock::new(EmbedderStatus::Checking));
+        let embedder = build_embedder(&config, &cache, status.clone());
+        assert_eq!(embedder.model_id(), "all-MiniLM-L6-v2");
+        assert_eq!(*status.read().unwrap(), EmbedderStatus::Ready);
+        // The no-host leg keeps today's shape — that is
+        // build_embedder_falls_back_to_hash_for_unknown_bundled_model's
+        // ground (an unknown model can never load, so no download).
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn build_code_embedder_prefers_a_healthy_host() {
+        // The code embedder is remote-first too: a host serving the code
+        // model is used, nothing is downloaded into this process. The
+        // memory model in the serve list only matters on the spawn leg —
+        // the exact-set attach rule takes this host as-is.
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        crate::host::models_host::spawn_test_host(
+            home.path(),
+            &[crate::memory::embedder::CODE_EMBEDDING_MODEL],
+            crate::host::models_host::HOST_IDLE,
+        );
+        let embedder = build_code_embedder(&cache, Some("all-MiniLM-L6-v2"));
+        assert_eq!(embedder.model_id(), crate::memory::embedder::CODE_EMBEDDING_MODEL);
+        assert_eq!(embedder.dim(), 768);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn code_serve_models_widens_only_for_a_real_memory_model() {
+        // Plan d3336a8a step 9: the host the code side spawns serves both
+        // models — the code model plus the configured memory model, so
+        // the memory side later attaches instead of spawning a second
+        // host. Only a REAL bundled memory model joins the list; the
+        // opt-out, an unknown id, and the code model itself degrade to
+        // the code model alone.
+        let code = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        assert_eq!(code_serve_models(None), vec![code]);
+        assert_eq!(code_serve_models(Some("hash")), vec![code]);
+        assert_eq!(code_serve_models(Some("HASH")), vec![code]);
+        assert_eq!(code_serve_models(Some("not-a-bundled-model")), vec![code]);
+        assert_eq!(code_serve_models(Some(code)), vec![code]);
+        assert_eq!(
+            code_serve_models(Some("all-MiniLM-L6-v2")),
+            vec![code, "all-MiniLM-L6-v2"]
+        );
+    }
+
+    /// Publish a live (this-process) descriptor that does NOT serve the
+    /// code model: serveable (the pid is alive), but every acquire
+    /// attempt rejects it fast — the descriptor is validated against the
+    /// requested model, not probed.
+    #[cfg(feature = "embeddings")]
+    fn publish_live_descriptor(config_dir: &std::path::Path, port: u16, token: &str) {
+        crate::host::shared_service::write_service(
+            &crate::host::shared_service::service_dir(config_dir, "models"),
+            &crate::host::shared_service::ServiceInfo {
+                pid: std::process::id(),
+                port,
+                token: token.to_string(),
+                version: "test".into(),
+                started_ms: crate::host::shared_service::now_ms(),
+                created: crate::process_tree::process_creation_id(std::process::id())
+                    .unwrap_or_default(),
+                models: vec!["some-other-model".into()],
+            },
+        )
+        .expect("publish the test descriptor");
+    }
+
+    /// Step 17 A regression: while a host is serveable the code embedder
+    /// NEVER constructs the in-process ONNX session. The live descriptor
+    /// does not serve the code model, so every acquire attempt fails —
+    /// after the (backoff-shrunk) retries the build returns the not-ready
+    /// signal (the hash embedder, not the code model) and the in-process
+    /// load counter never moves.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn build_code_embedder_skips_in_process_while_a_host_is_serveable() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        publish_live_descriptor(home.path(), 64000, "stub-token");
+        ACQUIRE_RETRY_BASE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let before = CODE_INPROCESS_LOADS.load(std::sync::atomic::Ordering::Relaxed);
+        let embedder = build_code_embedder(&cache, Some("all-MiniLM-L6-v2"));
+        assert_ne!(
+            embedder.model_id(),
+            crate::memory::embedder::CODE_EMBEDDING_MODEL
+        );
+        assert_eq!(
+            CODE_INPROCESS_LOADS.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "no in-process session may be constructed while a host is serveable"
+        );
+    }
+
+    /// The serveable rule itself (step 17 A): a live descriptor makes a
+    /// config dir serveable even without a host binary; a dead pid does
+    /// not, and neither does a bare home. This is the seam that keeps the
+    /// code embedder on the remote-only path exactly when a host could
+    /// serve, and off it only when nothing can.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn host_is_serveable_follows_the_binary_or_live_descriptor_rule() {
+        // A bare home: no binary (the test binary's sibling lookup finds
+        // nothing, MNEMO_MODELS_EXE is unset) and no descriptor.
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        assert!(!host_is_serveable(&cache));
+        // A live descriptor (this test process) — no binary needed.
+        publish_live_descriptor(home.path(), 64000, "stub-token");
+        assert!(host_is_serveable(&cache));
+        // A descriptor whose pid is gone (no process holds u32::MAX) is
+        // not serveable — the stale-descriptor case.
+        crate::host::shared_service::write_service(
+            &crate::host::shared_service::service_dir(home.path(), "models"),
+            &crate::host::shared_service::ServiceInfo {
+                pid: u32::MAX,
+                port: 64000,
+                token: "stub-token".into(),
+                version: "test".into(),
+                started_ms: crate::host::shared_service::now_ms(),
+                created: crate::process_tree::process_creation_id(u32::MAX).unwrap_or_default(),
+                models: vec!["some-other-model".into()],
+            },
+        )
+        .expect("publish the dead-pid descriptor");
+        assert!(
+            !host_is_serveable(&cache),
+            "a stale descriptor is not serveable"
+        );
+    }
+
+    /// The retry cadence itself (step 17 A): a serveable host keeps the
+    /// acquire retrying — the first attempt plus [`ACQUIRE_RETRY_STEPS`]
+    /// more with the backoff shrunk to zero, and the FRESH leg runs
+    /// exactly once (finding spawnChurnPerRound: one spawn-allowed
+    /// attempt per round, the retries are attach-only); a non-serveable
+    /// setup stops after the first attempt.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn acquire_retries_only_while_a_host_is_serveable() {
+        let home = tempfile::tempdir().unwrap();
+        let cache = crate::config::embedder_cache_dir(home.path());
+        ACQUIRE_RETRY_BASE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        publish_live_descriptor(home.path(), 64000, "stub-token");
+        let mut fresh_flags: Vec<bool> = Vec::new();
+        let found: Option<()> = retry_while_serveable(&cache, |fresh| {
+            fresh_flags.push(fresh);
+            None
+        });
+        assert!(found.is_none());
+        assert_eq!(
+            fresh_flags,
+            vec![true, false, false, false, false],
+            "the spawn-allowed leg runs exactly once per round"
+        );
+        let bare = tempfile::tempdir().unwrap();
+        let bare_cache = crate::config::embedder_cache_dir(bare.path());
+        let mut bare_flags: Vec<bool> = Vec::new();
+        let found: Option<()> = retry_while_serveable(&bare_cache, |fresh| {
+            bare_flags.push(fresh);
+            None
+        });
+        assert!(found.is_none());
+        assert_eq!(bare_flags, vec![true]);
     }
 }

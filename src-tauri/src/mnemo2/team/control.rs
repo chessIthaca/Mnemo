@@ -21,10 +21,14 @@ use crate::mnemo2::dispatch_routing::{
     DispatchRoutingRow, RoutingMode, TEXT_MAX_CHARS, classify_dispatch,
 };
 
+use serde_json::{Value, json};
+
 use super::deletion::{CheckoutKind, validated_checkout, worker_checkout};
+use super::dispatch::claude_agent_block;
 use super::{
     LiveWorker, RECOVERED_WORKTREE_CLEANUP_ERROR, TeamRuntime, WorkerSessionSpec,
-    cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key,
+    cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key, status_name,
+    unix_ms,
 };
 use super::nudge::{
     NUDGE_STRIKE_LIMIT, claim_nudge, deliver_nudge, message_can_show_drift, nudge_ignored_row,
@@ -33,12 +37,33 @@ use super::pump::{pump_worker, snapshot_model};
 use super::spawn::load_check_commands;
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
-    audit_finished, audit_finished_error, kickoff_message, note_model, session_model_spec,
+    agent_continue_prompt, agent_resume_refusal, agent_worker_refusal, audit_finished, audit_finished_error,
+    kickoff_message, note_model, session_model_spec,
 };
 use super::routing::{
     NUDGE_LADDER, final_tier, logs_label, logs_routing, next_tier_above, outcome_row,
     reroute_destination,
 };
+
+/// The refusal of a resume while Mnemo2 shuts the team down.
+const CLOSING_RESUME_ERROR: &str = "Mnemo2 is closing; the worker cannot be resumed now";
+
+/// What a resume onto a tier did: the worker, and the `claude_agent` block
+/// when the move handed its step to the external lead's Claude Code agent
+/// (plan e52e0be1 decision 5) instead of switching its model.
+pub(super) struct TierResume {
+    pub(super) worker: WorkerRecord,
+    pub(super) claude_agent: Option<Value>,
+}
+
+impl TierResume {
+    fn switched(worker: WorkerRecord) -> Self {
+        Self {
+            worker,
+            claude_agent: None,
+        }
+    }
+}
 
 impl TeamRuntime {
     /// Send a message to a worker with its sender attached. A busy worker gets
@@ -51,7 +76,66 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
+        let record = self.worker(worker_id).await?;
+        // A Claude Code agent worker has no session to message: the external
+        // lead continues its agent with SendMessage, so the message is only
+        // recorded here (plan ca7f2177 decision 5). Anyone else is refused.
+        if record.claude_agent.is_some() && sender == MessageSender::ExternalLead {
+            return self.message_agent_locked(&record, text, sender).await;
+        }
+        if let Some(refusal) = agent_worker_refusal(&record) {
+            return Err(refusal);
+        }
         self.message_inner(worker_id, text, sender).await
+    }
+
+    /// `team_message` on a worker that runs as a Claude Code agent: record
+    /// the inbox entry as for a Mnemo worker and move an idle worker back to
+    /// work (Fixing while a fix round is open), without any session. The
+    /// lead's answer carries the SendMessage instruction. A worker that has
+    /// ended or merged keeps its refusal. The caller holds the merge lock.
+    async fn message_agent_locked(
+        &self,
+        record: &WorkerRecord,
+        text: String,
+        sender: MessageSender,
+    ) -> Result<WorkerRecord, String> {
+        if text.trim().is_empty() {
+            return Err("the worker message is empty".to_string());
+        }
+        let idle = match record.status {
+            WorkerStatus::Working | WorkerStatus::Fixing => false,
+            WorkerStatus::Interrupted
+            | WorkerStatus::Completed
+            | WorkerStatus::InReview
+            | WorkerStatus::Conflict => true,
+            _ => return Err(agent_worker_refusal(record).unwrap_or_default()),
+        };
+        self.update_worker(&record.id, |worker| {
+            append_inbox(
+                worker,
+                InboxEntry {
+                    sender,
+                    kind: InboxKind::Prompt,
+                    text: text.clone(),
+                    at_ms: now_key(),
+                },
+            );
+            if idle {
+                worker.status = if worker.fixer_finding_id.is_some() {
+                    WorkerStatus::Fixing
+                } else {
+                    WorkerStatus::Working
+                };
+                worker.pending = None;
+                worker.error = None;
+            }
+        })
+        .await;
+        self.persist().await?;
+        // A registered agent back at work is watched again.
+        self.ensure_agent_watch().await;
+        self.worker(&record.id).await
     }
 
     pub(super) async fn message_inner(
@@ -89,7 +173,17 @@ impl TeamRuntime {
             );
         }
         let previous_inbox = record.inbox.clone();
-        let delivered_text = format!("{}\n{text}", sender.header());
+        let mut delivered_text = format!("{}\n{text}", sender.header());
+        // A prompt to an idle implementation worker first brings a checkout
+        // that has no commits of its own up to the lead tip.
+        // Branches team_integrate merged in since the last message come
+        // next, after that fast-forward note (plan ca7f2177 decision 6).
+        if let Some(note) = record.integration_note.as_deref() {
+            delivered_text = format!("{note}\n{delivered_text}");
+        }
+        if let Some(note) = self.fast_forward_note(worker_id, kind).await {
+            delivered_text = format!("{note}\n{delivered_text}");
+        }
         let (busy, idle, steer_pending, sent) = {
             let live = self.live.lock().await;
             let live = live
@@ -172,6 +266,10 @@ impl TeamRuntime {
             // A delivered message starts the worker over: a stale failure is
             // no longer the record's truth.
             worker.error = None;
+            // The integration note went out with this message.
+            if worker.integration_note == record.integration_note {
+                worker.integration_note = None;
+            }
         })
         .await;
         self.persist().await?;
@@ -427,10 +525,188 @@ impl TeamRuntime {
     pub async fn resume(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
+        // A Claude Code agent worker has no session to reattach: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
+            return Err(refusal);
+        }
         self.resume_inner(worker_id).await
     }
 
+    /// Move a worker onto the lead's `tier`/`model`/`reasoning_effort` choice
+    /// and resume it there with its transcript: the path `team_resume` with a
+    /// choice takes, and the one Mnemo takes itself for a usage-limited worker
+    /// in routing mode auto. The choice resolves through the ladder (an empty
+    /// or unavailable tier folds down); an effort alone keeps the worker's
+    /// model; the tier the choice resolved to is stamped once the switch is
+    /// made.
+    ///
+    /// A tier (with no pinned model) that runs as a Claude Code agent while
+    /// Claude Code leads hands the step to the lead's agent instead, through
+    /// [`Self::hand_to_agent_locked`].
+    pub(super) async fn resume_on_tier(
+        &self,
+        worker_id: &str,
+        tier: Option<&str>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+    ) -> Result<TierResume, String> {
+        let pinned = model.is_some();
+        let model = self.lead_model_choice(tier, model);
+        let _guard = self.merge_lock.lock().await;
+        self.proving_guard(worker_id)?;
+        // A Claude Code agent worker has no session to reroute: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
+            return Err(refusal);
+        }
+        if let (false, Some(tier)) = (pinned, tier) {
+            if let Some(handed) = self.hand_to_agent_locked(worker_id, tier, source).await? {
+                return Ok(handed);
+            }
+        }
+        self.resume_on_tier_locked(worker_id, tier, model?, reasoning_effort, source)
+            .await
+            .map(TierResume::switched)
+    }
+
+    /// The Claude Code agent `tier` hands a worker to, with the tier's agent
+    /// effort: `Some` only while Claude Code is the attached external lead,
+    /// for a Mnemo implementation worker (never an audit, never a worker that
+    /// already runs as an agent), on a tier that carries `claude_agent`.
+    pub(super) fn agent_handoff_target(
+        &self,
+        record: &WorkerRecord,
+        tier: &str,
+    ) -> Option<(String, Option<String>)> {
+        if record.kind == "audit" || record.claude_agent.is_some() || !self.external_lead_attached()
+        {
+            return None;
+        }
+        let ladder = self.tier_ladder();
+        let rung = ladder.get(tier)?;
+        Some((rung.claude_agent.clone()?, rung.claude_agent_effort.clone()))
+    }
+
+    /// Hand a Mnemo worker's step to the external lead's Claude Code agent
+    /// as it moves onto `tier` (plan e52e0be1 decision 5): stop its session
+    /// through the stop path, keep its record, branch, worktree, commits,
+    /// findings and review history, make it an agent worker on `tier`
+    /// (Working), and return the `claude_agent` block whose prompt says where
+    /// the previous worker stopped. `Ok(None)` when the move is no hand-off
+    /// ([`Self::agent_handoff_target`]), so the caller switches models as
+    /// before. The caller holds the merge lock; closing is re-checked here.
+    pub(super) async fn hand_to_agent_locked(
+        &self,
+        worker_id: &str,
+        tier: &str,
+        source: ChangeSource,
+    ) -> Result<Option<TierResume>, String> {
+        if self.persistence.closed.load(Ordering::SeqCst) {
+            return Err(CLOSING_RESUME_ERROR.to_string());
+        }
+        let record = self.worker(worker_id).await?;
+        let Some((agent, effort)) = self.agent_handoff_target(&record, tier) else {
+            return Ok(None);
+        };
+        if let Some(refusal) = self.agent_launch_refusal(Some(worker_id)).await {
+            return Err(refusal);
+        }
+        let previous = session_model_spec(&record).to_string();
+        let row = DispatchRoutingRow::LeadReroute {
+            ts: unix_ms(),
+            worker_id: worker_id.to_string(),
+            plan_id: record.plan_id.clone().unwrap_or_default(),
+            step: record.plan_step.map_or(0, |step| step + 1),
+            from_tier: final_tier(&record),
+            to_tier: tier.to_string(),
+            from_model: record.model.clone(),
+            to_model: Some(format!("claude-code/{agent}")),
+            status: status_name(record.status),
+            review_rounds: record.review_rounds,
+            fix_rounds: record.fix_rounds,
+            nudged: source == ChangeSource::Escalation,
+        };
+        self.stop_inner(worker_id).await?;
+        self.update_worker(worker_id, |worker| {
+            worker.claude_agent = Some(agent.clone());
+            worker.claude_agent_effort = effort.clone();
+            worker.tier = Some(tier.to_string());
+            worker.status = WorkerStatus::Working;
+            worker.error = None;
+            worker.reroutes.push(row.clone());
+            if let Some(routing) = worker.routing.as_mut() {
+                routing.nudged = None;
+            }
+        })
+        .await;
+        self.persist().await?;
+        self.append_reroute_row(&row, source, None);
+        let worker = self.worker(worker_id).await?;
+        let mut block = claude_agent_block(&worker)
+            .ok_or_else(|| format!("worker '{worker_id}' has no Claude Code agent"))?;
+        block["prompt"] = json!(agent_continue_prompt(&worker, &previous));
+        Ok(Some(TierResume {
+            worker,
+            claude_agent: Some(block),
+        }))
+    }
+
+    /// Tell the external lead that Mnemo moved a worker onto a tier that runs
+    /// as a Claude Code agent on its own (auto escalation, usage-limit
+    /// resume), with the block to launch. `lead_in` opens the notice, when
+    /// the cause has more to say.
+    pub(super) fn notify_agent_handoff(&self, handed: &TierResume, lead_in: Option<&str>) {
+        let worker = &handed.worker;
+        let tier = worker.tier.as_deref().unwrap_or("its tier");
+        let block = handed
+            .claude_agent
+            .as_ref()
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let opening = lead_in.map(|text| format!("{text}\n")).unwrap_or_default();
+        self.notify_lead(
+            format!("agent-handoff:{}:{}", worker.id, worker.generation),
+            format!(
+                "{opening}{id} moved to tier {tier}, which runs as a Claude Code agent: launch your Agent with this block, then call team_agent_done.\n{block}",
+                id = worker.id
+            ),
+        );
+    }
+
+    /// [`Self::resume_on_tier`] for a caller that holds the merge lock, has
+    /// asked the proving guard and refused agent workers, with `model`
+    /// already resolved from the choice by `lead_model_choice`.
+    pub(super) async fn resume_on_tier_locked(
+        &self,
+        worker_id: &str,
+        tier: Option<&str>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+    ) -> Result<WorkerRecord, String> {
+        // An effort alone keeps the worker's model.
+        let model = match model {
+            Some(model) => Some(model),
+            None => self.worker(worker_id).await.ok().and_then(|w| w.model),
+        };
+        let changed = self
+            .change_model_locked(worker_id, model, reasoning_effort, source)
+            .await;
+        match (changed, tier) {
+            (Ok(_), Some(tier)) => {
+                self.record_tier(worker_id, tier).await;
+                self.worker(worker_id).await
+            }
+            (changed, _) => changed,
+        }
+    }
+
     pub(super) async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        if self.persistence.closed.load(Ordering::SeqCst) {
+            return Err(CLOSING_RESUME_ERROR.to_string());
+        }
         let live_idle = {
             let live = self.live.lock().await;
             match live.get(worker_id) {
@@ -441,6 +717,12 @@ impl TeamRuntime {
                 None => None,
             }
         };
+        // `shutdown` marks the runtime closed and drains the live map without
+        // the merge lock, so it may have started while this waited on the
+        // live map: decide again before the fast path touches the record.
+        if self.persistence.closed.load(Ordering::SeqCst) {
+            return Err(CLOSING_RESUME_ERROR.to_string());
+        }
         if let Some(idle) = live_idle {
             let record = self.worker(worker_id).await?;
             // A failed worker whose session is still alive and idle is
@@ -465,7 +747,7 @@ impl TeamRuntime {
                 "worker '{worker_id}' is already running; team_message it to continue"
             ));
         }
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
@@ -539,18 +821,31 @@ impl TeamRuntime {
             self.fail_next_close.clone(),
             self.board(),
             self.proof_ctx(),
+            self.usage_limits(),
         ));
-        self.live.lock().await.insert(
-            worker_id.to_string(),
-            LiveWorker {
-                session,
-                busy,
-                pump,
-                cleanup_retry_only: false,
-                strikes,
-                steer_pending,
-            },
-        );
+        {
+            // Decided under the live lock: `shutdown` marks the runtime closed
+            // before it takes this lock to close every session, so a session
+            // that lands here after the mark would never be closed.
+            let mut live = self.live.lock().await;
+            if self.persistence.closed.load(Ordering::SeqCst) {
+                drop(live);
+                pump.abort();
+                let _ = session.close().await;
+                return Err(CLOSING_RESUME_ERROR.to_string());
+            }
+            live.insert(
+                worker_id.to_string(),
+                LiveWorker {
+                    session,
+                    busy,
+                    pump,
+                    cleanup_retry_only: false,
+                    strikes,
+                    steer_pending,
+                },
+            );
+        }
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Idle;
             worker.generation = generation;
@@ -593,6 +888,11 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
+        // A Claude Code agent worker has no session to reroute: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
+            return Err(refusal);
+        }
         self.change_model_locked(worker_id, model, reasoning_effort, source)
             .await
     }
@@ -737,6 +1037,11 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         let mut record = self.worker(worker_id).await?;
+        // A Claude Code agent worker has no session to compact: the lead
+        // continues it with its own agent and closes it with team_agent_done.
+        if let Some(refusal) = agent_resume_refusal(&record) {
+            return Err(refusal);
+        }
         if record.compacting {
             return Err(format!("worker '{worker_id}' is already compacting"));
         }

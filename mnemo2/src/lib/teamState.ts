@@ -87,10 +87,10 @@ export interface TeamFinding {
 }
 
 /** Who sent a message to a worker, as the host serializes it. */
-export type TeamInboxSender = "external_lead" | "lead" | "user" | "mnemo";
+export type TeamInboxSender = "external_lead" | "lead" | "user" | "mnemo" | "claude_agent";
 
 /** The form a message to a worker was delivered in, as the host serializes it. */
-export type TeamInboxKind = "prompt" | "steer" | "brief" | "fix";
+export type TeamInboxKind = "prompt" | "steer" | "brief" | "fix" | "progress";
 
 /** One durable message delivered to a worker, as the host serializes it. */
 export interface TeamInboxEntry {
@@ -98,6 +98,17 @@ export interface TeamInboxEntry {
   kind: TeamInboxKind;
   text: string;
   at_ms: number;
+}
+
+/** What the host knows about a worker's registered Claude Code agent (`team_status`'s `agent`). */
+export interface TeamAgentView {
+  id: string;
+  transcript: string | null;
+  last_activity_ms: number | null;
+  tool_calls: number;
+  tokens: number;
+  finished: boolean;
+  stalled: boolean;
 }
 
 export interface TeamWorkerRecord {
@@ -155,6 +166,8 @@ export interface TeamWorkerRecord {
    * text, time. Absent in ledgers saved before senders were recorded.
    */
   inbox?: TeamInboxEntry[];
+  /** The registered Claude Code agent's state; the store fills it from the snapshot's `agents`. */
+  agent?: TeamAgentView | null;
 }
 
 /**
@@ -249,6 +262,8 @@ export interface TeamSnapshot {
   transcript_revs?: Record<string, number>;
   /** Workers whose transcript was left out because the window already holds it. */
   omitted_transcripts?: string[];
+  /** Each registered Claude Code agent's state, by worker id. */
+  agents?: Record<string, TeamAgentView>;
 }
 
 /** One worker transcript as the window holds it, with the revision it came from. */
@@ -436,8 +451,8 @@ export function findingFromWire(finding: TeamFinding): Finding {
  * know; those degrade to Mnemo2/prompt rather than crashing the ledger.
  */
 export function inboxFromWire(entry: TeamInboxEntry): InboxEntry {
-  const senders: readonly TeamInboxSender[] = ["external_lead", "lead", "user", "mnemo"];
-  const kinds: readonly TeamInboxKind[] = ["prompt", "steer", "brief", "fix"];
+  const senders: readonly TeamInboxSender[] = ["external_lead", "lead", "user", "mnemo", "claude_agent"];
+  const kinds: readonly TeamInboxKind[] = ["prompt", "steer", "brief", "fix", "progress"];
   return {
     sender: senders.includes(entry.sender) ? entry.sender : "mnemo",
     kind: kinds.includes(entry.kind) ? entry.kind : "prompt",

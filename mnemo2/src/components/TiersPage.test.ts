@@ -46,6 +46,8 @@ function rung(id: string, overrides: Partial<TierDto> = {}): TierDto {
     effort: null,
     role: id === "escalate" ? "escalate" : null,
     resolves_to: { trivial: "trivial", routine: "trivial", medium: "routine", high: "medium", escalate: "high" }[id] ?? "trivial",
+    claude_agent: null,
+    claude_agent_effort: null,
     ...overrides,
   };
 }
@@ -308,6 +310,118 @@ describe("TiersPage", () => {
     expect(within(medium).getByText("uses Routine's model")).toBeTruthy();
     const escalate = screen.getByRole("region", { name: "Escalate tier" });
     expect(within(escalate).getByText("only after a lower tier failed")).toBeTruthy();
+  });
+
+  it("offers Run as on every tier but escalate, with the agent choices in order", async () => {
+    renderPage();
+    for (const name of ["Trivial", "Routine", "Medium", "High"]) {
+      const tier = await screen.findByRole("region", { name: `${name} tier` });
+      expect(within(tier).getByLabelText("Run as")).toBeTruthy();
+    }
+    const high = screen.getByRole("region", { name: "High tier" });
+    const select = within(high).getByLabelText("Run as") as HTMLSelectElement;
+    expect(select.value).toBe("");
+    expect(Array.from(select.options).map((option) => option.textContent?.trim())).toEqual([
+      "Mnemo models",
+      "Claude Code agent — Opus",
+      "Claude Code agent — Sonnet",
+      "Claude Code agent — Haiku",
+      "Claude Code agent — Fable",
+    ]);
+    const escalate = screen.getByRole("region", { name: "Escalate tier" });
+    expect(within(escalate).queryByLabelText("Run as")).toBeNull();
+    expect(within(escalate).queryByText("Run as")).toBeNull();
+  });
+
+  it("picks Opus on High: hint, preview suffix, and the saved wire", async () => {
+    const saveTiers = vi.fn(async (next: TiersDto) => structuredClone(next));
+    const page = renderPage({ saveTiers });
+    const high = await screen.findByRole("region", { name: "High tier" });
+    const select = within(high).getByLabelText("Run as") as HTMLSelectElement;
+    await fireEvent.change(select, { target: { value: "opus" } });
+    // The hint under the select explains when the choice applies.
+    expect(
+      within(high).getByText(
+        "When Claude Code leads, this tier runs on your Claude Code agent, and Mnemo follows it through its transcript; the models above are used otherwise.",
+      ),
+    ).toBeTruthy();
+    // The preview line carries the same suffix the backend's tier_guidance adds.
+    expect(page.container.textContent).toContain(
+      "high (High) - high work: alpha/m1 ($1.5/$2.5); runs as a Claude Code agent (opus) when Claude Code leads",
+    );
+    // With an effort set, the suffix stays at the very end of the line.
+    await fireEvent.input(within(high).getByLabelText("Effort"), { target: { value: "high" } });
+    expect(page.container.textContent).toContain(
+      "high (High) - high work: alpha/m1 ($1.5/$2.5); effort high; runs as a Claude Code agent (opus) when Claude Code leads",
+    );
+
+    await fireEvent.click(screen.getByRole("button", { name: "Save tiers" }));
+    await waitFor(() => expect(saveTiers).toHaveBeenCalledTimes(1));
+    const sent = saveTiers.mock.calls[0][0];
+    expect(sent.tiers.find((tier) => tier.id === "high")?.claude_agent).toBe("opus");
+    expect(sent.tiers.filter((tier) => tier.id !== "high").every((tier) => tier.claude_agent === null)).toBe(true);
+  });
+
+  it("Discard drops the Run as pick back to Mnemo models", async () => {
+    const page = renderPage();
+    const high = await screen.findByRole("region", { name: "High tier" });
+    await fireEvent.change(within(high).getByLabelText("Run as"), { target: { value: "opus" } });
+    expect(within(high).getByText(/When Claude Code leads/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() =>
+      expect((within(high).getByLabelText("Run as") as HTMLSelectElement).value).toBe(""),
+    );
+    expect(within(high).queryByText(/When Claude Code leads/)).toBeNull();
+    expect(page.container.textContent).not.toContain("runs as a Claude Code agent");
+  });
+
+  it("picks Opus at xhigh effort: preview suffix, and the saved wire", async () => {
+    const saveTiers = vi.fn(async (next: TiersDto) => structuredClone(next));
+    const page = renderPage({ saveTiers });
+    const high = await screen.findByRole("region", { name: "High tier" });
+    await fireEvent.change(within(high).getByLabelText("Run as"), { target: { value: "opus" } });
+    const effort = within(high).getByLabelText("Agent effort") as HTMLSelectElement;
+    // The effort choices, in the order the design fixes.
+    expect(Array.from(effort.options).map((option) => option.textContent?.trim())).toEqual([
+      "Default",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    await fireEvent.change(effort, { target: { value: "xhigh" } });
+    // The preview line carries the same suffix the backend's tier_guidance adds.
+    expect(page.container.textContent).toContain(
+      "high (High) - high work: alpha/m1 ($1.5/$2.5); runs as a Claude Code agent (opus, xhigh effort) when Claude Code leads",
+    );
+    await fireEvent.click(screen.getByRole("button", { name: "Save tiers" }));
+    await waitFor(() => expect(saveTiers).toHaveBeenCalledTimes(1));
+    const sent = saveTiers.mock.calls[0][0];
+    expect(sent.tiers.find((tier) => tier.id === "high")?.claude_agent_effort).toBe("xhigh");
+    expect(sent.tiers.filter((tier) => tier.id !== "high").every((tier) => tier.claude_agent_effort === null)).toBe(true);
+  });
+
+  it("switching Run as back to Mnemo models clears the agent effort", async () => {
+    const page = renderPage({ ladder: ladder({ high: { claude_agent: "opus", claude_agent_effort: "xhigh" } }) });
+    const high = await screen.findByRole("region", { name: "High tier" });
+    expect((within(high).getByLabelText("Agent effort") as HTMLSelectElement).value).toBe("xhigh");
+    await fireEvent.change(within(high).getByLabelText("Run as"), { target: { value: "" } });
+    expect(within(high).queryByLabelText("Agent effort")).toBeNull();
+    expect(page.container.textContent).not.toContain("runs as a Claude Code agent");
+    // Picking an agent again starts at Default, not the cleared effort.
+    await fireEvent.change(within(high).getByLabelText("Run as"), { target: { value: "sonnet" } });
+    expect((within(high).getByLabelText("Agent effort") as HTMLSelectElement).value).toBe("");
+  });
+
+  it("offers no Agent effort while Run as is Mnemo models", async () => {
+    renderPage();
+    for (const name of ["Trivial", "Routine", "Medium", "High"]) {
+      const tier = await screen.findByRole("region", { name: `${name} tier` });
+      expect(within(tier).queryByLabelText("Agent effort")).toBeNull();
+    }
+    const escalate = screen.getByRole("region", { name: "Escalate tier" });
+    expect(within(escalate).queryByLabelText("Agent effort")).toBeNull();
   });
 
   it("shows the Laya label chips only while Laya helps pick", async () => {

@@ -54,6 +54,10 @@ uuid = { version = "1", features = ["v4"] }
 # The `[claude_lead]` agent allow-list in config.toml (mnemo2/mcp_server.rs);
 # same version the mnemo lib pins, so the crate unifies.
 toml = "1"
+# The local HH:MM a usage-limited model returns at, in the lead's failure
+# notice (mnemo2/team/routing.rs). Already in the lockfile through serde_with,
+# so the crate unifies; only the clock (local time zone) is needed.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

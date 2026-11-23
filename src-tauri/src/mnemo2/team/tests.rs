@@ -20,11 +20,14 @@ use super::deletion::{
     validated_checkout, worktree_list_paths,
 };
 use super::dispatch::{
-    dispatch_routing_line, require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
+    claude_agent_block, dispatch_result, dispatch_routing_line,
+    require_acceptance_scenarios, DispatchRequest, DispatchSource, PlanRef,
 };
 use super::guardrails::{audit_guardrails, executor_guardrails};
 use super::lead_tools::worker_status_view;
-use super::merge::{delete_merged_branch, merge_tip, validate_merge, WORKTREE_CLEANUP_ERROR};
+use super::merge::{
+    delete_merged_branch, merge_outcome_line, merge_tip, validate_merge, WORKTREE_CLEANUP_ERROR,
+};
 use super::nudge::{message_can_show_drift, note_tool_outcome, route_fix_brief, TOOL_ERROR_CHARS, NUDGE_STRIKE_LIMIT};
 use super::persistence::{
     PersistedTeam, TEAM_PRE_TIERS_BACKUP, TEAM_STATE_FILE, TRANSCRIPTS_DIR,
@@ -34,7 +37,7 @@ use super::pump::{
     pump_worker,
 };
 use super::review::CheckRecorder;
-use super::record::{append_inbox, audit_finished, WORKER_INBOX_LIMIT};
+use super::record::{append_inbox, audit_finished, MessageSender, WORKER_INBOX_LIMIT};
 use super::review::clear_review_for_a_newer_tip;
 use super::routing::final_tier;
 
@@ -245,6 +248,29 @@ async fn executor_denies(tool: &str, args: Value) -> bool {
     )
 }
 
+/// Runs a call through the executor's declarative gate and reports the
+/// refusal message — `None` when the call is allowed — so tests can tell
+/// the shared-stash refusal from the integration one.
+async fn executor_refusal(tool: &str, args: Value) -> Option<String> {
+    use mnemo::agent::policy::{AgentPolicy, DeclarativePolicy};
+    let policy =
+        DeclarativePolicy::new(Arc::new(executor_guardrails())).expect("rules compile");
+    match policy.gate_call(tool, &args).await {
+        GateVerdict::Deny { message } => Some(message),
+        // Not a refusal: the call is either allowed outright or proceeds
+        // to the regular approval flow.
+        GateVerdict::Allow | GateVerdict::RequireApproval => None,
+    }
+}
+
+/// Runs a call through the executor's declarative gate and reports
+/// whether it was denied as a shared-stash violation.
+async fn executor_denies_stash(tool: &str, args: Value) -> bool {
+    executor_refusal(tool, args)
+        .await
+        .is_some_and(|message| message.contains("shared by every worker checkout"))
+}
+
 #[tokio::test]
 async fn executor_gate_denies_integration_through_the_git_tool() {
     for args in [
@@ -263,7 +289,8 @@ async fn executor_gate_denies_integration_through_the_git_tool() {
         json!({"subcommand": "diff", "args": ["--stat"]}),
         json!({"subcommand": "log", "args": ["-5"]}),
         json!({"subcommand": "commit", "message": "push the button"}),
-        json!({"subcommand": "stash", "action": "push"}),
+        // `stash push` is no longer in the allowed set: the shared-stash
+        // refusal covers it (executor_gate_refuses_the_shared_stash_stack).
         json!({"subcommand": "branch", "action": "list"}),
         json!({"subcommand": "restore", "paths": ["src/lib.rs"]}),
     ] {
@@ -334,10 +361,10 @@ async fn executor_gate_denies_integration_through_the_shell() {
 }
 
 /// A job runs the same commands as `shell`, so the gate that keeps workers out
-/// of integration must cover `job_start` too (plan 5b85ab61 step 2) — otherwise
-/// a worker could push or merge by wrapping the command in a job.
+/// of integration must cover `job` too (plans 5b85ab61 step 2, 5b498359) —
+/// otherwise a worker could push or merge by wrapping the command in a job.
 #[tokio::test]
-async fn executor_gate_denies_integration_through_job_start() {
+async fn executor_gate_denies_integration_through_job() {
     for command in [
         "git push",
         "git -C ../repo push",
@@ -348,7 +375,7 @@ async fn executor_gate_denies_integration_through_job_start() {
     ] {
         assert!(
             executor_denies(
-                "job_start",
+                "job",
                 json!({"command": command, "purpose": "building"})
             )
             .await,
@@ -362,7 +389,7 @@ async fn executor_gate_denies_integration_through_job_start() {
     ] {
         assert!(
             !executor_denies(
-                "job_start",
+                "job",
                 json!({"command": command, "purpose": "building"})
             )
             .await,
@@ -371,14 +398,113 @@ async fn executor_gate_denies_integration_through_job_start() {
     }
 }
 
+/// Every worker checkout is a worktree of the same repository, so they all
+/// share one git stash stack (`refs/stash`): a worker's pop or drop takes
+/// whatever is on top — another worker's WIP (2026-11-20: symVec01's pop
+/// applied hostToken01's stash in the wrong checkout) or a months-old stash
+/// from the lead checkout. The executor gate must refuse every push, pop and
+/// drop on that shared stack — through the structured git tool, `shell` and
+/// `job` alike — while the read-only forms and `git stash apply <sha>`
+/// (recovering a known dangling commit) still run.
+#[tokio::test]
+async fn executor_gate_refuses_the_shared_stash_stack() {
+    // The structured git tool has no ref parameter, so every stash pop and
+    // drop through it lands on the shared stack: every carrier of a push,
+    // pop or drop is refused.
+    for args in [
+        json!({"subcommand": "stash", "action": "push"}),
+        json!({"subcommand": "stash", "action": "pop"}),
+        json!({"subcommand": "stash", "action": "drop"}),
+        // No action — or the subcommand repeated in `action` — defaults
+        // to push.
+        json!({"subcommand": "stash"}),
+        json!({"subcommand": "stash", "action": "stash"}),
+        // Stash action names ride either field.
+        json!({"subcommand": "pop"}),
+        json!({"subcommand": "drop"}),
+        json!({"action": "pop"}),
+        json!({"action": "drop"}),
+        json!({"action": "stash"}),
+    ] {
+        assert!(executor_denies_stash("git", args.clone()).await, "{args}");
+    }
+    // `stash list` is read-only: both carrier spellings stay allowed.
+    for args in [
+        json!({"subcommand": "stash", "action": "list"}),
+        json!({"subcommand": "list", "action": "stash"}),
+    ] {
+        assert!(!executor_denies_stash("git", args.clone()).await, "{args}");
+    }
+    // A bare `git stash` is a push ("you can omit push"), and so is a bare
+    // `git stash <push-option>` (`-m`, `-- pathspec`); the named mutators
+    // and `apply` without a SHA — no argument, or a `stash@{…}` ref — all
+    // touch the shared stack.
+    for command in [
+        "git stash",
+        "git stash push",
+        "git stash save",
+        "git stash pop",
+        "git stash drop",
+        "git stash clear",
+        "git stash store",
+        "git stash branch",
+        "git stash -m \"wip\"",
+        "git stash -- src/",
+        "git -C x stash pop",
+        "cargo test && git stash",
+        "cargo test && git stash pop",
+        "git stash apply",
+        "git stash apply stash@{0}",
+        "git stash apply stash@{1}",
+        "git stash apply -q",
+    ] {
+        for tool in ["shell", "job"] {
+            assert!(
+                executor_denies_stash(tool, json!({"command": command, "purpose": "p"})).await,
+                "{tool}: {command}"
+            );
+        }
+    }
+    // The read-only forms and the SHA recovery run.
+    for command in [
+        "git stash list",
+        "git stash list --format=%gd",
+        "git stash show -p",
+        "git stash show --stat stash@{0}",
+        "git stash create",
+        "git stash apply 78b29bbd",
+        "git stash apply 78b29bbd1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
+    ] {
+        for tool in ["shell", "job"] {
+            assert!(
+                !executor_denies_stash(tool, json!({"command": command, "purpose": "p"}))
+                    .await,
+                "{tool}: {command}"
+            );
+        }
+    }
+    // The refusal names the WIP-commit alternative and the SHA recovery.
+    let refusal = executor_refusal("git", json!({"subcommand": "stash", "action": "pop"}))
+        .await
+        .expect("stash pop is refused");
+    assert!(
+        refusal.contains("Park work as a WIP commit"),
+        "the stash refusal must name the WIP-commit alternative: {refusal}"
+    );
+    assert!(
+        refusal.contains("git stash apply"),
+        "the stash refusal must name the stash-apply recovery: {refusal}"
+    );
+}
+
 /// The audit worker is read-only by construction: the job tools ride
 /// `ToolGroup::Shell`, so they must be excluded from its surface by name
-/// (plan 5b85ab61 step 2).
+/// (plans 5b85ab61 step 2, 5b498359).
 #[test]
 fn audit_surface_excludes_the_job_tools() {
     let audit = audit_guardrails().tools.exclude;
     let executor = executor_guardrails().tools.exclude;
-    for tool in ["job_start", "job_wait", "job_tail", "job_kill"] {
+    for tool in ["job", "job_wait", "job_tail", "job_kill"] {
         assert!(
             audit.iter().any(|excluded| excluded == tool),
             "the audit surface still allows {tool}"
@@ -1639,6 +1765,14 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         model: None,
         model_id: None,
         reasoning_effort: None,
+        claude_agent: None,
+        claude_agent_effort: None,
+        claude_agent_id: None,
+        claude_agent_transcript: None,
+        integrations: Vec::new(),
+        integration_note: None,
+        base_commit: None,
+        report: None,
         branch,
         worktree: root
             .join(".worktrees")
@@ -4609,6 +4743,7 @@ async fn team_dispatch_refuses_unmet_openspec_apply_requirements() {
             tier: None,
             dispatch_routing: false,
             source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model: None,
             reasoning_effort: None,
             worker_id: None,
@@ -4646,6 +4781,7 @@ async fn redispatch_with_a_different_read_back_is_refused() {
             tier: None,
             dispatch_routing: false,
         source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model: None,
             reasoning_effort: None,
             worker_id: Some(existing.id.clone()),
@@ -4664,6 +4800,7 @@ async fn redispatch_with_a_different_read_back_is_refused() {
             tier: None,
             dispatch_routing: false,
         source: DispatchSource::Ipc,
+            sender: MessageSender::User,
             model: None,
             reasoning_effort: None,
             worker_id: Some(existing.id.clone()),
@@ -9539,6 +9676,7 @@ async fn permit_wait_counts_toward_laya_timeout() {
         tier: None,
         dispatch_routing: true,
         source: DispatchSource::Ipc,
+            sender: MessageSender::User,
         model: None,
         reasoning_effort: None,
         worker_id: Some("permitwait".into()),
@@ -10611,6 +10749,523 @@ async fn auto_strike_streak_escalates_when_the_worker_becomes_idle() {
             .then_some(())
     })
     .await;
+    fixture.team.shutdown().await;
+}
+
+/// The Ollama Cloud glm weekly limit as the provider streams it: a 429 whose
+/// body says the account's usage is spent (plan e5d93df3 decision 8).
+const GLM_WEEKLY_LIMIT: &str = "stream request: HTTP 429 from https://ollama.com/v1/chat/completions — {\"error\":\"you (x) have reached your weekly usage limit, add usage credits\"}";
+
+/// The scripted turn that fails a worker on the glm weekly limit: the stream
+/// errors before any output, so the session fails the turn at once (a 429
+/// with no alternate endpoint is never retried).
+fn glm_weekly_limit_turn() -> Vec<mnemo::provider::LlmEvent> {
+    vec![mnemo::provider::LlmEvent::Error {
+        error: GLM_WEEKLY_LIMIT.to_string(),
+    }]
+}
+
+/// `Mnemo marked <spec> unavailable until <HH:MM>; ...`, with the local time
+/// read from the team's own mark, formatted independently of the code under
+/// test. Also checks the mark lasts six hours.
+fn usage_limit_marked_sentence(team: &TeamRuntime, spec: &str, tail: &str) -> String {
+    let now = unix_ms();
+    let until = team
+        .usage_limits
+        .until(spec, now)
+        .unwrap_or_else(|| panic!("{spec} is marked unavailable"));
+    let six_hours = 6 * 60 * 60 * 1000;
+    assert!(
+        until > now + six_hours - 120_000 && until <= now + six_hours,
+        "the mark lasts six hours: until {until}, now {now}"
+    );
+    let local = chrono::DateTime::from_timestamp_millis(until as i64)
+        .expect("a valid instant")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M");
+    format!("Mnemo marked {spec} unavailable until {local}; {tail}")
+}
+
+#[tokio::test]
+async fn a_usage_limit_marks_the_model_and_folds_the_tier() {
+    // Shadow mode: Mnemo marks the model, but only auto mode resumes.
+    let (fixture, mut notices) = nudge_fixture(vec![glm_weekly_limit_turn()]).await;
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high resolves");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("high", "test/scripted-difficult")
+    );
+    let dispatched = fixture.dispatch(Some("high"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    let failed = eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        (worker.status == WorkerStatus::Failed).then_some(worker)
+    })
+    .await;
+    let error = failed.error.clone().expect("the failure is recorded");
+    assert!(error.contains("weekly usage limit"), "{error}");
+    // The next dispatch on high folds past the limited model.
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high still resolves");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("routine", "test/scripted-average")
+    );
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    assert!(
+        guidance.contains("high (") && guidance.contains("no model; folds down to routine"),
+        "{guidance}"
+    );
+    // The failure notice says what Mnemo marked and ends with the call.
+    let notice = fixture
+        .team
+        .usage_limit_notice(&failed, &error)
+        .expect("a usage-limit failure notice");
+    let marked = usage_limit_marked_sentence(
+        &fixture.team,
+        "test/scripted-difficult",
+        "the high tier now runs on test/scripted-average.",
+    );
+    assert_eq!(
+        notice,
+        format!(
+            "{marked}\nMove it there, then team_message it to continue: team_resume worker_id=routingworker tier=high"
+        )
+    );
+    // Any other failure keeps the generic lines.
+    assert!(fixture
+        .team
+        .usage_limit_notice(&failed, "provider error: HTTP 500 from gateway")
+        .is_none());
+    // Outside auto mode nothing resumes the worker.
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Failed);
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    while let Ok(signal) = notices.try_recv() {
+        if let BoardSignal::Notice { key, text } = signal {
+            assert!(!key.starts_with("usage-limit:"), "no resume notice: {text}");
+        }
+    }
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_mode_resumes_a_usage_limited_worker_on_the_fold_target() {
+    let (fixture, mut notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+        std::time::Duration::ZERO,
+        vec![glm_weekly_limit_turn()],
+    )
+    .await;
+    let dispatched = fixture.dispatch(Some("high"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    let message = "Your previous model test/scripted-difficult hit its usage limit; you are now on test/scripted-average. Run git status and git diff --stat to see where you were, then continue your task.";
+    let resumed = eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        worker
+            .inbox
+            .iter()
+            .any(|entry| entry.sender == MessageSender::Mnemo && entry.text == message)
+            .then_some(worker)
+    })
+    .await;
+    assert_eq!(resumed.model.as_deref(), Some("test/scripted-average"));
+    assert_eq!(resumed.tier.as_deref(), Some("routine"));
+    assert_ne!(resumed.status, WorkerStatus::Failed);
+    assert!(
+        !resumed.transcript.messages.is_empty(),
+        "the failed turn's transcript was kept"
+    );
+    assert_eq!(
+        resumed.models_used,
+        vec![
+            "test/scripted-difficult".to_string(),
+            "test/scripted-average".to_string()
+        ]
+    );
+    // The lead hears what Mnemo marked and that it resumed the worker.
+    let marked = usage_limit_marked_sentence(
+        &fixture.team,
+        "test/scripted-difficult",
+        "the high tier now runs on test/scripted-average.",
+    );
+    let mut notice = None;
+    for _ in 0..800 {
+        while let Ok(signal) = notices.try_recv() {
+            if let BoardSignal::Notice { key, text } = signal {
+                if key.starts_with("usage-limit:routingworker:") {
+                    notice = Some(text);
+                }
+            }
+        }
+        if notice.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        notice.expect("the usage-limit notice"),
+        format!("{marked} Mnemo resumed routingworker on test/scripted-average with its transcript.")
+    );
+    // Outside auto mode the same failure's notice ends with the resume call
+    // instead.
+    crate::mnemo2::dispatch_routing::save_routing_settings(
+        fixture._config.path(),
+        &crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+    )
+    .expect("save shadow mode");
+    fixture.team.reload_routing_settings();
+    let mut failed = resumed.clone();
+    failed.status = WorkerStatus::Failed;
+    failed.model = Some("test/scripted-difficult".into());
+    failed.tier = Some("high".into());
+    let notice = fixture
+        .team
+        .usage_limit_notice(&failed, &format!("provider error: {GLM_WEEKLY_LIMIT}"))
+        .expect("a usage-limit failure notice");
+    assert!(
+        notice.ends_with("team_resume worker_id=routingworker tier=high"),
+        "{notice}"
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn unavailable_models_return_after_their_window() {
+    let fixture = routing_fixture(
+        crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+        None,
+        false,
+    )
+    .await;
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms() + 60_000);
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high folds");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("routine", "test/scripted-average")
+    );
+    // A window that has passed leaves the model available again.
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms().saturating_sub(1));
+    let (tier, model) = fixture.team.resolve_tier_choice("high").expect("high resolves");
+    assert_eq!(
+        (tier.as_str(), model.spec.as_str()),
+        ("high", "test/scripted-difficult")
+    );
+    assert!(fixture
+        .team
+        .current_models()
+        .iter()
+        .any(|model| model.spec == "test/scripted-difficult"));
+    fixture.team.shutdown().await;
+}
+
+/// The local `HH:MM` of an epoch-milliseconds instant, formatted
+/// independently of the code under test.
+fn local_hh_mm_for_test(epoch_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(epoch_ms as i64)
+        .expect("a valid instant")
+        .with_timezone(&chrono::Local)
+        .format("%H:%M")
+        .to_string()
+}
+
+#[tokio::test]
+async fn auto_escalation_skips_an_unavailable_model() {
+    let responses = (1..=3)
+        .map(|attempt| {
+            tool_call_batch(
+                &format!("limited-call-{attempt}"),
+                "not_a_real_tool",
+                &format!("{{\"attempt\":{attempt}}}"),
+            )
+        })
+        .chain([vec![
+            mnemo::provider::LlmEvent::TextDelta { text: "done".into() },
+            mnemo::provider::LlmEvent::Finish {
+                reason: mnemo::provider::FinishReason::Stop,
+            },
+        ]])
+        .collect::<Vec<_>>();
+    let (fixture, _notices) = nudge_fixture_with(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: crate::mnemo2::dispatch_routing::RoutingMode::Auto,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        routing_answer(mnemo::agent::route_question::LABEL_ROUTINE, 0.8),
+        std::time::Duration::ZERO,
+        responses,
+    )
+    .await;
+    // High's only model is out of its usage limit.
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms() + 600_000);
+    let dispatched = fixture.dispatch(Some("routine"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        (worker.status == WorkerStatus::Completed).then_some(())
+    })
+    .await;
+    // The strike nudge offers no tier whose model is out: with medium empty
+    // and high limited, nothing above routine is a candidate.
+    assert!(
+        !fixture.team.direct_nudge_tiers(Some("test/scripted-average")).high,
+        "high is no nudge candidate while its model is out"
+    );
+    assert!(
+        fixture
+            .rows()
+            .iter()
+            .all(|row| !matches!(row, DispatchRoutingRow::Nudge { .. })),
+        "the strikes nudged nobody onto the limited model: {:?}",
+        fixture.rows()
+    );
+    // Settle any escalation still owed, then check the worker stayed put.
+    let _ = fixture.team.auto_escalate_worker("routingworker").await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-average"));
+    assert!(worker.routing.as_ref().expect("routing").nudged.is_none());
+    // A nudge already pending for high folds past the limited model instead
+    // of switching onto it.
+    fixture
+        .team
+        .update_worker("routingworker", |worker| {
+            if let Some(routing) = worker.routing.as_mut() {
+                routing.nudged = Some("high".into());
+            }
+        })
+        .await;
+    let _ = fixture
+        .team
+        .auto_escalate_worker("routingworker")
+        .await
+        .expect("auto escalation");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_ne!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-average"));
+    fixture.team.shutdown().await;
+}
+
+/// The worker a usage-limited failure left Failed (shadow mode, so nothing
+/// resumed it), with its failed generation.
+async fn usage_limited_failed_worker() -> (RoutingFixture, broadcast::Receiver<BoardSignal>, u64) {
+    let (fixture, notices) = nudge_fixture(vec![glm_weekly_limit_turn()]).await;
+    let dispatched = fixture.dispatch(Some("high"), None).await;
+    assert!(dispatched.success, "{}", dispatched.output);
+    let failed = eventually(|| async {
+        let worker = fixture.team.worker("routingworker").await.expect("worker");
+        (worker.status == WorkerStatus::Failed).then_some(worker)
+    })
+    .await;
+    let generation = failed.generation;
+    (fixture, notices, generation)
+}
+
+/// No usage-limit resume reached the worker: no Mnemo message, no notice.
+fn assert_no_usage_limit_resume(
+    worker: &WorkerRecord,
+    notices: &mut broadcast::Receiver<BoardSignal>,
+) {
+    assert!(
+        worker
+            .inbox
+            .iter()
+            .all(|entry| entry.sender != MessageSender::Mnemo),
+        "Mnemo never told the worker it moved: {:?}",
+        worker.inbox
+    );
+    while let Ok(signal) = notices.try_recv() {
+        if let BoardSignal::Notice { key, text } = signal {
+            assert!(!key.starts_with("usage-limit:"), "no resume notice: {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_resume_yields_to_a_lead_resume_or_stop() {
+    let (fixture, mut notices, generation) = usage_limited_failed_worker().await;
+    // The lead's stop wins the merge lock while the automatic resume for the
+    // failed generation waits on it.
+    let guard = fixture.team.merge_lock.lock().await;
+    let auto = tokio::spawn({
+        let team = fixture.team.clone();
+        async move {
+            team.resume_usage_limited("routingworker", generation, "test/scripted-difficult")
+                .await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    fixture
+        .team
+        .stop_inner("routingworker")
+        .await
+        .expect("the lead stops the worker");
+    drop(guard);
+    auto.await.expect("the automatic resume task");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Stopped);
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_no_usage_limit_resume(&worker, &mut notices);
+    // Failed again at the same generation, the lead's own resume wins the
+    // lock and moves the worker to a new generation first.
+    fixture
+        .team
+        .update_worker("routingworker", |worker| worker.status = WorkerStatus::Failed)
+        .await;
+    let guard = fixture.team.merge_lock.lock().await;
+    let auto = tokio::spawn({
+        let team = fixture.team.clone();
+        async move {
+            team.resume_usage_limited("routingworker", generation, "test/scripted-difficult")
+                .await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let led = fixture
+        .team
+        .resume_on_tier_locked(
+            "routingworker",
+            Some("routine"),
+            Some("test/scripted-average".into()),
+            None,
+            ChangeSource::Lead,
+        )
+        .await
+        .expect("the lead resumes the worker");
+    drop(guard);
+    auto.await.expect("the automatic resume task");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_ne!(led.generation, generation);
+    assert_eq!(worker.generation, led.generation, "no second resume followed");
+    assert_no_usage_limit_resume(&worker, &mut notices);
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_resume_does_nothing_after_shutdown() {
+    let (fixture, mut notices, generation) = usage_limited_failed_worker().await;
+    fixture.team.shutdown().await;
+    // The detached task acting late finds Mnemo closed.
+    fixture
+        .team
+        .resume_usage_limited("routingworker", generation, "test/scripted-difficult")
+        .await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Failed);
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_eq!(worker.generation, generation);
+    assert_no_usage_limit_resume(&worker, &mut notices);
+    // And the resume path itself refuses while closing.
+    let refused = fixture
+        .team
+        .resume("routingworker")
+        .await
+        .expect_err("no resume after shutdown");
+    assert!(refused.contains("closing"), "{refused}");
+}
+
+#[tokio::test]
+async fn resume_refuses_an_idle_live_worker_once_closing() {
+    // A failed worker whose session is still alive and idle: the resume fast
+    // path recovers it in place.
+    let (fixture, _notices, _generation) = usage_limited_failed_worker().await;
+    let persisted_status = || {
+        TeamPersistence::new(fixture.state.path())
+            .load()
+            .expect("load the ledger")
+            .expect("a saved ledger")
+            .workers
+            .into_iter()
+            .find(|worker| worker.id == "routingworker")
+            .map(|worker| (worker.status, worker.error.is_some()))
+            .expect("the saved worker")
+    };
+    let before = persisted_status();
+    assert_eq!(before, (WorkerStatus::Failed, true));
+    // Shutdown marks the runtime closed while the resume is past its entry
+    // check and waits on the live map.
+    let live = fixture.team.live.lock().await;
+    assert!(live.contains_key("routingworker"), "the session is still live");
+    let resume = tokio::spawn({
+        let team = fixture.team.clone();
+        async move { team.resume("routingworker").await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    fixture.team.persistence.closed.store(true, Ordering::SeqCst);
+    drop(live);
+    let refused = resume
+        .await
+        .expect("the resume task")
+        .expect_err("no resume once closing");
+    assert_eq!(refused, "Mnemo2 is closing; the worker cannot be resumed now");
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Failed);
+    assert_eq!(persisted_status(), before);
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn naming_an_unavailable_model_says_why() {
+    let fixture = routing_fixture(
+        crate::mnemo2::dispatch_routing::RoutingMode::Shadow,
+        None,
+        false,
+    )
+    .await;
+    fixture
+        .team
+        .usage_limits
+        .mark_model_unavailable("test/scripted-difficult", unix_ms() + 600_000);
+    let until = fixture
+        .team
+        .usage_limits
+        .until("test/scripted-difficult", unix_ms())
+        .expect("marked");
+    let expected = format!(
+        "'test/scripted-difficult' is unavailable until {} after a usage limit; choose another model or dispatch by tier.",
+        local_hh_mm_for_test(until)
+    );
+    assert_eq!(
+        fixture
+            .team
+            .lead_model_choice(None, Some("test/scripted-difficult".into())),
+        Err(expected.clone())
+    );
+    assert_eq!(
+        fixture
+            .team
+            .lead_model_choice(Some("high"), Some("test/scripted-difficult".into())),
+        Err(expected.clone())
+    );
+    assert_eq!(
+        fixture
+            .team
+            .validate_model(&Some("test/scripted-difficult".into()), &None),
+        Err(expected.clone())
+    );
+    let dispatched = fixture.dispatch(None, Some("test/scripted-difficult")).await;
+    assert!(!dispatched.success);
+    assert!(dispatched.output.contains(&expected), "{}", dispatched.output);
+    // Another model is still refused for what it is.
+    let unknown = fixture
+        .team
+        .validate_model(&Some("test/not-configured".into()), &None)
+        .expect_err("an unknown model");
+    assert!(unknown.contains("is not a configured model"), "{unknown}");
     fixture.team.shutdown().await;
 }
 
@@ -12442,12 +13097,23 @@ impl proving::ProofRunner for ScriptedProofs {
     }
 }
 
-/// Wait for one lead notice whose text contains `needle`.
+/// Wait up to 10 s for one lead notice whose text contains `needle`.
 async fn drain_notice(
     receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
     needle: &str,
 ) -> Option<String> {
-    for _ in 0..400 {
+    drain_notice_within(receiver, needle, std::time::Duration::from_secs(10)).await
+}
+
+/// Wait up to `limit` for one lead notice whose text contains `needle`,
+/// polling every 25 ms. A run that outlives the limit returns `None`.
+async fn drain_notice_within(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+    limit: std::time::Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
         while let Ok(signal) = receiver.try_recv() {
             if let BoardSignal::Notice { text, .. } = signal {
                 if text.contains(needle) {
@@ -12455,9 +13121,11 @@ async fn drain_notice(
                 }
             }
         }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    None
 }
 
 /// A team whose board holds a `bug_fixing` plan naming `regression_proves_red`
@@ -13260,6 +13928,7 @@ async fn manual_pump_worker(
         team.fail_next_close.clone(),
         team.board(),
         team.proof_ctx(),
+        team.usage_limits(),
     ));
     session
         .send(mnemo::headless::SessionCommand::Prompt {
@@ -14210,6 +14879,19 @@ async fn activity_counts_match_the_snapshot_counts() {
             record.status = status;
             records.push(record);
         }
+        // Two finished audits (their reports delivered) never wait; one audit
+        // that failed before reporting still needs its resume.
+        for (index, status, delivered) in [
+            (0, WorkerStatus::Completed, true),
+            (1, WorkerStatus::Completed, true),
+            (2, WorkerStatus::Failed, false),
+        ] {
+            let mut record = worker(root.path(), &format!("actaudit{index:04}"));
+            record.kind = "audit".to_string();
+            record.status = status;
+            record.report_delivered = delivered;
+            records.push(record);
+        }
     }
 
     let counts = team.activity_counts().await;
@@ -14223,14 +14905,3919 @@ async fn activity_counts_match_the_snapshot_counts() {
         snapshot
             .workers
             .iter()
-            .filter(|worker| worker.status.waiting_on_user())
+            .filter(|worker| worker.waiting_on_user())
             .count(),
     );
     assert_eq!(counts, from_snapshot, "the accessor and the snapshot agree");
     assert_eq!(
         counts,
-        (4, 3),
-        "working, dispatching, fixing and merging run; needs-you, conflict and completed wait"
+        (4, 4),
+        "working, dispatching, fixing and merging run; needs-you, conflict, completed and the \
+         unreported audit wait, while the two delivered audits do not"
     );
     team.shutdown().await;
+}
+
+/// A finished audit is never reviewed or merged, so it stays `Completed`
+/// forever: it must not count as waiting on the person (the Mission Control
+/// instances list reported eight waiting workers with nothing waiting on the
+/// user — all of them completed audits).
+#[tokio::test]
+async fn completed_audits_do_not_count_as_waiting() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    {
+        let mut records = team.records.lock().await;
+        let mut implementation = worker(root.path(), "waitimpl01");
+        implementation.status = WorkerStatus::Completed;
+        records.push(implementation);
+        for index in 0..2 {
+            let mut audit = worker(root.path(), &format!("waitaudit{index:02}"));
+            audit.kind = "audit".to_string();
+            audit.status = WorkerStatus::Completed;
+            audit.report_delivered = true;
+            records.push(audit);
+        }
+    }
+
+    let (running, waiting) = team.activity_counts().await;
+    assert_eq!(running, 0, "nothing is running");
+    assert_eq!(
+        waiting, 1,
+        "only the implementation awaiting review waits; the two finished audits do not"
+    );
+    let snapshot = team.snapshot().await;
+    assert_eq!(
+        snapshot
+            .workers
+            .iter()
+            .filter(|worker| worker.waiting_on_user())
+            .count(),
+        waiting,
+        "the snapshot counts the same"
+    );
+    // An audit that failed before delivering its report still needs a resume.
+    {
+        let mut records = team.records.lock().await;
+        let mut failed = worker(root.path(), "waitfaile01");
+        failed.kind = "audit".to_string();
+        failed.status = WorkerStatus::Failed;
+        records.push(failed);
+    }
+    assert_eq!(
+        team.activity_counts().await.1,
+        2,
+        "an unreported failed audit waits for its resume"
+    );
+    team.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code agent tiers (plan e21c4820): a tier may run as the lead's own
+// Claude Code agent, with team_agent_done closing the worker.
+// ---------------------------------------------------------------------------
+
+/// The routing fixture with the high tier set to run as a Claude Code agent
+/// (`claude_model`): a dispatch that settles on high from the external lead
+/// hands the step to the lead's agent instead of a Mnemo session.
+async fn agent_fixture(
+    mode: RoutingMode,
+    answer: Option<mnemo::memory::Answer>,
+    install_classifier: bool,
+    claude_model: &str,
+    high_models: Vec<String>,
+) -> RoutingFixture {
+    agent_fixture_with_settings(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode,
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        answer,
+        install_classifier,
+        claude_model,
+        high_models,
+    )
+    .await
+}
+
+/// The agent fixture with explicit routing settings, for the Auto fallback.
+async fn agent_fixture_with_settings(
+    settings: crate::mnemo2::dispatch_routing::RoutingSettings,
+    answer: Option<mnemo::memory::Answer>,
+    install_classifier: bool,
+    claude_model: &str,
+    high_models: Vec<String>,
+) -> RoutingFixture {
+    let fixture = routing_fixture_with(
+        settings,
+        answer,
+        install_classifier,
+        std::time::Duration::ZERO,
+    )
+    .await;
+    let mut dto = tiers_dto! {
+        difficult: high_models,
+        average: vec!["test/scripted-average".into()],
+        simple: vec!["test/scripted-simple".into()],
+    };
+    dto.tiers[3].claude_agent = Some(claude_model.into());
+    fixture.team.set_catalog(
+        vec![
+            lead_model("scripted-difficult"),
+            lead_model("scripted-average"),
+            lead_model("scripted-simple"),
+        ],
+        dto,
+        Vec::new(),
+    );
+    fixture
+}
+
+/// An explicit dispatch on the high tier from the external lead, the way
+/// Claude Code's `team_dispatch` lands.
+fn agent_dispatch_request(plan_id: &str, brief: &str, worker_id: &str) -> DispatchRequest {
+    DispatchRequest {
+        brief: brief.into(),
+        tier: Some("high".into()),
+        model: None,
+        reasoning_effort: None,
+        worker_id: Some(worker_id.into()),
+        review_risk: Some("standard".into()),
+        source: DispatchSource::LeadTool,
+        sender: MessageSender::ExternalLead,
+        dispatch_routing: true,
+        plan: Some(PlanRef {
+            plan_id: plan_id.into(),
+            step: 0,
+        }),
+        read_back: false,
+    }
+}
+
+#[tokio::test]
+async fn agent_tier_dispatch_prepares_the_checkout_without_a_session() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let brief = "Add the per-tier claude_agent handling";
+    let (record, reused, _pending) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, brief, "agenttier01"))
+        .await
+        .expect("the agent dispatch prepares the step");
+
+    // Provisioning ran as today: a real worktree on the agent branch.
+    assert!(!reused);
+    assert!(std::path::Path::new(&record.worktree).is_dir());
+    assert_eq!(record.branch, agent_branch("agenttier01"));
+    // The record claims the agent model and the settled pre-fold tier.
+    assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert_eq!(record.status, WorkerStatus::Working);
+    // No Mnemo session was started for the agent worker.
+    assert!(
+        fixture.team.live.lock().await.get("agenttier01").is_none(),
+        "an agent worker has no Mnemo session"
+    );
+
+    // The block the lead hands its own Agent: the model, the prepared
+    // checkout, and the full self-contained prompt.
+    let block = claude_agent_block(&record).expect("the dispatch answer's claude_agent block");
+    let prompt = block["prompt"].as_str().expect("the prompt text");
+    assert_eq!(block["model"].as_str(), Some("opus"));
+    assert_eq!(
+        block["worktree"].as_str().map(str::to_string),
+        Some(record.worktree.display().to_string())
+    );
+    assert_eq!(
+        block["branch"].as_str().map(str::to_string),
+        Some(record.branch.clone())
+    );
+    assert!(!prompt.contains(record.worktree.to_str().expect("a utf-8 worktree path")), "the prompt names no folder: {prompt}");
+    assert!(prompt.contains(&record.branch), "the prompt names the branch: {prompt}");
+    assert!(prompt.contains("Never push"), "{prompt}");
+    assert!(prompt.contains("git stash"), "{prompt}");
+    assert!(prompt.contains(".coding/checks.toml"), "{prompt}");
+    assert!(
+        prompt.contains(
+            "Implement the requested routing behavior in src-tauri/src/mnemo2/team.rs"
+        ),
+        "the prompt carries the step text: {prompt}"
+    );
+    assert!(prompt.contains(brief), "the prompt carries the brief: {prompt}");
+
+    // The block rides both halves of the dispatch answer, and team_status
+    // shows the worker as a Claude Code agent.
+    let answer = dispatch_result(
+        Ok((record.clone(), false, false)),
+        "team_dispatch",
+        RoutingMode::Off,
+        None,
+        false,
+        Vec::new(),
+    );
+    let result: Value =
+        serde_json::from_str(&answer.output).expect("the dispatch answer JSON");
+    assert_eq!(
+        result["result"]["claude_agent"]["model"].as_str(),
+        Some("opus"),
+        "{result}"
+    );
+    assert_eq!(
+        answer.data.as_ref().unwrap()["claude_agent"]["prompt"].as_str(),
+        block["prompt"].as_str(),
+        "data carries the same block"
+    );
+    let view = worker_status_view(&record, false);
+    assert_eq!(view["model"].as_str(), Some("claude-code/opus"), "{view}");
+
+    // An idempotent re-dispatch returns the same agent block.
+    let (again, reused, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, brief, "agenttier01"))
+        .await
+        .expect("the re-dispatch reuses the worker");
+    assert!(reused);
+    assert_eq!(again.claude_agent.as_deref(), Some("opus"));
+    let again_block = claude_agent_block(&again).expect("the reused agent block");
+    assert_eq!(
+        again_block["prompt"].as_str(),
+        block["prompt"].as_str(),
+        "the reuse returns the same prompt"
+    );
+}
+
+#[tokio::test]
+async fn agent_tier_without_models_is_still_an_agent_tier() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "sonnet", vec![]).await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "hand the empty tier to the agent",
+            "agenttier02",
+        ))
+        .await
+        .expect("the empty agent tier still goes to the agent");
+    // The pre-fold settled tier claims the agent before fold-down moves the
+    // dispatch onto a lower tier's model.
+    assert_eq!(record.claude_agent.as_deref(), Some("sonnet"));
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert!(fixture.team.live.lock().await.get("agenttier02").is_none());
+    // The routed model still names the fold target; the status view shows
+    // the Claude Code agent.
+    assert_eq!(record.model.as_deref(), Some("test/scripted-average"));
+    assert_eq!(
+        worker_status_view(&record, false)["model"].as_str(),
+        Some("claude-code/sonnet")
+    );
+}
+
+#[tokio::test]
+async fn agent_tier_with_an_explicit_model_still_starts_a_mnemo_worker() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request = agent_dispatch_request(
+        &fixture.plan_id,
+        "the lead explicitly chose this Mnemo model",
+        "agenttier11",
+    );
+    request.model = Some("test/scripted-difficult".into());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the explicit-model dispatch");
+    assert!(record.claude_agent.is_none());
+    assert_eq!(record.model.as_deref(), Some("test/scripted-difficult"));
+    assert!(fixture.team.live.lock().await.get("agenttier11").is_some());
+}
+
+#[tokio::test]
+async fn agent_tier_is_ignored_without_an_external_lead() {
+    // No external lead attached: the in-app lead's dispatch on the agent
+    // tier starts a normal Mnemo worker on the tier's models.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let mut request = agent_dispatch_request(&fixture.plan_id, "in-app brief", "agenttier03");
+    request.sender = MessageSender::Lead;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the in-app dispatch starts a normal worker");
+    assert!(
+        record.claude_agent.is_none(),
+        "without an external lead the tier resolves exactly as today"
+    );
+    assert_eq!(record.model.as_deref(), Some("test/scripted-difficult"));
+    assert!(
+        fixture.team.live.lock().await.get("agenttier03").is_some(),
+        "a normal Mnemo session started"
+    );
+
+    // An attached external lead does not claim the in-app lead's dispatch:
+    // the sender, not the attach state alone, decides.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request =
+        agent_dispatch_request(&fixture.plan_id, "in-app brief with the lead attached", "agenttier04");
+    request.sender = MessageSender::Lead;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the in-app dispatch with the lead attached");
+    assert!(record.claude_agent.is_none());
+    assert!(fixture.team.live.lock().await.get("agenttier04").is_some());
+
+    // IPC dispatches (the Control Room form) never take the agent path,
+    // even when Laya clears the agent tier while a lead is attached.
+    let fixture = agent_fixture(
+        RoutingMode::Auto,
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.93),
+        true,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _) = fixture
+        .team
+        .dispatch_on_plan(
+            "the control-room brief with enough implementation detail for Laya to classify this step".into(),
+            None,
+            None,
+            Some("agenttier05".into()),
+            None,
+            false,
+            &fixture.plan_id,
+            1,
+        )
+        .await
+        .expect("the IPC dispatch");
+    assert!(
+        record.claude_agent.is_none(),
+        "IPC dispatches never take the agent path"
+    );
+    assert_eq!(
+        record.model.as_deref(),
+        Some("test/scripted-difficult"),
+        "Laya cleared high and the worker runs on its model"
+    );
+    assert!(fixture.team.live.lock().await.get("agenttier05").is_some());
+}
+
+#[tokio::test]
+async fn laya_auto_into_an_agent_tier_hands_it_to_the_lead() {
+    let fixture = agent_fixture(
+        RoutingMode::Auto,
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.93),
+        true,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let request = DispatchRequest {
+        brief: "auto-routed brief with enough implementation detail for Laya to classify this step".into(),
+        tier: None,
+        model: None,
+        reasoning_effort: None,
+        worker_id: Some("layaagnt01".into()),
+        review_risk: Some("standard".into()),
+        source: DispatchSource::LeadTool,
+        sender: MessageSender::ExternalLead,
+        dispatch_routing: true,
+        plan: Some(PlanRef {
+            plan_id: fixture.plan_id.clone(),
+            step: 0,
+        }),
+        read_back: false,
+    };
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the auto dispatch");
+    assert_eq!(
+        record.claude_agent.as_deref(),
+        Some("opus"),
+        "Laya's cleared tier hands the step to the lead's agent: {record:?}"
+    );
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert!(fixture.team.live.lock().await.get("layaagnt01").is_none());
+}
+
+#[tokio::test]
+async fn auto_fallback_into_an_agent_tier_hands_it_to_the_lead() {
+    let fixture = agent_fixture_with_settings(
+        crate::mnemo2::dispatch_routing::RoutingSettings {
+            mode: RoutingMode::Auto,
+            fallback_tier: "high".into(),
+            ..crate::mnemo2::dispatch_routing::RoutingSettings::default()
+        },
+        None,
+        false,
+        "fable",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request = agent_dispatch_request(
+        &fixture.plan_id,
+        "Auto has no cleared Laya decision, so its fallback tier settles the dispatch",
+        "agenttier12",
+    );
+    request.tier = None;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the Auto fallback dispatch");
+    assert_eq!(record.claude_agent.as_deref(), Some("fable"));
+    assert_eq!(record.tier.as_deref(), Some("high"));
+    assert!(fixture.team.live.lock().await.get("agenttier12").is_none());
+}
+
+#[tokio::test]
+async fn team_agent_done_finishes_the_worker_and_notifies_the_lead() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    // The merge lands on the lead branch, not main.
+    run_git(fixture._root.path(), &["checkout", "-b", "wt/mnemo"]);
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier06",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let worktree = std::path::PathBuf::from(&record.worktree);
+
+    // The lead's own agent commits in the prepared worktree.
+    std::fs::write(worktree.join("agent-work.txt"), "done\n").expect("write in the worktree");
+    run_git(&worktree, &["add", "."]);
+    run_git(&worktree, &["commit", "-m", "the agent's work"]);
+
+    // With no live entry, the session-free agent must still be closed by
+    // team_agent_done before checks, review or merge can start.
+    let unfinished =
+        "agenttier06 runs as a Claude Code agent: call team_agent_done when it has finished";
+    let error = fixture
+        .team
+        .record_check(
+            "agenttier06",
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect_err("an unfinished agent worker cannot be checked");
+    assert_eq!(error, unfinished);
+    let error = fixture
+        .team
+        .review(
+            "agenttier06",
+            "this review is premature".into(),
+            Vec::new(),
+            evidence(),
+        )
+        .await
+        .expect_err("an unfinished agent worker cannot be reviewed");
+    assert_eq!(error, unfinished);
+    let error = fixture
+        .team
+        .merge("agenttier06")
+        .await
+        .expect_err("an unfinished agent worker cannot be merged");
+    assert_eq!(error, unfinished);
+
+    // team_agent_done records the report, completes the worker and bumps
+    // the turn as the pump's Finished handling does.
+    let report = "Committed the change; cargo test --workspace and clippy pass.";
+    let done = fixture
+        .team
+        .agent_done("agenttier06", report.to_string(), false)
+        .await
+        .expect("finish the agent worker");
+    assert_eq!(done.status, WorkerStatus::Completed);
+    assert_eq!(done.turns, 1);
+    assert_eq!(done.report.as_deref(), Some(report));
+
+    // The finished notice reaches the external lead's queue, and survives
+    // current_notices exactly as a session's tagged notice does.
+    let notices = fixture
+        .team
+        .current_notices(fixture.team.drain_external_notices())
+        .await;
+    let notice = notices
+        .iter()
+        .find(|notice| notice.contains("agenttier06"))
+        .expect("the finished notice reached the external lead");
+    assert!(notice.contains("finished its turn"), "{notice}");
+    assert!(notice.contains("Review it now"), "{notice}");
+    assert!(
+        notice.ends_with(
+            "Use team_status with this exact worker_id. Fix findings through your own agent (SendMessage to it); team_stop clears the worker. Never infer lifecycle from Git, files, timestamps, or team.json."
+        ),
+        "{notice}"
+    );
+
+    // team_check, team_review and team_merge then work as for any worker.
+    fixture
+        .team
+        .record_check(
+            "agenttier06",
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect("record the check");
+    fixture
+        .team
+        .review("agenttier06", "the agent's work is good".into(), Vec::new(), evidence())
+        .await
+        .expect("review the agent's work");
+    let merged = fixture
+        .team
+        .merge("agenttier06")
+        .await
+        .expect("merge the agent worker");
+    assert_eq!(merged.status, WorkerStatus::Merged);
+}
+
+#[tokio::test]
+async fn team_agent_done_failed_marks_failed() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier07",
+        ))
+        .await
+        .expect("the agent dispatch");
+    // Reopen recovery can leave an agent worker Interrupted; the lead can
+    // still close it with team_agent_done.
+    fixture
+        .team
+        .update_worker("agenttier07", |worker| {
+            worker.status = WorkerStatus::Interrupted;
+        })
+        .await;
+    let report = "the agent hit a failing build it could not fix";
+    let failed = fixture
+        .team
+        .agent_done("agenttier07", report.to_string(), true)
+        .await
+        .expect("mark the agent worker failed");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert_eq!(failed.turns, 1);
+    assert_eq!(failed.report.as_deref(), Some(report));
+
+    // The failure notice is failure-shaped: it names the failure, quotes the
+    // report, and never tells the lead to review now.
+    let notices = fixture
+        .team
+        .current_notices(fixture.team.drain_external_notices())
+        .await;
+    let notice = notices
+        .iter()
+        .find(|notice| notice.contains("agenttier07"))
+        .expect("the failed notice reached the external lead");
+    assert!(notice.contains("could not finish its turn"), "{notice}");
+    assert!(notice.contains(report), "{notice}");
+    assert!(!notice.contains("Review it now"), "{notice}");
+}
+
+#[tokio::test]
+async fn team_agent_done_refuses_a_mnemo_worker() {
+    // A worker with a Mnemo session is never an agent worker.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let mut request = agent_dispatch_request(&fixture.plan_id, "a normal Mnemo worker", "agenttier08");
+    request.sender = MessageSender::Lead;
+    fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("a normal worker dispatch");
+    let error = fixture
+        .team
+        .agent_done("agenttier08", "report".to_string(), false)
+        .await
+        .expect_err("a Mnemo worker is not an agent worker");
+    assert!(
+        error.contains("does not run as a Claude Code agent"),
+        "{error}"
+    );
+
+    // And an agent worker outside Working/Interrupted is refused with its state.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier09",
+        ))
+        .await
+        .expect("the agent dispatch");
+    fixture
+        .team
+        .agent_done("agenttier09", "done".to_string(), false)
+        .await
+        .expect("finish the agent worker");
+    let error = fixture
+        .team
+        .agent_done("agenttier09", "again".to_string(), false)
+        .await
+        .expect_err("an already-completed worker is refused");
+    assert!(error.contains("completed"), "{error}");
+}
+
+#[tokio::test]
+async fn session_tools_refuse_an_agent_worker() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "agenttier10",
+        ))
+        .await
+        .expect("the agent dispatch");
+
+    // Every tool that would drive a Mnemo session refuses, pointing at the
+    // lead's own agent instead (team_message from Claude Code is recorded
+    // and answered with the SendMessage instruction: plan ca7f2177 step 2).
+    let guidance = "agenttier10 runs as a Claude Code agent: Mnemo can't resume or compact it. Continue it with team_message (which gives you the SendMessage instruction) or start a new Agent.";
+    for (refusal, expected) in [
+        (
+            fixture
+                .team
+                .message("agenttier10", "status?".into(), MessageSender::Lead)
+                .await
+                .expect_err("the in-app lead's team_message refuses"),
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done.",
+        ),
+        (
+            fixture
+                .team
+                .resume("agenttier10")
+                .await
+                .expect_err("team_resume refuses"),
+            guidance,
+        ),
+        (
+            fixture
+                .team
+                .change_model("agenttier10", Some("test/scripted-average".into()), None, ChangeSource::Lead)
+                .await
+                .expect_err("team_resume with a model refuses"),
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done.",
+        ),
+        (
+            fixture
+                .team
+                .compact("agenttier10")
+                .await
+                .expect_err("team_compact refuses"),
+            guidance,
+        ),
+        (
+            fixture
+                .team
+                .route_fix_with_tier("agenttier10", "finding1", None)
+                .await
+                .expect_err("team_route_fix refuses while the agent runs"),
+            "agenttier10 runs as a Claude Code agent: call team_agent_done when it has finished",
+        ),
+    ] {
+        assert_eq!(refusal, expected);
+    }
+
+    fixture
+        .team
+        .agent_done("agenttier10", "finished".into(), false)
+        .await
+        .expect("finish the agent worker");
+    let refusal = fixture
+        .team
+        .message("agenttier10", "fix the finding".into(), MessageSender::Lead)
+        .await
+        .expect_err("a finished agent worker is fixed through the lead's agent");
+    assert_eq!(
+        refusal,
+        "agenttier10 runs as a Claude Code agent: fix it with your own Agent (SendMessage to it), then run team_check and team_review on the new tip."
+    );
+
+    // team_stop still works: the lead cancels the record itself.
+    let stopped = fixture
+        .team
+        .stop("agenttier10")
+        .await
+        .expect("team_stop still works on an agent worker");
+    assert_eq!(stopped.status, WorkerStatus::Stopped);
+    let refusal = fixture
+        .team
+        .resume("agenttier10")
+        .await
+        .expect_err("an ended agent worker cannot be resumed");
+    assert_eq!(
+        refusal,
+        "agenttier10 runs as a Claude Code agent and has ended: dispatch the step again with a new worker_id."
+    );
+}
+
+#[tokio::test]
+async fn tier_guidance_names_the_claude_agent() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (opus) when Claude Code leads"),
+        "{line}"
+    );
+
+    // An agent tier with no models still appears, naming the fold target as
+    // today, followed by the same suffix.
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "haiku", vec![]).await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(line.contains("no model; folds down to routine"), "{line}");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (haiku) when Claude Code leads"),
+        "{line}"
+    );
+}
+
+/// The agent fixture with the high tier's Claude Code effort set too.
+async fn agent_fixture_with_effort(
+    claude_model: &str,
+    effort: &str,
+    high_models: Vec<String>,
+) -> RoutingFixture {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, claude_model, high_models).await;
+    let mut dto = mnemo::headless::TiersDto::from(fixture.team.tier_ladder());
+    dto.tiers[3].claude_agent_effort = Some(effort.into());
+    fixture.team.set_tiers(dto);
+    fixture
+}
+
+#[tokio::test]
+async fn agent_dispatch_carries_the_tier_effort() {
+    let fixture = agent_fixture_with_effort("opus", "xhigh", vec!["test/scripted-difficult".into()])
+        .await;
+    assert!(fixture.team.attach_external_lead());
+    let request = agent_dispatch_request(
+        &fixture.plan_id,
+        "run the step at the tier's effort",
+        "agenttier14",
+    );
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    assert_eq!(block["effort"], "xhigh", "{block}");
+
+    // An idempotent re-dispatch returns the same block.
+    let request = agent_dispatch_request(
+        &fixture.plan_id,
+        "run the step at the tier's effort",
+        "agenttier14",
+    );
+    let (retry, reused, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the same-id retry");
+    assert!(reused);
+    assert_eq!(block, claude_agent_block(&retry).expect("the retry block"));
+
+    // A tier without an effort carries null.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let request = agent_dispatch_request(
+        &fixture.plan_id,
+        "run the step without an effort",
+        "agenttier15",
+    );
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    assert!(block["effort"].is_null(), "{block}");
+}
+
+#[tokio::test]
+async fn tier_guidance_names_the_agent_effort() {
+    let fixture = agent_fixture_with_effort("opus", "xhigh", vec!["test/scripted-difficult".into()])
+        .await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (opus, xhigh effort) when Claude Code leads"),
+        "{line}"
+    );
+
+    // Without an effort the suffix stays exactly as it was.
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let guidance = fixture.team.tier_guidance().expect("tier guidance");
+    let line = guidance
+        .lines()
+        .find(|line| line.starts_with("high "))
+        .expect("the high line");
+    assert!(
+        line.ends_with("; runs as a Claude Code agent (opus) when Claude Code leads"),
+        "{line}"
+    );
+}
+
+
+#[tokio::test]
+async fn agent_dispatch_read_back_uses_the_updated_record_and_reuses_the_same_block() {
+    let fixture = agent_fixture(
+        RoutingMode::Auto,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let mut request = agent_dispatch_request(
+        &fixture.plan_id,
+        "read the step back before implementing it",
+        "agenttier13",
+    );
+    request.read_back = true;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(request)
+        .await
+        .expect("the read-back agent dispatch");
+    let first = claude_agent_block(&record).expect("the first agent block");
+    assert!(record.read_back, "the returned record keeps read_back: {record:?}");
+    assert!(record.routing.is_some(), "the returned record keeps routing");
+    assert!(
+        first["prompt"]
+            .as_str()
+            .is_some_and(|prompt| prompt.starts_with(super::record::AGENT_READ_BACK_KICKOFF)),
+        "the prompt uses the READ_BACK kickoff"
+    );
+
+    let mut retry_request = agent_dispatch_request(
+        &fixture.plan_id,
+        "read the step back before implementing it",
+        "agenttier13",
+    );
+    retry_request.read_back = true;
+    let (retry, reused, _) = fixture
+        .team
+        .dispatch_request(retry_request)
+        .await
+        .expect("the same-id retry");
+    assert!(reused);
+    assert_eq!(first, claude_agent_block(&retry).expect("the retry block"));
+
+    let answer = dispatch_result(
+        Ok((record, false, false)),
+        "team_dispatch",
+        RoutingMode::Auto,
+        None,
+        false,
+        Vec::new(),
+    );
+    let data = answer.data.expect("dispatch data");
+    assert_eq!(data["worker"]["read_back"], true);
+    assert!(data["worker"]["routing"].is_object());
+}
+
+#[tokio::test]
+async fn agent_workers_count_against_dispatch_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    fixture.team.set_slots(1).await.expect("one worker slot");
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the first session-free agent occupies the only slot",
+            "slotOne0001",
+        ))
+        .await
+        .expect("the first agent dispatch");
+
+    let error = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the second agent must wait for a free slot",
+            "slotTwo0001",
+        ))
+        .await
+        .expect_err("the working agent occupies the only slot");
+    assert_eq!(error, "all 1 worker slots are busy");
+
+    fixture
+        .team
+        .agent_done("slotOne0001", "finished".into(), false)
+        .await
+        .expect("free the agent slot");
+    let (second, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the second agent runs after team_agent_done",
+            "slotTwo0001",
+        ))
+        .await
+        .expect("the slot is available after team_agent_done");
+    assert_eq!(second.status, WorkerStatus::Working);
+}
+
+
+#[tokio::test]
+async fn agent_workers_count_when_reducing_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    for (id, brief) in [
+        ("slotThree01", "the first agent counts as an active worker"),
+        ("slotFour001", "the second agent also counts as an active worker"),
+    ] {
+        fixture
+            .team
+            .dispatch_request(agent_dispatch_request(&fixture.plan_id, brief, id))
+            .await
+            .expect("an agent dispatch within the original slot cap");
+        // Its agent is launched, so the next agent dispatch may go ahead.
+        fixture
+            .team
+            .update_worker(id, |worker| worker.claude_agent_id = Some(format!("agent-{id}")))
+            .await;
+    }
+
+    let error = fixture
+        .team
+        .set_slots(1)
+        .await
+        .expect_err("two active agents prevent reducing the cap to one");
+    assert_eq!(error, "stop 1 worker(s) before reducing slots to 1");
+    fixture
+        .team
+        .agent_done("slotThree01", "finished".into(), false)
+        .await
+        .expect("finish one agent");
+    fixture
+        .team
+        .set_slots(1)
+        .await
+        .expect("one active agent fits the reduced cap");
+}
+
+#[tokio::test]
+async fn agent_merge_and_outcome_use_the_claude_code_model() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    run_git(fixture._root.path(), &["checkout", "-b", "wt/mnemo"]);
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "attribute the merged work to the Claude Code agent model",
+            "agenttier14",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let worktree = std::path::PathBuf::from(&record.worktree);
+    std::fs::write(worktree.join("attribution.txt"), "done\n").expect("agent work");
+    run_git(&worktree, &["add", "."]);
+    run_git(&worktree, &["commit", "-m", "agent attribution"]);
+    fixture
+        .team
+        .agent_done("agenttier14", "finished".into(), false)
+        .await
+        .expect("finish the agent");
+    fixture
+        .team
+        .record_check(
+            "agenttier14",
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect("record the check");
+    fixture
+        .team
+        .review("agenttier14", "reviewed".into(), Vec::new(), evidence())
+        .await
+        .expect("review the agent");
+    let merged = fixture.team.merge("agenttier14").await.expect("merge the agent");
+
+    assert_eq!(merged.models_used, vec!["claude-code/opus".to_string()]);
+    let merge = merged.merge.as_ref().expect("the merge record");
+    assert_eq!(merge.worker_model.as_deref(), Some("claude-code/opus"));
+    let progress = merge_outcome_line(1, &merged);
+    assert!(progress.contains("claude-code/opus"), "{progress}");
+    let mut without_merge = merged.clone();
+    without_merge.merge = None;
+    let progress = merge_outcome_line(1, &without_merge);
+    assert!(progress.contains("claude-code/opus"), "{progress}");
+
+    // A merged agent worker is done: no surface may offer to continue it.
+    let refusal = fixture
+        .team
+        .message("agenttier14", "continue please".into(), MessageSender::ExternalLead)
+        .await
+        .expect_err("a merged agent worker has nothing left to continue");
+    assert_eq!(
+        refusal,
+        "agenttier14 ran as a Claude Code agent and is merged: there is nothing left to continue."
+    );
+}
+
+
+/// A git command's trimmed stdout.
+fn git_stdout(root: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// The lead commits `file` on the fixture's lead branch.
+fn lead_commit(root: &std::path::Path, file: &str, message: &str) -> String {
+    std::fs::write(root.join(file), format!("{message}\n")).expect("lead file");
+    run_git(root, &["add", file]);
+    run_git(root, &["commit", "-m", message]);
+    git_stdout(root, &["rev-parse", "HEAD"])
+}
+
+/// The worker's transcript as one JSON string, for what a session received.
+async fn transcript_text(team: &TeamRuntime, worker_id: &str) -> String {
+    let worker = team.worker(worker_id).await.expect("worker record");
+    serde_json::to_string(&worker.transcript.messages).expect("transcript json")
+}
+
+const FAST_FORWARD_NOTE: &str =
+    "[From Mnemo2] The lead branch moved: your checkout was fast-forwarded to";
+
+#[tokio::test]
+async fn dispatch_records_and_names_the_base_commit() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let lead_tip = git_stdout(root, &["rev-parse", "HEAD"]);
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.base_commit.as_deref(), Some(lead_tip.as_str()));
+    let prompt = record.opening_prompt.as_deref().expect("opening prompt");
+    let line = format!(
+        "You start at {} (seed), the tip of main when you were dispatched.",
+        &lead_tip[..8]
+    );
+    assert!(prompt.ends_with(&line), "{prompt}");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_after_a_lead_commit_gets_the_new_tip() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let root = fixture._root.path();
+    assert!(fixture.team.attach_external_lead());
+    let first_tip = git_stdout(root, &["rev-parse", "HEAD"]);
+    let (first, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "first fresh worker",
+            "alphabase1",
+        ))
+        .await
+        .expect("first dispatch");
+    assert_eq!(first.base_commit.as_deref(), Some(first_tip.as_str()));
+    // The first agent is launched before the next agent dispatch.
+    fixture
+        .team
+        .update_worker("alphabase1", |worker| worker.claude_agent_id = Some("a1".into()))
+        .await;
+    let second_tip = lead_commit(root, "lead.txt", "lead moves on");
+    let (second, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "second fresh worker",
+            "betabase02",
+        ))
+        .await
+        .expect("second dispatch");
+    assert_eq!(second.base_commit.as_deref(), Some(second_tip.as_str()));
+    assert_eq!(git_stdout(&second.worktree, &["rev-parse", "HEAD"]), second_tip);
+    let prompt = second.opening_prompt.as_deref().expect("opening prompt");
+    assert!(
+        prompt.ends_with(&format!(
+            "You start at {} (lead moves on), the tip of main when you were dispatched.",
+            &second_tip[..8]
+        )),
+        "{prompt}"
+    );
+    let first_again = fixture.team.worker("alphabase1").await.expect("first record");
+    assert_eq!(first_again.base_commit.as_deref(), Some(first_tip.as_str()));
+}
+
+#[tokio::test]
+async fn idle_worker_without_commits_follows_the_lead() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    let lead_tip = lead_commit(root, "lead.txt", "lead moves on");
+    assert_ne!(settled.base_commit.as_deref(), Some(lead_tip.as_str()));
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the idle worker");
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), lead_tip);
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.base_commit.as_deref(), Some(lead_tip.as_str()));
+    let expected = format!("{FAST_FORWARD_NOTE} {} (lead moves on).", &lead_tip[..8]);
+    eventually(|| async {
+        transcript_text(&fixture.team, "routingworker")
+            .await
+            .contains(&expected)
+            .then_some(())
+    })
+    .await;
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn worker_with_commits_is_flagged_stale_not_rewritten() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    std::fs::write(settled.worktree.join("work.txt"), "work\n").expect("worker file");
+    run_git(&settled.worktree, &["add", "work.txt"]);
+    run_git(&settled.worktree, &["commit", "-m", "worker commit"]);
+    let worker_tip = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    lead_commit(root, "lead.txt", "lead moves on");
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the worker");
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), worker_tip);
+    assert!(!transcript_text(&fixture.team, "routingworker")
+        .await
+        .contains(FAST_FORWARD_NOTE));
+
+    let status = fixture
+        .team
+        .handle_lead_host_tool("team_status", json!({"worker_id": "routingworker"}))
+        .await;
+    let status: Value = serde_json::from_str(&status.output).expect("status json");
+    assert_eq!(status["result"][0]["stale_base"], 1, "{status}");
+
+    let check = fixture
+        .team
+        .handle_lead_host_tool(
+            "team_check",
+            json!({"worker_id": "routingworker", "name": "cargo test", "status": "passed"}),
+        )
+        .await;
+    assert!(check.success, "{}", check.output);
+    assert!(
+        check.output.contains(
+            "stale base: the lead branch has 1 commit(s) this branch does not; the checks ran without them. Rebase or merge deliberately if they matter."
+        ),
+        "{}",
+        check.output
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn dirty_worker_is_not_fast_forwarded() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    let base = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(settled.worktree.join("README.md"), "edited by the worker\n")
+        .expect("uncommitted change");
+    lead_commit(root, "lead.txt", "lead moves on");
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the dirty worker");
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), base);
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.base_commit.as_deref(), Some(base.as_str()));
+    assert!(!transcript_text(&fixture.team, "routingworker")
+        .await
+        .contains(FAST_FORWARD_NOTE));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispatch_warns_about_uncommitted_coding_files() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    // Track `.coding/` for this test: the fixture ignores it.
+    std::fs::write(root.join(".gitignore"), ".worktrees/\n").expect("gitignore");
+    run_git(root, &["add", ".gitignore"]);
+    run_git(root, &["commit", "-m", "track .coding"]);
+    std::fs::create_dir_all(root.join(".coding/plans")).expect("plans dir");
+    std::fs::write(root.join(".coding/plans/x.md"), "dirty plan\n").expect("plan file");
+
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let answer: Value = serde_json::from_str(result.output.lines().next().unwrap()).expect("dispatch json");
+    assert_eq!(answer["result"]["warnings"], json!([]), "plan files alone: {answer}");
+
+    std::fs::write(root.join(".coding/notes.md"), "scratch\n").expect("notes file");
+    // The same dispatch again is an idempotent reuse and still warns.
+    let again = fixture.dispatch(Some("routine"), None).await;
+    assert!(again.success, "{}", again.output);
+    let answer: Value = serde_json::from_str(again.output.lines().next().unwrap()).expect("dispatch json");
+    assert_eq!(
+        answer["result"]["warnings"][0],
+        "The lead checkout has 1 uncommitted file(s) under .coding/ that this worker's checkout will not contain: .coding/notes.md. Commit them first if the worker needs them.",
+        "{answer}"
+    );
+    assert_eq!(again.data.as_ref().unwrap()["warnings"], answer["result"]["warnings"]);
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_done_persist_failure_rolls_back_and_can_retry() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "a failed completion write must leave the agent retryable",
+            "agenttier15",
+        ))
+        .await
+        .expect("the agent dispatch");
+
+    // A fresh transcript Arc makes the persistence seam attempt the write;
+    // the directory where that transcript belongs makes the rename fail.
+    let transcript = fixture
+        .state
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join("agenttier15.json");
+    let mut snapshot = fixture
+        .team
+        .worker("agenttier15")
+        .await
+        .expect("the working snapshot");
+    // Record the original transcript Arc as written. The ordinary concurrent
+    // saver then skips the transcript directory and races only the ledger,
+    // while the snapshot override's fresh Arc still forces the failure.
+    std::fs::write(
+        &transcript,
+        serde_json::to_vec(&*snapshot.transcript).expect("encode the empty transcript"),
+    )
+    .expect("seed the transcript");
+    fixture.team.persist().await.expect("record the transcript write");
+    std::fs::remove_file(&transcript).expect("replace the transcript with a directory");
+    std::fs::create_dir(&transcript).expect("inject the transcript rename failure");
+    snapshot.transcript = std::sync::Arc::new(Transcript::default());
+
+    let save_guard = fixture.team.save_lock.lock().await;
+    let saver_team = fixture.team.clone();
+    let saver = tokio::spawn(async move { saver_team.persist().await });
+    tokio::task::yield_now().await;
+    let done_team = fixture.team.clone();
+    let done = tokio::spawn(async move {
+        done_team
+            .agent_done_with_snapshot(
+                "agenttier15",
+                "this completion must not become durable".into(),
+                false,
+                Some(snapshot),
+            )
+            .await
+    });
+    // Before the fix the shared record becomes Completed while the first
+    // saver is queued. With the fix it stays Working until the save lock is
+    // available, so the timeout is what lets the test proceed.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            let worker = fixture
+                .team
+                .worker("agenttier15")
+                .await
+                .expect("the worker while completion races a save");
+            if worker.status == WorkerStatus::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop(save_guard);
+    let error = done
+        .await
+        .expect("join the completion")
+        .expect_err("the injected transcript write fails");
+    saver
+        .await
+        .expect("join the concurrent saver")
+        .expect("the concurrent ledger save");
+    assert!(error.contains("could not replace the transcript"), "{error}");
+
+    let current = fixture
+        .team
+        .worker("agenttier15")
+        .await
+        .expect("the in-memory record after the failed write");
+    assert_eq!(current.status, WorkerStatus::Working);
+    assert_eq!(current.turns, 0);
+    assert!(current.report.is_none());
+    assert!(fixture.team.drain_external_notices().is_empty());
+    std::fs::remove_dir(&transcript).expect("clear the injected failure");
+    let saved = TeamPersistence::new(fixture.state.path())
+        .load()
+        .expect("reload the durable ledger")
+        .expect("a saved team");
+    let saved_worker = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == "agenttier15")
+        .expect("the durable agent record");
+    assert_eq!(saved_worker.status, WorkerStatus::Working);
+
+    let done = fixture
+        .team
+        .agent_done("agenttier15", "the clean retry completes".into(), false)
+        .await
+        .expect("the clean retry");
+    assert_eq!(done.status, WorkerStatus::Completed);
+    assert!(fixture
+        .team
+        .drain_external_notices()
+        .iter()
+        .any(|notice| notice.contains("agenttier15") && notice.contains("finished its turn")));
+    let saved = TeamPersistence::new(fixture.state.path())
+        .load()
+        .expect("reload after the retry")
+        .expect("a saved team");
+    let saved_worker = saved
+        .workers
+        .iter()
+        .find(|worker| worker.id == "agenttier15")
+        .expect("the persisted completed agent");
+    assert_eq!(saved_worker.status, WorkerStatus::Completed);
+    assert_eq!(saved_worker.report.as_deref(), Some("the clean retry completes"));
+}
+
+
+#[tokio::test]
+async fn agent_workers_count_against_resume_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    fixture.team.set_slots(1).await.expect("one worker slot");
+    assert!(fixture.team.attach_external_lead());
+    let mut normal = agent_dispatch_request(
+        &fixture.plan_id,
+        "a stopped Mnemo worker will later need the only slot",
+        "resumeB01",
+    );
+    normal.sender = MessageSender::Lead;
+    fixture
+        .team
+        .dispatch_request(normal)
+        .await
+        .expect("dispatch the Mnemo worker");
+    fixture.team.stop("resumeB01").await.expect("stop the worker");
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the agent now owns the only worker slot",
+            "agentRsum01",
+        ))
+        .await
+        .expect("dispatch the agent");
+
+    let error = fixture
+        .team
+        .resume("resumeB01")
+        .await
+        .expect_err("resume must not run alongside the active agent");
+    assert_eq!(error, "all 1 worker slots are busy");
+    fixture
+        .team
+        .agent_done("agentRsum01", "finished".into(), false)
+        .await
+        .expect("release the agent slot");
+    fixture
+        .team
+        .resume("resumeB01")
+        .await
+        .expect("resume succeeds once the agent is done");
+}
+
+
+#[tokio::test]
+async fn agent_workers_count_against_audit_slots() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    fixture.team.set_slots(1).await.expect("one worker slot");
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "the active agent occupies the audit's only possible slot",
+            "agentAud001",
+        ))
+        .await
+        .expect("dispatch the agent");
+
+    let mut target = worker(fixture._root.path(), "auditTarget");
+    target.plan_id = Some(fixture.plan_id.clone());
+    target.plan_step = Some(0);
+    provision_agent_worktree(
+        fixture._root.path().to_path_buf(),
+        target.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision the audit target");
+    fixture.team.records.lock().await.push(target.clone());
+
+    let error = fixture
+        .team
+        .audit_dispatch(&target.id, "auditSlot01", None, None, None)
+        .await
+        .expect_err("audit dispatch must not run alongside the active agent");
+    assert_eq!(error, "all 1 worker slots are busy");
+    fixture
+        .team
+        .agent_done("agentAud001", "finished".into(), false)
+        .await
+        .expect("release the agent slot");
+    let (_, reused) = fixture
+        .team
+        .audit_dispatch(&target.id, "auditSlot01", None, None, None)
+        .await
+        .expect("audit dispatch succeeds once the agent is done");
+    assert!(!reused);
+}
+
+
+#[tokio::test]
+async fn agent_prompt_names_only_tools_a_claude_agent_has() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "use only the tools available to a Claude Code agent",
+            "promptNorm1",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    let prompt = block["prompt"].as_str().expect("the agent prompt");
+    assert!(!prompt.contains("message_parent"), "{prompt}");
+    assert!(!prompt.contains("plan_read"), "{prompt}");
+    assert!(!prompt.contains("(pinned)"), "{prompt}");
+    assert!(!prompt.contains("plan_show"), "agents use no Mnemo tools: {prompt}");
+    assert!(prompt.contains("end your turn"), "{prompt}");
+    assert!(
+        !prompt.contains(record.worktree.to_str().expect("a utf-8 worktree")),
+        "the agent runs in its own checkout, so the prompt names no folder: {prompt}"
+    );
+
+    // The first agent is launched before the next agent dispatch.
+    fixture
+        .team
+        .update_worker("promptNorm1", |worker| worker.claude_agent_id = Some("a1".into()))
+        .await;
+    let mut read_back = agent_dispatch_request(
+        &fixture.plan_id,
+        "read the task back without Mnemo worker tools",
+        "promptRead1",
+    );
+    read_back.read_back = true;
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(read_back)
+        .await
+        .expect("the read-back agent dispatch");
+    let block = claude_agent_block(&record).expect("the read-back agent block");
+    let prompt = block["prompt"].as_str().expect("the read-back prompt");
+    assert!(prompt.contains("No questions."), "{prompt}");
+    assert!(!prompt.contains("message_parent"), "{prompt}");
+    assert!(!prompt.contains("plan_read"), "{prompt}");
+}
+
+
+#[tokio::test]
+async fn team_agent_done_rollback_keeps_a_concurrent_routing_update() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "a concurrent routing classification must survive rollback",
+            "agentRb0001",
+        ))
+        .await
+        .expect("the agent dispatch");
+    let transcript = fixture
+        .state
+        .path()
+        .join(TRANSCRIPTS_DIR)
+        .join("agentRb0001.json");
+    std::fs::create_dir(&transcript).expect("inject the transcript rename failure");
+    let mut snapshot = fixture
+        .team
+        .worker("agentRb0001")
+        .await
+        .expect("the working snapshot");
+    snapshot.transcript = std::sync::Arc::new(Transcript::default());
+
+    let save_guard = fixture.team.save_lock.lock().await;
+    let done_team = fixture.team.clone();
+    let done = tokio::spawn(async move {
+        done_team
+            .agent_done_with_snapshot(
+                "agentRb0001",
+                "the failed completion must not erase routing".into(),
+                false,
+                Some(snapshot),
+            )
+            .await
+    });
+    // agent_done captures its rollback snapshot before waiting for this lock.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let routing = super::record::WorkerRouting {
+        laya_tier: Some("high".into()),
+        confidence: Some(0.91),
+        cleared: true,
+        lead_tier: Some("high".into()),
+        routed_by: "laya".into(),
+        ran_tier: Some("high".into()),
+        nudged: None,
+    };
+    fixture
+        .team
+        .update_worker("agentRb0001", |worker| {
+            worker.routing = Some(routing.clone());
+        })
+        .await;
+    drop(save_guard);
+    let error = done
+        .await
+        .expect("join the failed completion")
+        .expect_err("the injected save fails");
+    assert!(error.contains("could not replace the transcript"), "{error}");
+
+    let current = fixture
+        .team
+        .worker("agentRb0001")
+        .await
+        .expect("the rolled-back worker");
+    assert_eq!(current.status, WorkerStatus::Working);
+    assert_eq!(current.turns, 0);
+    assert!(current.report.is_none());
+    assert_eq!(current.routing.as_ref(), Some(&routing));
+}
+
+/// A team whose `.coding/checks.toml` lists `commands` and whose one pool
+/// worker sits idle on a committed change. Returns the workspace, the state
+/// dir, the config dir, the team and the worker id.
+async fn check_run_fixture(
+    id: &str,
+    commands: &[&str],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Arc<TeamRuntime>,
+    String,
+) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    // Mnemo2 never merges into main: the lead works on its own branch.
+    run_git(root.path(), &["switch", "-c", "wt/mnemo"]);
+    std::fs::create_dir_all(root.path().join(".coding")).expect("coding dir");
+    let list = commands
+        .iter()
+        .map(|command| format!("{command:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        root.path().join(".coding/checks.toml"),
+        format!("commands = [{list}]\n"),
+    )
+    .expect("checks.toml");
+    let team = Arc::new(
+        open_test_team_with_config(root.path(), state.path(), Vec::new(), config.path()).await,
+    );
+    let worker = provision_pool_worker(&team, id).await;
+    std::fs::write(worker.worktree.join("change.txt"), "change\n").expect("worker change");
+    run_git(&worker.worktree, &["add", "change.txt"]);
+    run_git(&worker.worktree, &["commit", "-m", "worker change"]);
+    team.update_worker(&worker.id, |current| {
+        current.status = WorkerStatus::Completed;
+    })
+    .await;
+    (root, state, config, team, worker.id)
+}
+
+/// Take every heavy-command slot of the fixture's machine (the default two),
+/// so a check run started now waits until the returned guards drop.
+fn hold_all_slots(config: &std::path::Path) -> Vec<mnemo::machine_slots::SlotGuard> {
+    let slots = mnemo::machine_slots::HeavySlots::new(
+        mnemo::machine_slots::default_dir(config),
+        2,
+    );
+    (0..slots.slots())
+        .map(|_| slots.try_take().guard().expect("a free slot"))
+        .collect()
+}
+
+/// Mnemo's check run records one check per command on the tip it started at,
+/// names the exit code and run time in the detail, and the notice reports
+/// each command and the next move.
+#[tokio::test]
+async fn team_run_checks_records_every_command_on_the_tip() {
+    let (_root, _state, _config, team, worker_id) = check_run_fixture(
+        "runChecks01",
+        &["git --version", "git rev-parse --verify refs/heads/nope", "git status"],
+    )
+    .await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let mut notices = team.subscribe_board();
+    let started = team
+        .run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    assert!(started.contains("a notice follows"), "{started}");
+    let notice = drain_notice_within(
+        &mut notices,
+        "Mnemo ran the checks for",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
+    assert!(notice.starts_with(&format!("worker_id={worker_id}\n")), "{notice}");
+    assert!(
+        notice.contains(&format!(
+            "Mnemo ran the checks for {worker_id} at {}: 2 passed, 1 failed.",
+            &tip[..8]
+        )),
+        "{notice}"
+    );
+    assert!(notice.contains("PASS git --version (exit 0"), "{notice}");
+    assert!(
+        notice.contains("FAIL git rev-parse --verify refs/heads/nope (exit "),
+        "{notice}"
+    );
+    assert!(notice.ends_with("Route the failures with team_route_fix."), "{notice}");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert_eq!(worker.checks.len(), 3, "{:?}", worker.checks);
+    for (name, status) in [
+        ("git --version", "passed"),
+        ("git rev-parse --verify refs/heads/nope", "failed"),
+        ("git status", "passed"),
+    ] {
+        let check = worker
+            .checks
+            .iter()
+            .find(|check| check.name == name)
+            .unwrap_or_else(|| panic!("a check named {name}: {:?}", worker.checks));
+        assert_eq!(check.status, status, "{name}");
+        assert_eq!(check.tip, tip, "{name}");
+        let detail = check.detail.clone().unwrap_or_default();
+        assert!(detail.starts_with("run by Mnemo: exit "), "{detail}");
+    }
+    team.shutdown().await;
+}
+
+/// A tip that moves while the run waits for a slot makes the run record
+/// nothing and say so.
+#[tokio::test]
+async fn team_run_checks_discards_results_when_the_tip_moves() {
+    let (_root, _state, config, team, worker_id) =
+        check_run_fixture("runChecks02", &["git --version"]).await;
+    let slots = hold_all_slots(config.path());
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    run_git(
+        &worker.worktree,
+        &["commit", "--allow-empty", "-m", "the tip moves under the run"],
+    );
+    drop(slots);
+    let notice = drain_notice_within(
+        &mut notices,
+        "while they ran",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run says the tip moved");
+    assert!(notice.contains("nothing was recorded"), "{notice}");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(worker.checks.is_empty(), "{:?}", worker.checks);
+    team.shutdown().await;
+}
+
+/// A review with no open findings at a tip without checks starts Mnemo's own
+/// run and says so; team_merge waits for it and succeeds after its notice.
+#[tokio::test]
+async fn a_clean_review_starts_the_missing_checks() {
+    let (_root, _state, config, team, worker_id) =
+        check_run_fixture("runChecks03", &["git --version", "git status"]).await;
+    let slots = hold_all_slots(config.path());
+    let mut notices = team.subscribe_board();
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let tip = phase3::tip(&worker.worktree).await.expect("tip");
+    let answer = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": worker_id,
+                "summary": "checked the diff",
+                "findings": [],
+                "evidence": serde_json::to_value(evidence()).expect("evidence"),
+            }),
+        )
+        .await;
+    assert!(answer.success, "{answer:?}");
+    assert!(
+        answer.output.contains(&format!(
+            "Mnemo is running the missing checks at {}; merge after its notice.",
+            &tip[..8]
+        )),
+        "{}",
+        answer.output
+    );
+    let refused = team
+        .handle_lead_host_tool("team_merge", json!({"worker_id": worker_id}))
+        .await;
+    assert!(!refused.success, "{refused:?}");
+    assert!(
+        refused.output.contains(&format!(
+            "Mnemo is running the checks for {worker_id}; wait for its notice."
+        )),
+        "{}",
+        refused.output
+    );
+    drop(slots);
+    let notice = drain_notice_within(
+        &mut notices,
+        "2 passed, 0 failed",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
+    assert!(notice.contains("Merge it with team_merge."), "{notice}");
+    let merged = team
+        .handle_lead_host_tool("team_merge", json!({"worker_id": worker_id}))
+        .await;
+    assert!(merged.success, "{merged:?}");
+    team.shutdown().await;
+}
+
+/// While a run is in progress the entry points that would move or judge the
+/// checkout refuse with one message.
+#[tokio::test]
+async fn merge_waits_for_a_running_check_run() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks04", &["git --version"]).await;
+    assert!(team.check_runs.hold_for_test(&worker_id));
+    let expected = format!("Mnemo is running the checks for {worker_id}; wait for its notice.");
+    assert_eq!(
+        team.merge_as(&worker_id, true)
+            .await
+            .expect_err("a merge is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.message(&worker_id, "hello".to_string(), MessageSender::Lead)
+            .await
+            .expect_err("a message is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.resume(&worker_id)
+            .await
+            .expect_err("a resume is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.route_fix(&worker_id, "any-finding")
+            .await
+            .expect_err("a routed fix is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.review_fix(&worker_id, "any-finding", "change.txt", "change", "changed")
+            .await
+            .expect_err("review_fix is refused while the checks run"),
+        expected
+    );
+    assert_eq!(
+        team.run_checks_tool(Some(&worker_id))
+            .await
+            .expect_err("a second run is refused"),
+        expected
+    );
+    // A re-dispatch of the same worker id starts a turn in its checkout, so it
+    // is refused too.
+    team.update_worker(&worker_id, |current| {
+        current.status = WorkerStatus::Failed;
+        current.brief_sent = false;
+    })
+    .await;
+    let brief = team.worker(&worker_id).await.expect("worker").brief;
+    assert_eq!(
+        team.dispatch_request(DispatchRequest {
+            brief,
+            tier: None,
+            dispatch_routing: false,
+            source: DispatchSource::Ipc,
+            sender: MessageSender::User,
+            model: None,
+            reasoning_effort: None,
+            worker_id: Some(worker_id.clone()),
+            plan: None,
+            review_risk: None,
+            read_back: false,
+        })
+        .await
+        .expect_err("a re-dispatch is refused while the checks run"),
+        expected
+    );
+    team.shutdown().await;
+}
+
+/// Without a worker the run goes to the lead checkout: the notice names the
+/// lead branch and its tip, and nothing is recorded on any worker.
+#[tokio::test]
+async fn team_run_checks_without_a_worker_runs_in_the_lead_checkout() {
+    let (root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks05", &["git --version"]).await;
+    let tip = phase3::tip(root.path()).await.expect("lead tip");
+    let mut notices = team.subscribe_board();
+    let answer = team
+        .handle_lead_host_tool("team_run_checks", json!({}))
+        .await;
+    assert!(answer.success, "{answer:?}");
+    let notice = drain_notice_within(
+        &mut notices,
+        "lead checkout",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
+    assert!(
+        notice.contains(&format!(
+            "Mnemo ran the checks in the lead checkout (wt/mnemo at {}): 1 passed, 0 failed.",
+            &tip[..8]
+        )),
+        "{notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(worker.checks.is_empty(), "{:?}", worker.checks);
+    team.shutdown().await;
+}
+
+/// The routed-fix prompt asks for the narrowest covering tests instead of the
+/// full checks.
+#[test]
+fn route_fix_brief_asks_for_narrow_tests() {
+    let root = tempfile::tempdir().expect("workspace");
+    let mut record = worker(root.path(), "narrowfix001");
+    let routed = open_finding("finding1");
+    record.findings = vec![routed.clone()];
+    let brief = route_fix_brief(&record, &routed);
+    assert!(
+        brief.ends_with(
+            "\nCommit fixes for every finding above. Verify them with the narrowest tests that cover your change (for example the touched crate's tests or the tests the findings name), not with run_checks: Mnemo runs the full checks once at the reviewed tip. Report the commit and the tests you ran for delta review."
+        ),
+        "{brief}"
+    );
+}
+
+/// A command that exits 0 but rewrites tracked files is not a passed check:
+/// the pump's counting rule rejects it, Mnemo records it failed with the
+/// reason, and the merge gate refuses because of it.
+#[tokio::test]
+async fn team_run_checks_does_not_count_a_command_that_changes_files() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks06", &["git mv change.txt moved.txt"]).await;
+    let mut notices = team.subscribe_board();
+    let answer = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": worker_id,
+                "summary": "checked the diff",
+                "findings": [],
+                "evidence": serde_json::to_value(evidence()).expect("evidence"),
+            }),
+        )
+        .await;
+    assert!(answer.success, "{answer:?}");
+    let notice = drain_notice_within(
+        &mut notices,
+        "Mnemo ran the checks for",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run ends with a notice");
+    assert!(notice.contains("0 passed, 1 failed"), "{notice}");
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let check = worker
+        .checks
+        .iter()
+        .find(|check| check.name == "git mv change.txt moved.txt")
+        .expect("the command is recorded");
+    assert_eq!(check.status, "failed");
+    let detail = check.detail.clone().unwrap_or_default();
+    assert!(detail.starts_with("run by Mnemo: exit 0, "), "{detail}");
+    assert!(
+        detail.ends_with(", but it changed the checkout's files, so it does not count. Commit or discard the change, or fix the command."),
+        "{detail}"
+    );
+    // The command left the checkout dirty and its check is failed: the merge
+    // is refused (the dirty-tree gate answers first).
+    let refused = team
+        .handle_lead_host_tool("team_merge", json!({"worker_id": worker_id}))
+        .await;
+    assert!(!refused.success, "{refused:?}");
+    assert!(
+        refused.output.contains("the worker working tree must be clean"),
+        "{}",
+        refused.output
+    );
+    team.shutdown().await;
+}
+
+/// A turn-end proof cannot claim a checkout while Mnemo's check run measures
+/// it: the proof's edit and restore would taint what the checks see.
+#[tokio::test]
+async fn a_proof_cannot_claim_during_a_check_run() {
+    let (_root, _state, team, worker_id) = proof_fixture("proveVsChecks1").await;
+    assert!(team.check_runs.hold_for_test(&worker_id));
+    let error = team
+        .proof_ctx()
+        .spawn(&worker_id, &[proving::ProofJob::Regression])
+        .await
+        .expect_err("a proof is refused while the checks run");
+    assert_eq!(
+        error,
+        format!("Mnemo is running the checks for {worker_id}; wait for its notice.")
+    );
+    team.shutdown().await;
+}
+
+/// The run uses the configured core-operation list, like a worker session's
+/// tool: a check command that is one of them is refused, not run.
+#[tokio::test]
+async fn mnemo_check_run_refuses_a_configured_core_operation() {
+    let (_root, _state, config, team, worker_id) =
+        check_run_fixture("runChecks07", &["git --version", "git status"]).await;
+    let mut text = std::fs::read_to_string(config.path().join("config.toml")).expect("config.toml");
+    text.push_str("\n[git]\ncore_operations = [\"status\"]\n");
+    std::fs::write(config.path().join("config.toml"), text).expect("config.toml");
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    let notice = drain_notice(&mut notices, "Mnemo ran the checks for")
+        .await
+        .expect("the run ends with a notice");
+    assert!(notice.contains("1 passed, 1 failed"), "{notice}");
+    assert!(
+        notice.contains("FAIL git status (refused: core git operation)"),
+        "{notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    let check = worker
+        .checks
+        .iter()
+        .find(|check| check.name == "git status")
+        .expect("the refused command is recorded");
+    assert_eq!(check.status, "failed");
+    team.shutdown().await;
+}
+
+/// Mnemo checks only a committed tip: a checkout with uncommitted changes is
+/// refused up front, and the automatic start after a clean review says so in
+/// the review result instead of starting.
+#[tokio::test]
+async fn team_run_checks_refuses_a_dirty_checkout() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks08", &["git --version"]).await;
+    let worker = team.worker(&worker_id).await.expect("worker");
+    std::fs::write(worker.worktree.join("scratch.txt"), "uncommitted\n").expect("dirty file");
+    let sentence = format!(
+        "{worker_id}'s checkout has uncommitted changes; Mnemo checks only a committed tip. Commit or discard them first."
+    );
+    assert_eq!(
+        team.run_checks_tool(Some(&worker_id))
+            .await
+            .expect_err("a dirty checkout is refused"),
+        sentence
+    );
+    let answer = team
+        .handle_lead_host_tool(
+            "team_review",
+            json!({
+                "worker_id": worker_id,
+                "summary": "checked the diff",
+                "findings": [],
+                "evidence": serde_json::to_value(evidence()).expect("evidence"),
+            }),
+        )
+        .await;
+    assert!(answer.success, "{answer:?}");
+    assert!(answer.output.contains(&sentence), "{}", answer.output);
+    assert!(!answer.output.contains("Mnemo is running the missing checks"), "{}", answer.output);
+    team.shutdown().await;
+}
+
+/// A lead branch that moves while the lead-checkout run waits for a slot gets
+/// the moved-tip notice, with no pass claim.
+#[tokio::test]
+async fn the_lead_check_run_reports_a_moved_tip() {
+    let (root, _state, config, team, _worker_id) =
+        check_run_fixture("runChecks09", &["git --version"]).await;
+    let slots = hold_all_slots(config.path());
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(None).await.expect("the run starts");
+    run_git(
+        root.path(),
+        &["commit", "--allow-empty", "-m", "the lead moves under the run"],
+    );
+    drop(slots);
+    let notice = drain_notice_within(
+        &mut notices,
+        "while the checks ran",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the run says the lead branch moved");
+    assert!(notice.contains("the lead branch moved from "), "{notice}");
+    assert!(notice.contains("run team_run_checks again"), "{notice}");
+    assert!(!notice.contains("passed"), "{notice}");
+    assert!(!notice.contains("PASS"), "{notice}");
+    team.shutdown().await;
+}
+
+/// A check run that panics still tells the lead, records nothing, and gives
+/// the claim back, so the next request is accepted.
+#[tokio::test]
+async fn a_panicking_check_run_still_notifies() {
+    let (_root, _state, _config, team, worker_id) =
+        check_run_fixture("runChecks10", &["git --version"]).await;
+    team.check_runs
+        .panic_next
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut notices = team.subscribe_board();
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the run starts");
+    let notice = drain_notice_within(
+        &mut notices,
+        "stopped unexpectedly",
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .expect("the stopped run still sends a notice");
+    assert!(
+        notice.contains(&format!(
+            "Mnemo's check run for {worker_id} stopped unexpectedly; nothing was recorded. Run team_run_checks again."
+        )),
+        "{notice}"
+    );
+    let worker = team.worker(&worker_id).await.expect("worker");
+    assert!(worker.checks.is_empty(), "{:?}", worker.checks);
+    eventually(|| async { (!team.check_runs.is_active(&worker_id)).then_some(()) }).await;
+    team.run_checks_tool(Some(&worker_id))
+        .await
+        .expect("the claim was released, so a new run is accepted");
+    team.shutdown().await;
+}
+
+
+// --- Claude Code agent workers are observable (plan ca7f2177, step 1) -------
+
+/// A transcript with two tool_use blocks across two assistant lines, one
+/// garbage line, and usage that sums to 1125 tokens.
+const AGENT_TRANSCRIPT: &str = concat!(
+    "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"do the step\"}}\n",
+    "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":1000}}}\n",
+    "this line is not json\n",
+    "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Read\",\"input\":{}}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}}\n",
+);
+
+/// A started agent worker, a projects folder to find its transcript in, and
+/// the transcript path it will have.
+async fn agent_watch_fixture(
+    worker_id: &str,
+) -> (RoutingFixture, tempfile::TempDir, std::path::PathBuf) {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            worker_id,
+        ))
+        .await
+        .expect("the agent dispatch");
+    let projects = tempfile::tempdir().expect("projects folder");
+    fixture
+        .team
+        .agent_watch
+        .set_projects_root_for_test(projects.path().to_path_buf());
+    // The transcript path is stored canonical, so the tests compare to it.
+    let transcript = std::fs::canonicalize(projects.path())
+        .expect("canonical projects folder")
+        .join("D--proj")
+        .join("session1")
+        .join("subagents")
+        .join("agent-a1b2c3.jsonl");
+    (fixture, projects, transcript)
+}
+
+fn write_agent_transcript(path: &std::path::Path, text: &str) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("folders");
+    std::fs::write(path, text).expect("write the transcript");
+}
+
+async fn start_agent(team: &TeamRuntime, worker_id: &str, extra: serde_json::Value) -> ToolResult {
+    let mut args = serde_json::json!({"worker_id": worker_id, "agent_id": "a1b2c3"});
+    if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            args.insert(key.clone(), value.clone());
+        }
+    }
+    team.handle_lead_host_tool("team_agent_started", args).await
+}
+
+async fn status_agent(team: &TeamRuntime, worker_id: &str) -> serde_json::Value {
+    let result = team
+        .handle_lead_host_tool("team_status", serde_json::json!({"worker_id": worker_id}))
+        .await;
+    assert!(result.success, "{}", result.output);
+    let parsed: serde_json::Value = serde_json::from_str(&result.output).expect("status json");
+    parsed["result"][0]["agent"].clone()
+}
+
+fn count_notices(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    while let Ok(signal) = receiver.try_recv() {
+        if let BoardSignal::Notice { text, .. } = signal {
+            if text.contains(needle) {
+                found.push(text);
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn team_agent_started_records_the_agent_and_its_transcript() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch01").await;
+    let team = &fixture.team;
+    // The documented location is searched when no path is given; a missing
+    // file stores the id and says so.
+    let early = start_agent(team, "agentWatch01", serde_json::json!({})).await;
+    assert!(early.success, "{}", early.output);
+    assert!(early.output.contains("not found yet"), "{}", early.output);
+    let worker = team.worker("agentWatch01").await.expect("worker");
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert_eq!(worker.claude_agent_transcript, None);
+    // The file appears: a later read finds it and keeps it on the record.
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let agent = status_agent(team, "agentWatch01").await;
+    assert_eq!(agent["transcript"], transcript.to_string_lossy().as_ref());
+    let worker = team.worker("agentWatch01").await.expect("worker");
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    // A given path wins, and an unknown worker is refused.
+    let named = start_agent(
+        team,
+        "agentWatch01",
+        serde_json::json!({"transcript_path": transcript.to_string_lossy()}),
+    )
+    .await;
+    assert!(named.success, "{}", named.output);
+    assert!(named.output.contains("follows its transcript"), "{}", named.output);
+    let missing = start_agent(team, "noSuchWorker1", serde_json::json!({})).await;
+    assert!(!missing.success);
+    // The watcher runs while the registered worker works, and stops on shutdown.
+    assert!(team.agent_watch.running_for_test());
+    team.shutdown().await;
+    assert!(!team.agent_watch.running_for_test());
+}
+
+#[tokio::test]
+async fn team_status_shows_agent_activity_from_the_transcript() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch02").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch02", serde_json::json!({})).await.success);
+    let agent = status_agent(team, "agentWatch02").await;
+    assert_eq!(agent["id"], "a1b2c3");
+    assert_eq!(agent["tool_calls"], 2, "{agent}");
+    assert_eq!(agent["tokens"], 1125, "{agent}");
+    assert_eq!(agent["finished"], false);
+    assert_eq!(agent["stalled"], false);
+    assert!(agent["last_activity_ms"].as_u64().unwrap_or(0) > 0, "{agent}");
+    // Reading is incremental: a second look counts nothing twice, and an
+    // appended line counts once.
+    let again = status_agent(team, "agentWatch02").await;
+    assert_eq!(again["tool_calls"], 2);
+    let mut text = AGENT_TRANSCRIPT.to_string();
+    text.push_str("{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"Bash\",\"input\":{}}],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n");
+    write_agent_transcript(&transcript, &text);
+    let more = status_agent(team, "agentWatch02").await;
+    assert_eq!(more["tool_calls"], 3, "{more}");
+    assert_eq!(more["tokens"], 1130, "{more}");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_silent_agent_is_flagged_stalled() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch03").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch03", serde_json::json!({})).await.success);
+    let mut notices = team.subscribe_board();
+    team.agent_watch_tick().await;
+    assert!(count_notices(&mut notices, "has written nothing").is_empty());
+    assert_eq!(status_agent(team, "agentWatch03").await["stalled"], false);
+
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .expect("open")
+        .set_modified(old)
+        .expect("set mtime");
+    assert_eq!(status_agent(team, "agentWatch03").await["stalled"], true);
+    team.agent_watch_tick().await;
+    team.agent_watch_tick().await;
+    let sent = count_notices(&mut notices, "has written nothing");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("agentWatch03's Claude Code agent has written nothing for 11 minutes; it may have stalled or stopped. Check it, then continue it with SendMessage or call team_agent_done."),
+        "{}",
+        sent[0]
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_finished_agent_prompts_team_agent_done() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch04").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch04", serde_json::json!({})).await.success);
+    let mut notices = team.subscribe_board();
+    team.agent_watch_tick().await;
+    assert!(count_notices(&mut notices, "finished").is_empty());
+    std::fs::write(
+        transcript.with_extension("meta.json"),
+        "{\"agentType\":\"general-purpose\",\"finished\":true}",
+    )
+    .expect("meta");
+    assert_eq!(status_agent(team, "agentWatch04").await["finished"], true);
+    team.agent_watch_tick().await;
+    team.agent_watch_tick().await;
+    let sent = count_notices(&mut notices, "finished");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("agentWatch04's Claude Code agent finished; call team_agent_done with its report."),
+        "{}",
+        sent[0]
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_progress_lands_in_the_log_and_notifies() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentWatch05").await;
+    let team = &fixture.team;
+    let mut notices = team.subscribe_board();
+    let posted = team
+        .handle_lead_host_tool(
+            "team_progress",
+            serde_json::json!({"worker_id": "agentWatch05", "note": "  the change is in  "}),
+        )
+        .await;
+    assert!(posted.success, "{}", posted.output);
+    let worker = team.worker("agentWatch05").await.expect("worker");
+    let entry = worker.inbox.last().expect("the note is in the log");
+    assert_eq!(entry.sender, MessageSender::ClaudeAgent);
+    assert_eq!(entry.kind, InboxKind::Progress);
+    assert_eq!(entry.text, "the change is in");
+    let sent = count_notices(&mut notices, "progress:");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0], "worker_id=agentWatch05\nagentWatch05 progress: the change is in");
+    for note in ["   ".to_string(), "x".repeat(501)] {
+        let refused = team
+            .handle_lead_host_tool(
+                "team_progress",
+                serde_json::json!({"worker_id": "agentWatch05", "note": note}),
+            )
+            .await;
+        assert!(!refused.success, "{}", refused.output);
+    }
+    assert_eq!(team.worker("agentWatch05").await.expect("worker").inbox.len(), worker.inbox.len());
+    team.shutdown().await;
+}
+
+#[test]
+fn the_agent_prompt_uses_no_mnemo_tools_and_no_cd_rule() {
+    let mut record = worker(std::path::Path::new("D:/proj"), "agentWatch06");
+    record.claude_agent = Some("opus".into());
+    let prompt = super::record::agent_prompt(&record);
+    let worktree = record.worktree.display().to_string();
+    assert!(
+        prompt.contains(&format!(
+            "- You run in your own checkout of this project on branch {}; commit your work there.",
+            record.branch
+        )),
+        "{prompt}"
+    );
+    assert!(prompt.contains("- Do not use Mnemo's team_* or plan_* tools."), "{prompt}");
+    assert!(prompt.contains("- Run shell commands in the foreground."), "{prompt}");
+    // The live run (plan 4d920eec step 6) showed the agent still prefixing
+    // every command with a cd into the folder it already ran in.
+    assert!(
+        prompt.contains("- Your shell already starts in that checkout: run each command as it is, without a cd into the checkout first."),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Mnemo runs the full checks in .coding/checks.toml on your final commit."), "{prompt}");
+    for gone in ["cd \"", "Set-Location", "team_progress", "plan_show", "Work only inside"] {
+        assert!(!prompt.contains(gone), "{gone} is gone from the prompt: {prompt}");
+    }
+    assert!(!prompt.contains(&worktree), "the prompt names no folder: {prompt}");
+}
+
+// --- Audit fixes for the agent watch (plan ca7f2177, step 1) ----------------
+
+fn notice_keys(
+    receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
+    needle: &str,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    while let Ok(signal) = receiver.try_recv() {
+        if let BoardSignal::Notice { key, text } = signal {
+            if text.contains(needle) {
+                found.push(key);
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn team_agent_started_ignores_a_path_outside_claude_projects() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch07").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let outside = tempfile::tempdir().expect("outside folder");
+    let stray = outside.path().join("agent-a1b2c3.jsonl");
+    std::fs::write(&stray, AGENT_TRANSCRIPT).expect("stray file");
+    let result = start_agent(
+        team,
+        "agentWatch07",
+        serde_json::json!({"transcript_path": stray.to_string_lossy()}),
+    )
+    .await;
+    assert!(result.success, "{}", result.output);
+    assert!(result.output.contains("was ignored"), "{}", result.output);
+    let worker = team.worker("agentWatch07").await.expect("worker");
+    // The documented location is used instead.
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    // A file under the projects folder with another agent's name is ignored too.
+    let other = transcript.with_file_name("agent-zzz.jsonl");
+    std::fs::write(&other, AGENT_TRANSCRIPT).expect("other file");
+    let result = start_agent(
+        team,
+        "agentWatch07",
+        serde_json::json!({"transcript_path": other.to_string_lossy()}),
+    )
+    .await;
+    assert!(result.output.contains("was ignored"), "{}", result.output);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_replaced_transcript_resets_the_counts() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch08").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch08", serde_json::json!({})).await.success);
+    assert_eq!(status_agent(team, "agentWatch08").await["tool_calls"], 2);
+    // Same length, different content.
+    let replaced = AGENT_TRANSCRIPT.replace("tool_use", "tool_xyz");
+    assert_eq!(replaced.len(), AGENT_TRANSCRIPT.len());
+    write_agent_transcript(&transcript, &replaced);
+    let agent = status_agent(team, "agentWatch08").await;
+    assert_eq!(agent["tool_calls"], 0, "{agent}");
+    assert_eq!(agent["tokens"], 1125, "{agent}");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_partial_line_is_read_once() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch09").await;
+    let team = &fixture.team;
+    let lines: Vec<&str> = AGENT_TRANSCRIPT.lines().collect();
+    let (first, second) = (lines[1], lines[3]);
+    let cut = second.len() / 2;
+    write_agent_transcript(
+        &transcript,
+        &format!("{first}\n{}", &second[..cut]),
+    );
+    assert!(start_agent(team, "agentWatch09", serde_json::json!({})).await.success);
+    let agent = status_agent(team, "agentWatch09").await;
+    assert_eq!(agent["tool_calls"], 1, "{agent}");
+    // The unfinished half is kept, not reread.
+    assert_eq!(team.agent_watch.tail_len_for_test("agentWatch09"), Some(cut));
+    write_agent_transcript(&transcript, &format!("{first}\n{second}\n"));
+    let agent = status_agent(team, "agentWatch09").await;
+    assert_eq!(agent["tool_calls"], 2, "{agent}");
+    assert_eq!(agent["tokens"], 1125, "{agent}");
+    assert_eq!(team.agent_watch.tail_len_for_test("agentWatch09"), Some(0));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_second_finish_notifies_again() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch10").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch10", serde_json::json!({})).await.success);
+    let meta = transcript.with_extension("meta.json");
+    let mut notices = team.subscribe_board();
+    std::fs::write(&meta, "{\"finished\":true}").expect("meta");
+    team.agent_watch_tick().await;
+    let first = notice_keys(&mut notices, "finished");
+    assert_eq!(first.len(), 1, "{first:?}");
+    // The lead closed the run (a turn counted) and continued the agent.
+    team.update_worker("agentWatch10", |worker| worker.turns += 1).await;
+    std::fs::write(&meta, "{\"finished\":false}").expect("meta");
+    team.agent_watch_tick().await;
+    std::fs::write(&meta, "{\"finished\":true}").expect("meta");
+    team.agent_watch_tick().await;
+    let second = notice_keys(&mut notices, "finished");
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_ne!(first[0], second[0], "the lead pump drops a repeated key");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_progress_notes_in_one_tick_both_notify() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentWatch11").await;
+    let team = &fixture.team;
+    let mut notices = team.subscribe_board();
+    // Two notes of equal length in the same millisecond.
+    super::agent_watch::PROGRESS_CLOCK_FIXED.store(1_700_000_000_000, std::sync::atomic::Ordering::SeqCst);
+    for note in ["read the code", "made the code"] {
+        let posted = team
+            .handle_lead_host_tool(
+                "team_progress",
+                serde_json::json!({"worker_id": "agentWatch11", "note": note}),
+            )
+            .await;
+        assert!(posted.success, "{}", posted.output);
+    }
+    super::agent_watch::PROGRESS_CLOCK_FIXED.store(0, std::sync::atomic::Ordering::SeqCst);
+    let keys = notice_keys(&mut notices, "progress:");
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_ne!(keys[0], keys[1], "the lead pump drops a repeated key");
+    team.shutdown().await;
+}
+
+/// Link `link` to the folder `target`: a junction on Windows, a symlink
+/// elsewhere. `false` when the machine cannot make one.
+fn make_dir_link(link: &std::path::Path, target: &std::path::Path) -> bool {
+    let status = if std::env::consts::OS == "windows" {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+    } else {
+        std::process::Command::new("ln")
+            .arg("-s")
+            .arg(target)
+            .arg(link)
+            .output()
+    };
+    status.is_ok_and(|out| out.status.success()) && link.exists()
+}
+
+#[tokio::test]
+async fn a_link_below_the_projects_root_is_rejected() {
+    let (fixture, projects, transcript) = agent_watch_fixture("agentWatch12").await;
+    let team = &fixture.team;
+    let root = projects.path();
+    // R/link points back at R: R/link/D--proj/session1/subagents/... is the
+    // same file, one link deeper than the canonical path is.
+    let link = root.join("link");
+    if !make_dir_link(&link, root) {
+        eprintln!("skipped: this machine cannot create a directory link");
+        team.shutdown().await;
+        return;
+    }
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let through_link = link
+        .join("D--proj")
+        .join("session1")
+        .join("subagents")
+        .join("agent-a1b2c3.jsonl");
+    assert!(through_link.is_file());
+    let result = start_agent(
+        team,
+        "agentWatch12",
+        serde_json::json!({"transcript_path": through_link.to_string_lossy()}),
+    )
+    .await;
+    assert!(result.output.contains("was ignored"), "{}", result.output);
+    // The glob finds the real file; the stored path is the canonical one.
+    let worker = team.worker("agentWatch12").await.expect("worker");
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_over_cap_line_is_skipped() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch13").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, "");
+    assert!(start_agent(team, "agentWatch13", serde_json::json!({})).await.success);
+    // The first look creates the reading state; then the cap drops to 100.
+    status_agent(team, "agentWatch13").await;
+    team.agent_watch.set_line_cap_for_test("agentWatch13", 100);
+    let small = "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\"}]}}";
+    let big = format!(
+        "{{\"message\":{{\"role\":\"assistant\",\"pad\":\"{}\",\"content\":[{{\"type\":\"tool_use\"}}]}}}}",
+        "x".repeat(150)
+    );
+    assert!(small.len() <= 100 && big.len() > 100);
+    write_agent_transcript(&transcript, &format!("{small}\n{big}\n{small}\n"));
+    let agent = status_agent(team, "agentWatch13").await;
+    assert_eq!(agent["tool_calls"], 2, "the over-cap line is skipped: {agent}");
+    team.shutdown().await;
+}
+
+// --- plan e52e0be1 step 1: team_tiers, tier changes and bypass warnings ---
+
+/// A `team_dispatch` from Claude Code (the external lead) on the fixture's
+/// plan, with the given tier and model.
+async fn external_dispatch(
+    fixture: &RoutingFixture,
+    worker_id: &str,
+    tier: Option<&str>,
+    model: Option<&str>,
+) -> ToolResult {
+    let mut args = json!({
+        "worker_id": worker_id,
+        "plan_id": fixture.plan_id,
+        "step": 1,
+        "brief": "Implement the step exactly and run its focused regression tests.",
+    });
+    if let Some(tier) = tier {
+        args["tier"] = json!(tier);
+    }
+    if let Some(model) = model {
+        args["model"] = json!(model);
+    }
+    fixture
+        .team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await
+}
+
+/// The `warnings` of a dispatch result.
+fn dispatch_warnings(result: &ToolResult) -> Vec<String> {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data["warnings"].as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|line| line.as_str().map(str::to_string))
+        .collect()
+}
+
+#[tokio::test]
+async fn team_tiers_reports_models_health_and_run_as() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into(), "test/ghost".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let until = unix_ms() + 60 * 60 * 1000;
+    fixture
+        .team
+        .usage_limits()
+        .mark_model_unavailable("test/scripted-average", until);
+
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from("team_tiers", json!({}), MessageSender::ExternalLead)
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let view = answer.data.expect("team_tiers data");
+    assert_eq!(view["lead"], "claude_code", "{view}");
+    assert!(view["tiers_changed_at"].is_string(), "the usage limit is a change: {view}");
+    let tiers = view["tiers"].as_array().expect("tiers");
+    assert_eq!(
+        tiers.iter().map(|tier| tier["id"].as_str().unwrap()).collect::<Vec<_>>(),
+        ["trivial", "routine", "medium", "high", "escalate"]
+    );
+
+    let high = &tiers[3];
+    assert_eq!(
+        high["models"],
+        json!([
+            {"spec": "test/scripted-difficult", "health": "available"},
+            {"spec": "test/ghost", "health": "not configured"},
+        ])
+    );
+    assert_eq!(
+        high["run_as"],
+        json!({"kind": "claude_agent", "model": "opus", "effort": null, "applies": true})
+    );
+    assert_eq!(high["resolves_to"], json!({"tier": "high", "model": "claude-code/opus"}));
+    assert_eq!(
+        high["mnemo_resolves_to"],
+        json!({"tier": "high", "model": "test/scripted-difficult"})
+    );
+
+    let routine = &tiers[1];
+    assert_eq!(
+        routine["models"],
+        json!([{
+            "spec": "test/scripted-average",
+            "health": format!("unavailable until {} (usage limit)", routing::local_hh_mm(until)),
+        }])
+    );
+    assert_eq!(routine["run_as"], json!({"kind": "mnemo"}));
+    // Its only model is out, so a routine dispatch folds down to trivial.
+    assert_eq!(
+        routine["resolves_to"],
+        json!({"tier": "trivial", "model": "test/scripted-simple"})
+    );
+    assert!(routine.get("mnemo_resolves_to").is_none());
+
+    // With the in-app lead the agent tier still shows how it would run.
+    fixture.team.detach_external_lead();
+    let view = fixture
+        .team
+        .handle_lead_host_tool("team_tiers", json!({}))
+        .await
+        .data
+        .expect("team_tiers data");
+    assert_eq!(view["lead"], "in_app");
+    assert_eq!(view["tiers"][3]["run_as"]["applies"], false);
+    assert_eq!(
+        view["tiers"][3]["resolves_to"],
+        json!({"tier": "high", "model": "test/scripted-difficult"})
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_tier_change_is_flagged_until_the_lead_reads_team_tiers() {
+    let fixture = routing_fixture(RoutingMode::Off, None, false).await;
+    assert!(fixture.team.attach_external_lead());
+    let changed = |result: &ToolResult| {
+        dispatch_warnings(result).iter().any(|line| {
+            line.starts_with("Tiers changed at ")
+                && line.ends_with(" since you last read them; call team_tiers for the live setup.")
+        })
+    };
+
+    let first = external_dispatch(&fixture, "chgOne01", Some("routine"), None).await;
+    assert!(first.success, "{}", first.output);
+    assert!(!changed(&first), "nothing changed since the lead attached: {:?}", dispatch_warnings(&first));
+    fixture.team.stop("chgOne01").await.expect("stop");
+
+    // The same ladder again is no change.
+    fixture
+        .team
+        .set_tiers(mnemo::headless::TiersDto::from(fixture.team.tier_ladder()));
+    let same = external_dispatch(&fixture, "chgTwo01", Some("routine"), None).await;
+    assert!(same.success, "{}", same.output);
+    assert!(!changed(&same), "{:?}", dispatch_warnings(&same));
+    fixture.team.stop("chgTwo01").await.expect("stop");
+
+    // High now runs as a Claude Code agent: the setup changed.
+    let mut dto = mnemo::headless::TiersDto::from(fixture.team.tier_ladder());
+    dto.tiers[3].claude_agent = Some("opus".into());
+    fixture.team.set_tiers(dto);
+    let second = external_dispatch(&fixture, "chgThree1", Some("routine"), None).await;
+    assert!(second.success, "{}", second.output);
+    assert!(changed(&second), "{:?}", dispatch_warnings(&second));
+    fixture.team.stop("chgThree1").await.expect("stop");
+
+    // Reading team_tiers clears it.
+    let read = fixture
+        .team
+        .handle_lead_host_tool_from("team_tiers", json!({}), MessageSender::ExternalLead)
+        .await;
+    assert!(read.success, "{}", read.output);
+    let third = external_dispatch(&fixture, "chgFour01", Some("routine"), None).await;
+    assert!(third.success, "{}", third.output);
+    assert!(!changed(&third), "{:?}", dispatch_warnings(&third));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn pinned_model_on_an_agent_tier_warns() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let warning = "model test/scripted-difficult bypasses tier high's Claude Code agent (opus); dispatch by tier to use the agent.";
+
+    // (a) The tier runs as an agent and the lead pins a model on it.
+    let pinned = external_dispatch(
+        &fixture,
+        "bypOne01",
+        Some("high"),
+        Some("test/scripted-difficult"),
+    )
+    .await;
+    assert!(pinned.success, "{}", pinned.output);
+    assert!(
+        dispatch_warnings(&pinned).iter().any(|line| line == warning),
+        "{:?}",
+        dispatch_warnings(&pinned)
+    );
+    let data = pinned.data.clone().expect("dispatch data");
+    assert!(data["claude_agent"].is_null(), "a pinned model starts a Mnemo worker: {data}");
+    let worker = fixture.team.worker("bypOne01").await.expect("worker");
+    assert!(worker.claude_agent.is_none());
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    fixture.team.stop("bypOne01").await.expect("stop");
+
+    // (b) No tier: the model is listed in a tier that runs as an agent.
+    let untiered =
+        external_dispatch(&fixture, "bypTwo01", None, Some("test/scripted-difficult")).await;
+    assert!(untiered.success, "{}", untiered.output);
+    assert!(
+        dispatch_warnings(&untiered).iter().any(|line| line == warning),
+        "{:?}",
+        dispatch_warnings(&untiered)
+    );
+    assert!(fixture
+        .team
+        .worker("bypTwo01")
+        .await
+        .expect("worker")
+        .claude_agent
+        .is_none());
+    fixture.team.stop("bypTwo01").await.expect("stop");
+
+    // A model on a tier without an agent is no bypass.
+    let plain = external_dispatch(
+        &fixture,
+        "bypThree1",
+        Some("routine"),
+        Some("test/scripted-average"),
+    )
+    .await;
+    assert!(plain.success, "{}", plain.output);
+    assert!(
+        dispatch_warnings(&plain).iter().all(|line| !line.contains("bypasses tier")),
+        "{:?}",
+        dispatch_warnings(&plain)
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn laya_label_on_an_agent_tier_notifies_the_pinned_dispatch() {
+    let fixture = agent_fixture(
+        RoutingMode::Shadow,
+        routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.9),
+        true,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let result = external_dispatch(
+        &fixture,
+        "layaBypass01",
+        Some("routine"),
+        Some("test/scripted-average"),
+    )
+    .await;
+    assert!(result.success, "{}", result.output);
+    let routing = wait_laya_label(&fixture.team, "layaBypass01").await;
+    assert_eq!(routing.laya_tier.as_deref(), Some("high"));
+    let expected = "Laya reads layaBypass01's step as high, which runs as a Claude Code agent (opus); the pinned model test/scripted-average bypassed it.";
+    let notices = || {
+        fixture
+            .team
+            .peek_external_notices()
+            .into_iter()
+            .filter(|notice| notice.contains(expected))
+            .count()
+    };
+    eventually(|| async { (notices() == 1).then_some(()) }).await;
+
+    // At most once per worker.
+    fixture
+        .team
+        .notice_laya_bypass("layaBypass01", "high", "test/scripted-average");
+    assert_eq!(notices(), 1);
+    fixture.team.shutdown().await;
+}
+
+// --- plan e52e0be1 step 3: a move onto an agent tier hands the step to the lead's agent ---
+
+/// The continuation paragraph an agent block's prompt ends with.
+fn continuation(previous: &str, base: &str) -> String {
+    format!(
+        "A Mnemo worker on {previous} already worked on this step in this checkout. Before you change anything, run git status, git log --oneline {base}..HEAD and git diff to see where it stopped, then finish the step."
+    )
+}
+
+#[tokio::test]
+async fn resume_onto_an_agent_tier_returns_a_claude_agent_block() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let started = external_dispatch(&fixture, "handOne01", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    let before = fixture.team.worker("handOne01").await.expect("worker");
+    assert!(before.claude_agent.is_none(), "routine runs a Mnemo worker");
+    let previous = super::record::session_model_spec(&before).to_string();
+    let base = before.base_commit.clone().expect("the dispatch records its base");
+
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "handOne01", "tier": "high"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let data = answer.data.clone().expect("resume data");
+    let block = &data["claude_agent"];
+    assert_eq!(block["model"], "opus", "{data}");
+    assert_eq!(block["branch"], json!(before.branch));
+    let prompt = block["prompt"].as_str().expect("prompt");
+    assert!(prompt.ends_with(&continuation(&previous, &base)), "{prompt}");
+    assert!(prompt.contains("This step runs as a Claude Code agent"), "{prompt}");
+    let output: Value = serde_json::from_str(answer.output.lines().next().unwrap()).expect("json");
+    assert_eq!(output["result"]["claude_agent"], *block);
+
+    let worker = fixture.team.worker("handOne01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(worker.tier.as_deref(), Some("high"));
+    assert_eq!(worker.branch, before.branch);
+    assert_eq!(worker.worktree, before.worktree);
+    assert!(!fixture.team.live.lock().await.contains_key("handOne01"), "no Mnemo session");
+    assert!(matches!(
+        worker.reroutes.last(),
+        Some(DispatchRoutingRow::LeadReroute { to_tier, to_model, nudged: false, .. })
+            if to_tier == "high" && to_model.as_deref() == Some("claude-code/opus")
+    ));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_escalation_onto_an_agent_tier_notifies_the_lead_with_a_block() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let started = external_dispatch(&fixture, "handTwo01", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handTwo01").await.expect("stop");
+    let before = fixture.team.worker("handTwo01").await.expect("worker");
+    let previous = super::record::session_model_spec(&before).to_string();
+    let base = before.base_commit.clone().expect("base");
+    fixture
+        .team
+        .update_worker("handTwo01", |worker| {
+            worker.routing = Some(WorkerRouting {
+                laya_tier: None,
+                confidence: None,
+                cleared: false,
+                lead_tier: Some("routine".into()),
+                routed_by: "lead".into(),
+                ran_tier: Some("routine".into()),
+                nudged: Some("high".into()),
+            });
+        })
+        .await;
+    let mut notices = fixture.team.signals.subscribe();
+
+    assert!(fixture.team.auto_escalate_worker("handTwo01").await.expect("escalate"));
+    let notice = drain_notice(
+        &mut notices,
+        "handTwo01 moved to tier high, which runs as a Claude Code agent: launch your Agent with this block, then call team_agent_done.",
+    )
+    .await
+    .expect("the hand-off notice");
+    let block: Value =
+        serde_json::from_str(notice.lines().last().expect("block line")).expect("block json");
+    assert_eq!(block["model"], "opus");
+    assert!(
+        block["prompt"].as_str().unwrap().ends_with(&continuation(&previous, &base)),
+        "{block}"
+    );
+
+    let worker = fixture.team.worker("handTwo01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(worker.routing.as_ref().and_then(|r| r.nudged.as_deref()), None);
+    assert!(matches!(
+        worker.reroutes.last(),
+        Some(DispatchRoutingRow::LeadReroute { to_tier, nudged: true, .. }) if to_tier == "high"
+    ));
+    // A second try finds nothing left to hand over.
+    assert!(!fixture.team.auto_escalate_worker("handTwo01").await.expect("again"));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn without_an_external_lead_resume_switches_models() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    let started = fixture
+        .team
+        .handle_lead_host_tool(
+            "team_dispatch",
+            json!({
+                "worker_id": "handThree1",
+                "plan_id": fixture.plan_id,
+                "step": 1,
+                "tier": "routine",
+                "brief": "Implement the step exactly and run its focused regression tests.",
+            }),
+        )
+        .await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handThree1").await.expect("stop");
+
+    let answer = fixture
+        .team
+        .handle_lead_host_tool("team_resume", json!({"worker_id": "handThree1", "tier": "high"}))
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert!(!answer.data.as_ref().expect("data")["claude_agent"].is_object());
+    assert!(!answer.output.contains("runs as a Claude Code agent"), "{}", answer.output);
+    let worker = fixture.team.worker("handThree1").await.expect("worker");
+    assert!(worker.claude_agent.is_none());
+    assert_eq!(worker.model.as_deref(), Some("test/scripted-difficult"));
+    assert_eq!(worker.tier.as_deref(), Some("high"));
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn audits_never_move_to_an_agent() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    let started = external_dispatch(&fixture, "handFour1", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handFour1").await.expect("stop");
+    let implementation = fixture.team.worker("handFour1").await.expect("worker");
+    assert!(fixture.team.agent_handoff_target(&implementation, "high").is_some());
+
+    fixture
+        .team
+        .update_worker("handFour1", |worker| worker.kind = "audit".into())
+        .await;
+    let audit = fixture.team.worker("handFour1").await.expect("worker");
+    assert!(fixture.team.agent_handoff_target(&audit, "high").is_none());
+    let handed = {
+        let _guard = fixture.team.merge_lock.lock().await;
+        fixture
+            .team
+            .hand_to_agent_locked("handFour1", "high", ChangeSource::Lead)
+            .await
+            .expect("no error")
+    };
+    assert!(handed.is_none());
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "handFour1", "tier": "high"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(
+        answer.data.as_ref().is_none_or(|data| !data["claude_agent"].is_object()),
+        "{}",
+        answer.output
+    );
+    assert!(fixture.team.worker("handFour1").await.expect("worker").claude_agent.is_none());
+    fixture.team.shutdown().await;
+}
+
+// --- plan ca7f2177 step 2: lifecycle tools speak agent ---
+
+/// `team_route_fix` from Claude Code on `finding_id`, after the worker's
+/// first run closed and its review left that finding open.
+async fn route_agent_fix(team: &TeamRuntime, worker_id: &str, finding_id: &str) -> ToolResult {
+    team.agent_done(worker_id, "first run done".into(), false)
+        .await
+        .expect("the first run closes");
+    team.update_worker(worker_id, |worker| {
+        worker.status = WorkerStatus::InReview;
+        worker.findings.push(open_finding(finding_id));
+        worker.review_rounds = 1;
+    })
+    .await;
+    team.handle_lead_host_tool_from(
+        "team_route_fix",
+        json!({"worker_id": worker_id, "finding_id": finding_id}),
+        MessageSender::ExternalLead,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn team_message_on_an_agent_worker_returns_the_sendmessage_instruction() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentMsg01").await;
+    let team = &fixture.team;
+    team.agent_done("agentMsg01", "first run done".into(), false)
+        .await
+        .expect("the first run closes");
+
+    // No agent is registered: start a new one with the message.
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "agentMsg01", "text": "Also add the doc comment."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let worker = team.worker("agentMsg01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert!(
+        answer.output.contains(
+            "No agent is registered for agentMsg01: start a new Agent with isolation \"worktree\" and this message; Mnemo hands it this worker's checkout and registers it."
+        ),
+        "{}",
+        answer.output
+    );
+    assert_eq!(
+        answer.data.expect("data")["continue_agent"],
+        json!({"agent_id": null, "worktree": worker.worktree, "message": "Also add the doc comment."})
+    );
+    let entry = worker.inbox.last().expect("the inbox entry");
+    assert_eq!(entry.sender, MessageSender::ExternalLead);
+    assert_eq!(entry.text, "Also add the doc comment.");
+    assert!(!team.live.lock().await.contains_key("agentMsg01"), "no session starts");
+
+    // A registered agent: continue it with SendMessage.
+    let started = start_agent(team, "agentMsg01", json!({})).await;
+    assert!(started.success, "{}", started.output);
+    team.agent_done("agentMsg01", "second run done".into(), false)
+        .await
+        .expect("the second run closes");
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "agentMsg01", "text": "Run the tests again."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert!(
+        answer.output.ends_with(
+            "Continue agentMsg01's Claude Code agent with SendMessage to a1b2c3, sending the message below; call team_agent_done when it finishes.\n\nRun the tests again."
+        ),
+        "{}",
+        answer.output
+    );
+    assert_eq!(answer.data.expect("data")["continue_agent"]["agent_id"], "a1b2c3");
+
+    // The in-app lead has no agent to continue: it is still refused.
+    let refused = team
+        .handle_lead_host_tool(
+            "team_message",
+            json!({"worker_id": "agentMsg01", "text": "From the in-app lead."}),
+        )
+        .await;
+    assert!(!refused.success, "{}", refused.output);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_route_fix_on_an_agent_worker_records_the_round_and_returns_the_fix_text() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentFix01").await;
+    let team = &fixture.team;
+    let answer = route_agent_fix(team, "agentFix01", "fixMe01").await;
+    assert!(answer.success, "{}", answer.output);
+
+    let worker = team.worker("agentFix01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Fixing);
+    assert_eq!(worker.fixer_finding_id.as_deref(), Some("fixMe01"));
+    assert_eq!(worker.fix_rounds, 1);
+    assert_eq!(worker.review_rounds, 1);
+    assert!(worker.checks.is_empty());
+    assert!(worker.review.is_none());
+    let entry = worker.inbox.last().expect("the fix brief");
+    assert_eq!(entry.sender, MessageSender::Mnemo);
+    assert_eq!(entry.kind, InboxKind::Fix);
+    assert!(entry.text.contains("the unchecked path"), "{}", entry.text);
+    let block = &answer.data.as_ref().expect("data")["continue_agent"];
+    assert_eq!(block["message"], json!(entry.text));
+    assert!(
+        answer.output.contains("No agent is registered for agentFix01"),
+        "{}",
+        answer.output
+    );
+    assert!(answer.output.ends_with(&entry.text), "{}", answer.output);
+    assert!(!team.live.lock().await.contains_key("agentFix01"), "no session starts");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_agent_done_closes_a_fix_round() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentFix02").await;
+    let team = &fixture.team;
+    let answer = route_agent_fix(team, "agentFix02", "fixMe02").await;
+    assert!(answer.success, "{}", answer.output);
+    let turns = team.worker("agentFix02").await.expect("worker").turns;
+
+    let closed = team
+        .agent_done("agentFix02", "fixed at abc1234".into(), false)
+        .await
+        .expect("the fix round closes");
+    assert_eq!(closed.status, WorkerStatus::Completed);
+    assert_eq!(closed.fixer_finding_id, None);
+    assert_eq!(closed.turns, turns + 1);
+    assert_eq!(closed.report.as_deref(), Some("fixed at abc1234"));
+    // Once per run: a closed worker cannot be closed again.
+    assert!(team.agent_done("agentFix02", "again".into(), false).await.is_err());
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn gate_allows_agents_while_an_agent_worker_fixes() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentGate1").await;
+    let team = &fixture.team;
+    team.agent_done("agentGate1", "first run done".into(), false)
+        .await
+        .expect("the first run closes");
+    assert_eq!(team.claude_agent_working().await, None, "nothing runs while it is reviewed");
+    team.update_worker("agentGate1", |worker| {
+        worker.status = WorkerStatus::InReview;
+        worker.findings.push(open_finding("gateFix1"));
+    })
+    .await;
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_route_fix",
+            json!({"worker_id": "agentGate1", "finding_id": "gateFix1"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert_eq!(
+        team.claude_agent_working().await,
+        Some(("agentGate1".to_string(), "high".to_string()))
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn resume_and_compact_still_refuse_agent_workers_with_guidance() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentRes01").await;
+    let team = &fixture.team;
+    team.agent_done("agentRes01", "done".into(), false)
+        .await
+        .expect("the run closes");
+    let guidance = "agentRes01 runs as a Claude Code agent: Mnemo can't resume or compact it. Continue it with team_message (which gives you the SendMessage instruction) or start a new Agent.";
+    for (tool, args) in [
+        ("team_resume", json!({"worker_id": "agentRes01"})),
+        ("team_resume", json!({"worker_id": "agentRes01", "tier": "routine"})),
+        ("team_compact", json!({"worker_id": "agentRes01"})),
+    ] {
+        let answer = team
+            .handle_lead_host_tool_from(tool, args, MessageSender::ExternalLead)
+            .await;
+        assert!(!answer.success, "{tool}: {}", answer.output);
+        assert!(answer.output.contains(guidance), "{tool}: {}", answer.output);
+    }
+    team.shutdown().await;
+}
+
+// --- plan ca7f2177 step 3: team_integrate ---
+
+/// A branch `name` off the lead checkout's HEAD with one commit writing
+/// `file`; the lead checkout is back on its own branch afterwards.
+fn side_branch(root: &std::path::Path, name: &str, file: &str, text: &str) -> String {
+    run_git(root, &["checkout", "-q", "-b", name]);
+    std::fs::write(root.join(file), text).expect("side file");
+    run_git(root, &["add", file]);
+    run_git(root, &["commit", "-q", "-m", &format!("{name} work")]);
+    let tip = git_stdout(root, &["rev-parse", "HEAD"]);
+    run_git(root, &["checkout", "-q", "-"]);
+    tip
+}
+
+async fn integrate(fixture: &RoutingFixture, branch: &str) -> ToolResult {
+    fixture
+        .team
+        .handle_lead_host_tool(
+            "team_integrate",
+            json!({"worker_id": "routingworker", "branch": branch}),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn team_integrate_merges_a_branch_into_the_worker() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    side_branch(root, "side", "side.txt", "from the side\n");
+
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.success, "{}", answer.output);
+    let tip = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    assert!(settled.worktree.join("side.txt").is_file());
+    assert_eq!(
+        git_stdout(&settled.worktree, &["log", "-1", "--format=%s"]),
+        format!("integrate side into {} (team_integrate)", settled.branch)
+    );
+    let parents = git_stdout(&settled.worktree, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 3, "a merge commit: {parents}");
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(record.integrations.len(), 1);
+    assert_eq!(record.integrations[0].branch, "side");
+    assert_eq!(record.integrations[0].commit, tip);
+    assert_eq!(
+        record.integration_note.as_deref(),
+        Some(
+            format!(
+                "[From Mnemo2] Mnemo merged side into your branch at {}; read git log -1 --stat to see what came in.",
+                &tip[..8]
+            )
+            .as_str()
+        )
+    );
+    assert!(
+        answer.output.contains(&format!("Merged side into routingworker at {}", &tip[..8])),
+        "{}",
+        answer.output
+    );
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_integrate_reports_conflicts_and_changes_nothing() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    std::fs::write(settled.worktree.join("README.md"), "the worker's readme\n").expect("edit");
+    run_git(&settled.worktree, &["add", "README.md"]);
+    run_git(&settled.worktree, &["commit", "-q", "-m", "worker readme"]);
+    let before = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+    side_branch(root, "rival", "README.md", "the rival readme\n");
+
+    let answer = integrate(&fixture, "rival").await;
+    assert!(!answer.success, "{}", answer.output);
+    assert!(
+        answer
+            .output
+            .contains("merging rival into routingworker conflicts in: README.md; nothing changed."),
+        "{}",
+        answer.output
+    );
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git_stdout(&settled.worktree, &["status", "--porcelain"]), "");
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert!(record.integrations.is_empty());
+    assert!(record.integration_note.is_none());
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_integrate_refuses_a_busy_or_dirty_worker() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    side_branch(root, "side", "side.txt", "from the side\n");
+    let before = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+
+    // Busy: its turn has not ended.
+    let busy = fixture
+        .team
+        .live
+        .lock()
+        .await
+        .get("routingworker")
+        .expect("live worker")
+        .busy
+        .clone();
+    busy.store(true, std::sync::atomic::Ordering::SeqCst);
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.output.contains("routingworker is busy"), "{}", answer.output);
+    busy.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Dirty: an uncommitted change in its checkout.
+    std::fs::write(settled.worktree.join("scratch.txt"), "uncommitted\n").expect("dirty");
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.output.contains("uncommitted changes"), "{}", answer.output);
+    std::fs::remove_file(settled.worktree.join("scratch.txt")).expect("clean again");
+
+    // Its own branch, and a branch that does not exist.
+    let answer = integrate(&fixture, &settled.branch).await;
+    assert!(answer.output.contains("own branch"), "{}", answer.output);
+    let answer = integrate(&fixture, "no-such-branch").await;
+    assert!(
+        answer.output.contains("there is no local branch named no-such-branch"),
+        "{}",
+        answer.output
+    );
+    assert_eq!(git_stdout(&settled.worktree, &["rev-parse", "HEAD"]), before);
+    assert!(fixture.team.worker("routingworker").await.expect("record").integrations.is_empty());
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_next_prompt_names_the_integration() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    side_branch(root, "side", "side.txt", "from the side\n");
+    let answer = integrate(&fixture, "side").await;
+    assert!(answer.success, "{}", answer.output);
+    let tip = git_stdout(&settled.worktree, &["rev-parse", "HEAD"]);
+
+    fixture
+        .team
+        .message("routingworker", "carry on".to_string(), MessageSender::Lead)
+        .await
+        .expect("message the worker");
+    let expected = format!(
+        "[From Mnemo2] Mnemo merged side into your branch at {}; read git log -1 --stat to see what came in.",
+        &tip[..8]
+    );
+    eventually(|| async {
+        transcript_text(&fixture.team, "routingworker")
+            .await
+            .contains(&expected)
+            .then_some(())
+    })
+    .await;
+    let record = fixture.team.worker("routingworker").await.expect("record");
+    assert!(record.integration_note.is_none(), "the note is consumed");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn integrating_the_lead_branch_clears_stale_base() {
+    let (fixture, _notices) = nudge_fixture(Vec::new()).await;
+    let root = fixture._root.path();
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    let settled = wait_worker_settled(&fixture.team, "routingworker").await;
+    std::fs::write(settled.worktree.join("work.txt"), "work\n").expect("worker file");
+    run_git(&settled.worktree, &["add", "work.txt"]);
+    run_git(&settled.worktree, &["commit", "-q", "-m", "worker commit"]);
+    lead_commit(root, "lead.txt", "lead moves on");
+    let worker = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(fixture.team.stale_base(&worker).await, Some(1));
+
+    let lead = git_stdout(root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let answer = integrate(&fixture, &lead).await;
+    assert!(answer.success, "{}", answer.output);
+    let worker = fixture.team.worker("routingworker").await.expect("record");
+    assert_eq!(fixture.team.stale_base(&worker).await, None);
+    assert!(settled.worktree.join("lead.txt").is_file());
+    fixture.team.shutdown().await;
+}
+
+// --- plan 4d920eec step 2: the WorktreeCreate hook's claim ---
+
+#[tokio::test]
+async fn worktree_claim_hands_the_waiting_agent_worker_its_pool() {
+    let (fixture, projects, transcript) = agent_watch_fixture("claimOne01").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let lead_transcript = std::fs::canonicalize(projects.path())
+        .expect("canonical projects folder")
+        .join("D--proj")
+        .join("session1.jsonl");
+    let before = team.worker("claimOne01").await.expect("worker");
+    assert!(before.claude_agent_id.is_none(), "the agent is not launched yet");
+
+    let claimed = team
+        .claim_agent_checkout("agent-a1b2c3", Some(&lead_transcript.to_string_lossy()))
+        .await
+        .expect("the claim");
+    assert_eq!(claimed, Some((before.worktree.clone(), "claimOne01".to_string())));
+    let worker = team.worker("claimOne01").await.expect("worker");
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    let agent = status_agent(team, "claimOne01").await;
+    assert_eq!(agent["tool_calls"], 2, "Mnemo follows the agent's transcript: {agent}");
+
+    // The worker no longer waits: the next isolated agent is not Mnemo work.
+    assert_eq!(
+        team.claim_agent_checkout("agent-ffff01", None).await.expect("second claim"),
+        None
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn worktree_claim_without_a_waiting_worker_falls_back() {
+    let fixture = agent_fixture(
+        RoutingMode::Off,
+        None,
+        false,
+        "opus",
+        vec!["test/scripted-difficult".into()],
+    )
+    .await;
+    assert!(fixture.team.attach_external_lead());
+    assert_eq!(
+        fixture.team.claim_agent_checkout("agent-a1b2c3", None).await.expect("claim"),
+        None
+    );
+    // A malformed name is never Mnemo's either.
+    assert_eq!(
+        fixture.team.claim_agent_checkout("../escape", None).await.expect("claim"),
+        None
+    );
+    fixture.team.shutdown().await;
+}
+
+// --- plan 4d920eec step 3: dispatch rules and the agent block ---
+
+#[tokio::test]
+async fn a_second_waiting_agent_dispatch_is_refused() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    let (first, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "the first agent step", "waitOne01"))
+        .await
+        .expect("the first agent dispatch");
+    assert!(first.claude_agent.is_some());
+    let refused = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "the second agent step", "waitTwo01"))
+        .await
+        .expect_err("a second waiting agent is refused");
+    assert_eq!(
+        refused,
+        "waitOne01 is waiting for its agent: launch it (Agent with isolation \"worktree\") before dispatching another agent step."
+    );
+    // Once the first agent is launched (registered), the next dispatch goes through.
+    fixture
+        .team
+        .update_worker("waitOne01", |worker| worker.claude_agent_id = Some("a1".into()))
+        .await;
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "the second agent step", "waitTwo01"))
+        .await
+        .expect("the second agent dispatch after the first launch");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_workers_are_capped_at_three() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    fixture.team.persistence.slots.store(8, std::sync::atomic::Ordering::SeqCst);
+    for (index, id) in ["capOne01", "capTwo01", "capThree1"].iter().enumerate() {
+        fixture
+            .team
+            .dispatch_request(agent_dispatch_request(&fixture.plan_id, &format!("agent step {index}"), id))
+            .await
+            .expect("an agent dispatch under the cap");
+        fixture
+            .team
+            .update_worker(id, |worker| worker.claude_agent_id = Some(format!("agent{index}")))
+            .await;
+    }
+    let refused = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "agent step 3", "capFour01"))
+        .await
+        .expect_err("a fourth running agent worker is refused");
+    assert_eq!(
+        refused,
+        "3 Claude Code agent workers are already running (capOne01, capTwo01, capThree1); wait for one to finish (team_agent_done) before starting another."
+    );
+    fixture
+        .team
+        .agent_done("capOne01", "done".into(), false)
+        .await
+        .expect("one finishes");
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "agent step 3", "capFour01"))
+        .await
+        .expect("room again after one finished");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_agent_block_asks_for_worktree_isolation() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    let (record, _, _) = fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "an agent step", "isoBlock01"))
+        .await
+        .expect("the agent dispatch");
+    let block = claude_agent_block(&record).expect("the agent block");
+    assert_eq!(block["isolation"], "worktree", "{block}");
+    assert_eq!(block["model"], "opus");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_hand_off_counts_toward_the_waiting_rule() {
+    let fixture = agent_fixture(RoutingMode::Off, None, false, "opus", vec!["test/scripted-difficult".into()]).await;
+    assert!(fixture.team.attach_external_lead());
+    fixture
+        .team
+        .dispatch_request(agent_dispatch_request(&fixture.plan_id, "an agent step", "handWait01"))
+        .await
+        .expect("an agent worker waiting for its launch");
+    let started = external_dispatch(&fixture, "handMove01", Some("routine"), None).await;
+    assert!(started.success, "{}", started.output);
+    fixture.team.stop("handMove01").await.expect("stop");
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "handMove01", "tier": "high"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!answer.success, "{}", answer.output);
+    assert!(answer.output.contains("handWait01 is waiting for its agent"), "{}", answer.output);
+    let worker = fixture.team.worker("handMove01").await.expect("worker");
+    assert!(worker.claude_agent.is_none(), "the refused hand-off changed nothing");
+    fixture.team.shutdown().await;
+}
+
+// --- plan 4d920eec step 4: pools return when no worker needs them ---
+
+/// A routine Mnemo worker, stopped, in its pool checkout.
+async fn stopped_pool_worker() -> (RoutingFixture, std::path::PathBuf) {
+    let fixture = routing_fixture(RoutingMode::Off, None, false).await;
+    let result = fixture.dispatch(Some("routine"), None).await;
+    assert!(result.success, "{}", result.output);
+    fixture.team.stop("routingworker").await.expect("stop");
+    let worktree = fixture.team.worker("routingworker").await.expect("worker").worktree;
+    assert!(mnemo::app::worktrees::is_pool_checkout(&worktree), "{}", worktree.display());
+    (fixture, worktree)
+}
+
+#[tokio::test]
+async fn a_reported_audit_releases_its_pool() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    fixture
+        .team
+        .update_worker("routingworker", |worker| {
+            worker.kind = "audit".into();
+            worker.report_delivered = true;
+            worker.report = Some("no findings".into());
+        })
+        .await;
+    fixture.team.release_idle_checkouts().await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert!(worker.worktree.as_os_str().is_empty(), "the record no longer holds the pool");
+    assert_eq!(worker.report.as_deref(), Some("no findings"), "the report stays");
+    assert!(pool.join(".git").exists(), "the pool folder stays for reuse");
+    assert_eq!(git_stdout(&pool, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stopped_worker_on_a_done_step_releases_its_pool() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    let board = fixture.team.board().expect("board");
+    board.tick(&fixture.plan_id, 0, "done by the lead").expect("tick");
+    fixture.team.release_idle_checkouts().await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert!(worker.worktree.as_os_str().is_empty());
+    assert!(pool.join(".git").exists());
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stopped_worker_on_an_open_step_keeps_its_pool() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    fixture.team.release_idle_checkouts().await;
+    let worker = fixture.team.worker("routingworker").await.expect("worker");
+    assert_eq!(worker.worktree, pool, "it may still be resumed");
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_released_audit_pool_is_reused_warm() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    let root = fixture._root.path().to_path_buf();
+    let exclude = root.join(".git").join("info").join("exclude");
+    let mut ignored = std::fs::read_to_string(&exclude).unwrap_or_default();
+    ignored.push_str("\ntarget/\n");
+    std::fs::write(&exclude, ignored).expect("ignore target/");
+    std::fs::create_dir_all(pool.join("target")).expect("target");
+    std::fs::write(pool.join("target").join("WARM_MARKER"), "warm\n").expect("marker");
+    fixture
+        .team
+        .update_worker("routingworker", |worker| {
+            worker.kind = "audit".into();
+            worker.report_delivered = true;
+        })
+        .await;
+
+    let next = external_dispatch(&fixture, "warmNext01", Some("routine"), None).await;
+    assert!(next.success, "{}", next.output);
+    let worker = fixture.team.worker("warmNext01").await.expect("worker");
+    assert_eq!(worker.worktree, pool, "the next dispatch reuses the released pool");
+    assert!(pool.join("target").join("WARM_MARKER").exists(), "with its build output");
+    fixture.team.shutdown().await;
 }

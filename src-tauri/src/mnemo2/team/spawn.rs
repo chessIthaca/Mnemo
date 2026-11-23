@@ -28,7 +28,7 @@ use super::dispatch::PlanRef;
 use super::guardrails::guardrails_for;
 use super::nudge::NUDGE_STRIKE_LIMIT;
 use super::record::{kickoff_message, note_model, session_model_spec, WorkerRecord, WorkerStatus};
-use super::routing::{logs_label, outcome_row};
+use super::routing::{logs_label, outcome_row, ClaudeAgentDispatch};
 use super::pump::pump_worker;
 use super::{LiveWorker, TeamRuntime};
 
@@ -107,6 +107,11 @@ impl TeamRuntime {
         model: &Option<String>,
         reasoning_effort: &Option<String>,
     ) -> Result<(), String> {
+        // A model a usage limit took out is still configured: say why it is
+        // refused instead of calling it unknown.
+        if let Some(refusal) = model.as_deref().and_then(|spec| self.usage_limits.refusal(spec)) {
+            return Err(refusal);
+        }
         let models = self.current_models();
         let configured = match model {
             Some(spec) => Some(
@@ -179,6 +184,7 @@ impl TeamRuntime {
         };
         let millis = phase3::now_ms();
         let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
+        self.release_idle_checkouts().await;
         let held = self.held_checkouts().await;
         let (worktree, branch) = provision_agent_checkout(
             self.workspace_root.clone(),
@@ -233,6 +239,7 @@ impl TeamRuntime {
             audit_target: None,
             audit_tip: None,
             report_delivered: false,
+            report: None,
             findings: Vec::new(),
 
             fixer_finding_id: None,
@@ -242,6 +249,13 @@ impl TeamRuntime {
             plan_id: plan.as_ref().map(|plan| plan.plan_id.clone()),
             plan_step: plan.map(|plan| plan.step),
             tier,
+            claude_agent: None,
+            claude_agent_effort: None,
+            claude_agent_id: None,
+            claude_agent_transcript: None,
+            integrations: Vec::new(),
+            integration_note: None,
+            base_commit: Some(base_tip.clone()),
             routing: None,
             reroutes: Vec::new(),
         };
@@ -274,8 +288,41 @@ impl TeamRuntime {
         Ok(record)
     }
 
+    /// Hand a provisioned step to the lead's own Claude Code agent instead of
+    /// a Mnemo session: the record claims the Claude Code model and the
+    /// settled tier, goes `Working` with its brief already handed over, and
+    /// no live session exists — the lead runs its own agent on the prompt
+    /// in the dispatch answer, and `team_agent_done` closes the worker.
+    pub(super) async fn start_agent_worker(
+        &self,
+        mut record: WorkerRecord,
+        agent: ClaudeAgentDispatch,
+    ) -> Result<WorkerRecord, String> {
+        let model = format!("claude-code/{}", agent.model);
+        record.claude_agent = Some(agent.model);
+        record.claude_agent_effort = agent.effort;
+        record.tier = Some(agent.tier);
+        record.status = WorkerStatus::Working;
+        record.brief_sent = true;
+        record.compacting = false;
+        note_model(&mut record, &model);
+        self.update_worker(&record.id, |worker| {
+            worker.claude_agent = record.claude_agent.clone();
+            worker.claude_agent_effort = record.claude_agent_effort.clone();
+            worker.tier = record.tier.clone();
+            worker.status = WorkerStatus::Working;
+            worker.brief_sent = true;
+            worker.compacting = false;
+            note_model(worker, &model);
+        })
+        .await;
+        self.persist().await?;
+        Ok(record)
+    }
+
+
     pub(super) async fn start_worker(&self, record: WorkerRecord) -> Result<WorkerRecord, String> {
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
             return Err(format!("all {slots} worker slots are busy"));
@@ -353,6 +400,7 @@ impl TeamRuntime {
             self.fail_next_close.clone(),
             self.board(),
             self.proof_ctx(),
+            self.usage_limits(),
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {

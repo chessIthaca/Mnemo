@@ -1268,6 +1268,15 @@ function leadChat(): AppState {
   return {
     ...state,
     route: "lead",
+    // The status line under the composer: the code index rebuilding with the
+    // memory re-embed an embedding-model change started beside it.
+    indexing: {
+      revision: 1,
+      firstRun: false,
+      code: { state: "running", done: 1200, total: 2400, detail: null },
+      memory: null,
+      embeddings: { state: "running", done: 3200, total: 12444, detail: null },
+    },
     leadEntries: [...state.leadEntries, ...extra],
     selectedWorkerId: null,
     workerPanelId: null,
@@ -2099,7 +2108,8 @@ function memoryTab(): AppState {
 /** The lead chat with the tool-row bodies: named-file headlines, the expanded
  *  edit row showing its coloured diff, a replayed multi_edit rebuilt from
  *  its arguments, a write's added lines, the read row's file-and-range list,
- *  and the shell's command with split output. */
+ *  the shell's command with split output, and the job rows (a build and a
+ *  still-running test) titled by purpose and state. */
 function leadToolRows(): AppState {
   const row = (id: string, toolName: string, args: Record<string, unknown>, result: ToolEntry["result"]): ToolEntry => ({
     id,
@@ -2217,6 +2227,47 @@ function leadToolRows(): AppState {
         {
           success: true,
           output: "Test Files  1 passed (1)\n[stderr]\nnpm notice run mnemo@1.3.0\n[exit code: 0]",
+        },
+      ),
+      row(
+        "preview-lead-tools-job",
+        "job",
+        { command: "cargo build --workspace", purpose: "build game", cwd: "C:\\Mnemo" },
+        {
+          success: true,
+          output: [
+            "state: exited 0",
+            "elapsed: 41.2s",
+            "tail (filtered):",
+            "[out] Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.18s",
+          ].join("\n"),
+          data: {
+            job_id: "j1",
+            purpose: "build game",
+            command: "cargo build --workspace",
+            state: "exited",
+            exit_code: 0,
+          },
+        },
+      ),
+      row(
+        "preview-lead-tools-job-wait",
+        "job_wait",
+        { job_id: "j2", timeout_s: 600 },
+        {
+          success: true,
+          output: [
+            "state: running",
+            "elapsed: 600.0s",
+            "tail (filtered):",
+            "[out] Compiling mnemo v1.3.0",
+          ].join("\n"),
+          data: {
+            job_id: "j2",
+            purpose: "run tests",
+            command: "cargo test --workspace",
+            state: "running",
+          },
         },
       ),
       row(
@@ -2540,18 +2591,20 @@ export const previewScenes: PreviewScene[] = [
     name: "lead-tool-rows",
     title: "Lead tool rows",
     description:
-      "The lead chat's tool rows with file-named headlines: the expanded edit row shows its coloured diff, a replayed multi_edit reconstructs one from its arguments, a write shows its added lines, a read lists its files and line ranges, and the shell row keeps its command and split output.",
+      "The lead chat's tool rows with file-named headlines: the expanded edit row shows its coloured diff, a replayed multi_edit reconstructs one from its arguments, a write shows its added lines, a read lists its files and line ranges, the shell row keeps its command and split output, and the job rows are titled by purpose and state.",
     build: leadToolRows,
     // The rows' bodies are component-local state, so the scene opens the edit
-    // row after mounting — its diff is the body this scene is about; the
-    // other rows stay collapsed for the index click-through.
+    // row after mounting — its diff is the body this scene is about; the job
+    // row opens too, so its purpose/command/output body is visible. The other
+    // rows stay collapsed for the index click-through.
     mount: (target) => {
       app.set(leadToolRows());
       const shell = svelteMount(App, { target });
-      const editRow = target.querySelector<HTMLDetailsElement>(
-        'article[aria-label^="Editing"] .tool-disclosure',
-      );
-      if (editRow !== null) editRow.open = true;
+      const openRows = ['article[aria-label^="Editing"]', 'article[aria-label^="job · build game"]'];
+      for (const label of openRows) {
+        const row = target.querySelector<HTMLDetailsElement>(`${label} .tool-disclosure`);
+        if (row !== null) row.open = true;
+      }
       return () => unmount(shell);
     },
   },

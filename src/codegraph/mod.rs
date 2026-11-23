@@ -38,14 +38,14 @@ pub mod watcher;
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::Hasher;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::codegraph::extract::{extract_file, extract_file_with, ParserCache, RefKind};
+use crate::codegraph::extract::{extract_file, extract_file_with, ParserCache, RefKind, Symbol, SymbolKind};
 use crate::codegraph::query::GraphView;
 use crate::codegraph::store::{
     ContentHit, FileData, FileMeta, GraphStats, Store, UpsertEntry,
@@ -85,12 +85,460 @@ pub struct IndexStats {
 pub struct CodeGraph {
     /// The project root the graph indexes (paths are stored relative to it).
     root: PathBuf,
-    /// The SQLite store. Short critical sections only: `index` takes the
-    /// lock once for the metadata snapshot and once per wave of upserts,
-    /// and query snapshots load in two fast SELECTs.
-    store: Mutex<Store>,
+    /// The SQLite store behind an `Arc`, so the background symbol-embed
+    /// pass (plan d3336a8a step 9) shares the SAME connection and lock
+    /// discipline. Short critical sections only: `index` takes the lock
+    /// once for the metadata snapshot and once per wave of upserts, query
+    /// snapshots load in two fast SELECTs, and the embed pass holds it
+    /// only around one batch read or one vector write — never across an
+    /// embed call.
+    store: Arc<Mutex<Store>>,
     /// True while an indexing pass is running (status surface only).
     indexing: AtomicBool,
+    /// State for the background symbol-embed pass (plan d3336a8a step 9).
+    symbol_embed: SymbolEmbedState,
+    /// The semantic code search snapshot (plan d3336a8a step 11): the
+    /// generation counter the vector/symbol writers bump, plus the loaded
+    /// in-memory index [`Self::symbol_search`] ranks against.
+    symbol_search: SymbolSearchState,
+}
+
+/// The embedder source a pass builds from (plan d3336a8a step 9).
+#[cfg(feature = "embeddings")]
+#[derive(Clone)]
+enum ArmedEmbedder {
+    /// The real path:
+    /// [`crate::provider::client_factory::build_code_embedder`] on the
+    /// pass thread, once per process (the process-global slot), with the
+    /// configured memory model widening the shared host's serve list.
+    Real {
+        /// The model cache dir (`<config dir>/models`).
+        cache_dir: PathBuf,
+        /// The configured bundled memory model, when there is one.
+        memory_model: Option<String>,
+    },
+    /// The test seam: a stub embedder runs the pass directly — tests
+    /// never download a model or touch any host. Test builds only: the
+    /// release pass always builds the real embedder.
+    #[cfg(test)]
+    Stub(Arc<dyn crate::memory::embedder::Embedder>),
+}
+
+/// Per-graph state for the background symbol-embed pass (plan d3336a8a
+/// step 9). The stop flag exists in every build so [`CodeGraph`]'s drop
+/// stays feature-independent; the armed/running state is
+/// `embeddings`-only.
+pub(crate) struct SymbolEmbedState {
+    /// Set by [`CodeGraph`]'s drop: a running pass polls it between
+    /// batches and exits, so a dropped graph (engine shutdown, a test
+    /// graph going out of scope) never leaves a pass writing to its DB.
+    stop: Arc<AtomicBool>,
+    /// The armed embedder source — set once by
+    /// [`CodeGraph::arm_symbol_embeddings`] BEFORE the graph is shared
+    /// (`&mut self`); seed graphs (worktree seeding) are never armed, so
+    /// their passes never exist.
+    #[cfg(feature = "embeddings")]
+    armed: Option<ArmedEmbedder>,
+    /// Single-flight: at most one pass per graph — a trigger while one
+    /// runs is a no-op (the running pass re-reads the pending queue
+    /// every batch, so rows the new trigger produced are picked up).
+    #[cfg(feature = "embeddings")]
+    running: Arc<AtomicBool>,
+}
+
+impl Default for SymbolEmbedState {
+    #[cfg(feature = "embeddings")]
+    fn default() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            armed: None,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Light build (no `embeddings` feature): the pass does not exist —
+    /// the state is only the stop flag.
+    #[cfg(not(feature = "embeddings"))]
+    fn default() -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Drop for CodeGraph {
+    /// Signal a running symbol-embed pass to stop at its next batch
+    /// boundary (plan d3336a8a step 9): a dropped graph must not leave a
+    /// detached pass writing to a DB nobody reads. The pass holds the
+    /// store `Arc` only, so without this signal it would run its whole
+    /// queue against a database whose engine is gone.
+    fn drop(&mut self) {
+        self.symbol_embed.stop.store(true, Ordering::Release);
+    }
+}
+
+// ====== Semantic code search snapshot (plan d3336a8a step 11) ======
+// `find_code` ranks symbols by meaning blended with text and name matches.
+// The vectors live in `cg_symbol_vec`; re-reading ~16k × 768 f32 rows per
+// query would cost more than the ranking itself, so one snapshot per
+// generation is held in memory and reloaded only when a writer says it moved.
+
+/// The semantic-search snapshot state (plan d3336a8a step 11): the
+/// generation counter the writers bump plus the loaded snapshot.
+pub(crate) struct SymbolSearchState {
+    /// Bumped whenever stored vectors or symbols change — the symbol-embed
+    /// pass storing a batch, an index pass re-parsing or pruning files. The
+    /// snapshot records the generation it was loaded at; a query that finds
+    /// a newer generation reloads it.
+    generation: Arc<AtomicU64>,
+    /// The loaded snapshot with the generation and model it was built for.
+    cached: Mutex<Option<(u64, String, Arc<SymbolSearchIndex>)>>,
+}
+
+impl Default for SymbolSearchState {
+    fn default() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+/// The in-memory snapshot `find_code` ranks against (plan d3336a8a step
+/// 11): every stored vector for one embedding model plus the symbol
+/// metadata and text rows the ranking and the output need. Loaded once per
+/// generation by [`CodeGraph::symbol_search`], on the blocking pool.
+pub(crate) struct SymbolSearchIndex {
+    /// Unit-normalised vectors keyed by symbol id, so cosine is a plain dot
+    /// product. Zero vectors are dropped — they carry no direction.
+    vectors: HashMap<String, Vec<f32>>,
+    /// Every stored symbol, in stable (id) order.
+    symbols: Vec<Symbol>,
+    /// Symbol id → index into `symbols`.
+    by_id: HashMap<String, usize>,
+    /// File → symbol indices ordered by `(start_line asc, end_line desc)`,
+    /// so an FTS hit's enclosing-symbol lookup is a short scan.
+    by_file: HashMap<String, Vec<usize>>,
+    /// Symbol id → `(signature, doc block)` from the stored text rows.
+    text: HashMap<String, (String, String)>,
+    /// Stored vector rows for the model (the progress note's N).
+    vector_rows: usize,
+    /// Stored symbol text rows (the progress note's M).
+    text_rows: usize,
+}
+
+impl SymbolSearchIndex {
+    /// Load the snapshot for `model`: one read per table, never on the
+    /// request path ([`CodeGraph::symbol_search`] runs it on the blocking
+    /// pool).
+    fn load(store: &Store, model: &str) -> Result<Self> {
+        let symbols = store.all_symbols()?;
+        let mut by_id = HashMap::with_capacity(symbols.len());
+        let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, sym) in symbols.iter().enumerate() {
+            by_id.insert(sym.id.clone(), i);
+            by_file.entry(sym.file.clone()).or_default().push(i);
+        }
+        for list in by_file.values_mut() {
+            list.sort_by(|a, b| {
+                let (x, y) = (&symbols[*a], &symbols[*b]);
+                x.start_line
+                    .cmp(&y.start_line)
+                    .then(y.end_line.cmp(&x.end_line))
+            });
+        }
+        let text: HashMap<String, (String, String)> = store
+            .all_symbol_texts()?
+            .into_iter()
+            .map(|t| (t.symbol_id, (t.signature, t.doc)))
+            .collect();
+        let text_rows = store.symbol_text_count()?;
+        let rows = store.all_symbol_vecs(model)?;
+        let vector_rows = rows.len();
+        let mut vectors = HashMap::with_capacity(rows.len());
+        for row in rows {
+            // A vector whose symbol vanished awaits a prune — it can never
+            // be rendered, so it never ranks.
+            if !by_id.contains_key(&row.symbol_id) {
+                continue;
+            }
+            let norm = row.vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm <= 1e-6 {
+                // A zero vector carries no direction — it cannot rank.
+                continue;
+            }
+            vectors.insert(
+                row.symbol_id,
+                row.vec.iter().map(|v| v / norm).collect::<Vec<f32>>(),
+            );
+        }
+        Ok(Self {
+            vectors,
+            symbols,
+            by_id,
+            by_file,
+            text,
+            vector_rows,
+            text_rows,
+        })
+    }
+
+    /// Stored vector rows for the model — the progress note's N.
+    pub(crate) fn vector_count(&self) -> usize {
+        self.vector_rows
+    }
+
+    /// Stored symbol text rows — the progress note's M.
+    pub(crate) fn symbol_count(&self) -> usize {
+        self.text_rows
+    }
+
+    /// Whether any vector can carry the cosine term.
+    pub(crate) fn has_vectors(&self) -> bool {
+        !self.vectors.is_empty()
+    }
+
+    /// The cached vectors as `(symbol id, unit-norm vector)` pairs.
+    pub(crate) fn vectors(&self) -> impl Iterator<Item = (&str, &[f32])> {
+        self.vectors
+            .iter()
+            .map(|(id, vector)| (id.as_str(), vector.as_slice()))
+    }
+
+    /// One symbol by id, when it still exists.
+    pub(crate) fn symbol(&self, id: &str) -> Option<&Symbol> {
+        self.by_id.get(id).map(|i| &self.symbols[*i])
+    }
+
+    /// Every stored symbol, in stable (id) order — the name-match scan.
+    pub(crate) fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// The `(signature, doc block)` stored for a symbol, when it has a text
+    /// row.
+    pub(crate) fn text(&self, id: &str) -> Option<&(String, String)> {
+        self.text.get(id)
+    }
+
+    /// The innermost REAL symbol whose line range contains `line` in `file`
+    /// — how a content-index hit becomes a symbol (plan d3336a8a step 11).
+    /// Synthetic module symbols are skipped: a hit outside any real
+    /// definition has no useful symbol to name.
+    pub(crate) fn enclosing(&self, file: &str, line: usize) -> Option<&Symbol> {
+        let indices = self.by_file.get(file)?;
+        let span = |s: &Symbol| s.end_line.saturating_sub(s.start_line);
+        let mut best: Option<&Symbol> = None;
+        for &i in indices {
+            let sym = &self.symbols[i];
+            if sym.start_line > line || sym.end_line < line {
+                continue;
+            }
+            if matches!(sym.kind, SymbolKind::Module) {
+                continue;
+            }
+            best = match best {
+                Some(current)
+                    if span(sym) > span(current)
+                        || (span(sym) == span(current)
+                            && sym.start_line <= current.start_line) =>
+                {
+                    Some(current)
+                }
+                _ => Some(sym),
+            };
+        }
+        best
+    }
+}
+
+/// Why the code-embedder slot's retry gate was parked (plan d3336a8a step
+/// 17, finding parkedNoteEdges): the fallback note must blame the right
+/// thing — a serveable host that is not answering, or a model that could
+/// not be loaded offline.
+#[cfg(feature = "embeddings")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ParkReason {
+    /// A host is serveable (a binary resolves or a live descriptor is
+    /// published) but did not answer — the note says the shared model
+    /// host is not answering.
+    HostNotAnswering,
+    /// No host can serve at all and the in-process load failed — the
+    /// note says the model could not be loaded.
+    NotLoaded,
+}
+
+/// The process-global code-embedder slot's availability, read by
+/// find_code's text fallback (plan d3336a8a step 17, finding
+/// notReadyNoteMisleads): a parked retry gate must not be described as
+/// "still being built" — nothing is building, and the note says the
+/// model is unavailable and when the next round retries.
+#[cfg(feature = "embeddings")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CodeEmbedderState {
+    /// The slot holds a good build (or a test stub answers queries).
+    Ready,
+    /// A build is running on another thread.
+    Building,
+    /// A failed build parked the gate; `retry_in` is how long until the
+    /// next round may retry, and `reason` is why it parked.
+    Parked {
+        retry_in: std::time::Duration,
+        reason: ParkReason,
+    },
+    /// No build has run in this process yet (the graph was never armed,
+    /// or the first pass has not reached the embedder).
+    Unarmed,
+}
+
+impl CodeGraph {
+    /// Invalidate the semantic-search snapshot (plan d3336a8a step 11):
+    /// called wherever stored vectors or symbols change. The next query
+    /// reloads; the stale snapshot still serves until then.
+    fn bump_symbol_search(&self) {
+        self.symbol_search.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The semantic-search snapshot for `model` (plan d3336a8a step 11):
+    /// the cached one while its generation and model still match, else a
+    /// fresh load. Blocking (a full read of the vector and symbol tables) —
+    /// call it from the blocking pool, never a tokio worker.
+    pub(crate) fn symbol_search(&self, model: &str) -> Result<Arc<SymbolSearchIndex>> {
+        let generation = self.symbol_search.generation.load(Ordering::Acquire);
+        let mut cached = self
+            .symbol_search
+            .cached
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some((loaded_at, loaded_model, index)) = cached.as_ref() {
+            if *loaded_at == generation && loaded_model == model {
+                return Ok(Arc::clone(index));
+            }
+        }
+        let index = Arc::new(SymbolSearchIndex::load(&self.store(), model)?);
+        *cached = Some((generation, model.to_string(), Arc::clone(&index)));
+        Ok(index)
+    }
+
+    /// The stored vector and text-row counts without loading the snapshot —
+    /// the `find_code` fallback note and the eval's progress probe.
+    pub(crate) fn symbol_search_counts(&self) -> Result<(usize, usize)> {
+        let store = self.store();
+        Ok((store.symbol_vec_count()?, store.symbol_text_count()?))
+    }
+
+    /// How many symbols still await a vector for `model` (plan d3336a8a
+    /// step 11) — the eval waits for the pass to drain on this.
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn symbol_embed_pending(&self, model: &str) -> Result<usize> {
+        Ok(self.store().pending_symbols(model, 1)?.len())
+    }
+
+    /// Test seam (plan d3336a8a step 15): the eval's per-variant switch —
+    /// set the chunk shape every rebuilt chunk text uses, then re-hash
+    /// every stored text row so every symbol turns pending and the pass
+    /// re-embeds the shape's chunks (replacing the previous shape's
+    /// vectors). Returns the number of re-hashed rows.
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn retarget_symbol_chunks_for_test(
+        &self,
+        shape: crate::codegraph::store::ChunkShape,
+    ) -> Result<usize> {
+        let mut store = self.store();
+        store.set_chunk_shape_for_test(shape);
+        store.retarget_symbol_text_hashes_for_test()
+    }
+
+    /// Content-index hits for a token set, best bm25 first (plan d3336a8a
+    /// step 11): the semantic code search's lexical term. One FTS query.
+    pub(crate) fn content_hits_any(
+        &self,
+        tokens: &[String],
+        limit: usize,
+    ) -> Result<Vec<ContentHit>> {
+        self.store().search_content_any(tokens, limit)
+    }
+
+    /// Test seam (plan d3336a8a step 11): store one symbol's vector row, so
+    /// a ranking test needs no embed pass.
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn store_symbol_vector_for_test(
+        &self,
+        model: &str,
+        symbol_id: &str,
+        vec: &[f32],
+    ) -> Result<()> {
+        let mut store = self.store();
+        let batch: Vec<_> = store
+            .pending_symbols(model, 4096)?
+            .into_iter()
+            .filter(|p| p.symbol_id == symbol_id)
+            .collect();
+        store.store_symbol_vecs(model, vec.len(), &batch, &[vec.to_vec()])?;
+        Ok(())
+    }
+}
+
+impl CodeGraph {
+    /// The code embedder a `find_code` query may use (plan d3336a8a step
+    /// 11): the process-global slot's cached good build — never a build,
+    /// never a wait. A miss starts the shared build in the background and
+    /// answers `None`, so the query falls back to text search instead of
+    /// blocking. `None` also when the graph was never armed (no code
+    /// embedding for this project).
+    #[cfg(feature = "embeddings")]
+    pub(crate) fn query_embedder(&self) -> Option<Arc<dyn crate::memory::embedder::Embedder>> {
+        match &self.symbol_embed.armed {
+            Some(ArmedEmbedder::Real {
+                cache_dir,
+                memory_model,
+            }) => code_embedder_slot::cached().or_else(|| {
+                code_embedder_slot::ensure_build(cache_dir, memory_model.as_deref());
+                None
+            }),
+            #[cfg(test)]
+            Some(ArmedEmbedder::Stub(embedder)) => Some(Arc::clone(embedder)),
+            None => None,
+        }
+    }
+
+    /// The code-embedder slot's availability for find_code's text
+    /// fallback (plan d3336a8a step 17, finding notReadyNoteMisleads): a
+    /// parked retry gate must read as "not available right now" — nothing
+    /// is being built. Never waits on a build. A stub-armed test graph is
+    /// `Ready` (the stub answers queries); an un-armed graph is `Unarmed`.
+    #[cfg(feature = "embeddings")]
+    pub(crate) fn code_embedder_state(&self) -> CodeEmbedderState {
+        match &self.symbol_embed.armed {
+            Some(ArmedEmbedder::Real { .. }) => code_embedder_slot::state(),
+            #[cfg(test)]
+            Some(ArmedEmbedder::Stub(_)) => CodeEmbedderState::Ready,
+            None => CodeEmbedderState::Unarmed,
+        }
+    }
+
+
+
+    /// Light build (no `embeddings` feature): no code embedder exists, so
+    /// every `find_code` query answers from the text fallback.
+    #[cfg(not(feature = "embeddings"))]
+    pub(crate) fn query_embedder(&self) -> Option<Arc<dyn crate::memory::embedder::Embedder>> {
+        None
+    }
+}
+
+/// Lock a graph store, recovering from poisoning (review L4, 2026-04-19
+/// freeze-fix review): the DB is a derived cache — if a panic poisoned
+/// the mutex mid-write, the worst case is a corrupt cache recovered by
+/// deleting the file (rebuilt on next startup), so poisoning must not
+/// cascade into every later caller panicking in *their* thread. Shared
+/// by the graph's methods and the background symbol-embed pass (plan
+/// d3336a8a step 9), which locks the same mutex from its own thread.
+fn lock_store(mutex: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Clears the indexing flag on drop. Held for the duration of
@@ -301,8 +749,10 @@ impl CodeGraph {
     pub fn open(root: PathBuf, db_path: &Path) -> Result<Self> {
         Ok(Self {
             root,
-            store: Mutex::new(Store::open(db_path)?),
+            store: Arc::new(Mutex::new(Store::open(db_path)?)),
             indexing: AtomicBool::new(false),
+            symbol_embed: SymbolEmbedState::default(),
+            symbol_search: SymbolSearchState::default(),
         })
     }
 
@@ -310,8 +760,10 @@ impl CodeGraph {
     pub fn open_in_memory(root: PathBuf) -> Result<Self> {
         Ok(Self {
             root,
-            store: Mutex::new(Store::open_in_memory()?),
+            store: Arc::new(Mutex::new(Store::open_in_memory()?)),
             indexing: AtomicBool::new(false),
+            symbol_embed: SymbolEmbedState::default(),
+            symbol_search: SymbolSearchState::default(),
         })
     }
 
@@ -333,16 +785,10 @@ impl CodeGraph {
         self.indexing.store(value, Ordering::Relaxed);
     }
 
-    /// Lock the store, recovering from poisoning (review L4, 2026-04-19
-    /// freeze-fix review): the DB is a derived cache — if a panic poisoned
-    /// the mutex mid-write, the worst case is a corrupt cache recovered by
-    /// deleting the file (rebuilt on next startup), so poisoning must not
-    /// cascade into every later caller panicking in *their* thread.
+    /// Lock the store — [`lock_store`] owns the poisoning-recovery
+    /// behaviour (shared with the background symbol-embed pass thread).
     fn store(&self) -> std::sync::MutexGuard<'_, Store> {
-        match self.store.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        lock_store(&self.store)
     }
 
     /// Aggregate counts (files / symbols / edges / last indexed time).
@@ -626,6 +1072,17 @@ impl CodeGraph {
             stats.edges = s.edges;
         }
         stats.elapsed_ms = started.elapsed().as_millis() as u64;
+        if reindexed > 0 || stats.files_pruned > 0 {
+            // Semantic code search (step 11): the symbol and text rows
+            // moved — the in-memory query snapshot is stale.
+            self.bump_symbol_search();
+        }
+        // The background symbol-embed pass (plan d3336a8a step 9): armed
+        // graphs schedule it after every index pass — it embeds (or
+        // lazily re-embeds) whatever is pending and exits when the queue
+        // drains. No-op on unarmed graphs (worktree seeds) and in light
+        // builds.
+        self.schedule_symbol_embed_pass();
         Ok(stats)
     }
 
@@ -763,7 +1220,111 @@ impl CodeGraph {
         if touched_source || pruned {
             self.store().rebuild_edges()?;
         }
+        if touched_source || pruned {
+            // Semantic code search (step 11): re-parsed or pruned rows make
+            // the in-memory query snapshot stale.
+            self.bump_symbol_search();
+        }
+        // Same step-9 scheduling as the index pass above: the inline
+        // refresh changed text rows, so pending symbols are embedded.
+        self.schedule_symbol_embed_pass();
         Ok(refreshed)
+    }
+
+    /// Arm the background symbol-embed pass (plan d3336a8a step 9):
+    /// after this, every [`Self::index`], [`Self::reindex_stale_files`] and
+    /// [`Self::reindex_files_containing`] schedules a pass over symbols whose
+    /// text hash has no vector for the current model — batches of
+    /// [`SYMBOL_EMBED_BATCH`] through
+    /// [`Embedder::embed_batch`](crate::memory::embedder::Embedder::embed_batch).
+    /// Called once by the brain right after open, BEFORE the graph is
+    /// shared (`&mut self`); seed graphs are never armed, so worktree
+    /// seeding never spawns passes.
+    ///
+    /// `cache_dir` is the model cache dir (the same `<config>/models`
+    /// the memory embedder uses — the shared host serves both models).
+    /// `memory_model` is the configured bundled memory model
+    /// (`general.bundled_embedding_model`): when a pass SPAWNS the
+    /// shared host, the host's serve list includes it too, so the
+    /// memory side later attaches to the same host instead of spawning a
+    /// second one. The list only matters on the spawn leg — a host
+    /// already serving the code model is attached by the exact-set rule
+    /// regardless.
+    #[cfg(feature = "embeddings")]
+    pub fn arm_symbol_embeddings(&mut self, cache_dir: &Path, memory_model: Option<&str>) {
+        self.symbol_embed.armed = Some(ArmedEmbedder::Real {
+            cache_dir: cache_dir.to_path_buf(),
+            memory_model: memory_model.map(str::to_string),
+        });
+    }
+
+    /// The test seam (plan d3336a8a step 9): arm with a stub embedder —
+    /// fixed dim, deterministic vectors — so pass tests never download a
+    /// model or touch any host (the no-download rule). Generic over the
+    /// embedder so call sites pass their concrete stub Arcs. `pub(crate)`
+    /// since step 11: the `find_code` ranking tests arm it too.
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn arm_symbol_embedder_stub<E>(&mut self, embedder: Arc<E>)
+    where
+        E: crate::memory::embedder::Embedder + 'static,
+    {
+        self.symbol_embed.armed = Some(ArmedEmbedder::Stub(embedder));
+    }
+
+    /// The test seam for an ALREADY-BUILT embedder (plan d3336a8a step 11):
+    /// the eval arms the real code model through it (the generic stub arm
+    /// needs a concrete type, the factory answers a trait object).
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn arm_symbol_embedder_dyn(
+        &mut self,
+        embedder: Arc<dyn crate::memory::embedder::Embedder>,
+    ) {
+        self.symbol_embed.armed = Some(ArmedEmbedder::Stub(embedder));
+    }
+
+    /// Schedule the background symbol-embed pass when the graph is armed.
+    /// Light build (no `embeddings` feature): no pass exists, so this is
+    /// a no-op and the call sites stay cfg-free.
+    #[cfg(not(feature = "embeddings"))]
+    fn schedule_symbol_embed_pass(&self) {}
+
+    /// Schedule the background symbol-embed pass when the graph is armed
+    /// (plan d3336a8a step 9) — single-flight: a pass already running
+    /// keeps running (it re-reads the pending queue every batch), a
+    /// trigger for an unarmed graph is a no-op, and a failure to even
+    /// create the thread releases the flag so a later index retries.
+    #[cfg(feature = "embeddings")]
+    fn schedule_symbol_embed_pass(&self) {
+        let Some(armed) = self.symbol_embed.armed.clone() else {
+            return;
+        };
+        // The swap claims the single-flight flag; an already-running pass
+        // swallows this trigger.
+        if self.symbol_embed.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let stop = Arc::clone(&self.symbol_embed.stop);
+        let running = Arc::clone(&self.symbol_embed.running);
+        let store = Arc::clone(&self.store);
+        // Semantic code search (step 11): the pass announces stored vectors
+        // so an in-memory query snapshot reloads instead of ranking stale.
+        let generation = Arc::clone(&self.symbol_search.generation);
+        let spawned = std::thread::Builder::new()
+            .name("codegraph-symbol-embed".to_string())
+            .spawn(move || {
+                // Review finding panicStuckRunning: a panic inside the
+                // pass (a misbehaving embedder) must not leave the
+                // single-flight flag stuck for the rest of the process —
+                // the guard clears it on scope exit, unwind or return.
+                let _running = RunningFlagGuard(Arc::clone(&running));
+                run_symbol_embed_pass(armed, store, Arc::clone(&stop), generation);
+            });
+        if spawned.is_err() {
+            // Resource exhaustion — best-effort pass, never fatal. Free
+            // the single-flight flag so the next index can try again.
+            eprintln!("codegraph: could not start the symbol-embed pass");
+            self.symbol_embed.running.store(false, Ordering::Release);
+        }
     }
 
     /// Force a re-parse of every SOURCE file whose on-disk content contains
@@ -898,6 +1459,17 @@ impl CodeGraph {
         if touched_source {
             self.store().rebuild_edges()?;
         }
+        if touched_source {
+            // Semantic code search (step 11): re-parsed rows make the
+            // in-memory query snapshot stale — it would serve vanished ids
+            // and old line ranges, and the new text rows need vectors. Same
+            // two calls as `index` / `reindex_stale_files`, made after the
+            // store lock is released.
+            self.bump_symbol_search();
+        }
+        // Same step-9 scheduling as the index pass: the refresh changed text
+        // rows, so pending symbols are embedded.
+        self.schedule_symbol_embed_pass();
         Ok(ReindexOutcome {
             matched,
             matched_unparsed,
@@ -1216,6 +1788,512 @@ pub fn content_hash(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     hasher.write(bytes);
     format!("{:x}", hasher.finish())
+}
+
+// ============ Background symbol-embed pass (plan d3336a8a step 9) ============
+// `SymbolEmbedState`/`ArmedEmbedder` live at the struct above; the
+// scheduling methods inside `impl CodeGraph` sit right after
+// `reindex_stale_files`. This section holds the pass body and the
+// process-global embedder slot.
+
+/// How many symbols one embed batch carries (the step-9 rule: 64 at a
+/// time, yielding between batches).
+#[cfg(feature = "embeddings")]
+const SYMBOL_EMBED_BATCH: usize = 64;
+
+/// How many texts one inference call embeds on the pass (plan d3336a8a
+/// step 15): the host splits its /v1/embed requests at 16, and the
+/// in-process path gets the same bound here — fastembed pads every
+/// call to its longest text, so one 64-text call is the largest shape
+/// the ONNX arena ever sees, and the arena's per-shape blocks grew
+/// until an allocation failed mid-pass (the zeros stop the pass).
+#[cfg(feature = "embeddings")]
+const SYMBOL_EMBED_SUB_BATCH: usize = 16;
+
+/// Clears the pass's single-flight flag when the pass thread ends —
+/// normal return or panic (review finding panicStuckRunning: Drop runs
+/// on unwind too, so a panicking embedder must not disable the graph's
+/// pass for the rest of the process).
+#[cfg(feature = "embeddings")]
+struct RunningFlagGuard(Arc<AtomicBool>);
+
+#[cfg(feature = "embeddings")]
+impl Drop for RunningFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// The background pass body (plan d3336a8a step 9): builds the embedder
+/// per the armed source — the real path builds it ONCE per process ON
+/// THIS THREAD (attach-or-spawn of the shared host, or an in-process
+/// ONNX load, possibly a first ~600 MB download: never on a tokio
+/// worker, never under the store lock, never on the index path) — then
+/// loops batches of [`SYMBOL_EMBED_BATCH`]: read the pending batch in
+/// one short lock, RELEASE the store, embed, write the vectors in one
+/// short transaction, yield between batches. The stop flag (set by
+/// [`CodeGraph`]'s drop) is polled between batches, so a dropped graph
+/// ends the pass promptly.
+///
+/// Never stores junk: only the real code model with a non-`Failed`
+/// status runs, and an all-zero batch (the degraded-embedder contract)
+/// is dropped, not persisted.
+#[cfg(feature = "embeddings")]
+fn run_symbol_embed_pass(
+    armed: ArmedEmbedder,
+    store: Arc<Mutex<Store>>,
+    stop: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+) {
+    let embedder = match &armed {
+        #[cfg(test)]
+        ArmedEmbedder::Stub(embedder) => Arc::clone(embedder),
+        ArmedEmbedder::Real {
+            cache_dir,
+            memory_model,
+        } => match code_embedder_slot::acquire(cache_dir, memory_model.as_deref()) {
+            Some(embedder) => embedder,
+            None => {
+                // Not the code model (a fallback embedder), a Failed
+                // build, or the retry window — skip silently, one line
+                // per process.
+                code_embedder_slot::log_skip_once(
+                    "code embedder unavailable (fallback, failed load, or retry window)",
+                );
+                return;
+            }
+        },
+    };
+    // Belt and braces: the stub seam may carry any model id, so the
+    // model/status check lives on the pass path too, not only in the
+    // slot. The vec table's model column must always name the real
+    // model (the step-9 rule).
+    if embedder.model_id() != crate::memory::embedder::CODE_EMBEDDING_MODEL
+        || matches!(
+            embedder.status(),
+            Some(crate::memory::embedder::EmbedderStatus::Failed)
+        )
+    {
+        code_embedder_slot::log_skip_once("embedder is not the code model or reports Failed");
+        return;
+    }
+    let model = embedder.model_id().to_string();
+    let dim = embedder.dim();
+    // embed_batch is async (HTTP for the shared host; the in-process
+    // fallback internally hops to the blocking pool) — the pass gets
+    // its own minimal runtime on this dedicated thread.
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("codegraph: symbol-embed pass could not build its runtime");
+        return;
+    };
+    runtime.block_on(async move {
+        let mut stored = 0usize;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            // Read the batch under one short lock, RELEASE before the
+            // embed call — the write connection is never held across an
+            // embed.
+            let batch = match lock_store(&store).pending_symbols(&model, SYMBOL_EMBED_BATCH) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    eprintln!("codegraph: symbol-embed batch read failed: {e}");
+                    break;
+                }
+            };
+            if batch.is_empty() {
+                break;
+            }
+            let texts: Vec<String> = batch.iter().map(|s| s.text.clone()).collect();
+            // Step 15's RAM bound applies to the in-process path too
+            // (found by the step-15 eval, whose `1 pending` never
+            // drained): fastembed pads every inference call to its
+            // longest text, one 64-text call is the largest shape the
+            // arena ever sees, and the arena keeps a block per distinct
+            // padded length — it grows until an allocation fails
+            // mid-pass, the embedder answers zeros and the zero guard
+            // stops the pass with the queue half-drained. Sub-batch like
+            // the host does: at most SYMBOL_EMBED_SUB_BATCH texts per
+            // inference call, each sub-batch embedded, checked and
+            // stored on its own — the review guards below keep their
+            // semantics at the finer granularity (the sub-batch
+            // embedded before a degradation is stored; the ones after
+            // it are dropped and the pass stops).
+            let mut stop = false;
+            for (rows, texts) in batch
+                .chunks(SYMBOL_EMBED_SUB_BATCH)
+                .zip(texts.chunks(SYMBOL_EMBED_SUB_BATCH))
+            {
+                let vectors = embedder.embed_batch(texts).await;
+                // Review finding midPassHashJunk: re-check the status
+                // after every embed call. A mid-pass degradation — the
+                // shared host died and the in-process load failed —
+                // keeps ANSWERING, as the hash fallback's
+                // deterministic, NON-ZERO, right-dim vectors under the
+                // code model's id, so neither the model check, the dim
+                // guard nor the zero guard catches it; only the status
+                // flip to Failed does. Drop the sub-batch, stop the
+                // pass — the next pass retries after the host or model
+                // recovers.
+                if matches!(
+                    embedder.status(),
+                    Some(crate::memory::embedder::EmbedderStatus::Failed)
+                ) {
+                    code_embedder_slot::log_skip_once("embedder degraded mid-pass (status Failed)");
+                    stop = true;
+                    break;
+                }
+                if vectors.iter().all(|v| v.iter().all(|f| *f == 0.0)) {
+                    // The bundled embedder's own failure contract answers
+                    // zeros: persisting them would be junk, and a zero
+                    // vector is indistinguishable from no signal in cosine.
+                    // Stop — the next pass retries after recovery.
+                    code_embedder_slot::log_skip_once("embedder answered zero vectors");
+                    stop = true;
+                    break;
+                }
+                match lock_store(&store).store_symbol_vecs(&model, dim, rows, &vectors) {
+                    Ok(0) => {
+                        // Review finding zeroProgressLoop: nothing stored
+                        // for a NON-empty sub-batch (wrong-length vectors,
+                        // or every symbol vanished mid-batch) — re-reading
+                        // the queue would return the very same batch in a
+                        // hot loop. Stop; the next pass retries from a
+                        // fresh queue.
+                        code_embedder_slot::log_skip_once("a non-empty sub-batch stored nothing");
+                        stop = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        stored += n;
+                        // Semantic code search (step 11): the new vectors
+                        // are rankable now — the query snapshot reloads.
+                        generation.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Err(e) => {
+                        eprintln!("codegraph: symbol-embed store failed: {e}");
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        if stored > 0 {
+            eprintln!("codegraph: embedded {stored} symbols for semantic code search");
+        }
+    });
+}
+
+/// The process-global code-embedder slot (plan d3336a8a step 9): built
+/// lazily ONCE per process, on the pass thread, kept for the process
+/// lifetime. A FAILED build is never cached — only its retry gate is:
+/// the next pass may rebuild no sooner than [`retry_window`] later (a
+/// host may come up, a download may finish; the 10-minute rule).
+#[cfg(feature = "embeddings")]
+mod code_embedder_slot {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use crate::memory::embedder::{Embedder, EmbedderStatus};
+
+    use super::CodeEmbedderState;
+
+    /// How a fresh embedder is built. The default wraps
+    /// [`crate::provider::client_factory::build_code_embedder`]; tests
+    /// install their own (the no-download seam).
+    pub(super) type Build = Box<dyn Fn(&Path, Option<&str>) -> Arc<dyn Embedder> + Send + Sync>;
+
+    /// The parked slot: a good embedder, or the retry gate a failed
+    /// build left behind (with why it parked — finding
+    /// parkedNoteEdges).
+    struct Slot {
+        embedder: Option<Arc<dyn Embedder>>,
+        retry_at: Option<Instant>,
+        park_reason: Option<super::ParkReason>,
+    }
+
+    static SLOT: Mutex<Slot> = Mutex::new(Slot {
+        embedder: None,
+        retry_at: None,
+        park_reason: None,
+    });
+    static BUILDER: Mutex<Option<Build>> = Mutex::new(None);
+    static SKIP_LOGGED: AtomicBool = AtomicBool::new(false);
+    static RETRY_WINDOW_SECS: AtomicU64 = AtomicU64::new(DEFAULT_RETRY_WINDOW_SECS);
+    /// True while a query started the shared build (plan d3336a8a step 11)
+    /// — dedupes those background builds, which the pass's own acquire
+    /// would otherwise run again.
+    static BUILDING: AtomicBool = AtomicBool::new(false);
+
+    /// The retry window (10 minutes); tests shrink it via the injected
+    /// interval.
+    pub(super) const DEFAULT_RETRY_WINDOW_SECS: u64 = 600;
+
+    /// The retry window a failed build parks behind — the injected
+    /// interval (the lead's "inject the clock or the interval").
+    pub(super) fn retry_window() -> Duration {
+        Duration::from_secs(RETRY_WINDOW_SECS.load(Ordering::Relaxed))
+    }
+
+    /// Acquire the process-global code embedder: a cached good one
+    /// clones out instantly; a fresh build runs on THIS thread when no
+    /// live retry gate parks it and none is already running. The build
+    /// runs OUTSIDE the slot lock (finding slotLockAcrossRetry, plan
+    /// d3336a8a step 17): with the acquire retries it can take up to
+    /// about a minute, and `cached`/`state` readers must never wait
+    /// behind it — they see `BUILDING` and answer at once. A build
+    /// already in flight (the query-started shared build, or another
+    /// round) is WAITED FOR, bounded by [`PASS_BUILD_WAIT`] (finding
+    /// skippedPassNotRescheduled): on a quiet project nothing else
+    /// would re-run the pass when that build lands, so its result must
+    /// reach this round. `None` (a live gate parked, or the wait
+    /// expired) when the build is not the code model or reports
+    /// `Failed` — junk vectors are never stored, and a failed build is
+    /// never cached.
+    pub(super) fn acquire(
+        cache_dir: &Path,
+        memory_model: Option<&str>,
+    ) -> Option<Arc<dyn Embedder>> {
+        let deadline = Instant::now() + PASS_BUILD_WAIT;
+        loop {
+            let claimed = {
+                let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(embedder) = &slot.embedder {
+                    return Some(Arc::clone(embedder));
+                }
+                if slot.retry_at.is_some_and(|at| Instant::now() < at) {
+                    return None;
+                }
+                // Claim the build under the same lock hold that checked the
+                // cache and gate; the early returns above are fine — only
+                // build_and_store re-takes the (non-reentrant) lock, so it
+                // must run OUTSIDE this block (finding slotLockAcrossRetry).
+                !BUILDING.swap(true, Ordering::AcqRel)
+            };
+            if claimed {
+                return build_and_store(cache_dir, memory_model);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(BUILD_POLL);
+        }
+    }
+
+    /// How long a pass round waits for an in-flight query-started build
+    /// before skipping the round (finding skippedPassNotRescheduled):
+    /// about the build's own worst-case budget, so the result reaches
+    /// this round instead of a someday index event.
+    const PASS_BUILD_WAIT: Duration = Duration::from_secs(120);
+
+    /// The wait loop's poll cadence.
+    const BUILD_POLL: Duration = Duration::from_millis(100);
+
+    /// The build + store half of [`acquire`], run OUTSIDE the slot lock.
+    /// The caller has claimed `BUILDING`; the [`BuildingGuard`] clears
+    /// it on ANY exit — return or panic unwind (finding
+    /// buildingFlagPanicWedge, the same discipline as the pass's
+    /// `RunningFlagGuard`): a panic inside the build must not wedge the
+    /// slot into "always building" — every later acquire would answer
+    /// `None` and every note would say "still being built" for the rest
+    /// of the process.
+    fn build_and_store(cache_dir: &Path, memory_model: Option<&str>) -> Option<Arc<dyn Embedder>> {
+        let _building = BuildingGuard;
+        let embedder = build(cache_dir, memory_model);
+        let good = embedder.model_id() == crate::memory::embedder::CODE_EMBEDDING_MODEL
+            && !matches!(embedder.status(), Some(EmbedderStatus::Failed));
+        // Why a failure parks the gate (finding parkedNoteEdges (a)),
+        // computed BEFORE the slot lock (finding serveableUnderSlotLock):
+        // the serveable probe stats the filesystem and pokes a pid, and
+        // cached()/state() readers must never wait behind that I/O.
+        let park_reason = (!good).then(|| {
+            if crate::provider::client_factory::host_is_serveable(cache_dir) {
+                super::ParkReason::HostNotAnswering
+            } else {
+                super::ParkReason::NotLoaded
+            }
+        });
+        let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        if good {
+            slot.embedder = Some(Arc::clone(&embedder));
+            slot.retry_at = None;
+            slot.park_reason = None;
+        } else {
+            slot.retry_at = Some(Instant::now() + retry_window());
+            slot.park_reason = park_reason;
+        }
+        good.then_some(embedder)
+    }
+
+    /// Clears the shared `BUILDING` flag on scope exit — unwind or return
+    /// (finding buildingFlagPanicWedge).
+    struct BuildingGuard;
+
+    impl Drop for BuildingGuard {
+        fn drop(&mut self) {
+            BUILDING.store(false, Ordering::Release);
+        }
+    }
+
+    /// The cached good build, WITHOUT building one (plan d3336a8a step 11)
+    /// — the instant path a `find_code` query uses. `None` when the slot is
+    /// empty or parked behind a retry gate. NEVER waits on a build: builds
+    /// run outside the slot lock (finding slotLockAcrossRetry), so this
+    /// only ever holds the lock long enough to read one field.
+    pub(super) fn cached() -> Option<Arc<dyn Embedder>> {
+        let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        slot.embedder.as_ref().map(Arc::clone)
+    }
+
+    /// The availability snapshot for find_code's fallback note (plan
+    /// d3336a8a step 17, finding notReadyNoteMisleads): a parked retry
+    /// gate must not read as "still being built" — nothing is building,
+    /// and the note says the model is unavailable and when the next
+    /// round retries. An EXPIRED gate is not `Parked` either (finding
+    /// parkedNoteEdges (c)): the window has lapsed, a query's
+    /// `ensure_build` starts the retry, and the note must not promise a
+    /// retry that already happened. Like [`cached`], never waits on a
+    /// build.
+    pub(super) fn state() -> CodeEmbedderState {
+        let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.embedder.is_some() {
+            return CodeEmbedderState::Ready;
+        }
+        if BUILDING.load(Ordering::Acquire) {
+            return CodeEmbedderState::Building;
+        }
+        match slot.retry_at {
+            Some(at) if Instant::now() < at => CodeEmbedderState::Parked {
+                retry_in: at.saturating_duration_since(Instant::now()),
+                reason: slot
+                    .park_reason
+                    .unwrap_or(super::ParkReason::HostNotAnswering),
+            },
+            _ => CodeEmbedderState::Unarmed,
+        }
+    }
+
+    /// Start the shared build on its own thread and return at once (plan
+    /// d3336a8a step 11): a query that finds no cached embedder must never
+    /// wait for the tens-of-seconds build. One build at a time; a LIVE
+    /// retry gate is left alone (the pass retries it once the window
+    /// expires, a query does not), but an EXPIRED gate is retried NOW
+    /// (finding parkedNoteEdges (c)): the fallback note promises "it
+    /// retries in about N minutes", so a query after the window must
+    /// really start the retry. The `BUILDING` claim happens inside the
+    /// SAME lock hold as the cache/gate check (finding
+    /// ensureBuildSwapRace): a build that lands between a separate check
+    /// and a separate swap would otherwise be rebuilt redundantly. The
+    /// thread builds outside the slot lock like [`acquire`] does (finding
+    /// slotLockAcrossRetry).
+    pub(super) fn ensure_build(cache_dir: &Path, memory_model: Option<&str>) {
+        {
+            let slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+            if slot.embedder.is_some() {
+                return;
+            }
+            if slot.retry_at.is_some_and(|at| Instant::now() < at) {
+                return;
+            }
+            if BUILDING.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
+        let cache_dir = cache_dir.to_path_buf();
+        let memory_model = memory_model.map(str::to_string);
+        let spawned = std::thread::Builder::new()
+            .name("codegraph-code-embedder".to_string())
+            .spawn(move || {
+                // BUILDING is already ours (the swap above) — the build
+                // runs outside the slot lock, and build_and_store's guard
+                // clears the flag when the result lands, panic or return.
+                let _ = build_and_store(&cache_dir, memory_model.as_deref());
+            });
+        if spawned.is_err() {
+            // Resource exhaustion — best-effort, never fatal; the pass
+            // builds on its own thread at the next index.
+            BUILDING.store(false, Ordering::Release);
+        }
+    }
+
+    /// Log one skip reason per process (the step's "skip silently, one
+    /// info line per process").
+    pub(super) fn log_skip_once(reason: &str) {
+        if !SKIP_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!("codegraph: symbol embedding skipped — {reason}");
+        }
+    }
+
+    fn build(cache_dir: &Path, memory_model: Option<&str>) -> Arc<dyn Embedder> {
+        let guard = BUILDER.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.as_ref() {
+            Some(build) => build(cache_dir, memory_model),
+            None => crate::provider::client_factory::build_code_embedder(cache_dir, memory_model),
+        }
+    }
+
+    /// Test-only control over the process-global slot: the slot is
+    /// shared by every test in the binary, so tests touching it
+    /// serialize through `SLOT_TEST_GUARD` (see mod tests) and reset on
+    /// both ends.
+    #[cfg(test)]
+    pub(crate) mod test {
+        use super::*;
+
+        pub(crate) fn reset() {
+            *SLOT.lock().unwrap_or_else(|p| p.into_inner()) = Slot {
+                embedder: None,
+                retry_at: None,
+                park_reason: None,
+            };
+            *BUILDER.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            SKIP_LOGGED.store(false, Ordering::Relaxed);
+            BUILDING.store(false, Ordering::Relaxed);
+            RETRY_WINDOW_SECS.store(DEFAULT_RETRY_WINDOW_SECS, Ordering::Relaxed);
+        }
+
+        pub(crate) fn install_builder(build: Build) {
+            *BUILDER.lock().unwrap_or_else(|p| p.into_inner()) = Some(build);
+        }
+
+        pub(crate) fn set_retry_window(secs: u64) {
+            RETRY_WINDOW_SECS.store(secs, Ordering::Relaxed);
+        }
+
+        /// Park the retry gate NOW (the note tests): the state a failed
+        /// build leaves behind, without running a build. `window` is how
+        /// long the gate stays live — `Duration::ZERO` is an instantly
+        /// expired gate (finding parkedNoteEdges (c)); `reason` is what
+        /// the note blames (finding parkedNoteEdges (a)).
+        pub(crate) fn park_gate_for_test(
+            reason: crate::codegraph::ParkReason,
+            window: std::time::Duration,
+        ) {
+            let mut slot = SLOT.lock().unwrap_or_else(|p| p.into_inner());
+            slot.retry_at = Some(Instant::now() + window);
+            slot.park_reason = Some(reason);
+        }
+
+        /// Fake a build in flight (the slotLockAcrossRetry and note tests).
+        pub(crate) fn set_building_for_test(building: bool) {
+            BUILDING.store(building, Ordering::Release);
+        }
+
+        /// Whether a build is in flight (the promptness test polls this).
+        pub(crate) fn building() -> bool {
+            BUILDING.load(Ordering::Acquire)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2105,5 +3183,1032 @@ mod tests {
             stats.unresolved_refs,
             stats.elapsed_ms
         );
+    }
+
+    // ===== Background symbol-embed pass (plan d3336a8a step 9) =====
+
+    /// Serialize tests that mutate the process-global code-embedder slot
+    /// (builder, retry window, skip-log gate): the slot is shared by the
+    /// whole test binary.
+    #[cfg(feature = "embeddings")]
+    static SLOT_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    /// The deterministic stub embedder (the lead's no-download seam):
+    /// fixed dim, vectors derived from the text's bytes, a configurable
+    /// model id and status, an embed-call counter — and a degrade knob:
+    /// after `fail_after_batches` served batches, `status()` reports
+    /// Failed (the mid-pass fallback shape, review finding
+    /// midPassHashJunk: the hash fallback keeps answering, non-zero and
+    /// right-dim, under the code model's id).
+    #[cfg(feature = "embeddings")]
+    struct StubEmbedder {
+        model: String,
+        dim: usize,
+        status: Option<crate::memory::embedder::EmbedderStatus>,
+        calls: AtomicUsize,
+        batches: AtomicUsize,
+        fail_after_batches: usize,
+        max_batch: AtomicUsize,
+    }
+
+    #[cfg(feature = "embeddings")]
+    impl StubEmbedder {
+        fn new(
+            model: &str,
+            dim: usize,
+            status: Option<crate::memory::embedder::EmbedderStatus>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                model: model.to_string(),
+                dim,
+                status,
+                calls: AtomicUsize::new(0),
+                batches: AtomicUsize::new(0),
+                fail_after_batches: 0,
+                max_batch: AtomicUsize::new(0),
+            })
+        }
+
+        /// Degrade after `after` served batches: `status()` flips to
+        /// Failed from the batch after them on (zero = never degrade).
+        fn new_degrading(model: &str, dim: usize, after: usize) -> Arc<Self> {
+            Arc::new(Self {
+                model: model.to_string(),
+                dim,
+                status: None,
+                calls: AtomicUsize::new(0),
+                batches: AtomicUsize::new(0),
+                fail_after_batches: after,
+                max_batch: AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        /// The step-15 regression seam: the largest inference call the
+        /// stub served, and how many inference calls it served.
+        fn max_batch_texts(&self) -> usize {
+            self.max_batch.load(Ordering::Relaxed)
+        }
+
+        fn batches_served(&self) -> usize {
+            self.batches.load(Ordering::Relaxed)
+        }
+
+        /// Deterministic pseudo-embedding: the vector depends only on
+        /// the text, so re-embed behaviour is observable. The first
+        /// element is always non-zero (this stub must never trip the
+        /// pass's all-zero guard).
+        fn embed_one(&self, text: &str) -> Vec<f32> {
+            let mut v = vec![0.0; self.dim];
+            v[0] = 1.0;
+            for (i, b) in text.bytes().enumerate() {
+                v[(i + 1) % self.dim] += (b as f32) / 255.0 - 0.5;
+            }
+            v
+        }
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for StubEmbedder {
+        async fn embed(&self, text: &str) -> Vec<f32> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.embed_one(text)
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            self.calls.fetch_add(texts.len(), Ordering::Relaxed);
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            self.max_batch.fetch_max(texts.len(), Ordering::Relaxed);
+            texts.iter().map(|t| self.embed_one(t)).collect()
+        }
+
+        fn dim(&self) -> usize {
+            self.dim
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model
+        }
+
+        fn status(&self) -> Option<crate::memory::embedder::EmbedderStatus> {
+            if self.fail_after_batches > 0
+                && self.batches.load(Ordering::Relaxed) > self.fail_after_batches
+            {
+                return Some(crate::memory::embedder::EmbedderStatus::Failed);
+            }
+            self.status.clone()
+        }
+    }
+
+    /// Run one pass synchronously against an armed graph — the
+    /// direct-call seam for deterministic pass tests (the schedule
+    /// path's own thread is exercised separately).
+    #[cfg(feature = "embeddings")]
+    fn run_armed_pass(graph: &CodeGraph) {
+        let armed = graph
+            .symbol_embed
+            .armed
+            .clone()
+            .expect("the graph must be armed first");
+        run_symbol_embed_pass(
+            armed,
+            Arc::clone(&graph.store),
+            Arc::clone(&graph.symbol_embed.stop),
+            Arc::clone(&graph.symbol_search.generation),
+        );
+    }
+
+    /// Step 9: an unchanged symbol is never re-embedded — the second
+    /// pass over an identical index embeds nothing (text-hash-keyed
+    /// incremental embedding, end to end through index() and the pass).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn unchanged_symbol_not_reembedded() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let embedder = StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&embedder));
+        run_armed_pass(&graph);
+        let first = embedder.calls();
+        assert!(first > 0, "the first pass embeds the fixture's symbols");
+        let stored = graph.store().symbol_vec_count().unwrap();
+        assert_eq!(stored, first, "every embedded symbol stored its vector");
+        // The second pass over the unchanged index embeds nothing.
+        run_armed_pass(&graph);
+        assert_eq!(embedder.calls(), first, "no symbol is re-embedded");
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), stored);
+    }
+
+    /// Step 9: a model change re-embeds everything lazily — rows
+    /// stamped with another model turn pending and are re-embedded by the
+    /// next pass (the vec table's model column always names the real
+    /// model).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn model_change_reembeds() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let model = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        let embedder = StubEmbedder::new(model, 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&embedder));
+        run_armed_pass(&graph);
+        let first = embedder.calls();
+        assert!(first > 0);
+        // What a future CODE_EMBEDDING_MODEL change leaves behind: the
+        // stored rows name the old model.
+        graph
+            .store()
+            .overwrite_symbol_vec_model_for_test("old-code-model")
+            .unwrap();
+        assert_eq!(
+            graph.store().pending_symbols(model, 100).unwrap().len(),
+            first,
+            "every row of the old model is pending again"
+        );
+        run_armed_pass(&graph);
+        assert_eq!(embedder.calls(), first * 2, "everything is re-embedded");
+        assert_eq!(
+            graph.store().symbol_vec_count().unwrap(),
+            first,
+            "INSERT OR REPLACE keeps one row per symbol"
+        );
+        assert_eq!(
+            graph
+                .store()
+                .symbol_vec("src/lib.rs::helper::1")
+                .unwrap()
+                .unwrap()
+                .model,
+            model
+        );
+    }
+
+    /// Step 9's never-store-junk rule: a pass with an embedder that is
+    /// not the code model (the hash fallback's id) or reports Failed
+    /// embeds nothing and stores nothing.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_skips_embedders_that_are_not_the_code_model() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+
+        // The hash fallback's model id — the shape the real path answers
+        // with when neither the host nor the in-process model is
+        // available.
+        let hash = StubEmbedder::new("hash", 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&hash));
+        run_armed_pass(&graph);
+        assert_eq!(hash.calls(), 0);
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+
+        // The right model id but a Failed status (a degraded remote
+        // whose fallback would answer zeros): still skipped.
+        let failed = StubEmbedder::new(
+            crate::memory::embedder::CODE_EMBEDDING_MODEL,
+            8,
+            Some(crate::memory::embedder::EmbedderStatus::Failed),
+        );
+        graph.arm_symbol_embedder_stub(Arc::clone(&failed));
+        run_armed_pass(&graph);
+        assert_eq!(failed.calls(), 0);
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+    }
+
+    /// Step 9: a failed embedder build stores nothing and is never
+    /// cached — the retry window parks the rebuild (10 minutes by
+    /// default), and the injected zero interval lets the next pass try
+    /// again (the lead's clock/interval injection).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn failed_build_is_not_cached_and_retries_after_the_window() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let builds = Arc::new(AtomicUsize::new(0));
+        // A builder that returns a FALLBACK embedder (not the code
+        // model, so the build fails the slot's validation) and counts
+        // its calls.
+        fn count_builder(builds: &Arc<AtomicUsize>) -> code_embedder_slot::Build {
+            let counted = Arc::clone(builds);
+            Box::new(move |_cache_dir, _memory_model| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                StubEmbedder::new("hash", 8, None)
+            })
+        }
+        code_embedder_slot::test::install_builder(count_builder(&builds));
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        run_armed_pass(&graph);
+        // The failed build stored nothing...
+        assert_eq!(builds.load(Ordering::Relaxed), 1, "one build attempt");
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+        // ...and within the retry window there is no second attempt.
+        run_armed_pass(&graph);
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "the retry window parks the rebuild"
+        );
+        // A zero window (the injected interval) unparks the slot: the
+        // next pass builds again — and the build still fails, still
+        // storing nothing, and a follow-up pass may build again too
+        // (the gate never re-arms when the window is zero).
+        code_embedder_slot::test::reset();
+        code_embedder_slot::test::set_retry_window(0);
+        code_embedder_slot::test::install_builder(count_builder(&builds));
+        run_armed_pass(&graph);
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            2,
+            "the window's expiry allows a rebuild"
+        );
+        run_armed_pass(&graph);
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            3,
+            "a zero window never parks the slot"
+        );
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding slotLockAcrossRetry (plan d3336a8a step 17): the slot lock
+    /// is never held across a build. A deliberately slow build (3 s — far
+    /// longer than the old lock-hold) is in progress, and `cached()`
+    /// still answers at once with `None` instead of stalling a tokio
+    /// worker behind the build; the running build stores its result for
+    /// the next round.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn cached_answers_promptly_while_a_build_is_in_progress() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        code_embedder_slot::test::install_builder(Box::new(move |_cache_dir, _memory_model| {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let builder = std::thread::spawn(|| {
+            code_embedder_slot::acquire(Path::new("does-not-matter"), None)
+        });
+        // Wait until the slow build is actually in flight.
+        let start = std::time::Instant::now();
+        while !code_embedder_slot::test::building() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the slow build never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let t0 = std::time::Instant::now();
+        let cached = code_embedder_slot::cached();
+        let elapsed = t0.elapsed();
+        assert!(
+            cached.is_none(),
+            "no cached embedder exists while the build runs"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "cached() waited {elapsed:?} behind a build — the slot lock must never be held across a build"
+        );
+        // The running build stores its result for the next round.
+        let built = builder.join().unwrap();
+        assert!(built.is_some(), "the slow build completed");
+        assert!(
+            code_embedder_slot::cached().is_some(),
+            "the finished build is cached for the next round"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding notReadyNoteMisleads (plan d3336a8a step 17): a parked
+    /// retry gate says the model is NOT AVAILABLE and when it retries —
+    /// nothing is being built, so the old "still being built (0 of M)"
+    /// line would mislead. The gate is parked directly (the test control)
+    /// so no build ever runs.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn find_code_note_says_unavailable_while_the_gate_is_parked() {
+        use crate::tool::Tool;
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        // A stub builder makes an accidentally expired gate harmless
+        // (finding tailTestRealBuild): the default builder's in-process
+        // ONNX load could download a model in CI.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        code_embedder_slot::test::park_gate_for_test(
+            crate::codegraph::ParkReason::HostNotAnswering,
+            std::time::Duration::from_secs(600),
+        );
+        let tool = crate::tool::agent::find_code::FindCodeTool::new(Some(Arc::new(graph)));
+        // Sync test + block_on: the slot guard is a std Mutex and must not
+        // be held across an await.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(tool.execute(serde_json::json!({
+            "query": "parse the fixture files",
+            "limit": 4,
+        })));
+        assert!(result.success, "the text fallback answers: {result:?}");
+        assert!(
+            result.output.starts_with(
+                "the code search model is not available right now (the shared \
+                 model host is not answering); showing text matches; it retries \
+                 in about 10 minutes"
+            ),
+            "the parked note reads: {result:?}"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// The other wording (finding notReadyNoteMisleads): while a build is
+    /// actually in progress the note keeps the honest "still being built"
+    /// progress line. The building flag is set directly so no build ever
+    /// runs (and the query must not wait for one).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn find_code_note_keeps_being_built_while_a_build_runs() {
+        use crate::tool::Tool;
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        code_embedder_slot::test::set_building_for_test(true);
+        let tool = crate::tool::agent::find_code::FindCodeTool::new(Some(Arc::new(graph)));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(tool.execute(serde_json::json!({
+            "query": "parse the fixture files",
+            "limit": 4,
+        })));
+        assert!(result.success, "the text fallback answers: {result:?}");
+        assert!(
+            result.output.starts_with("code embeddings are still being built (0 of"),
+            "the building note reads: {result:?}"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding buildingFlagPanicWedge (plan d3336a8a step 17): a panic
+    /// inside the build must not wedge `BUILDING` — the Drop guard
+    /// clears it on unwind, and a later acquire builds again.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_panicking_build_leaves_the_slot_buildable() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            panic!("the injected build panics");
+        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            code_embedder_slot::acquire(Path::new("does-not-matter"), None)
+        }));
+        assert!(result.is_err(), "the panicking build panics");
+        assert!(
+            !code_embedder_slot::test::building(),
+            "the panic unwound with BUILDING cleared — the slot is not wedged"
+        );
+        // A later acquire builds again and stores the good result.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let built = code_embedder_slot::acquire(Path::new("does-not-matter"), None);
+        assert!(built.is_some(), "the slot builds again after the panic");
+        assert!(code_embedder_slot::cached().is_some());
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding skippedPassNotRescheduled (plan d3336a8a step 17): a pass
+    /// round that races a query-started build WAITS for it (bounded)
+    /// instead of skipping — the build's result reaches THIS round, so
+    /// pending symbols are embedded without any new index event, and no
+    /// redundant second build runs.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn a_pass_round_waits_for_the_query_started_build() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        code_embedder_slot::test::install_builder(Box::new(move |_cache_dir, _memory_model| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        // The query-started shared build: owns BUILDING at once, builds
+        // in the background.
+        code_embedder_slot::ensure_build(Path::new("does-not-matter"), None);
+        assert!(
+            code_embedder_slot::test::building(),
+            "ensure_build claimed the build at once"
+        );
+        // The pass round, racing the in-flight build: it waits for the
+        // good result instead of skipping — and does NOT build again.
+        let got = code_embedder_slot::acquire(Path::new("does-not-matter"), None);
+        assert!(got.is_some(), "the round waited for the build to land");
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "no second build — the round reused the query-started one"
+        );
+        assert!(code_embedder_slot::cached().is_some());
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding parkedNoteEdges (a): an OFFLINE park (no host could
+    /// serve, the in-process load failed) must not blame the shared
+    /// model host — the note says the model could not be loaded.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn find_code_note_blames_the_load_when_no_host_could_serve() {
+        use crate::tool::Tool;
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        // A stub builder makes an accidentally expired gate harmless
+        // (finding tailTestRealBuild): the default builder's in-process
+        // ONNX load could download a model in CI.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        code_embedder_slot::test::park_gate_for_test(
+            crate::codegraph::ParkReason::NotLoaded,
+            std::time::Duration::from_secs(600),
+        );
+        let tool = crate::tool::agent::find_code::FindCodeTool::new(Some(Arc::new(graph)));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(tool.execute(serde_json::json!({
+            "query": "parse the fixture files",
+            "limit": 4,
+        })));
+        assert!(result.success, "the text fallback answers: {result:?}");
+        assert!(
+            result.output.starts_with(
+                "the code search model could not be loaded; showing text \
+                 matches; it retries in about 10 minutes"
+            ),
+            "the offline note reads: {result:?}"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding parkedNoteEdges (b): the retry tail is grammatical — one
+    /// minute singular, and "shortly" for a gate that has all but
+    /// expired.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn find_code_note_retry_tail_is_worded_correctly() {
+        use crate::tool::Tool;
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        // A stub builder before the note loop (finding tailTestRealBuild):
+        // if a thread stall lets the sub-second "shortly" gate expire, the
+        // query's ensure_build must build the harmless stub — never the
+        // DEFAULT builder, whose in-process ONNX load could download a
+        // model in CI.
+        code_embedder_slot::test::install_builder(Box::new(|_cache_dir, _memory_model| {
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        let tool = crate::tool::agent::find_code::FindCodeTool::new(Some(Arc::new(graph)));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let note = |window: std::time::Duration| -> String {
+            code_embedder_slot::test::park_gate_for_test(
+                crate::codegraph::ParkReason::HostNotAnswering,
+                window,
+            );
+            let result = rt.block_on(tool.execute(serde_json::json!({
+                "query": "parse the fixture files",
+                "limit": 4,
+            })));
+            result.output.lines().next().unwrap().to_string()
+        };
+        let minute = note(std::time::Duration::from_secs(60));
+        assert!(
+            minute.ends_with("it retries in about 1 minute"),
+            "the singular tail reads: {minute}"
+        );
+        let shortly = note(std::time::Duration::from_millis(900));
+        assert!(
+            shortly.ends_with("it retries shortly"),
+            "the expiring tail reads: {shortly}"
+        );
+        let minutes = note(std::time::Duration::from_secs(600));
+        assert!(
+            minutes.ends_with("it retries in about 10 minutes"),
+            "the plural tail reads: {minutes}"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Finding parkedNoteEdges (c): an EXPIRED gate is not reported
+    /// Parked, and a query really retries it — ensure_build starts the
+    /// retry the note promised.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn an_expired_gate_is_retried_by_the_next_query() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        code_embedder_slot::test::install_builder(Box::new(move |_cache_dir, _memory_model| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        // An instantly-expired gate: the state must not report Parked.
+        code_embedder_slot::test::park_gate_for_test(
+            crate::codegraph::ParkReason::HostNotAnswering,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            graph.code_embedder_state(),
+            CodeEmbedderState::Unarmed,
+            "an expired gate is not Parked"
+        );
+        // The next query really retries: ensure_build claims the
+        // expired gate and builds.
+        code_embedder_slot::ensure_build(Path::new("does-not-matter"), None);
+        // Poll for the STORED result, not just the builder's counter
+        // (finding tailTestRealBuild): the counter moves when build()
+        // starts, while build_and_store stores after it returns — so a
+        // counter-only wait races the store under load.
+        let start = std::time::Instant::now();
+        while code_embedder_slot::cached().is_none() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the query-started retry never stored its result"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "the query-started retry ran exactly once"
+        );
+        code_embedder_slot::test::reset();
+    }
+
+    /// Step 9: the stop flag (set by the graph's Drop) ends a pass at
+    /// the next batch boundary — a pre-stopped graph embeds nothing
+    /// despite pending symbols, and dropping the graph really sets the
+    /// flag.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_stops_when_the_graph_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let embedder = StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&embedder));
+        // The signal Drop sends, simulated first (the deterministic
+        // half): a stopped graph embeds nothing.
+        graph.symbol_embed.stop.store(true, Ordering::Release);
+        run_armed_pass(&graph);
+        assert_eq!(embedder.calls(), 0);
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+        // The real signal: dropping the graph sets the flag.
+        let stop = Arc::clone(&graph.symbol_embed.stop);
+        drop(graph);
+        assert!(
+            stop.load(Ordering::Acquire),
+            "CodeGraph's Drop sets the stop flag"
+        );
+    }
+
+    /// Step 9's scheduling end to end: `schedule_symbol_embed_pass` runs
+    /// the pass on its own thread (single-flight), the vectors land, and
+    /// the running flag clears when the queue drains.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn scheduled_pass_runs_in_background_and_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let embedder = StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&embedder));
+        graph.schedule_symbol_embed_pass();
+        // Poll the single-flight flag until the pass finishes (a
+        // generous deadline; the fixture is tiny).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while graph.symbol_embed.running.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !graph.symbol_embed.running.load(Ordering::Acquire),
+            "the scheduled pass finished"
+        );
+        assert!(embedder.calls() > 0);
+        assert_eq!(
+            graph.store().symbol_vec_count().unwrap(),
+            embedder.calls(),
+            "the background pass embedded every pending symbol"
+        );
+    }
+
+    /// A stub that panics inside its embed calls — a misbehaving embedder
+    /// (review finding panicStuckRunning).
+    #[cfg(feature = "embeddings")]
+    struct PanickingStubEmbedder {
+        entries: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for PanickingStubEmbedder {
+        async fn embed(&self, _text: &str) -> Vec<f32> {
+            self.entries.fetch_add(1, Ordering::Relaxed);
+            panic!("a misbehaving embedder");
+        }
+
+        async fn embed_batch(&self, _texts: &[String]) -> Vec<Vec<f32>> {
+            self.entries.fetch_add(1, Ordering::Relaxed);
+            panic!("a misbehaving embedder");
+        }
+
+        fn dim(&self) -> usize {
+            8
+        }
+
+        fn model_id(&self) -> &str {
+            crate::memory::embedder::CODE_EMBEDDING_MODEL
+        }
+    }
+
+    /// Review finding panicStuckRunning: the pass thread's Drop guard
+    /// clears the single-flight flag even when the pass panics, so a
+    /// later trigger schedules the pass again — a panicking embedder
+    /// cannot disable the graph's pass for the rest of the process.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn panicking_embedder_does_not_stick_the_single_flight_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let entries = Arc::new(AtomicUsize::new(0));
+        graph.arm_symbol_embedder_stub(Arc::new(PanickingStubEmbedder {
+            entries: Arc::clone(&entries),
+        }));
+        graph.schedule_symbol_embed_pass();
+        // Wait out the panicking pass: the guard clears the flag on
+        // unwind.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while graph.symbol_embed.running.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !graph.symbol_embed.running.load(Ordering::Acquire),
+            "the guard cleared the flag despite the panic"
+        );
+        assert_eq!(entries.load(Ordering::Relaxed), 1);
+        // The second schedule really runs — the flag was not stuck.
+        graph.schedule_symbol_embed_pass();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while graph.symbol_embed.running.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            entries.load(Ordering::Relaxed),
+            2,
+            "the pass runs again after the panicking embedder"
+        );
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+    }
+
+    /// A stub answering non-zero vectors of the WRONG length — the
+    /// store's dim-mismatch guard skips every row, so a non-empty batch
+    /// stores nothing (review finding zeroProgressLoop).
+    #[cfg(feature = "embeddings")]
+    struct WrongLengthStubEmbedder {
+        batches: AtomicUsize,
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[async_trait::async_trait]
+    impl crate::memory::embedder::Embedder for WrongLengthStubEmbedder {
+        async fn embed(&self, _text: &str) -> Vec<f32> {
+            vec![1.0, 2.0]
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            texts.iter().map(|_| vec![1.0, 2.0]).collect()
+        }
+
+        fn dim(&self) -> usize {
+            // The vectors above are 2-long: the mismatch trips the store
+            // guard, and the batch stores nothing.
+            8
+        }
+
+        fn model_id(&self) -> &str {
+            crate::memory::embedder::CODE_EMBEDDING_MODEL
+        }
+    }
+
+    /// Review finding zeroProgressLoop: a non-empty batch that stores
+    /// nothing stops the pass after ONE embed — re-reading the queue
+    /// would return the very same batch forever.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_stops_when_a_non_empty_batch_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let stub = Arc::new(WrongLengthStubEmbedder {
+            batches: AtomicUsize::new(0),
+        });
+        graph.arm_symbol_embedder_stub(Arc::clone(&stub));
+        run_armed_pass(&graph);
+        assert_eq!(
+            stub.batches.load(Ordering::Relaxed),
+            1,
+            "exactly one batch embed — no hot loop"
+        );
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+        assert_eq!(
+            graph
+                .store()
+                .pending_symbols(crate::memory::embedder::CODE_EMBEDDING_MODEL, 100)
+                .unwrap()
+                .len(),
+            3,
+            "the symbols stay pending for the next pass"
+        );
+    }
+
+    /// Review finding midPassHashJunk: a mid-pass degradation keeps
+    /// answering — the hash fallback's deterministic, non-zero,
+    /// right-dim vectors under the code model's id — so only the
+    /// per-batch status re-check catches it. The batch embedded before
+    /// the flip is stored; the batch embedded after it is dropped, and
+    /// the pass stops.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_stops_and_drops_the_batch_when_the_embedder_degrades_mid_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 embeddable fns: two batches at SYMBOL_EMBED_BATCH = 64.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let mut src = String::new();
+        for i in 0..100 {
+            src.push_str(&format!("pub fn f{i}() -> u32 {{ {i} }}\n"));
+        }
+        std::fs::write(src_dir.join("big.rs"), src).unwrap();
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let model = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        assert_eq!(
+            graph.store().pending_symbols(model, 1000).unwrap().len(),
+            100
+        );
+        let stub = StubEmbedder::new_degrading(model, 8, 4);
+        graph.arm_symbol_embedder_stub(Arc::clone(&stub));
+        run_armed_pass(&graph);
+        // Batch 1 (64 symbols, four step-15 sub-batches) stored; batch 2
+        // embedded its first sub-batch, then dropped it on the status
+        // check; nothing after.
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 64);
+        assert_eq!(stub.calls(), 80);
+        // The pass stopped: the degraded batch's symbols stay pending
+        // for the next pass.
+        assert_eq!(
+            graph.store().pending_symbols(model, 1000).unwrap().len(),
+            36
+        );
+    }
+
+    /// Plan d3336a8a step 15: the pass embeds at most
+    /// SYMBOL_EMBED_SUB_BATCH texts per inference call — one 64-symbol
+    /// batch in a single ONNX call is the padded shape that grew the
+    /// arena until an allocation failed mid-pass (the eval's queue
+    /// stuck at `1 pending`, never draining). The stub records the
+    /// largest inference call it served; it must stay within the
+    /// sub-batch bound, and the answers still cover every symbol.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn pass_sub_batches_its_inference_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        // 100 embeddable fns: two batches at SYMBOL_EMBED_BATCH = 64,
+        // five inference calls at SYMBOL_EMBED_SUB_BATCH = 16.
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let mut src = String::new();
+        for i in 0..100 {
+            src.push_str(&format!("pub fn f{i}() -> u32 {{ {i} }}\n"));
+        }
+        std::fs::write(src_dir.join("big.rs"), src).unwrap();
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        let model = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        let stub = StubEmbedder::new(model, 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&stub));
+        run_armed_pass(&graph);
+        assert_eq!(
+            stub.max_batch_texts(),
+            SYMBOL_EMBED_SUB_BATCH,
+            "no inference call exceeds the sub-batch bound"
+        );
+        assert_eq!(stub.batches_served(), 7);
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 100);
+    }
+
+    /// Step 9's migration path end to end: a pre-step-9 DB (its tables
+    /// absent, files stamped with the older extractor version) opens,
+    /// gains the tables, and the version backfill re-parses the files so
+    /// the text rows appear — then the pass embeds them, and a later
+    /// index never re-parses them again (never perpetual).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn old_db_migrates_and_backfills_text_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let db = dir.path().join("graph.db");
+        {
+            let graph = CodeGraph::open(dir.path().to_path_buf(), &db).unwrap();
+            graph.index(None).unwrap();
+        }
+        {
+            // The pre-step-9 database: no step-9 tables, v1 stamps (a
+            // separate connection — the graph is closed).
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "DROP TABLE cg_symbol_text;
+                 DROP TABLE cg_symbol_vec;
+                 UPDATE cg_extract_meta SET version = 1;",
+            )
+            .unwrap();
+        }
+        let mut graph = CodeGraph::open(dir.path().to_path_buf(), &db).unwrap();
+        // The version bump forces one re-parse of every v1-stamped file
+        // (mtime and hash unchanged), backfilling the text rows.
+        let stats = graph.index(None).unwrap();
+        assert_eq!(
+            stats.files_reindexed, 3,
+            "every v1-stamped file is re-parsed once"
+        );
+        let model = crate::memory::embedder::CODE_EMBEDDING_MODEL;
+        let pending = graph.store().pending_symbols(model, 100).unwrap();
+        assert_eq!(pending.len(), 3, "the re-parse backfilled the text rows");
+        let embedder = StubEmbedder::new(model, 8, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&embedder));
+        run_armed_pass(&graph);
+        assert_eq!(embedder.calls(), 3);
+        assert_eq!(graph.store().symbol_vec_count().unwrap(), 3);
+        // And a second index pass does NOT re-parse them again (the
+        // re-parse stamped v2 — the backfill fires exactly once).
+        let stats2 = graph.index(None).unwrap();
+        assert_eq!(stats2.files_reindexed, 0, "the backfill is never perpetual");
+    }
+
+    /// Step 9's report fixture: indexes THIS repository and runs one
+    /// full embed pass with the deterministic stub embedder — reporting
+    /// symbol counts, the embedded count, DB growth, and pass duration.
+    /// Run with `cargo test symbol_embed_measurement -- --ignored
+    /// --nocapture` (ignored in normal runs: it walks the whole repo
+    /// tree, like `repo_index_timing` above). The stub's vectors carry
+    /// the real model's 768 dims, so the DB-growth number is the real
+    /// one; only the inference time is stubbed.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    #[ignore]
+    fn symbol_embed_measurement_on_this_repo() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("codegraph.db");
+        let mut graph = CodeGraph::open(root, &db).unwrap();
+        let stats = graph.index(None).unwrap();
+        let db_bytes_before = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+        let embedder = StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 768, None);
+        graph.arm_symbol_embedder_stub(Arc::clone(&embedder));
+        let started = Instant::now();
+        run_armed_pass(&graph);
+        let pass_elapsed = started.elapsed();
+        let db_bytes_after = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+        let embedded = graph.store().symbol_vec_count().unwrap();
+        let still_pending = graph
+            .store()
+            .pending_symbols(crate::memory::embedder::CODE_EMBEDDING_MODEL, 10_000_000)
+            .unwrap()
+            .len();
+        println!(
+            "step-9 measurement: files scanned {}, reindexed {}, symbols {} (incl. modules/impls), embedded {}, pending after pass {}, db {} -> {} bytes (+{}), full pass {:?} (stub inference)",
+            stats.files_scanned,
+            stats.files_reindexed,
+            stats.symbols,
+            embedded,
+            still_pending,
+            db_bytes_before,
+            db_bytes_after,
+            db_bytes_after.saturating_sub(db_bytes_before),
+            pass_elapsed
+        );
+        assert!(embedded > 0);
+        assert_eq!(still_pending, 0, "the pass drained the queue");
     }
 }

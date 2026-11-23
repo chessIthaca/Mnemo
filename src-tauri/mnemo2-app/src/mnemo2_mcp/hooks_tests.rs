@@ -803,3 +803,135 @@ fn session_start_without_a_session_id_teaches_no_waiter() {
     let output = notices(&sandbox.env(), NoticesMode::SessionStart, &stdin);
     assert_eq!(parsed(output)["hookSpecificOutput"]["additionalContext"], "Mnemo: idle.");
 }
+
+// ---- worktree-create / worktree-remove ----------------------------------------
+
+/// `git <args>` in `dir`, asserting success; its trimmed stdout.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// `sandbox.elsewhere` as a git repository with one commit: outside any
+/// Mnemo project, so the worktree hooks make plain worktrees there.
+fn plain_repo(sandbox: &Sandbox) -> std::path::PathBuf {
+    let repo = sandbox.elsewhere.clone();
+    std::fs::create_dir_all(&repo).expect("repo folder");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "hello\n").expect("file");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    repo
+}
+
+fn worktree_input(cwd: &std::path::Path, name: &str) -> String {
+    hook_stdin(
+        cwd,
+        json!({
+            "hook_event_name": "WorktreeCreate",
+            "name": name,
+            "transcript_path": "C:/Users/me/.claude/projects/slug/lead-session.jsonl",
+        }),
+    )
+}
+
+#[test]
+fn worktree_create_hands_out_the_claimed_pool() {
+    let sandbox = Sandbox::new();
+    let pool = sandbox.project.join(".worktrees").join("pool-3");
+    let server = server_with(
+        &sandbox,
+        "/lead/worktree-claim",
+        json!({ "worktree": pool.to_string_lossy(), "worker_id": "agentWork01" }),
+    );
+    let answer = worktree_create(&sandbox.env(), &worktree_input(&sandbox.deep, "agent-a1b2c3"));
+    assert_eq!(answer, Ok(pool.to_string_lossy().into_owned()));
+    let sent = server.requests_to("/lead/worktree-claim");
+    assert_eq!(
+        sent[0].json(),
+        json!({
+            "root": sandbox.project_str(),
+            "name": "agent-a1b2c3",
+            "transcript_path": "C:/Users/me/.claude/projects/slug/lead-session.jsonl",
+        })
+    );
+}
+
+#[test]
+fn worktree_create_reports_a_claim_error() {
+    let sandbox = Sandbox::new();
+    let _server = server_with(
+        &sandbox,
+        "/lead/worktree-claim",
+        json!({ "error": "2 agent workers wait for their agent (a, b)" }),
+    );
+    let answer = worktree_create(&sandbox.env(), &worktree_input(&sandbox.deep, "agent-a1b2c3"));
+    assert_eq!(answer, Err("2 agent workers wait for their agent (a, b)".to_string()));
+}
+
+#[test]
+fn worktree_create_refuses_a_name_that_is_a_path() {
+    let sandbox = Sandbox::new();
+    for name in ["", "..", "a/b", "a\\b", "a b"] {
+        assert!(worktree_create(&sandbox.env(), &worktree_input(&sandbox.deep, name)).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn worktree_create_fallback_makes_a_claude_style_worktree() {
+    let sandbox = Sandbox::new();
+    let repo = plain_repo(&sandbox);
+    let answer = worktree_create(&sandbox.env(), &worktree_input(&repo, "agent-plain1"))
+        .expect("a plain worktree");
+    let dir = repo.join(".claude").join("worktrees").join("agent-plain1");
+    assert_eq!(std::path::PathBuf::from(&answer), dir);
+    assert_eq!(git(&dir, &["branch", "--show-current"]), "worktree-agent-plain1");
+    // The same name again reuses that folder, as Claude Code does.
+    let again = worktree_create(&sandbox.env(), &worktree_input(&repo, "agent-plain1"))
+        .expect("the same worktree");
+    assert_eq!(again, answer);
+}
+
+#[test]
+fn worktree_remove_removes_plain_worktrees_and_leaves_pools_alone() {
+    let sandbox = Sandbox::new();
+    let repo = plain_repo(&sandbox);
+    let plain = worktree_create(&sandbox.env(), &worktree_input(&repo, "agent-plain2"))
+        .expect("a plain worktree");
+    let pool = repo.join(".worktrees").join("pool-1");
+    git(&repo, &["worktree", "add", "-q", "--detach", &pool.to_string_lossy()]);
+    let remove = |path: &str| {
+        worktree_remove(
+            &sandbox.env(),
+            &hook_stdin(&repo, json!({ "hook_event_name": "WorktreeRemove", "worktree_path": path })),
+        )
+    };
+    assert_eq!(remove(&pool.to_string_lossy()), Ok(()));
+    assert!(pool.join(".git").exists(), "a pool is never removed by the hook");
+    assert_eq!(remove(&plain), Ok(()));
+    assert!(!std::path::Path::new(&plain).exists(), "the plain worktree is gone");
+    assert_eq!(git(&repo, &["branch", "--list", "worktree-agent-plain2"]), "");
+}
+
+#[test]
+fn gate_agent_passes_the_isolation_on() {
+    let sandbox = Sandbox::new();
+    let server = server_with(&sandbox, "/lead/gate-agent", json!({ "decision": "allow", "reason": "" }));
+    let env = sandbox.env();
+    assert!(gate_agent(
+        &env,
+        &gate_input(&sandbox, "Agent", json!({ "subagent_type": "general-purpose", "isolation": "worktree" })),
+    )
+    .is_none());
+    assert!(gate_agent(&env, &gate_input(&sandbox, "Agent", json!({ "subagent_type": "Explore" }))).is_none());
+    let sent = server.requests_to("/lead/gate-agent");
+    assert_eq!(sent[0].json()["isolation"], "worktree");
+    assert!(sent[1].json().get("isolation").is_none(), "no isolation, no field");
+}

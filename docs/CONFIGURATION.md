@@ -15,7 +15,9 @@ How to configure Mnemo2: the global files in `~/.mnemo/` (or `$MNEMO_HOME`), end
 | `state-owner-id` | this machine's id, which stamps each project's `.coding/mnemo2/` |
 | `bin/mnemo2-mcp` | the Claude Code plugin's helper; Mnemo2 installs it at every start (a source build installs it too) |
 | `claude-plugin/` | the Claude Code plugin as a local marketplace (`.claude-plugin/marketplace.json` plus `plugin/` with the helper in `plugin/bin/`), rewritten at every start; Settings → Claude Code connects it |
-| `run/` | one `mnemo2-<pid>.json` per running Mnemo2 (port, token, open project), read by the helper |
+| `run/` | one `mnemo2-<pid>.json` per running Mnemo2 (port, token, open project), read by the helper and by every instance's Mission Control; the shared-service lease dirs `laya/` and `models/` (a `service.json` plus one `lease-<pid>.json` per attached instance); `heavy/` and `endpoint-<hash>/` hold the machine-wide file-lock slots and the shared 429 cooldown |
+| `models/` | the embedding models every instance shares, downloaded once (`mnemo-models` and the in-process fallback load them from here) |
+| `knowledge/` | the machine knowledge tier: `how/` and `decision/` records every project indexes read-only and shows as `[machine]`, written with `memory_write` `scope: "machine"` |
 | `index-staleness.jsonl` | the index-repair log (last section) |
 | `laya/training/` | Laya training logs |
 
@@ -88,6 +90,8 @@ Strict tool schemas are capability-gated per endpoint: `supports_strict_schema` 
 ### Tiers
 
 `endpoints.toml` holds five `[[tier]]` entries in fixed order: `trivial`, `routine`, `medium`, `high`, `escalate`. Each has an id, a name, a definition and an ordered list of models. A worker runs on its tier's first available model; an empty tier falls back to the nearest cheaper tier that has one; `escalate` is only for moving a worker that keeps failing, never a first pick. Edit them in Settings → Tiers.
+
+A tier except `escalate` may also carry `claude_agent = "opus" | "sonnet" | "haiku" | "fable"` (omitted by default, set in Settings → Tiers with the "Run as" choice). While an external Claude Code lead leads the team, a dispatch that settles on such a tier is handed to the lead's own Claude Code agent on that model instead of a Mnemo worker session: Mnemo still prepares the worktree and branch, gates and routes the step, and the agent gate allows the lead's Agent calls without asking, but no Mnemo session starts — the lead finishes the step with `team_agent_done`, and review and merge stay the normal Mnemo flow. Without an external lead attached the tier resolves to its models exactly as before; `escalate` rejects the key at validation ("the escalate tier cannot run as a Claude Code agent").
 
 ## mnemo2.toml
 

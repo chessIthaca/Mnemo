@@ -37,6 +37,15 @@ path = "src/main.rs"
 name = "mnemo2-mcp"
 path = "src/mnemo2_mcp.rs"
 
+# The machine-wide shared embedding-model host (plan d3336a8a step 2): a
+# detached console binary every Mnemo2 instance embeds through when one is
+# running (loopback HTTP, bearer-token auth, idle exit when no instance
+# leases it). `npm run rebuild:mnemo2` installs it to <config>/bin via
+# scripts/install-mnemo2-mcp.mjs — the same packaging as mnemo2-mcp.
+[[bin]]
+name = "mnemo-models"
+path = "src/mnemo_models.rs"
+
 [[example]]
 name = "mnemo2_route_eval"
 path = "examples/mnemo2_route_eval.rs"

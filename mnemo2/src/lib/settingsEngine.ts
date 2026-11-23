@@ -63,6 +63,17 @@ export interface TierDto {
   role: string | null;
   /** What this rung runs on when it has no model — the tier it folds down to. */
   resolves_to: string;
+  /**
+   * `opus`, `sonnet`, `haiku` or `fable`: run this tier as a Claude Code agent
+   * with that model when Claude Code leads; `null` runs Mnemo's own models.
+   * The escalate tier never carries one.
+   */
+  claude_agent: string | null;
+  /**
+   * `low`, `medium`, `high`, `xhigh` or `max`: the Claude Code agent's effort,
+   * or `null` for the agent default. Only valid when `claude_agent` is set.
+   */
+  claude_agent_effort: string | null;
 }
 
 /** The tier ladder — the Rust `TiersDto`: five rungs, cheapest first. */
@@ -84,6 +95,8 @@ export function emptyTiers(): TiersDto {
       effort: null,
       role: id === "escalate" ? "escalate" : null,
       resolves_to: TIER_IDS[Math.max(0, index - 1)],
+      claude_agent: null,
+      claude_agent_effort: null,
     })),
   };
 }

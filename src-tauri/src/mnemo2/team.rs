@@ -35,7 +35,10 @@ use crate::mnemo2::runtime::LeadModel;
 use crate::mnemo2::pricing::usage_model_key;
 use crate::mnemo2::usage::{ProjectUsage, ProjectUsageView};
 
+mod agent_log;
+mod agent_watch;
 mod audit;
+mod check_run;
 mod control;
 mod deletion;
 mod dispatch;
@@ -43,6 +46,7 @@ mod escalation;
 mod external_lead;
 pub(crate) mod findings_ledger;
 mod guardrails;
+mod integrate;
 mod lead_tools;
 mod merge;
 mod nudge;
@@ -195,6 +199,11 @@ pub struct TeamSnapshot {
     /// already holds that revision.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub omitted_transcripts: Vec<String>,
+    /// What Mnemo knows about each registered Claude Code agent, by worker
+    /// id (the `agent` object of `team_status`). Such a worker's transcript
+    /// above is the agent's own log, converted.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub agents: HashMap<String, serde_json::Value>,
 }
 
 /// One event forwarded from a worker session, tagged with its worker id.
@@ -316,6 +325,11 @@ pub struct TeamRuntime {
     /// The dispatch-routing settings, shared with every worker pump so a
     /// failure's `outcome` row follows the mode in force when it happens.
     routing: Arc<std::sync::RwLock<RoutingSettings>>,
+    /// The models a provider usage limit took out, with the time each serves
+    /// again, and the runtime's own handle (plan e5d93df3 decision 8). Shared
+    /// with every worker pump, which marks the model a usage-limited worker
+    /// ran on and, in routing mode auto, resumes that worker. In memory only.
+    usage_limits: routing::UsageLimits,
     classifier: Option<ClassifierSlot>,
     /// The online-learning overlay over `dispatch_routing.jsonl`, present when
     /// the engine exposes its shared embedder. Consulted before Laya.
@@ -343,6 +357,12 @@ pub struct TeamRuntime {
     /// The workers whose proofs are running. Every entry point that would move
     /// a proved checkout refuses while the worker's id is in here.
     proving: proving::Proving,
+    /// The workers (or the lead checkout) whose Mnemo-run check runs are in
+    /// progress; the same entry points refuse them as refuse a proof.
+    check_runs: check_run::CheckRuns,
+    /// The registered Claude Code agents' transcript readings and their
+    /// watcher task.
+    agent_watch: agent_watch::AgentWatch,
     /// The two proof commands, behind a seam a test can answer without a
     /// twenty-minute build.
     proofs: std::sync::RwLock<Arc<dyn proving::ProofRunner>>,
@@ -370,6 +390,71 @@ impl TeamRuntime {
             .filter(|worker| !worker.worktree.as_os_str().is_empty())
             .map(|worker| worker.worktree.clone())
             .collect()
+    }
+
+    /// Give back the pool checkouts no worker needs any more (plan 4d920eec
+    /// decision 8), so the next dispatch reuses them warm instead of making a
+    /// cold pool: an audit that has delivered its report (it is locked and
+    /// never builds again), and a Stopped or Failed worker whose plan step is
+    /// already done on the board. Each is released the way a merge releases
+    /// a pool (detached, build caches kept, the record's worktree cleared);
+    /// one with a live session or uncommitted work keeps its pool. Runs
+    /// right before a pool is handed out, so no background job is needed.
+    pub(super) async fn release_idle_checkouts(&self) {
+        let board = self.board();
+        let step_done = |worker: &WorkerRecord| -> bool {
+            let (Some(board), Some(plan_id), Some(step)) =
+                (board.as_ref(), worker.plan_id.as_deref(), worker.plan_step)
+            else {
+                return false;
+            };
+            board
+                .get(plan_id)
+                .ok()
+                .and_then(|plan| plan.steps.get(step).map(|board_step| board_step.done))
+                .unwrap_or(false)
+        };
+        let candidates: Vec<(String, PathBuf, String)> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| mnemo::app::worktrees::is_pool_checkout(&worker.worktree))
+            .filter(|worker| {
+                (worker.kind == "audit" && worker.report_delivered)
+                    || (matches!(worker.status, WorkerStatus::Stopped | WorkerStatus::Failed)
+                        && step_done(worker))
+            })
+            .map(|worker| (worker.id.clone(), worker.worktree.clone(), worker.branch.clone()))
+            .collect();
+        let mut released = false;
+        for (worker_id, checkout, branch) in candidates {
+            if self.live.lock().await.contains_key(&worker_id) {
+                continue;
+            }
+            match mnemo::app::worktrees::release_pool_checkout(
+                self.workspace_root.clone(),
+                checkout.clone(),
+                branch,
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.update_worker(&worker_id, |worker| worker.worktree = PathBuf::new())
+                        .await;
+                    released = true;
+                }
+                Err(error) => eprintln!(
+                    "team: kept the pool checkout {} of {worker_id}: {error}",
+                    checkout.display()
+                ),
+            }
+        }
+        if released {
+            if let Err(error) = self.persist().await {
+                eprintln!("team: could not save the released pool checkouts: {error}");
+            }
+        }
     }
 
     /// Every checkout held by a record other than `worker_id`.
@@ -458,6 +543,7 @@ impl TeamRuntime {
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
             config_dir: config_dir.clone(),
             routing: Arc::new(std::sync::RwLock::new(load_routing_settings(&config_dir))),
+            usage_limits: routing::UsageLimits::default(),
             classifier: options.classifier,
             route_knn,
             routing_permit: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -470,6 +556,8 @@ impl TeamRuntime {
             transcript_revs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             board: std::sync::Mutex::new(None),
             proving: proving::Proving::default(),
+            check_runs: check_run::CheckRuns::default(),
+            agent_watch: agent_watch::AgentWatch::default(),
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
@@ -483,6 +571,8 @@ impl TeamRuntime {
         // App start: a checkout a previous run could not remove (something
         // held it) is retried now, and the branch it was blocking goes with it.
         runtime.retry_leftover_cleanups().await;
+        // A registered agent that was running when the app closed is watched again.
+        runtime.ensure_agent_watch().await;
         Ok(runtime)
     }
 
@@ -530,6 +620,9 @@ impl TeamRuntime {
     /// that tells working workers when the lead records something new.
     pub(crate) fn attach_board(self: &Arc<Self>, board: Arc<PlanBoard>) {
         board.set_external_lead_attached(self.external_lead_attached());
+        // The worker pumps resume a usage-limited worker through this handle;
+        // a second attach finds it already set to this same runtime.
+        let _ = self.usage_limits.team.set(Arc::downgrade(self));
         let team = Arc::downgrade(self);
         let runtime = tokio::runtime::Handle::try_current().ok();
         board.set_edit_observer(Box::new(move |plan_id, kinds| {
@@ -594,6 +687,7 @@ impl TeamRuntime {
             persistence: self.persistence.clone(),
             signals: self.signals.clone(),
             proving: self.proving.clone(),
+            check_runs: self.check_runs.clone(),
             board: self.board(),
             runner: Arc::clone(&*self.proofs.read().unwrap_or_else(|e| e.into_inner())),
             mutation_memory: self.mutation_memory.clone(),
@@ -602,14 +696,17 @@ impl TeamRuntime {
         }
     }
 
-    /// The refusal an entry point returns while a proof owns the worker's
-    /// checkout. Every path that would move that checkout, or start a turn in
+    /// The refusal an entry point returns while a proof, or Mnemo's own check
+    /// run, owns the worker's checkout. Every path that would move that checkout, or start a turn in
     /// it, must ask this **after** it takes the merge lock (finding
     /// claimRace): a claim holds the same lock while it decides, so the check
     /// and the claim are serialized and one of them always sees the other.
     pub(super) fn proving_guard(&self, worker_id: &str) -> Result<(), String> {
         if self.proving.is_active(worker_id) {
             return Err(proving::proving_error(worker_id));
+        }
+        if self.check_runs.is_active(worker_id) {
+            return Err(check_run::check_run_error(worker_id));
         }
         Ok(())
     }
@@ -717,6 +814,25 @@ impl TeamRuntime {
         ledger::live_turns(&self.records.lock().await)
     }
 
+    /// Active workers for every slot gate: live Mnemo sessions plus
+    /// session-free Claude Code agents in Working or Interrupted.
+    pub(super) async fn active_workers_for_slots(&self) -> usize {
+        let active_agents = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|worker| {
+                worker.claude_agent.is_some()
+                    && matches!(
+                        worker.status,
+                        WorkerStatus::Working | WorkerStatus::Fixing | WorkerStatus::Interrupted
+                    )
+            })
+            .count();
+        self.live.lock().await.len() + active_agents
+    }
+
     /// Persist a new live-session cap without dropping active workers.
     pub async fn set_slots(&self, slots: usize) -> Result<TeamSnapshot, String> {
         if !(1..=MAX_WORKER_SLOTS).contains(&slots) {
@@ -725,7 +841,7 @@ impl TeamRuntime {
             ));
         }
         let _operation = self.merge_lock.lock().await;
-        let active = self.live.lock().await.len();
+        let active = self.active_workers_for_slots().await;
         if slots < active {
             return Err(format!(
                 "stop {} worker(s) before reducing slots to {slots}",
@@ -814,7 +930,7 @@ impl TeamRuntime {
                 .count(),
             records
                 .iter()
-                .filter(|worker| worker.status.waiting_on_user())
+                .filter(|worker| worker.waiting_on_user())
                 .count(),
         )
     }
@@ -843,6 +959,10 @@ impl TeamRuntime {
                 .iter()
                 .map(|record| {
                     let mut record = record.clone();
+                    // A registered agent's thread is its own log, read-only.
+                    if let Some(log) = agent_log::agent_transcript(&self.agent_watch, &record) {
+                        record.transcript = log;
+                    }
                     let rev = match revisions.get(&record.id) {
                         Some((cached, rev)) if Arc::ptr_eq(cached, &record.transcript) => *rev,
                         _ => {
@@ -864,6 +984,12 @@ impl TeamRuntime {
             revisions.retain(|id, _| transcript_revs.contains_key(id));
             workers
         };
+        let mut agents = HashMap::new();
+        for worker in workers.iter().filter(|worker| worker.claude_agent_id.is_some()) {
+            if let Some(view) = self.agent_view(worker).await {
+                agents.insert(worker.id.clone(), view.to_json());
+            }
+        }
         let active = self.live.lock().await.len();
         let usage = self.usage.lock().await.clone();
         let pricing = self
@@ -878,6 +1004,7 @@ impl TeamRuntime {
             usage: usage.view(&pricing),
             transcript_revs,
             omitted_transcripts,
+            agents,
         }
     }
 
@@ -937,9 +1064,26 @@ impl TeamRuntime {
     }
 
     async fn persist(&self) -> Result<(), String> {
+        self.persist_with_snapshot(None).await
+    }
+
+    /// Persist the ledger, optionally substituting one worker in the saved
+    /// snapshot. The override is a regression seam for transcript write
+    /// failures; normal lifecycle writes always pass `None`.
+    async fn persist_with_snapshot(
+        &self,
+        snapshot_override: Option<WorkerRecord>,
+    ) -> Result<(), String> {
         // The final write of a closing runtime, so it bypasses the shutdown
         // check that voids detached saves.
-        save_workers_now(&self.records, &self.usage, &self.save_lock, &self.persistence).await
+        save_workers_now(
+            &self.records,
+            &self.usage,
+            &self.save_lock,
+            &self.persistence,
+            snapshot_override,
+        )
+        .await
     }
 
     /// Stop every live worker while preserving merged audit records.
@@ -957,6 +1101,7 @@ impl TeamRuntime {
     pub async fn shutdown(&self) {
         // Void a pending telemetry flush: the final persist is the last write.
         self.persistence.closed.store(true, Ordering::SeqCst);
+        self.agent_watch.stop();
         *self.lead_session.lock().await = None;
         let live = {
             let mut map = self.live.lock().await;

@@ -7,6 +7,39 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
+## [2.8.0] — 2026-11-23
+
+A tier can run as a Claude Code agent, code search finds code by meaning, and one shared model host serves every window.
+
+2.7.0's installers were never published, so 2.8.0 is the first release after 2.6.0 and carries 2.7.0's changes too.
+
+### Added
+- A tier can run as a Claude Code agent: **Run as** on the Tiers page picks Mnemo's own model or a Claude Code agent (Opus, Sonnet, Haiku, Fable) with its own effort, and a step that lands on such a tier is handed to that agent instead of a Mnemo worker.
+- Claude Code agent workers are registered, watched and heard from: Mission Control shows an agent's phase, log, activity and its real model, the workers band names its agent, and `team_message`, `team_route_fix` and `team_integrate` reach it.
+- Up to three isolated agent workers work at once, spawned one at a time, each in a pool checkout that its shell already starts in; its screenshots survive the checkout's release.
+- `find_code` searches code by meaning: describe what a function does and it blends the code model's vectors over every stored symbol (signature and doc text included) with the keyword index and a name match.
+- `team_run_checks` runs the whole check battery for the team while a fix round verifies narrowly, and workers record their lead base, follow the lead while idle and report a stale one.
+- `team_tiers` reads and changes the tiers, with a warning when a change reaches running work and when a dispatch bypasses a guardrail.
+- One `mnemo-models` host per machine serves the embeddings over loopback to every window, under an unguessable token; **Settings → Machine** and **Settings → Models** show its status and what each model is for.
+- A changed memory model re-embeds the store automatically, resumes only the rows still stale, and the status line shows the run.
+
+### Changed
+- `job` replaces `job_start`: one tool starts a long command and can wait for its result, and `job_wait`, `job_tail` and `job_kill` drive it from there.
+- A window's tool calls say what the call is for instead of "Using Bash", built from the arguments as they stream in, and `job` calls read like shell calls.
+- Used audits show as done in Mission Control, a finished audit no longer counts as waiting on you, and a stop closes the audit and refreshes the board.
+- A model that hit its usage limit is skipped until it resets, and the limit holds through an escalation, a resume and a refusal.
+- An agent's `git stash` is refused: the stack is shared with other workers, so park work in a WIP commit instead.
+- Free pool checkouts above the worker slot count are trimmed as a soft cap, and an idle one is removed in the background.
+- A bug plan records its regression test by the bare test name.
+- Dependency updates: rusqlite 0.43, tree-sitter-c-sharp 0.24, clap 4.6, svelte 5.59, vitest 5.1, the Tauri CLI and API 2.12, and the CodeQL actions (#146–#151).
+
+### Fixed
+- An npm check in a checkout that never installed its dependencies installs them first instead of failing.
+- `run_checks` reports failing tests above git CRLF warnings in a FAIL block.
+- A check run no longer fails on the lead's own `.coding/` bookkeeping change, and the lead's tool list refreshes when the tiers change or Mnemo2 restarts.
+- Agent workers survive a restart, a short run finishes, a merged one has nothing left to continue, and prompts, notices and refusals suit a Claude agent.
+- A dropped regression proof kills and reaps its `git apply` before restoring the tree.
+
 ## [2.7.0] — 2026-11-19
 
 Workers run long builds in one call, edit more reliably, prove their tests, and several Mnemo2 windows share one machine.

@@ -4,7 +4,7 @@
   import { briefSummary } from "../lib/brief";
   import { app } from "../lib/store";
   import { workerPhaseLabel } from "../lib/workerActivity";
-  import { workerStatusText, type Worker } from "../lib/types";
+  import { workerAgentPhaseText, workerStatusText, type Worker } from "../lib/types";
   import { nudgeChipText, routingChipText } from "../lib/workerRouting";
   import ActivityStatus from "./ActivityStatus.svelte";
   import ModelBadge from "./ModelBadge.svelte";
@@ -28,6 +28,8 @@
   const routingChip = $derived(routingChipText(worker.routing));
   /** The live nudge chip: it clears on a tier change or when the run ends. */
   const nudgeChip = $derived(nudgeChipText(worker.routing, worker.tier, worker.status));
+  /** The Claude Code agent phase, while the worker waits on or runs one. */
+  const agentPhaseText = $derived(workerAgentPhaseText(worker.agentPhase));
 </script>
 
 <button
@@ -50,7 +52,7 @@
     {#if !compact}<span class="worker-progress"><span style={`width: ${worker.progress}%`}></span></span>{/if}
   </span>
   <span class="worker-meta">
-    <span class="status-label" data-status={worker.status}>{workerStatusText(worker)}</span>
+    <span class="status-label" data-status={worker.status} data-agent-phase={worker.agentPhase ?? undefined} title={agentPhaseText ?? undefined}>{agentPhaseText ?? workerStatusText(worker)}</span>
     {#if worker.activity}
       <span class="worker-live">
         <ActivityStatus
@@ -92,6 +94,7 @@
   .worker-meta small { display: block; width: 100%; min-width: 0; margin-top: 4px; overflow: hidden; color: var(--muted); font-size: var(--text-meta); text-overflow: ellipsis; white-space: nowrap; }
   .worker-live { display: block; width: 100%; min-width: 0; margin-top: 4px; white-space: nowrap; }
   .status-label { display: inline-flex; padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: var(--text-meta); font-weight: 650; white-space: nowrap; }
+  .status-label[data-agent-phase] { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
   .status-label[data-status="in_review"], .status-label[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
   .status-label[data-status="failed"] { background: var(--risk-bg); color: var(--danger); }
   .status-label[data-status="merged"] { background: var(--accent-soft); color: var(--accent-strong); }

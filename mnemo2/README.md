@@ -256,7 +256,10 @@ only the app.
   "show" can never override a newer "hide". There is no iframe or CDP browser
   path. Other platforms
   offer an external-open fallback. Worker screenshot chips open actual sandbox
-  PNG previews, and chat links open the Browser pane.
+  PNG previews: a merged or otherwise released worker's screenshots are archived
+  in `.coding/mnemo2/screenshots/<worker>/` before their checkout goes, so the
+  chip keeps opening after the pool checkout is reused and after a restart.
+  Chat links open the Browser pane.
 - **Persistence** keeps each project's state in its own `.coding/mnemo2/` (see
   **State** under Native lead). Transcripts carry project identity and
   timestamps; worker slots and workbench preferences survive restart with

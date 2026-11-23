@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use crate::mnemo2::dispatch_routing::RoutingMode;
 use crate::mnemo2::phase3::{self, ReviewEvidence};
 
+use super::agent_watch;
 use super::findings_ledger;
 use super::record::{ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
@@ -258,9 +259,9 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_agent_done".to_string(),
-                description: "Finish a worker that runs as a Claude Code agent: record its final report and mark it completed (or failed, with failed=true). Call it each time your Claude Code agent for that worker finishes a run (the step, a continuation after team_message, or a fix round after team_route_fix); then team_check, team_review and team_merge work as for any worker.".to_string(),
+                description: "Report on a run of a worker that runs as a Claude Code agent. Mnemo finishes such a worker itself when its agent ends (the agent's last message becomes the report, and the usual finished notice follows), so call this only to mark the run failed (failed=true, with the reason as the report) or to replace the agent's last message with a fuller report. On a run Mnemo already finished it sends no second finished notice; failed=true then marks it Failed and sends the failed notice. Then team_check, team_review and team_merge work as for any worker.".to_string(),
                 parameters: json!({"type":"object","properties":{
-                    "worker_id":{"type":"string","description":"The agent worker to close."},
+                    "worker_id":{"type":"string","description":"The agent worker whose run you report on."},
                     "report":{"type":"string","description":"The agent's final report: the commit hash, the checks it ran and their results, and anything left open."},
                     "failed":{"type":"boolean","description":"True when the agent could not finish the step."}
                 },"required":["worker_id","report"]}),
@@ -824,10 +825,15 @@ impl TeamRuntime {
             let mut views = Vec::with_capacity(workers.len());
             for worker in workers {
                 let mut view = worker_status_view(worker, detail);
-                if let (Some(agent), Some(object)) =
-                    (self.agent_view(worker).await, view.as_object_mut())
-                {
-                    object.insert("agent".to_string(), agent.to_json());
+                let agent = self.agent_view(worker).await;
+                if let Some(object) = view.as_object_mut() {
+                    if let Some(agent) = &agent {
+                        object.insert("agent".to_string(), agent.to_json());
+                    }
+                    // Derived, never stored: the record has no such field.
+                    if let Some(phase) = agent_watch::agent_phase(worker, agent.as_ref()) {
+                        object.insert("agent_phase".to_string(), json!(phase));
+                    }
                 }
                 if let (Some(missing), Some(object)) =
                     (self.stale_base(worker).await, view.as_object_mut())
@@ -1181,7 +1187,7 @@ fn agent_handoff_answer(worker: &WorkerRecord, block: Value) -> ToolResult {
     }))
     .unwrap_or_else(|_| "team_resume".to_string());
     let output = format!(
-        "{output}\n{} now runs as a Claude Code agent: launch your Agent with the claude_agent block (prompt unchanged), then call team_agent_done.",
+        "{output}\n{} now runs as a Claude Code agent: launch your Agent with the claude_agent block (prompt unchanged); Mnemo finishes the worker when the agent ends.",
         worker.id
     );
     let data = serde_json::to_value(worker).unwrap_or(Value::Null);
@@ -1213,7 +1219,7 @@ fn continue_agent_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
     .unwrap_or_else(|_| action.to_string());
     let how = match worker.claude_agent_id.as_deref() {
         Some(agent_id) => format!(
-            "Continue {}'s Claude Code agent with SendMessage to {agent_id}, sending the message below; call team_agent_done when it finishes.",
+            "Continue {}'s Claude Code agent with SendMessage to {agent_id}, sending the message below; Mnemo finishes the worker when the agent ends.",
             worker.id
         ),
         None => format!(

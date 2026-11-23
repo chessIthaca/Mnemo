@@ -302,3 +302,32 @@ describe("WorkerDetail hand-overs stay on the team tab", () => {
     expect(get(app).workbenchTab).toBe("diff");
   });
 });
+
+describe("WorkerDetail agent phase", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  const statusPill = (container: HTMLElement): HTMLElement | null =>
+    container.querySelector<HTMLElement>(".status-pill");
+
+  it("shows the Claude Code agent phase in place of the plain worker status", async () => {
+    const base = createWorkers()[1];
+    const { container, rerender } = render(WorkerDetail, { worker: { ...base, agentPhase: "awaiting_launch" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Waiting for Claude Code agent");
+    expect(statusPill(container)?.getAttribute("data-agent-phase")).toBe("awaiting_launch");
+
+    await rerender({ worker: { ...base, agentPhase: "running" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Claude Code agent running");
+
+    await rerender({ worker: { ...base, agentPhase: "stalled" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Claude Code agent silent for 10+ min");
+
+    await rerender({ worker: { ...base, agentPhase: "finished" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Working");
+  });
+
+  it("keeps the plain status pill for a worker that is not a Claude Code agent worker", () => {
+    const { container } = render(WorkerDetail, { worker: createWorkers()[1] });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Working");
+    expect(statusPill(container)?.hasAttribute("data-agent-phase")).toBe(false);
+  });
+});

@@ -4232,6 +4232,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Developer install script only; no product behavior or governed capability changes."
+    },
+    {
+      "id": "aabd18a3",
+      "status": "closed",
+      "created_at_ms": 1795474371153,
+      "closed_at_ms": 1795476737651,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-aabd18a3-20261123-233217.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Release housekeeping: dependency and version bumps plus CHANGELOG; no specified behavior changes."
     }
   ]
 }

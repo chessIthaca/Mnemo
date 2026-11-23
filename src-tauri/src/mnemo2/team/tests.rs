@@ -15522,7 +15522,7 @@ async fn team_agent_done_finishes_the_worker_and_notifies_the_lead() {
     // With no live entry, the session-free agent must still be closed by
     // team_agent_done before checks, review or merge can start.
     let unfinished =
-        "agenttier06 runs as a Claude Code agent: call team_agent_done when it has finished";
+        "agenttier06 runs as a Claude Code agent that has not finished: wait for the agent to end; Mnemo then finishes the worker";
     let error = fixture
         .team
         .record_check(
@@ -15752,7 +15752,7 @@ async fn session_tools_refuse_an_agent_worker() {
                 .message("agenttier10", "status?".into(), MessageSender::Lead)
                 .await
                 .expect_err("the in-app lead's team_message refuses"),
-            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done.",
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it); Mnemo finishes the worker when the agent ends.",
         ),
         (
             fixture
@@ -15768,7 +15768,7 @@ async fn session_tools_refuse_an_agent_worker() {
                 .change_model("agenttier10", Some("test/scripted-average".into()), None, ChangeSource::Lead)
                 .await
                 .expect_err("team_resume with a model refuses"),
-            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done.",
+            "agenttier10 runs as a Claude Code agent: continue it with your own Agent (SendMessage to it); Mnemo finishes the worker when the agent ends.",
         ),
         (
             fixture
@@ -15784,7 +15784,7 @@ async fn session_tools_refuse_an_agent_worker() {
                 .route_fix_with_tier("agenttier10", "finding1", None)
                 .await
                 .expect_err("team_route_fix refuses while the agent runs"),
-            "agenttier10 runs as a Claude Code agent: call team_agent_done when it has finished",
+            "agenttier10 runs as a Claude Code agent that has not finished: wait for the agent to end; Mnemo then finishes the worker",
         ),
     ] {
         assert_eq!(refusal, expected);
@@ -17502,37 +17502,158 @@ async fn a_silent_agent_is_flagged_stalled() {
     let sent = count_notices(&mut notices, "has written nothing");
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert!(
-        sent[0].contains("agentWatch03's Claude Code agent has written nothing for 11 minutes; it may have stalled or stopped. Check it, then continue it with SendMessage or call team_agent_done."),
+        sent[0].contains("agentWatch03's Claude Code agent has written nothing for 11 minutes; it may have stalled or stopped. Check it, then continue it with SendMessage, or mark the run failed with team_agent_done."),
         "{}",
         sent[0]
     );
     team.shutdown().await;
 }
 
-#[tokio::test]
-async fn a_finished_agent_prompts_team_agent_done() {
-    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch04").await;
-    let team = &fixture.team;
-    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
-    assert!(start_agent(team, "agentWatch04", serde_json::json!({})).await.success);
-    let mut notices = team.subscribe_board();
-    team.agent_watch_tick().await;
-    assert!(count_notices(&mut notices, "finished").is_empty());
+/// A transcript whose agent ended with a final answer.
+const FINISHED_TRANSCRIPT: &str = concat!(
+    "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"do the step\"}}\n",
+    "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Looking.\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}]}}\n",
+    "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"}]}}\n",
+    "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Committed abc1234; the tests pass.\"}]}}\n",
+);
+
+/// A registered agent worker whose agent's transcript says it ended, after
+/// one watcher pass.
+async fn auto_finished_agent(
+    worker_id: &str,
+) -> (RoutingFixture, tempfile::TempDir, std::path::PathBuf) {
+    let (fixture, projects, transcript) = agent_watch_fixture(worker_id).await;
+    write_agent_transcript(&transcript, FINISHED_TRANSCRIPT);
+    assert!(start_agent(&fixture.team, worker_id, serde_json::json!({})).await.success);
+    // Only the notices of the finish count.
+    fixture.team.drain_external_notices();
     std::fs::write(
         transcript.with_extension("meta.json"),
         "{\"agentType\":\"general-purpose\",\"finished\":true}",
     )
     .expect("meta");
-    assert_eq!(status_agent(team, "agentWatch04").await["finished"], true);
+    fixture.team.agent_watch_tick().await;
+    (fixture, projects, transcript)
+}
+
+fn finished_notices(team: &TeamRuntime, worker_id: &str) -> Vec<String> {
+    team.drain_external_notices()
+        .into_iter()
+        .filter(|notice| notice.contains(worker_id) && notice.contains("finished its turn"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_finished_agent_transcript_finishes_the_worker_without_team_agent_done() {
+    let (fixture, _projects, _transcript) = auto_finished_agent("agentWatch04").await;
+    let team = &fixture.team;
+    let worker = team.worker("agentWatch04").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed);
+    assert_eq!(worker.turns, 1);
+    assert_eq!(worker.report.as_deref(), Some("Committed abc1234; the tests pass."));
+    // Further passes finish nothing again.
     team.agent_watch_tick().await;
     team.agent_watch_tick().await;
-    let sent = count_notices(&mut notices, "finished");
+    let sent = finished_notices(team, "agentWatch04");
     assert_eq!(sent.len(), 1, "{sent:?}");
-    assert!(
-        sent[0].contains("agentWatch04's Claude Code agent finished; call team_agent_done with its report."),
-        "{}",
-        sent[0]
+    assert!(sent[0].contains("Review it now"), "{}", sent[0]);
+    assert!(sent[0].contains("Committed abc1234; the tests pass."), "{}", sent[0]);
+    assert!(!sent[0].contains("call team_agent_done"), "{}", sent[0]);
+    // It survives the lead's stale-notice filter, as a session's does.
+    assert_eq!(team.current_notices(sent).await.len(), 1);
+    assert_eq!(team.worker("agentWatch04").await.expect("worker").turns, 1);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_agent_without_a_final_message_finishes_with_the_fallback_report() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch12").await;
+    let team = &fixture.team;
+    write_agent_transcript(
+        &transcript,
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"Bash\",\"input\":{}}]}}\n",
     );
+    assert!(start_agent(team, "agentWatch12", serde_json::json!({})).await.success);
+    std::fs::write(transcript.with_extension("meta.json"), "{\"finished\":true}").expect("meta");
+    team.agent_watch_tick().await;
+    let worker = team.worker("agentWatch12").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed);
+    assert_eq!(
+        worker.report.as_deref(),
+        Some("The Claude Code agent finished without a final message.")
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_agent_done_after_an_auto_finish_keeps_one_notice_and_takes_the_leads_report() {
+    let (fixture, _projects, _transcript) = auto_finished_agent("agentWatch13").await;
+    let team = &fixture.team;
+    assert_eq!(finished_notices(team, "agentWatch13").len(), 1);
+    let done = team
+        .agent_done("agentWatch13", "The lead's fuller report.".into(), false)
+        .await
+        .expect("team_agent_done on a run Mnemo finished succeeds");
+    assert_eq!(done.status, WorkerStatus::Completed);
+    assert_eq!(done.turns, 1, "the run is not counted twice");
+    assert_eq!(done.report.as_deref(), Some("The lead's fuller report."));
+    assert!(finished_notices(team, "agentWatch13").is_empty(), "no second notice");
+    // An empty report keeps the one stored.
+    let again = team
+        .agent_done("agentWatch13", "  ".into(), false)
+        .await
+        .expect("a second call on the same run");
+    assert_eq!(again.report.as_deref(), Some("The lead's fuller report."));
+    assert!(team.drain_external_notices().is_empty());
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn team_agent_done_failed_after_an_auto_finish_marks_it_failed() {
+    let (fixture, _projects, _transcript) = auto_finished_agent("agentWatch14").await;
+    let team = &fixture.team;
+    assert_eq!(finished_notices(team, "agentWatch14").len(), 1);
+    let failed = team
+        .agent_done("agentWatch14", "the build never passed".into(), true)
+        .await
+        .expect("team_agent_done failed on a run Mnemo finished");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert_eq!(failed.turns, 1);
+    assert_eq!(failed.report.as_deref(), Some("the build never passed"));
+    let notices = team.current_notices(team.drain_external_notices()).await;
+    let notice = notices
+        .iter()
+        .find(|notice| notice.contains("agentWatch14"))
+        .expect("the failed notice");
+    assert!(notice.contains("could not finish its turn"), "{notice}");
+    // The run is closed now: a further call is refused.
+    assert!(team.agent_done("agentWatch14", "again".into(), false).await.is_err());
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lead_team_agent_done_before_the_watcher_leaves_nothing_to_finish() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch15").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, FINISHED_TRANSCRIPT);
+    assert!(start_agent(team, "agentWatch15", serde_json::json!({})).await.success);
+    std::fs::write(transcript.with_extension("meta.json"), "{\"finished\":true}").expect("meta");
+    team.drain_external_notices();
+    // The watcher saw the finish, but the lead's call won the merge lock.
+    let run = super::agent_watch::FinishedRun {
+        worker_id: "agentWatch15".into(),
+        agent_id: "a1b2c3".into(),
+        turns: 0,
+        transcript: Some(transcript.to_string_lossy().into_owned()),
+    };
+    team.agent_done("agentWatch15", "the lead's report".into(), false)
+        .await
+        .expect("the lead closes the run");
+    assert!(!team.auto_finish_agent(&run).await.expect("no error"));
+    let worker = team.worker("agentWatch15").await.expect("worker");
+    assert_eq!(worker.turns, 1);
+    assert_eq!(worker.report.as_deref(), Some("the lead's report"));
+    assert_eq!(finished_notices(team, "agentWatch15").len(), 1);
     team.shutdown().await;
 }
 
@@ -17694,23 +17815,501 @@ async fn a_partial_line_is_read_once() {
 async fn a_second_finish_notifies_again() {
     let (fixture, _projects, transcript) = agent_watch_fixture("agentWatch10").await;
     let team = &fixture.team;
-    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    write_agent_transcript(&transcript, FINISHED_TRANSCRIPT);
     assert!(start_agent(team, "agentWatch10", serde_json::json!({})).await.success);
+    team.drain_external_notices();
     let meta = transcript.with_extension("meta.json");
-    let mut notices = team.subscribe_board();
     std::fs::write(&meta, "{\"finished\":true}").expect("meta");
     team.agent_watch_tick().await;
-    let first = notice_keys(&mut notices, "finished");
+    let first = finished_notices(team, "agentWatch10");
     assert_eq!(first.len(), 1, "{first:?}");
-    // The lead closed the run (a turn counted) and continued the agent.
-    team.update_worker("agentWatch10", |worker| worker.turns += 1).await;
+    assert_eq!(team.worker("agentWatch10").await.expect("worker").turns, 1);
+    // The lead continued the agent: the worker works again. A finish the
+    // agent has not left yet is not a new one.
+    continue_agent(team, "agentWatch10").await;
+    team.agent_watch_tick().await;
+    assert_eq!(team.worker("agentWatch10").await.expect("worker").status, WorkerStatus::Working);
     std::fs::write(&meta, "{\"finished\":false}").expect("meta");
+    append_agent_line(&transcript, "Second run done.");
     team.agent_watch_tick().await;
     std::fs::write(&meta, "{\"finished\":true}").expect("meta");
     team.agent_watch_tick().await;
-    let second = notice_keys(&mut notices, "finished");
+    let second = finished_notices(team, "agentWatch10");
     assert_eq!(second.len(), 1, "{second:?}");
-    assert_ne!(first[0], second[0], "the lead pump drops a repeated key");
+    assert_ne!(first[0], second[0], "a new turn's notice");
+    let worker = team.worker("agentWatch10").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed);
+    assert_eq!(worker.turns, 2);
+    team.shutdown().await;
+}
+
+/// `team_message` from the external lead: the agent worker goes back to
+/// work for a continuation.
+async fn continue_agent(team: &TeamRuntime, worker_id: &str) {
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            serde_json::json!({"worker_id": worker_id, "text": "Run the tests again."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert!(matches!(
+        team.worker(worker_id).await.expect("worker").status,
+        WorkerStatus::Working | WorkerStatus::Fixing
+    ));
+}
+
+/// Append one final assistant answer to an agent transcript.
+fn append_agent_line(path: &std::path::Path, text: &str) {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).expect("open");
+    writeln!(
+        file,
+        "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}"
+    )
+    .expect("append");
+}
+
+#[tokio::test]
+async fn a_short_continuation_between_ticks_is_still_finished() {
+    let (fixture, _projects, transcript) = auto_finished_agent("agentWatch16").await;
+    let team = &fixture.team;
+    assert_eq!(finished_notices(team, "agentWatch16").len(), 1);
+    continue_agent(team, "agentWatch16").await;
+    // The whole continuation runs between two passes: the transcript grows
+    // and the agent ends again, so no pass ever sees it unfinished.
+    append_agent_line(&transcript, "Tests pass again.");
+    team.agent_watch_tick().await;
+    let worker = team.worker("agentWatch16").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed);
+    assert_eq!(worker.turns, 2);
+    assert_eq!(worker.report.as_deref(), Some("Tests pass again."));
+    assert_eq!(finished_notices(team, "agentWatch16").len(), 1);
+    team.agent_watch_tick().await;
+    assert!(finished_notices(team, "agentWatch16").is_empty());
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_tick_during_a_continuation_start_does_not_finish_the_new_run() {
+    let (fixture, _projects, transcript) = auto_finished_agent("agentWatch17").await;
+    let team = &fixture.team;
+    assert_eq!(finished_notices(team, "agentWatch17").len(), 1);
+    // A watcher pass runs right after team_message put the worker back to
+    // work, while the previous run's finished flag is still in the meta file.
+    team.arm_run_start_probe();
+    continue_agent(team, "agentWatch17").await;
+    let probed = team.take_run_start_probe();
+    assert!(probed.is_empty(), "the old finish was taken for the new run: {probed:?}");
+    team.agent_watch_tick().await;
+    let worker = team.worker("agentWatch17").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.turns, 1);
+    assert!(finished_notices(team, "agentWatch17").is_empty());
+    // The new run ends: now it finishes, with its own report.
+    append_agent_line(&transcript, "The new run is done.");
+    team.agent_watch_tick().await;
+    let worker = team.worker("agentWatch17").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed);
+    assert_eq!(worker.report.as_deref(), Some("The new run is done."));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_auto_finish_closes_a_fix_round() {
+    let (fixture, _projects, transcript) = auto_finished_agent("agentFix03").await;
+    let team = &fixture.team;
+    assert_eq!(finished_notices(team, "agentFix03").len(), 1);
+    team.update_worker("agentFix03", |worker| {
+        worker.status = WorkerStatus::InReview;
+        worker.findings.push(open_finding("fixMe03"));
+        worker.review_rounds = 1;
+    })
+    .await;
+    // A pass right after the fix round starts does not finish it either.
+    team.arm_run_start_probe();
+    let routed = team
+        .handle_lead_host_tool_from(
+            "team_route_fix",
+            json!({"worker_id": "agentFix03", "finding_id": "fixMe03"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(routed.success, "{}", routed.output);
+    assert!(team.take_run_start_probe().is_empty());
+    let fixing = team.worker("agentFix03").await.expect("worker");
+    assert_eq!(fixing.status, WorkerStatus::Fixing);
+    assert_eq!(fixing.fixer_finding_id.as_deref(), Some("fixMe03"));
+    // The agent fixes it and ends.
+    append_agent_line(&transcript, "Fixed fixMe03 at def5678.");
+    team.agent_watch_tick().await;
+    let closed = team.worker("agentFix03").await.expect("worker");
+    assert_eq!(closed.status, WorkerStatus::Completed);
+    assert_eq!(closed.fixer_finding_id, None);
+    assert_eq!(closed.turns, fixing.turns + 1);
+    assert_eq!(closed.report.as_deref(), Some("Fixed fixMe03 at def5678."));
+    assert_eq!(finished_notices(team, "agentFix03").len(), 1);
+    team.shutdown().await;
+}
+
+/// Sets the projects folder every agent watch on this test thread uses,
+/// `TeamRuntime::open`'s included, and clears it when dropped.
+struct ThreadProjectsRoot;
+
+impl ThreadProjectsRoot {
+    fn set(root: &std::path::Path) -> Self {
+        super::agent_watch::TEST_PROJECTS_ROOT
+            .with(|slot| *slot.borrow_mut() = Some(root.to_path_buf()));
+        Self
+    }
+}
+
+impl Drop for ThreadProjectsRoot {
+    fn drop(&mut self) {
+        super::agent_watch::TEST_PROJECTS_ROOT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// A Mnemo2 start with one registered agent worker at work in the saved
+/// ledger, and a projects folder holding (or not) its transcript.
+struct RestartFixture {
+    _root: tempfile::TempDir,
+    _state: tempfile::TempDir,
+    _config: tempfile::TempDir,
+    _projects: tempfile::TempDir,
+    _projects_root: ThreadProjectsRoot,
+    team: TeamRuntime,
+    transcript: std::path::PathBuf,
+}
+
+async fn restart_with_agent(
+    worker_id: &str,
+    transcript_text: Option<&str>,
+    silent_for: std::time::Duration,
+) -> RestartFixture {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    let projects = tempfile::tempdir().expect("projects");
+    init_git(root.path());
+    let projects_root = ThreadProjectsRoot::set(projects.path());
+    let transcript = std::fs::canonicalize(projects.path())
+        .expect("canonical projects folder")
+        .join("D--proj")
+        .join("session1")
+        .join("subagents")
+        .join("agent-a1b2c3.jsonl");
+    let then = std::time::SystemTime::now() - silent_for;
+    if let Some(text) = transcript_text {
+        write_agent_transcript(&transcript, text);
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .expect("open")
+            .set_modified(then)
+            .expect("set mtime");
+    }
+    let checkout = root.path().join("checkout");
+    std::fs::create_dir_all(&checkout).expect("checkout");
+    let mut record = test_worker_record(worker_id);
+    record.claude_agent = Some("opus".into());
+    record.claude_agent_id = Some("a1b2c3".into());
+    record.claude_agent_transcript = Some(transcript.to_string_lossy().into_owned());
+    record.status = WorkerStatus::Working;
+    record.worktree = checkout;
+    record.last_activity_ms = then
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("epoch")
+        .as_millis();
+    let team = open_test_team_with_config(root.path(), state.path(), vec![record], config.path())
+        .await;
+    RestartFixture {
+        _root: root,
+        _state: state,
+        _config: config,
+        _projects: projects,
+        _projects_root: projects_root,
+        team,
+        transcript,
+    }
+}
+
+#[tokio::test]
+async fn a_running_agent_worker_survives_a_restart_and_is_finished_by_mnemo() {
+    let fixture = restart_with_agent(
+        "restartAgent01",
+        Some(FINISHED_TRANSCRIPT),
+        std::time::Duration::from_secs(60),
+    )
+    .await;
+    let team = &fixture.team;
+    // Still an agent worker at work, and watched.
+    let worker = team.worker("restartAgent01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert!(team.agent_watch.running_for_test(), "the agent watch runs");
+    assert!(team.take_undelivered_notices().is_empty(), "nothing was handed back");
+    // The agent ends: Mnemo finishes the worker.
+    std::fs::write(fixture.transcript.with_extension("meta.json"), "{\"finished\":true}")
+        .expect("meta");
+    team.agent_watch_tick().await;
+    let worker = team.worker("restartAgent01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed);
+    assert_eq!(worker.turns, 1);
+    assert_eq!(worker.report.as_deref(), Some("Committed abc1234; the tests pass."));
+    let held = team.take_undelivered_notices();
+    assert_eq!(
+        held.iter()
+            .filter(|notice| notice.contains("restartAgent01") && notice.contains("finished its turn"))
+            .count(),
+        1,
+        "{held:?}"
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stalled_agent_is_handed_back_at_startup() {
+    let fixture = restart_with_agent(
+        "restartAgent02",
+        Some(AGENT_TRANSCRIPT),
+        std::time::Duration::from_secs(11 * 60),
+    )
+    .await;
+    let team = &fixture.team;
+    let worker = team.worker("restartAgent02").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert_eq!(worker.claude_agent, None);
+    assert_eq!(worker.claude_agent_id, None);
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    let held = team.take_undelivered_notices();
+    assert_eq!(
+        held.iter().filter(|notice| notice.contains("restartAgent02 was handed back")).count(),
+        1,
+        "{held:?}"
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_agent_without_a_transcript_is_handed_back_at_startup() {
+    let fixture = restart_with_agent(
+        "restartAgent03",
+        None,
+        std::time::Duration::from_secs(11 * 60),
+    )
+    .await;
+    let team = &fixture.team;
+    let worker = team.worker("restartAgent03").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert_eq!(worker.claude_agent, None);
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_recent_agent_without_a_transcript_survives_a_restart() {
+    let fixture = restart_with_agent(
+        "restartAgent04",
+        None,
+        std::time::Duration::from_secs(60),
+    )
+    .await;
+    let worker = fixture.team.worker("restartAgent04").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert!(worker.claude_agent.is_some());
+    fixture.team.shutdown().await;
+}
+
+/// One worker's `team_status` entry.
+async fn status_entry(team: &TeamRuntime, worker_id: &str) -> serde_json::Value {
+    let result = team
+        .handle_lead_host_tool("team_status", serde_json::json!({"worker_id": worker_id}))
+        .await;
+    assert!(result.success, "{}", result.output);
+    let parsed: serde_json::Value = serde_json::from_str(&result.output).expect("status json");
+    parsed["result"][0].clone()
+}
+
+/// One worker as the window's snapshot sends it.
+async fn snapshot_worker(team: &TeamRuntime, worker_id: &str) -> serde_json::Value {
+    let snapshot = serde_json::to_value(team.snapshot().await).expect("snapshot json");
+    snapshot["workers"]
+        .as_array()
+        .expect("workers")
+        .iter()
+        .find(|worker| worker["id"] == worker_id)
+        .cloned()
+        .expect("the worker is in the snapshot")
+}
+
+#[tokio::test]
+async fn an_unlaunched_agent_worker_reports_awaiting_launch() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("agentPhase01").await;
+    let team = &fixture.team;
+    assert_eq!(status_entry(team, "agentPhase01").await["agent_phase"], "awaiting_launch");
+    assert_eq!(snapshot_worker(team, "agentPhase01").await["agent_phase"], "awaiting_launch");
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "agentPhase01", serde_json::json!({})).await.success);
+    assert_eq!(status_entry(team, "agentPhase01").await["agent_phase"], "running");
+    assert_eq!(snapshot_worker(team, "agentPhase01").await["agent_phase"], "running");
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .expect("open")
+        .set_modified(old)
+        .expect("set mtime");
+    assert_eq!(status_entry(team, "agentPhase01").await["agent_phase"], "stalled");
+    std::fs::write(transcript.with_extension("meta.json"), "{\"finished\":true}").expect("meta");
+    assert_eq!(snapshot_worker(team, "agentPhase01").await["agent_phase"], "finished");
+    // Finished, the worker is no agent in work: no phase.
+    team.agent_watch_tick().await;
+    let entry = status_entry(team, "agentPhase01").await;
+    assert!(entry.get("agent_phase").is_none(), "{entry}");
+    assert!(snapshot_worker(team, "agentPhase01").await.get("agent_phase").is_none());
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_phase_is_not_written_to_team_json() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("agentPhase02").await;
+    let team = &fixture.team;
+    assert_eq!(snapshot_worker(team, "agentPhase02").await["agent_phase"], "awaiting_launch");
+    team.persist().await.expect("save the ledger");
+    let saved = std::fs::read_to_string(&team.persistence.path).expect("team.json");
+    assert!(saved.contains("agentPhase02"), "the worker is saved");
+    assert!(!saved.contains("agent_phase"), "{saved}");
+    assert!(!saved.contains("awaiting_launch"), "{saved}");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_detached_lead_hands_back_an_unlaunched_agent_worker() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("handBack01").await;
+    let team = &fixture.team;
+    let before = team.worker("handBack01").await.expect("worker");
+    assert!(before.claude_agent.is_some());
+    assert!(team.leave_external_lead().await, "the lead was attached");
+    let worker = team.worker("handBack01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert_eq!(worker.claude_agent, None);
+    assert_eq!(worker.claude_agent_effort, None);
+    assert_eq!(worker.claude_agent_id, None);
+    assert_eq!(
+        worker.error.as_deref(),
+        Some("Its Claude Code lead left before the agent finished; resume it to continue on a Mnemo model.")
+    );
+    assert_eq!(worker.branch, before.branch);
+    assert_eq!(worker.worktree, before.worktree);
+    assert!(worker.worktree.is_dir(), "the checkout stays");
+    // Saved, not only in memory.
+    let saved = std::fs::read_to_string(&team.persistence.path).expect("team.json");
+    assert!(saved.contains("Its Claude Code lead left"), "{saved}");
+    // The next lead hears of it once.
+    let held = team.take_undelivered_notices();
+    let handed: Vec<_> = held
+        .iter()
+        .filter(|notice| notice.contains("handBack01 was handed back from Claude Code: Its Claude Code lead left"))
+        .collect();
+    assert_eq!(handed.len(), 1, "{held:?}");
+    assert!(entry_has_no_phase(&status_entry(team, "handBack01").await));
+    // An ordinary interrupted worker: team_resume starts it on a Mnemo model.
+    let resumed = team
+        .handle_lead_host_tool(
+            "team_resume",
+            serde_json::json!({"worker_id": "handBack01", "tier": "routine"}),
+        )
+        .await;
+    assert!(resumed.success, "{}", resumed.output);
+    let worker = team.worker("handBack01").await.expect("worker");
+    assert_eq!(worker.claude_agent, None);
+    assert_eq!(worker.branch, before.branch);
+    assert!(team.live.lock().await.contains_key("handBack01"), "a Mnemo session runs it");
+    team.shutdown().await;
+}
+
+fn entry_has_no_phase(entry: &serde_json::Value) -> bool {
+    entry.get("agent_phase").is_none()
+}
+
+#[tokio::test]
+async fn a_stalled_agent_is_handed_back_when_the_lead_leaves() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("handBack02").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "handBack02", serde_json::json!({})).await.success);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .expect("open")
+        .set_modified(old)
+        .expect("set mtime");
+    assert!(team.leave_external_lead().await);
+    let worker = team.worker("handBack02").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert_eq!(worker.claude_agent, None);
+    assert_eq!(worker.claude_agent_id, None);
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_running_agent_is_left_alone_when_the_lead_leaves() {
+    let (fixture, _projects, transcript) = agent_watch_fixture("handBack03").await;
+    let team = &fixture.team;
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    assert!(start_agent(team, "handBack03", serde_json::json!({})).await.success);
+    assert!(team.leave_external_lead().await);
+    let worker = team.worker("handBack03").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert!(team
+        .take_undelivered_notices()
+        .iter()
+        .all(|notice| !notice.contains("handed back")));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lead_that_came_back_keeps_its_agent_workers() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("handBack04").await;
+    let team = &fixture.team;
+    // The lead left and attached again before the hand-back ran.
+    assert!(team.detach_external_lead());
+    assert!(team.attach_external_lead());
+    assert!(team.hand_back_agent_workers().await.expect("no error").is_empty());
+    let worker = team.worker("handBack04").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert!(worker.claude_agent.is_some());
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn mnemo2_start_hands_back_an_unlaunched_agent_worker() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    init_git(root.path());
+    let mut waiting = test_worker_record("handBack05");
+    waiting.claude_agent = Some("opus".into());
+    waiting.status = WorkerStatus::Working;
+    waiting.worktree = root.path().join("checkout");
+    let team = open_test_team_with_config(root.path(), state.path(), vec![waiting], config.path())
+        .await;
+    let worker = team.worker("handBack05").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert_eq!(worker.claude_agent, None);
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    let held = team.take_undelivered_notices();
+    assert_eq!(
+        held.iter().filter(|notice| notice.contains("handBack05 was handed back")).count(),
+        1,
+        "{held:?}"
+    );
     team.shutdown().await;
 }
 
@@ -18187,7 +18786,7 @@ async fn auto_escalation_onto_an_agent_tier_notifies_the_lead_with_a_block() {
     assert!(fixture.team.auto_escalate_worker("handTwo01").await.expect("escalate"));
     let notice = drain_notice(
         &mut notices,
-        "handTwo01 moved to tier high, which runs as a Claude Code agent: launch your Agent with this block, then call team_agent_done.",
+        "handTwo01 moved to tier high, which runs as a Claude Code agent: launch your Agent with this block; Mnemo finishes the worker when the agent ends.",
     )
     .await
     .expect("the hand-off notice");
@@ -18374,7 +18973,7 @@ async fn team_message_on_an_agent_worker_returns_the_sendmessage_instruction() {
     assert!(answer.success, "{}", answer.output);
     assert!(
         answer.output.ends_with(
-            "Continue agentMsg01's Claude Code agent with SendMessage to a1b2c3, sending the message below; call team_agent_done when it finishes.\n\nRun the tests again."
+            "Continue agentMsg01's Claude Code agent with SendMessage to a1b2c3, sending the message below; Mnemo finishes the worker when the agent ends.\n\nRun the tests again."
         ),
         "{}",
         answer.output
@@ -18805,7 +19404,7 @@ async fn agent_workers_are_capped_at_three() {
         .expect_err("a fourth running agent worker is refused");
     assert_eq!(
         refused,
-        "3 Claude Code agent workers are already running (capOne01, capTwo01, capThree1); wait for one to finish (team_agent_done) before starting another."
+        "3 Claude Code agent workers are already running (capOne01, capTwo01, capThree1); wait for one to finish (Mnemo finishes it when its agent ends) before starting another."
     );
     fixture
         .team

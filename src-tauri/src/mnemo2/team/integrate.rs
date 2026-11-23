@@ -55,7 +55,7 @@ impl TeamRuntime {
             && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
         {
             return Err(format!(
-                "{worker_id}'s Claude Code agent is still working: call team_agent_done first"
+                "{worker_id}'s Claude Code agent is still working: wait for it to end; Mnemo then finishes the worker"
             ));
         }
         if self.worker_is_busy(worker_id).await {

@@ -917,7 +917,7 @@ impl TeamRuntime {
             WorkerStatus::Completed | WorkerStatus::InReview | WorkerStatus::Conflict => {}
             WorkerStatus::Fixing => {
                 return Err(format!(
-                    "{} is already fixing a finding: call team_agent_done when its agent finishes",
+                    "{} is already fixing a finding: wait for its agent to end; Mnemo then finishes the fix round",
                     worker.id
                 ));
             }
@@ -930,6 +930,10 @@ impl TeamRuntime {
             .ok_or_else(|| format!("unknown open finding '{finding_id}'"))?
             .clone();
         let brief = route_fix_brief(worker, &finding);
+        // A new run, recorded before the worker is back at work: no watcher
+        // pass may see it fixing without the new run's floor and take the
+        // previous run's finish for this one.
+        self.agent_watch.note_run_start(worker, now_key());
         self.update_worker(&worker.id, |worker| {
             worker.status = WorkerStatus::Fixing;
             worker.fixer_finding_id = Some(finding_id.to_string());
@@ -949,6 +953,8 @@ impl TeamRuntime {
             );
         })
         .await;
+        #[cfg(test)]
+        self.probe_run_start().await;
         self.persist().await?;
         self.ensure_agent_watch().await;
         self.worker(&worker.id).await

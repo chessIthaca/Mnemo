@@ -11,7 +11,7 @@ The review is yours; the worker's summary is a claim, not evidence. The merge ga
 ## 1. Orient
 
 - `team_status` with the exact `worker_id` from the notice. Note `status`, `branch`, `worktree`, `plan_id` and step, `review_risk`, any open findings and recorded checks. A worker is reviewable when it is idle (completed or in review). If it is still working, wait for its notice.
-- A worker whose `model` is `claude-code/<model>` runs as a Claude Code agent and has no Mnemo session. Review it the same way, but Mnemo2 does not see the agent's own check runs: start `team_run_checks` or run them yourself. For a fix larger than `review_fix`, call `team_route_fix`, send the `continue_agent` message to the agent with `SendMessage`, and call `team_agent_done` when it returns; then check and review the new tip.
+- A worker whose `model` is `claude-code/<model>` runs as a Claude Code agent and has no Mnemo session. Review it the same way, but Mnemo2 does not see the agent's own check runs: start `team_run_checks` or run them yourself. For a fix larger than `review_fix`, call `team_route_fix`, and send the `continue_agent` message to the agent with `SendMessage`. Mnemo finishes the worker when the agent ends, and the "finished its turn" notice follows; then check and review the new tip. Call `team_agent_done` only to mark a run failed or to give a fuller report.
 - A `stale_base` count means the lead branch has commits the worker's branch lacks. If the change or its checks depend on them, merge the lead branch in with `team_integrate` before you check and review.
 - `plan_show` for the plan: the step's text, the decisions and the interfaces are the intent you review against.
 

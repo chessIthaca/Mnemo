@@ -146,6 +146,24 @@ pub(super) fn convert(jsonl: &str) -> Vec<Message> {
     messages
 }
 
+/// The text of the last assistant message in Claude Code JSONL that has any:
+/// the agent's final answer when it ended. `None` when no assistant message
+/// carries text.
+pub(super) fn last_assistant_text(jsonl: &str) -> Option<String> {
+    convert(jsonl)
+        .into_iter()
+        .rev()
+        .filter(|message| message.role == mnemo::provider::Role::Assistant)
+        .map(|message| message.content.as_text().trim().to_string())
+        .find(|text| !text.is_empty())
+}
+
+/// [`last_assistant_text`] of a transcript file, read from its tail.
+pub(super) fn last_assistant_text_of(path: &Path) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    last_assistant_text(&read_tail(path, len)?)
+}
+
 /// Read the tail of a transcript file as text, dropping a cut first line.
 fn read_tail(path: &Path, len: u64) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
@@ -227,6 +245,14 @@ not json at all
         assert!(!messages[2].tool_is_error);
         assert!(messages[3].tool_is_error);
         assert_eq!(messages[4].content.as_text(), "Done.");
+    }
+
+    #[test]
+    fn the_last_assistant_text_is_the_final_answer() {
+        assert_eq!(last_assistant_text(FIXTURE).as_deref(), Some("Done."));
+        let only_tools = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{}}]}}"#;
+        assert_eq!(last_assistant_text(only_tools), None);
+        assert_eq!(last_assistant_text(""), None);
     }
 
     #[test]

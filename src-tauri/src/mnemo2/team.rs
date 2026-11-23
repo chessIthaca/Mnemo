@@ -510,7 +510,11 @@ impl TeamRuntime {
     /// still be created while the lower ones are held. A pool is kept when a
     /// worker record holds it, when it is on a branch or has uncommitted work,
     /// when another instance claims it, and always when its index is at or
-    /// below the slot count (those are the warm caches).
+    /// below the slot count (those are the warm caches). The removal itself is
+    /// cheap: the pool folder is renamed to a `trash-pool-*` name under
+    /// `.worktrees` and its 10-15 GB of caches are deleted on a DETACHED thread
+    /// (see `trim_pool_checkouts`), so a trim never deletes them while the
+    /// caller holds the merge lock.
     ///
     /// Takes the checkout pool lock itself, so a caller that holds the merge
     /// lock may call it (merge and trim both lock `merge_lock ->

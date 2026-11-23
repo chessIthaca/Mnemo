@@ -734,13 +734,16 @@ fn provision_pool_checkout_impl(
 /// discarded, another instance's pool is never raced, and a pool at or below
 /// `keep` stays as a warm cache.
 ///
-/// Removal is `git worktree remove --force` from `main_root` (the free test
-/// already proved there is no tracked or untracked work), then — when the
-/// folder survives with its ignored caches (Windows: an npm workspace junction
-/// outlives git's removal) — `std::fs::remove_dir_all` and a `worktree prune`.
-/// That removal never follows a symlink or junction (Rust removes the link
-/// itself), so a link's target outside the pool survives. One failed removal is
-/// reported and skipped; only a failure to LIST the pools is an error.
+/// Removal never deletes the caches inline: the folder is RENAMED to
+/// `.worktrees/trash-pool-<n>-<ms>` — a metadata operation, so a trim never
+/// stalls under the team locks for the minutes a 10-15 GB delete takes — the
+/// registration the moved folder left dangling is pruned, and a DETACHED thread
+/// deletes the trash with `std::fs::remove_dir_all`, which never follows a
+/// symlink or junction (it removes the link itself), so a link's target outside
+/// the pool survives. A failed rename leaves the pool untouched, and every trim
+/// sweeps the `trash-pool-*` folders an earlier delete did not finish. One
+/// failed removal is reported and skipped; only a failure to LIST the pools is
+/// an error.
 ///
 /// Runs the blocking git subprocesses on the blocking thread pool (see the
 /// module doc). Owns its arguments so the closure is `'static + Send`.
@@ -760,14 +763,16 @@ fn trim_pool_checkouts_impl(
     keep: u32,
     held: &[PathBuf],
 ) -> Result<Vec<PathBuf>, String> {
+    // Leftover trash goes first, so a delete that did not finish is retried
+    // even when no pool is above `keep`.
+    sweep_pool_trash(main_root);
     let mut pools = existing_pool_entries(main_root)?;
     // Highest index first, so the cap lands as close to `keep` as the pools
     // allow even when one of them cannot go.
     pools.retain(|(index, _, _)| *index > keep);
     pools.sort_by_key(|(index, _, _)| std::cmp::Reverse(*index));
     let mut removed = Vec::new();
-    let mut attempted = false;
-    for (_, pool, is_dir) in &pools {
+    for (index, pool, is_dir) in &pools {
         if held
             .iter()
             .any(|held_path| same_checkout_path(held_path, pool))
@@ -817,8 +822,7 @@ fn trim_pool_checkouts_impl(
             );
             continue;
         }
-        attempted = true;
-        match remove_pool_checkout(main_root, pool) {
+        match remove_pool_checkout(main_root, *index, pool) {
             Ok(()) => removed.push(pool.clone()),
             Err(error) => eprintln!(
                 "mnemo: could not remove idle pool checkout {}: {error}; skipped",
@@ -826,27 +830,88 @@ fn trim_pool_checkouts_impl(
             ),
         }
     }
-    if attempted {
-        let _ = git_raw(main_root, &["worktree", "prune"]);
-    }
     Ok(removed)
 }
 
-/// Remove one claimed, free pool checkout: `git worktree remove --force` from
-/// `main_root`, then `std::fs::remove_dir_all` for a folder git leaves behind
-/// because of its ignored build caches (Windows: an npm workspace junction
-/// outlives the removal). `remove_dir_all` never follows a symlink or junction
-/// — it removes the link itself, so a link's target outside the pool survives.
-fn remove_pool_checkout(main_root: &Path, pool: &Path) -> Result<(), String> {
-    let path = pool.to_string_lossy();
-    git_raw(main_root, &["worktree", "remove", "--force", path.as_ref()])?;
-    match std::fs::symlink_metadata(pool) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.to_string()),
+/// The `.worktrees` entry name prefix of a pool folder being deleted.
+const POOL_TRASH_PREFIX: &str = "trash-pool-";
+
+/// Where a pool being deleted is moved to: `.worktrees/trash-pool-<n>-<ms>`.
+/// The name never parses as a pool (`pool-<n>`), so a trash folder reserves no
+/// pool index while it is still being deleted.
+fn pool_trash_path(main_root: &Path, index: u32) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    worktrees_dir(main_root).join(format!("{POOL_TRASH_PREFIX}{index}-{millis}"))
+}
+
+/// Remove one claimed, free pool checkout without deleting its caches on the
+/// caller's thread: rename the folder to [`pool_trash_path`] (fast, and a failed
+/// rename leaves the pool untouched), prune the registration the moved folder
+/// left dangling, then hand the trash to [`delete_pool_trash_in_background`].
+fn remove_pool_checkout(main_root: &Path, index: u32, pool: &Path) -> Result<(), String> {
+    let trash = pool_trash_path(main_root, index);
+    std::fs::rename(pool, &trash)
+        .map_err(|error| format!("could not move it to {}: {error}", trash.display()))?;
+    if let Err(error) = git_raw(main_root, &["worktree", "prune"]) {
+        eprintln!(
+            "mnemo: could not prune the moved pool checkout {}: {error}",
+            trash.display()
+        );
     }
-    std::fs::remove_dir_all(pool)
-        .map_err(|error| format!("git deregistered it, but the folder remains: {error}"))
+    delete_pool_trash_in_background(trash);
+    Ok(())
+}
+
+/// Delete a trashed pool folder on a detached thread: its caches are 10-15 GB,
+/// so the deletion must never block the caller or the team locks it holds. A
+/// deletion this process never finishes is completed by the next trim's sweep.
+fn delete_pool_trash_in_background(trash: PathBuf) {
+    std::thread::spawn(move || {
+        if let Err(error) = std::fs::remove_dir_all(&trash) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "mnemo: could not delete the trashed pool checkout {}: {error}",
+                    trash.display()
+                );
+            }
+        }
+    });
+}
+
+/// Hand every leftover `trash-pool-*` folder to
+/// [`delete_pool_trash_in_background`] — the trash of a trim (or an app run)
+/// whose deletion did not finish. Best effort: a listing problem is reported and
+/// the trim goes on.
+fn sweep_pool_trash(main_root: &Path) {
+    let directory = worktrees_dir(main_root);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "mnemo: could not list {} to sweep the trashed pool checkouts: {error}",
+                directory.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(POOL_TRASH_PREFIX)
+        {
+            continue;
+        }
+        let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        if !is_directory {
+            continue;
+        }
+        delete_pool_trash_in_background(entry.path());
+    }
 }
 
 /// Reuse one free pool for a new worker: re-point its detached HEAD at
@@ -2262,6 +2327,37 @@ mod tests {
         assert_eq!(reused, pool);
     }
 
+    /// The `.worktrees/trash-pool-<index>-*` folders present right now.
+    fn trash_folders(main_root: &Path, index: u32) -> Vec<PathBuf> {
+        let prefix = format!("{POOL_TRASH_PREFIX}{index}-");
+        let entries = match std::fs::read_dir(worktrees_dir(main_root)) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Wait, bounded (~10 s), until the DETACHED delete of pool `<index>`'s
+    /// trash folder has finished — a trim only renames the pool away.
+    async fn wait_for_trash_removal(main_root: &Path, index: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !trash_folders(main_root, index).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trashed pool-{index} folder is still being deleted after 10 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     #[tokio::test]
     async fn trim_removes_free_pools_above_the_keep_count() {
         let repo = init_repo_ignoring_pool_caches();
@@ -2318,6 +2414,10 @@ mod tests {
                 .any(|path| same_checkout_path(path, &pools[0].0)),
             "pool-1 stays registered"
         );
+        // The folders are renamed away at once; the 10-15 GB of caches go on a
+        // detached thread, so wait for it here.
+        wait_for_trash_removal(&main, 2).await;
+        wait_for_trash_removal(&main, 3).await;
     }
 
     #[tokio::test]
@@ -2431,6 +2531,16 @@ mod tests {
         assert_eq!(removed, vec![pool_2.clone()]);
         assert!(!pool_2.exists(), "the pool folder is gone, link included");
         assert!(
+            !registered_worktrees(repo.path())
+                .expect("registered worktrees")
+                .iter()
+                .any(|path| same_checkout_path(path, &pool_2)),
+            "the moved pool is deregistered right away"
+        );
+        // The trash folder is deleted on a detached thread: wait for it before
+        // asserting the link's target survived.
+        wait_for_trash_removal(&main, 2).await;
+        assert!(
             outside.path().join("keep.txt").exists(),
             "removal never follows the link: its target survives"
         );
@@ -2470,5 +2580,80 @@ mod tests {
         for pool in &pools {
             assert!(pool.is_dir(), "{} stays at the keep count", pool.display());
         }
+    }
+
+    #[tokio::test]
+    async fn trim_sweeps_leftover_trash_folders() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        // A trim (or an app run) that stopped before its background delete
+        // finished leaves a trash folder behind.
+        let leftover = worktrees_dir(&main).join("trash-pool-9-1");
+        write_all(&[(leftover.join("leftover"), "x")]);
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "no pool is removed: {removed:?}");
+        wait_for_trash_removal(&main, 9).await;
+        assert!(!leftover.exists(), "the leftover trash is swept");
+    }
+
+    /// Windows only: a handle opened without sharing makes the rename of the
+    /// pool folder fail, and a failed rename must leave the pool untouched
+    /// (never half-deleted).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn trim_skips_a_pool_whose_rename_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let repo = init_repo_ignoring_pool_caches();
+        let main = repo.path().to_path_buf();
+        let (pool_1, _) = provision_agent_checkout(
+            main.clone(),
+            "aaaaaaaa1111".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("first provision");
+        let (pool_2, branch_2) = provision_agent_checkout(
+            main.clone(),
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("second provision");
+        release_pool_checkout(main.clone(), pool_2.clone(), branch_2)
+            .await
+            .expect("release");
+        // An ignored file (a target/ cache) held open without sharing blocks
+        // the folder rename while keeping the checkout clean.
+        let held = pool_2.join("target").join("held.txt");
+        write_all(&[(held.clone(), "held\n")]);
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&held)
+            .expect("hold the cache file open");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "the pool is skipped: {removed:?}");
+        assert!(pool_2.is_dir(), "the pool stays intact");
+        assert!(held.exists(), "its files stay");
+        assert!(
+            registered_worktrees(repo.path())
+                .expect("registered worktrees")
+                .iter()
+                .any(|path| same_checkout_path(path, &pool_2)),
+            "the pool stays registered"
+        );
+        assert!(
+            trash_folders(&main, 2).is_empty(),
+            "a failed rename leaves no trash behind"
+        );
+        assert!(pool_1.is_dir(), "pool-1 stays");
+        drop(handle);
     }
 }

@@ -965,7 +965,9 @@ impl Shared {
     /// ([`TeamRuntime::reattach_idle_external_lead`]) — a hook from any other
     /// session must never take the lead. The counters are read first and the
     /// queue is drained last, so the notices are the freshest thing in the
-    /// answer and nothing is held while the board is summarised.
+    /// answer. The team summary is built only for a real SessionStart
+    /// (`session_start` true); every other hook mode sends `"summary": ""`
+    /// and never pays for the records lock and the board read behind it.
     async fn notices(&self, target: Option<Target>, body: Value) -> Response {
         let Some(target) = target else {
             return Response::json(
@@ -997,21 +999,26 @@ impl Shared {
         };
         let active_workers = team.live_worker_turns().await;
         let waiter_alive = team.external_waiter_alive();
-        // The knowledge map rides only a real SessionStart (plan 373dec00 step
-        // 6): a PostToolUse drain sends the same "drain" mode without the
-        // flag, so it never pays for the file read. A missing INDEX.md (a
-        // project without a corpus, or before the first pass) adds nothing.
+        // The summary and the knowledge map ride only a real SessionStart
+        // (plan 373dec00 step 6): a PostToolUse drain sends the same "drain"
+        // mode without the flag and ignores the summary, so it never pays for
+        // the records lock, the board read or the knowledge file read. A
+        // missing INDEX.md (a project without a corpus, or before the first
+        // pass) adds nothing.
         let session_start = body
             .get("session_start")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut summary = team.external_summary().await;
-        if session_start {
+        let summary = if session_start {
+            let mut summary = team.external_summary().await;
             if let Some(map) = mnemo::memory::knowledge_index::knowledge_map_at(&target.root) {
                 summary.push_str("\n\n");
                 summary.push_str(&map);
             }
-        }
+            summary
+        } else {
+            String::new()
+        };
         let notices = if peek {
             team.current_notices(team.peek_external_notices()).await
         } else {
@@ -3860,7 +3867,14 @@ mod tests {
         let team = fixture.team().await;
         let root = fixture.root.to_string_lossy().into_owned();
 
-        let before = fixture.lead_post("/lead/notices", json!({ "root": root, "mode": "drain" })).await;
+        // The team summary rides only a SessionStart (plan 200ac7a9 step 2):
+        // name the flag here to keep checking what the board reports.
+        let before = fixture
+            .lead_post(
+                "/lead/notices",
+                json!({ "root": root, "mode": "drain", "session_start": true }),
+            )
+            .await;
         assert_eq!(before["attached"], false);
         assert_eq!(before["active_workers"], 0);
         assert_eq!(before["waiter_alive"], false);
@@ -3925,9 +3939,49 @@ mod tests {
             .await;
         let summary = start["summary"].as_str().expect("summary");
         assert!(
+            summary.starts_with("Mnemo2 team:"),
+            "a SessionStart still gets the team summary: {summary}"
+        );
+        assert!(
             summary.contains("Project knowledge (7 records): src/agent 3, general 4."),
             "a SessionStart carries the map: {summary}"
         );
+        fixture.shutdown().await;
+    }
+
+    /// Regression (plan 200ac7a9 step 2): a PostToolUse drain used to build
+    /// the whole team summary — locking the worker records and listing every
+    /// plan from disk — even though the hook reads it only on SessionStart.
+    /// A drain or peek now sends an empty summary; a SessionStart keeps it.
+    #[tokio::test]
+    async fn notices_drain_without_session_start_sends_no_summary() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+
+        let drained = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "drain" }))
+            .await;
+        assert_eq!(drained["summary"], "", "a PostToolUse drain gets no summary");
+        assert_eq!(drained["notices"], json!([]));
+        assert_eq!(drained["attached"], false);
+
+        let peeked = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "peek" }))
+            .await;
+        assert_eq!(peeked["summary"], "", "a Stop peek gets no summary");
+
+        let start = fixture
+            .lead_post(
+                "/lead/notices",
+                json!({ "root": root, "mode": "drain", "session_start": true }),
+            )
+            .await;
+        let summary = start["summary"].as_str().expect("summary");
+        assert!(
+            summary.starts_with("Mnemo2 team:"),
+            "a SessionStart still gets the team summary: {summary}"
+        );
+        assert!(summary.contains("0 worker(s) running"), "{summary}");
         fixture.shutdown().await;
     }
 

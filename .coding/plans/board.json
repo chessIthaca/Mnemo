@@ -4199,6 +4199,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Test synchronization only; no specified behaviour changes."
+    },
+    {
+      "id": "2e15085a",
+      "status": "closed",
+      "created_at_ms": 1795465028337,
+      "closed_at_ms": 1795468030584,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-2e15085a-20261123-210710.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Internal pool housekeeping; no OpenSpec capability covers pool folder lifetime (it is recorded in the .coding/knowledge spec record, which the step updates)."
     }
   ]
 }

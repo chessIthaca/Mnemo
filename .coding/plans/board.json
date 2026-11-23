@@ -2438,10 +2438,10 @@
     },
     {
       "id": "22002e68",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794493017194,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795432090325,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-22002e68-20261123-110810.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -2449,10 +2449,10 @@
     },
     {
       "id": "e1d2d242",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794496690741,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795432092557,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e1d2d242-20261123-110812.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -2724,10 +2724,10 @@
     },
     {
       "id": "e1529a36",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794833540411,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795432072969,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e1529a36-20261123-110752.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -3965,6 +3965,17 @@
       ],
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "7027e7bf",
+      "status": "open",
+      "created_at_ms": 1795430848583,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Where Mnemo2 keeps worker screenshots for the preview is not specified by any capability; review, merge and checkout behaviour are unchanged apart from removing untracked screenshot files after they are archived."
     }
   ]
 }

@@ -331,3 +331,47 @@ describe("WorkerDetail agent phase", () => {
     expect(statusPill(container)?.hasAttribute("data-agent-phase")).toBe(false);
   });
 });
+
+describe("WorkerDetail agent model", () => {
+  beforeEach(() => {
+    const state = fixtureState();
+    app.set({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        models: [
+          {
+            endpoint: "Ollama Cloud",
+            model: "glm-5.3",
+            spec: "Ollama Cloud/glm-5.3",
+            is_default: true,
+            reasoning_efforts: [],
+          },
+        ],
+      },
+    });
+  });
+
+  it("an agent worker's model is shown locked, not as a picker", () => {
+    const agentWorker: Worker = {
+      ...createWorkers()[0],
+      model: "claude-code/opus",
+      modelSpec: "Ollama Cloud/glm-5.3",
+      runsAsAgent: true,
+      reasoningEffort: "medium",
+    };
+
+    render(WorkerDetail, { worker: agentWorker });
+
+    // The tier's Mnemo model has a picker, but an agent worker never ran it.
+    expect(screen.queryByRole("combobox", { name: /model$/ })).toBeNull();
+    const badge = screen.getByLabelText("Worker model: claude-code/opus");
+    expect(badge.textContent).toContain("claude-code/opus");
+    const locked = badge.closest(".model-locked") as HTMLElement;
+    expect(locked.title).toBe(
+      "This worker runs as a Claude Code agent; its tier's agent setting chooses the model",
+    );
+    // The agent effort shows beside the locked model.
+    expect(screen.getByText("effort: medium")).toBeTruthy();
+  });
+});

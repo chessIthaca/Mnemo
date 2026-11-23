@@ -353,6 +353,12 @@ export interface Worker {
   model: string;
   /** The `endpoint/model` spec the worker was given; null = the configured default. */
   modelSpec?: string | null;
+  /**
+   * True when the worker runs as a Claude Code agent instead of a Mnemo
+   * session: the tier's Mnemo model never ran, so `model` reads
+   * `claude-code/<agent>` and the model picker is locked.
+   */
+  runsAsAgent?: boolean;
   /** The model tier it was dispatched or moved by, when one was used. */
   tier?: string;
   /** The worker's chosen reasoning effort, when one was set. */

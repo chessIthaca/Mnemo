@@ -3979,10 +3979,10 @@
     },
     {
       "id": "5520c914",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795432235661,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795441787884,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-5520c914-20261123-134947.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -4125,10 +4125,10 @@
     },
     {
       "id": "9e87b60b",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795435209401,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795442098616,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-9e87b60b-20261123-135458.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -4136,14 +4136,36 @@
     },
     {
       "id": "5ef34ca0",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795435809770,
+      "closed_at_ms": 1795441021555,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-5ef34ca0-20261123-133701.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test synchronization only; no specified behaviour changes. If the diagnosis finds a product race, the fix keeps the specified behaviour."
+    },
+    {
+      "id": "3d167bca",
+      "status": "open",
+      "created_at_ms": 1795441830935,
       "closed_at_ms": null,
       "report_path": null,
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
-      "no_spec_impact": "Test synchronization only; no specified behaviour changes. If the diagnosis finds a product race, the fix keeps the specified behaviour."
+      "no_spec_impact": "Only the ordering and filtering of the failure summary text for a failed check; which checks run, their pass/fail result and the notice flow are unchanged."
+    },
+    {
+      "id": "aa4903ac",
+      "status": "open",
+      "created_at_ms": 1795442324900,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Closing an already-reported read-only audit and its window label are not specified by any capability; review, merge and audit-dispatch rules are unchanged."
     }
   ]
 }

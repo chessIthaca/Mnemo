@@ -963,11 +963,19 @@ impl TeamRuntime {
             }
         }
         // Phase D: delete each worker — one failure never stops the rest.
+        let mut deleted = Vec::new();
         for (position, deletion) in deletions {
-            if let Err(error) = self.delete_one(&deletion).await {
-                outcomes[position].error = Some(error.clone());
+            match self.delete_one(&deletion).await {
+                Ok(()) => deleted.push(deletion.worker_id),
+                Err(error) => outcomes[position].error = Some(error.clone()),
             }
             on_result(outcomes[position].clone());
+        }
+        // A deleted target can no longer be adjudicated, so its audits are
+        // closed, reported or not (plan aa4903ac). This runs after the whole
+        // batch, so an audit deleted in the same batch is already gone.
+        for worker_id in &deleted {
+            self.close_audits_of_locked(worker_id, true).await;
         }
         Ok(TeamDeleteOutcome {
             results: outcomes,

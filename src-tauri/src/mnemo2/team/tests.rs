@@ -19582,3 +19582,210 @@ async fn a_released_audit_pool_is_reused_warm() {
     assert!(pool.join("target").join("WARM_MARKER").exists(), "with its build output");
     fixture.team.shutdown().await;
 }
+
+// --- plan aa4903ac step 1: Mnemo closes an audit once its verdict is used ---
+
+/// Whether the board told its subscribers it changed since the last drain.
+fn drained_board_changed(signals: &mut broadcast::Receiver<BoardSignal>) -> bool {
+    let mut changed = false;
+    while let Ok(signal) = signals.try_recv() {
+        changed |= matches!(signal, BoardSignal::Changed);
+    }
+    changed
+}
+
+/// A reviewed implementation worker on `wt/mnemo`, ready to merge, beside
+/// the audit records `audits` builds for its id and tip.
+async fn mergeable_with_audits(
+    audits: impl FnOnce(&str, &str) -> Vec<WorkerRecord>,
+) -> (tempfile::TempDir, tempfile::TempDir, TeamRuntime, WorkerRecord) {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    let mut target = worker(root.path(), "00000001000000000001");
+    target.status = WorkerStatus::InReview;
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        target.id.clone(),
+        "wt/mnemo".to_string(),
+    )
+    .await
+    .expect("provision worker");
+    std::fs::write(target.worktree.join("merged.txt"), "merged\n").expect("worker change");
+    run_git(&target.worktree, &["add", "merged.txt"]);
+    run_git(&target.worktree, &["commit", "-m", "worker change"]);
+    let tip = phase3::tip(&target.worktree).await.expect("worker tip");
+    target.checks = vec![WorkerCheck {
+        name: "cargo test --workspace".into(),
+        status: "passed".into(),
+        detail: None,
+        tip: tip.clone(),
+    }];
+    target.review = Some(ReviewRecord {
+        summary: "reviewed".into(),
+        tip: tip.clone(),
+        reviewed_at_ms: 1,
+        evidence: Some(evidence()),
+        lane: None,
+    });
+    let mut records = vec![target.clone()];
+    records.extend(audits(&target.id, &tip));
+    let team = open_test_team(root.path(), state.path(), records).await;
+    (root, state, team, target)
+}
+
+/// One reported audit record of `target` at `tip`.
+fn reported_audit(target: &str, tip: &str) -> WorkerRecord {
+    let mut audit = audit_worker(WorkerStatus::Completed, target, tip);
+    audit.report_delivered = true;
+    audit.report = Some("Read-only audit: no findings.".into());
+    audit
+}
+
+#[tokio::test]
+async fn an_adjudicated_audit_is_closed_and_frees_its_slot() {
+    let (fixture, pool) = stopped_pool_worker().await;
+    let root = fixture._root.path();
+    let target = worker(root, "auditTarget01");
+    provision_agent_worktree(root.to_path_buf(), target.id.clone(), "main".to_string())
+        .await
+        .expect("provision the target checkout");
+    fixture.team.records.lock().await.push(target.clone());
+    let tip = fixture.team.worker_tip(&target).await.expect("target tip");
+    // The pool worker becomes the target's reported audit with an idle live
+    // session that holds a slot, as a reported audit kept for follow-ups.
+    let audit_record = fixture.team.worker("routingworker").await.expect("audit");
+    let session = fixture
+        .team
+        .spawn_worker_session(WorkerSessionSpec {
+            model: None,
+            reasoning_effort: None,
+            worktree: pool.clone(),
+            resume: None,
+            kind: "audit".to_string(),
+            trace_identity: TeamRuntime::worker_trace_identity(&audit_record),
+            pinned_task: None,
+            check_commands: std::sync::Arc::new(Vec::new()),
+        })
+        .await
+        .expect("open the audit session");
+    fixture.team.live.lock().await.insert(
+        "routingworker".to_string(),
+        LiveWorker {
+            session,
+            pump: tokio::spawn(async {}),
+            cleanup_retry_only: false,
+            busy: Arc::new(AtomicBool::new(false)),
+            strikes: Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT))),
+            steer_pending: Arc::new(AtomicBool::new(false)),
+        },
+    );
+    assert_eq!(fixture.team.active_workers_for_slots().await, 1);
+    fixture
+        .team
+        .update_worker("routingworker", |audit| {
+            audit.kind = "audit".into();
+            audit.audit_target = Some(target.id.clone());
+            audit.audit_tip = Some(tip.clone());
+            audit.report_delivered = true;
+            audit.report = Some("no findings".into());
+            audit.status = WorkerStatus::Completed;
+        })
+        .await;
+
+    let mut linked = evidence();
+    linked.independent_reviewer_id = Some("routingworker".into());
+    linked.audit_adjudication = Some("accepted: no findings".into());
+    fixture
+        .team
+        .review(&target.id, "reviewed with the audit".into(), Vec::new(), linked)
+        .await
+        .expect("the review linking the audit");
+
+    let audit = fixture.team.worker("routingworker").await.expect("audit");
+    assert_eq!(audit.status, WorkerStatus::Stopped, "{audit:?}");
+    assert!(audit.worktree.as_os_str().is_empty(), "the checkout is released");
+    assert_eq!(audit.report.as_deref(), Some("no findings"), "the report stays");
+    assert!(audit.report_delivered);
+    assert!(!fixture.team.live.lock().await.contains_key("routingworker"));
+    assert_eq!(fixture.team.active_workers_for_slots().await, 0, "the slot is free");
+    assert!(pool.join(".git").exists(), "the pool folder stays for reuse");
+    // Closing again is a no-op.
+    fixture.team.close_used_audit("routingworker").await;
+    let again = fixture.team.worker("routingworker").await.expect("audit");
+    assert_eq!(again.status, WorkerStatus::Stopped);
+    fixture.team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_audit_closes_when_its_target_merges() {
+    let (_root, _state, team, target) =
+        mergeable_with_audits(|target, tip| vec![reported_audit(target, tip)]).await;
+
+    let merged = team.merge(&target.id).await.expect("merge");
+
+    assert_eq!(merged.status, WorkerStatus::Merged);
+    let audit = team.worker("auditor0001").await.expect("audit");
+    assert_eq!(audit.status, WorkerStatus::Stopped, "{audit:?}");
+    assert_eq!(audit.report.as_deref(), Some("Read-only audit: no findings."));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unreported_audit_stays_open_after_its_target_merges() {
+    let (_root, _state, team, target) = mergeable_with_audits(|target, tip| {
+        vec![audit_worker(WorkerStatus::Working, target, tip)]
+    })
+    .await;
+    // Opening the team recovers the sessionless audit as interrupted; the
+    // merge must leave whatever state it is in alone.
+    let before = team.worker("auditor0001").await.expect("audit").status;
+    assert_ne!(before, WorkerStatus::Stopped);
+
+    team.merge(&target.id).await.expect("merge");
+
+    let audit = team.worker("auditor0001").await.expect("audit");
+    assert_eq!(audit.status, before, "{audit:?}");
+    assert!(!audit.report_delivered);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_a_target_stops_its_audit() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let target = worker(root.path(), "00000001000000000001");
+    provision_agent_worktree(root.path().to_path_buf(), target.id.clone(), "main".to_string())
+        .await
+        .expect("provision the worker checkout");
+    let tip = phase3::tip(&target.worktree).await.expect("tip");
+    let audit = audit_worker(WorkerStatus::Working, &target.id, &tip);
+    let team = open_test_team(root.path(), state.path(), vec![target.clone(), audit]).await;
+
+    let outcome = team
+        .delete_workers(std::slice::from_ref(&target.id), true)
+        .await
+        .expect("delete the target");
+
+    assert!(outcome.results[0].error.is_none(), "{:?}", outcome.results);
+    let audit = team.worker("auditor0001").await.expect("the audit record stays");
+    assert_eq!(audit.status, WorkerStatus::Stopped, "{audit:?}");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn merge_and_stop_refresh_the_board() {
+    let (root, _state, team, target) = mergeable_with_audits(|_, _| Vec::new()).await;
+    let other = worker(root.path(), "00000002000000000002");
+    team.records.lock().await.push(other.clone());
+    let mut signals = team.subscribe_board();
+
+    team.merge(&target.id).await.expect("merge");
+    assert!(drained_board_changed(&mut signals), "a merge refreshes the board");
+
+    team.stop(&other.id).await.expect("stop");
+    assert!(drained_board_changed(&mut signals), "a stop refreshes the board");
+    team.shutdown().await;
+}

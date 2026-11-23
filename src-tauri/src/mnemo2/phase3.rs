@@ -460,7 +460,9 @@ const LEAD_BOOKKEEPING_PREFIXES: [&str; 5] = [
     ".coding/laya/",
 ];
 
-fn is_lead_bookkeeping(path: &str) -> bool {
+/// Whether `path`, relative to the project root, is one of the lead's own
+/// bookkeeping files ([`LEAD_BOOKKEEPING_PREFIXES`]).
+pub(crate) fn is_lead_bookkeeping(path: &str) -> bool {
     LEAD_BOOKKEEPING_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))

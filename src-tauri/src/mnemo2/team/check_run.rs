@@ -260,10 +260,15 @@ impl RunReport {
 }
 
 /// Run every command with the `run_checks` tool in `checkout`.
+///
+/// `lead` marks the lead checkout's run: there a tree change confined to the
+/// lead's own bookkeeping still counts as a pass ([`forgive_lead_bookkeeping`]).
+/// A worker's run stays strict.
 async fn run_all(
     checkout: &Path,
     commands: &[String],
     config_dir: &Path,
+    lead: bool,
 ) -> Result<RunReport, String> {
     let sandbox = Sandbox::new(checkout.to_path_buf())
         .map_err(|error| format!("cannot open the checkout {}: {error}", checkout.display()))?;
@@ -291,7 +296,82 @@ async fn run_all(
     if !result.success {
         return Err(result.output);
     }
-    build_report(checkout, commands, &args, &result)
+    report_with_lead_guard(checkout, commands, &args, &result, lead).await
+}
+
+/// One `run_checks` result as the run reports it: an outcome per entry, with the
+/// lead checkout's bookkeeping-only tree change forgiven when `lead`.
+///
+/// [`run_all`] passes its flag here, so the branch a worker run takes
+/// (`lead = false`: nothing forgiven) is the one the tests exercise.
+async fn report_with_lead_guard(
+    checkout: &Path,
+    commands: &[String],
+    args: &Value,
+    result: &ToolResult,
+    lead: bool,
+) -> Result<RunReport, String> {
+    let mut report = build_report(checkout, commands, args, result)?;
+    if lead {
+        forgive_lead_bookkeeping(checkout, result, &mut report).await;
+    }
+    Ok(report)
+}
+
+/// Count a lead checkout command as passed when the only files that changed
+/// under it were the lead's own bookkeeping.
+///
+/// The counting rule ([`counted_checks`]) rejects a command whose content tree
+/// differs before and after it ran. The lead keeps editing and committing its
+/// plan, review and knowledge files while a long command runs, which changes
+/// that tree without touching anything the command was meant to produce — and a
+/// merge already ignores those files ([`phase3::require_clean_lead`]). So the
+/// LEAD checkout's run diffs the two trees the entry measured and forgives the
+/// change when every path between them is lead bookkeeping. Fail closed: a
+/// missing tree id, a git error, an empty diff or one path outside the prefixes
+/// leaves the outcome exactly as the counting rule left it. Worker runs never
+/// come here.
+async fn forgive_lead_bookkeeping(checkout: &Path, result: &ToolResult, report: &mut RunReport) {
+    let Some(entries) = result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("checks"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for outcome in &mut report.outcomes {
+        if !outcome.changed_files {
+            continue;
+        }
+        // The command names its entry: `build_report` skips an entry without
+        // one, so position alone would drift.
+        let Some(entry) = entries.iter().find(|entry| {
+            entry.get("command").and_then(Value::as_str) == Some(outcome.command.as_str())
+        }) else {
+            continue;
+        };
+        let Some(before) = entry.get("tree_before").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(after) = entry.get("tree_after").and_then(Value::as_str) else {
+            continue;
+        };
+        if before.is_empty() || after.is_empty() {
+            continue;
+        }
+        let args = ["diff-tree", "-r", "--name-only", "-z", before, after];
+        let Ok(diff) = phase3::git_value(checkout, &args).await else {
+            continue;
+        };
+        let paths: Vec<&str> = diff.split('\0').filter(|path| !path.is_empty()).collect();
+        if paths.is_empty() || !paths.iter().all(|path| phase3::is_lead_bookkeeping(path)) {
+            continue;
+        }
+        outcome.passed = true;
+        outcome.changed_files = false;
+        outcome.failing = String::new();
+    }
 }
 
 /// Turn the `run_checks` result into one outcome per `data.checks` entry. Split
@@ -438,7 +518,7 @@ impl CheckCtx {
             panic!("injected check run panic");
         }
         let header = format!("worker_id={worker_id}");
-        let outcomes = run_all(&worktree, &commands, &self.config_dir).await;
+        let outcomes = run_all(&worktree, &commands, &self.config_dir, false).await;
         let text = match outcomes {
             Err(error) => format!("{header}\nMnemo could not run the checks for {worker_id}: {error}"),
             Ok(report) => {
@@ -502,7 +582,7 @@ impl CheckCtx {
 
     /// The same run in the lead checkout; nothing is recorded.
     async fn run_lead(&self, tip: String, branch: String, commands: Vec<String>, guard: CheckRunGuard) {
-        let outcomes = run_all(&self.workspace_root, &commands, &self.config_dir).await;
+        let outcomes = run_all(&self.workspace_root, &commands, &self.config_dir, true).await;
         let subject = format!(
             "Mnemo ran the checks in the lead checkout ({branch} at {})",
             short(&tip)
@@ -689,6 +769,170 @@ mod tests {
             "tree_after": "tree",
             "cwd": checkout.display().to_string(),
         })
+    }
+
+    /// The allow-listed command the lead-guard tests report.
+    const LEAD_GUARD_COMMAND: &str = "cargo test";
+
+    /// Run Git in `root`, returning its trimmed stdout; panic on failure.
+    fn git_in(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git process");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Write a fixture file, creating its directory.
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fixture directory");
+        }
+        std::fs::write(path, contents).expect("fixture file");
+    }
+
+    /// A committed project holding a source file and the lead's plan file, both
+    /// at `first`. Returns its directory and the commit's tree id.
+    fn tree_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("repo");
+        let root = dir.path();
+        git_in(root, &["init", "-q", "-b", "main"]);
+        git_in(root, &["config", "user.name", "Check Run Test"]);
+        git_in(root, &["config", "user.email", "check-run@example.invalid"]);
+        git_in(root, &["config", "core.autocrlf", "false"]);
+        write(root, "src/a.rs", "first\n");
+        write(root, ".coding/plans/x.md", "first\n");
+        git_in(root, &["add", "-A"]);
+        git_in(root, &["commit", "-qm", "base"]);
+        let tree = git_in(root, &["rev-parse", "HEAD^{tree}"]);
+        (dir, tree)
+    }
+
+    /// Commit the worktree as it stands and return the new commit's tree id.
+    fn commit_tree(root: &Path, message: &str) -> String {
+        git_in(root, &["add", "-A"]);
+        git_in(root, &["commit", "-qm", message]);
+        git_in(root, &["rev-parse", "HEAD^{tree}"])
+    }
+
+    /// The `run_checks` result of one exit-0 [`LEAD_GUARD_COMMAND`] that changed
+    /// the tree from `before` to `after`, in the tool's own shape.
+    fn changed_result(checkout: &Path, before: &str, after: &str) -> ToolResult {
+        ToolResult {
+            success: true,
+            output: format!(
+                "PASS {LEAD_GUARD_COMMAND} (exit 0, 1.0s) - changed files; not recorded\n\n1 passed, 0 failed"
+            ),
+            data: Some(json!({"checks": [{
+                "command": LEAD_GUARD_COMMAND,
+                "exit_code": 0,
+                "tree_before": before,
+                "tree_after": after,
+                "cwd": checkout.display().to_string(),
+            }]})),
+        }
+    }
+
+    /// The lead commits a plan file while a long command runs: in the LEAD
+    /// checkout's run that tree change is the lead's bookkeeping, so the command
+    /// passes instead of failing with "changed the checkout's files".
+    #[tokio::test]
+    async fn lead_run_forgives_a_bookkeeping_only_tree_change() {
+        let (dir, before) = tree_repo();
+        let checkout = dir.path();
+        write(checkout, ".coding/plans/x.md", "second\n");
+        let after = commit_tree(checkout, "plan");
+        let result = changed_result(checkout, &before, &after);
+        let commands = vec![LEAD_GUARD_COMMAND.to_string()];
+
+        // The counting rule alone still fails it, as the defect reported.
+        let strict = build_report(checkout, &commands, &json!({}), &result).expect("a report");
+        assert!(strict.outcomes[0].changed_files, "{:?}", strict.outcomes);
+        assert!(!strict.all_passed());
+
+        let report = report_with_lead_guard(checkout, &commands, &json!({}), &result, true)
+            .await
+            .expect("a report");
+        let outcome = &report.outcomes[0];
+        assert!(outcome.passed, "{outcome:?}");
+        assert!(!outcome.changed_files, "{outcome:?}");
+        assert!(outcome.failing.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.detail(), "run by Mnemo: exit 0, 1.0s");
+        assert!(report.all_passed(), "the lead branch passes the checks");
+    }
+
+    /// A tree change that touches a source file — alone, or beside the plan
+    /// file — still fails the lead checkout's run: only bookkeeping is forgiven.
+    #[tokio::test]
+    async fn lead_run_still_fails_a_source_change() {
+        let (dir, before) = tree_repo();
+        let checkout = dir.path();
+        write(checkout, "src/a.rs", "second\n");
+        let source = commit_tree(checkout, "source");
+        write(checkout, ".coding/plans/x.md", "second\n");
+        let both = commit_tree(checkout, "source and plan");
+        let commands = vec![LEAD_GUARD_COMMAND.to_string()];
+
+        for after in [source.as_str(), both.as_str()] {
+            let result = changed_result(checkout, &before, after);
+            let report = report_with_lead_guard(checkout, &commands, &json!({}), &result, true)
+                .await
+                .expect("a report");
+            let outcome = &report.outcomes[0];
+            assert!(!outcome.passed, "{after}: {outcome:?}");
+            assert!(outcome.changed_files, "{after}: {outcome:?}");
+            assert!(
+                outcome.detail().contains("changed the checkout's files"),
+                "{after}: {}",
+                outcome.detail()
+            );
+            assert!(!report.all_passed(), "{after}");
+        }
+    }
+
+    /// A worker checkout's run never forgives: the same bookkeeping-only tree
+    /// change stays a failed command there.
+    #[tokio::test]
+    async fn worker_run_never_forgives_bookkeeping() {
+        let (dir, before) = tree_repo();
+        let checkout = dir.path();
+        write(checkout, ".coding/plans/x.md", "second\n");
+        let after = commit_tree(checkout, "plan");
+        let result = changed_result(checkout, &before, &after);
+        let commands = vec![LEAD_GUARD_COMMAND.to_string()];
+
+        let report = report_with_lead_guard(checkout, &commands, &json!({}), &result, false)
+            .await
+            .expect("a report");
+        let outcome = &report.outcomes[0];
+        assert!(!outcome.passed, "{outcome:?}");
+        assert!(outcome.changed_files, "{outcome:?}");
+        assert!(!report.all_passed(), "a worker's tree change stays failed");
+    }
+
+    /// A tree id Git cannot diff keeps the failure: the guard fails closed
+    /// instead of counting an unreadable change as bookkeeping.
+    #[tokio::test]
+    async fn lead_run_keeps_the_failure_when_git_cannot_diff_the_trees() {
+        let (dir, before) = tree_repo();
+        let checkout = dir.path();
+        let result = changed_result(checkout, &before, "not-a-tree");
+        let commands = vec![LEAD_GUARD_COMMAND.to_string()];
+
+        let report = report_with_lead_guard(checkout, &commands, &json!({}), &result, true)
+            .await
+            .expect("a report");
+        let outcome = &report.outcomes[0];
+        assert!(!outcome.passed, "{outcome:?}");
+        assert!(outcome.changed_files, "{outcome:?}");
+        assert!(!report.all_passed());
     }
 
     /// An outcome per data entry, a cut-off block never reads as a clean run,

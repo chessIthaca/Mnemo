@@ -98,3 +98,10 @@ For each tier, Mnemo SHALL report each configured model as available, unavailabl
 - **WHEN** a tier's first model is unavailable after a usage limit
 - **THEN** the tier resolves to its next available model, or folds down
 - **AND** team_tiers shows the first model unavailable until its time
+
+### Requirement: Pools return to the ladder's workers when no worker needs them
+A pool checkout held by an audit that has reported, or by a stopped or failed worker whose plan step is done, SHALL be released with its build output kept, so a later dispatch on any tier can reuse it warm.
+
+#### Scenario: Reported audit
+- **WHEN** an audit worker delivers its report
+- **THEN** its pool is released and its record keeps the report

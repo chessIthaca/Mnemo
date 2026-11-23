@@ -17464,6 +17464,12 @@ fn the_agent_prompt_uses_no_mnemo_tools_and_no_cd_rule() {
     );
     assert!(prompt.contains("- Do not use Mnemo's team_* or plan_* tools."), "{prompt}");
     assert!(prompt.contains("- Run shell commands in the foreground."), "{prompt}");
+    // The live run (plan 4d920eec step 6) showed the agent still prefixing
+    // every command with a cd into the folder it already ran in.
+    assert!(
+        prompt.contains("- Your shell already starts in that checkout: run each command as it is, without a cd into the checkout first."),
+        "{prompt}"
+    );
     assert!(prompt.contains("Mnemo runs the full checks in .coding/checks.toml on your final commit."), "{prompt}");
     for gone in ["cd \"", "Set-Location", "team_progress", "plan_show", "Work only inside"] {
         assert!(!prompt.contains(gone), "{gone} is gone from the prompt: {prompt}");

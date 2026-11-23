@@ -111,6 +111,12 @@ impl TeamRuntime {
             | WorkerStatus::Conflict => true,
             _ => return Err(agent_worker_refusal(record).unwrap_or_default()),
         };
+        if idle {
+            // A new run, recorded before the worker is back at work: no
+            // watcher pass may see it working without the new run's floor
+            // and take the previous run's finish for this one.
+            self.agent_watch.note_run_start(record, now_key());
+        }
         self.update_worker(&record.id, |worker| {
             append_inbox(
                 worker,
@@ -132,15 +138,12 @@ impl TeamRuntime {
             }
         })
         .await;
+        #[cfg(test)]
+        self.probe_run_start().await;
         self.persist().await?;
-        let worker = self.worker(&record.id).await?;
-        if idle {
-            // A new run: its finish is the transcript's next one.
-            self.agent_watch.note_run_start(&worker, now_key());
-        }
         // A registered agent back at work is watched again.
         self.ensure_agent_watch().await;
-        Ok(worker)
+        self.worker(&record.id).await
     }
 
     pub(super) async fn message_inner(

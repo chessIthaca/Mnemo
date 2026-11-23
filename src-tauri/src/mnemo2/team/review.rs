@@ -930,6 +930,10 @@ impl TeamRuntime {
             .ok_or_else(|| format!("unknown open finding '{finding_id}'"))?
             .clone();
         let brief = route_fix_brief(worker, &finding);
+        // A new run, recorded before the worker is back at work: no watcher
+        // pass may see it fixing without the new run's floor and take the
+        // previous run's finish for this one.
+        self.agent_watch.note_run_start(worker, now_key());
         self.update_worker(&worker.id, |worker| {
             worker.status = WorkerStatus::Fixing;
             worker.fixer_finding_id = Some(finding_id.to_string());
@@ -949,12 +953,11 @@ impl TeamRuntime {
             );
         })
         .await;
+        #[cfg(test)]
+        self.probe_run_start().await;
         self.persist().await?;
-        let fixing = self.worker(&worker.id).await?;
-        // A new run: its finish is the transcript's next one.
-        self.agent_watch.note_run_start(&fixing, now_key());
         self.ensure_agent_watch().await;
-        Ok(fixing)
+        self.worker(&worker.id).await
     }
 }
 

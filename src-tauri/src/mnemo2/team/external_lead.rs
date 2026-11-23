@@ -596,8 +596,9 @@ impl TeamRuntime {
     ///
     /// On a run Mnemo already finished itself (the agent's transcript said
     /// it ended, [`TeamRuntime::auto_finish_agent`]) the call succeeds
-    /// without a second notice: a non-empty report replaces the agent's last
-    /// message, and `failed` marks the worker Failed with the failed notice.
+    /// without a second finished notice: a non-empty report replaces the
+    /// agent's last message, and `failed` marks the worker Failed and sends
+    /// the failed notice.
     pub(super) async fn agent_done_with_snapshot(
         &self,
         worker_id: &str,

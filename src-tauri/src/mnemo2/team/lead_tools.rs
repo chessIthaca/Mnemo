@@ -259,7 +259,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_agent_done".to_string(),
-                description: "Report on a run of a worker that runs as a Claude Code agent. Mnemo finishes such a worker itself when its agent ends (the agent's last message becomes the report, and the usual finished notice follows), so call this only to mark the run failed (failed=true, with the reason as the report) or to replace the agent's last message with a fuller report. On a run Mnemo already finished it sends no second notice. Then team_check, team_review and team_merge work as for any worker.".to_string(),
+                description: "Report on a run of a worker that runs as a Claude Code agent. Mnemo finishes such a worker itself when its agent ends (the agent's last message becomes the report, and the usual finished notice follows), so call this only to mark the run failed (failed=true, with the reason as the report) or to replace the agent's last message with a fuller report. On a run Mnemo already finished it sends no second finished notice; failed=true then marks it Failed and sends the failed notice. Then team_check, team_review and team_merge work as for any worker.".to_string(),
                 parameters: json!({"type":"object","properties":{
                     "worker_id":{"type":"string","description":"The agent worker whose run you report on."},
                     "report":{"type":"string","description":"The agent's final report: the commit hash, the checks it ran and their results, and anything left open."},

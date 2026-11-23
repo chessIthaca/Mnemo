@@ -141,6 +141,10 @@ struct Inner {
     states: HashMap<String, Observed>,
     /// The agent runs Mnemo finished itself, by worker id.
     auto_finished: HashMap<String, AutoFinished>,
+    /// Tests only: run a watcher pass right after a continuation or fix
+    /// round put its worker back to work, and keep the runs it found.
+    #[cfg(test)]
+    probe: Option<Vec<FinishedRun>>,
     /// Where the transcripts live; `~/.claude/projects` unless a test says
     /// otherwise.
     projects_root: Option<PathBuf>,
@@ -688,6 +692,32 @@ impl TeamRuntime {
                 }
             }
         }));
+    }
+
+    /// Arm the run-start probe ([`TeamRuntime::probe_run_start`]). Tests only.
+    #[cfg(test)]
+    pub(super) fn arm_run_start_probe(&self) {
+        self.agent_watch.lock().probe = Some(Vec::new());
+    }
+
+    /// The runs the armed probe's pass found ready to finish. Tests only.
+    #[cfg(test)]
+    pub(super) fn take_run_start_probe(&self) -> Vec<FinishedRun> {
+        self.agent_watch.lock().probe.take().unwrap_or_default()
+    }
+
+    /// The seam right after a continuation or fix round put its worker back
+    /// to work (the merge lock still held): when armed, one watcher pass runs
+    /// here and the runs it would finish are kept for the test.
+    #[cfg(test)]
+    pub(super) async fn probe_run_start(&self) {
+        if self.agent_watch.lock().probe.is_none() {
+            return;
+        }
+        let (_, finished, _) = tick(&self.records, &self.signals, &self.agent_watch).await;
+        if let Some(probe) = self.agent_watch.lock().probe.as_mut() {
+            probe.extend(finished);
+        }
     }
 
     /// One pass of the watcher. Tests call it instead of waiting a minute.

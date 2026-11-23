@@ -17891,6 +17891,68 @@ async fn a_short_continuation_between_ticks_is_still_finished() {
     team.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_tick_during_a_continuation_start_does_not_finish_the_new_run() {
+    let (fixture, _projects, transcript) = auto_finished_agent("agentWatch17").await;
+    let team = &fixture.team;
+    assert_eq!(finished_notices(team, "agentWatch17").len(), 1);
+    // A watcher pass runs right after team_message put the worker back to
+    // work, while the previous run's finished flag is still in the meta file.
+    team.arm_run_start_probe();
+    continue_agent(team, "agentWatch17").await;
+    let probed = team.take_run_start_probe();
+    assert!(probed.is_empty(), "the old finish was taken for the new run: {probed:?}");
+    team.agent_watch_tick().await;
+    let worker = team.worker("agentWatch17").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.turns, 1);
+    assert!(finished_notices(team, "agentWatch17").is_empty());
+    // The new run ends: now it finishes, with its own report.
+    append_agent_line(&transcript, "The new run is done.");
+    team.agent_watch_tick().await;
+    let worker = team.worker("agentWatch17").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Completed);
+    assert_eq!(worker.report.as_deref(), Some("The new run is done."));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_auto_finish_closes_a_fix_round() {
+    let (fixture, _projects, transcript) = auto_finished_agent("agentFix03").await;
+    let team = &fixture.team;
+    assert_eq!(finished_notices(team, "agentFix03").len(), 1);
+    team.update_worker("agentFix03", |worker| {
+        worker.status = WorkerStatus::InReview;
+        worker.findings.push(open_finding("fixMe03"));
+        worker.review_rounds = 1;
+    })
+    .await;
+    // A pass right after the fix round starts does not finish it either.
+    team.arm_run_start_probe();
+    let routed = team
+        .handle_lead_host_tool_from(
+            "team_route_fix",
+            json!({"worker_id": "agentFix03", "finding_id": "fixMe03"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(routed.success, "{}", routed.output);
+    assert!(team.take_run_start_probe().is_empty());
+    let fixing = team.worker("agentFix03").await.expect("worker");
+    assert_eq!(fixing.status, WorkerStatus::Fixing);
+    assert_eq!(fixing.fixer_finding_id.as_deref(), Some("fixMe03"));
+    // The agent fixes it and ends.
+    append_agent_line(&transcript, "Fixed fixMe03 at def5678.");
+    team.agent_watch_tick().await;
+    let closed = team.worker("agentFix03").await.expect("worker");
+    assert_eq!(closed.status, WorkerStatus::Completed);
+    assert_eq!(closed.fixer_finding_id, None);
+    assert_eq!(closed.turns, fixing.turns + 1);
+    assert_eq!(closed.report.as_deref(), Some("Fixed fixMe03 at def5678."));
+    assert_eq!(finished_notices(team, "agentFix03").len(), 1);
+    team.shutdown().await;
+}
+
 /// Sets the projects folder every agent watch on this test thread uses,
 /// `TeamRuntime::open`'s included, and clears it when dropped.
 struct ThreadProjectsRoot;

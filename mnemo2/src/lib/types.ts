@@ -61,6 +61,13 @@ export interface WorkerActivity {
   phase: WorkerPhase;
   /** The tool the worker is running, when `phase === "tool"`. */
   toolName: string | null;
+  /**
+   * The running call's argument JSON, when the tool-start event carried it:
+   * what the call is FOR (a Bash call's `description`, a shell call's
+   * `purpose`), so the status line can say "Running the workspace tests…"
+   * instead of "Running Bash…". Null when the event carried no arguments.
+   */
+  toolArgs: string | null;
   /** When the current turn began (ms epoch); null until the turn's `started` event arrives. */
   turnStartedAtMs: number | null;
   /** When the current phase began (ms epoch). */

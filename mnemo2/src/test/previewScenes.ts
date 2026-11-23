@@ -57,13 +57,21 @@ const NOW_MS = Date.now();
 
 /**
  * One worker's live activity at the scene's clock: `agoMs` is how long the
- * phase (and its turn) has been running. A dispatching worker has no turn
- * anchor yet — its turn timer starts when the turn's first event streams.
+ * phase (and its turn) has been running, `toolArgs` the running call's
+ * argument JSON (so the status line says what the call is for). A dispatching
+ * worker has no turn anchor yet — its turn timer starts when the turn's first
+ * event streams.
  */
-function liveActivity(phase: WorkerActivity["phase"], agoMs: number, toolName: string | null = null): WorkerActivity {
+function liveActivity(
+  phase: WorkerActivity["phase"],
+  agoMs: number,
+  toolName: string | null = null,
+  toolArgs: string | null = null,
+): WorkerActivity {
   return {
     phase,
     toolName,
+    toolArgs,
     turnStartedAtMs: phase === "starting" ? null : NOW_MS - agoMs,
     phaseSinceMs: NOW_MS - agoMs,
   };
@@ -304,7 +312,15 @@ function missionControl(): AppState {
     june: { createdAtMs: NOW_MS - minutes(2), activity: liveActivity("starting", minutes(2)) },
     sol: { createdAtMs: NOW_MS - minutes(21), activity: liveActivity("thinking", minutes(1.5)) },
     milo: { createdAtMs: NOW_MS - minutes(24), activity: liveActivity("writing", 45_000) },
-    kai: { createdAtMs: NOW_MS - minutes(18), activity: liveActivity("tool", 72_000, "shell") },
+    kai: {
+      createdAtMs: NOW_MS - minutes(18),
+      activity: liveActivity(
+        "tool",
+        72_000,
+        "shell",
+        JSON.stringify({ command: "npx vitest run src/lib src/components", purpose: "running tests" }),
+      ),
+    },
     noa: {
       status: "needs_you",
       needsYou: true,

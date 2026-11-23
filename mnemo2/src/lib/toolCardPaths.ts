@@ -1116,6 +1116,327 @@ function entryCount(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
+/** One string argument, from complete JSON or from a still-streaming fragment. */
+export function stringArg(args: string, key: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(args);
+    if (parsed && typeof parsed === "object" && key in parsed) {
+      const value = (parsed as Record<string, unknown>)[key];
+      return typeof value === "string" && value.trim() ? value : null;
+    }
+    return null;
+  } catch {
+    // An in-flight argument fragment still identifies the real action.
+    const marker = `"${key}"`;
+    const at = args.indexOf(marker);
+    if (at < 0) return null;
+    const match = /^\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(args.slice(at + marker.length));
+    return match?.[1] ? match[1] : null;
+  }
+}
+
+/** Team tool headlines: `worker` names the worker the call acts on, when it names one. */
+const teamPhrases: Record<string, (worker: string | null) => string> = {
+  team_message: (worker) => (worker ? `Messaging ${worker}` : "Messaging a worker"),
+  team_status: (worker) => (worker ? `Reading ${worker}’s status` : "Reading team status"),
+  team_stop: (worker) => (worker ? `Stopping ${worker}` : "Stopping a worker"),
+  team_resume: (worker) => (worker ? `Resuming ${worker}` : "Resuming a worker"),
+  team_compact: (worker) => (worker ? `Compacting ${worker}’s context` : "Compacting a worker’s context"),
+  team_review: (worker) => (worker ? `Reviewing ${worker}’s work` : "Reviewing a worker"),
+  team_check: (worker) => (worker ? `Recording a check for ${worker}` : "Recording a worker check"),
+  team_resolve_finding: (worker) => (worker ? `Resolving a finding for ${worker}` : "Resolving a review finding"),
+  review_fix: (worker) => (worker ? `Applying a review fix for ${worker}` : "Applying a review fix"),
+  team_route_fix: (worker) => (worker ? `Returning a finding to ${worker}` : "Returning a finding to the worker"),
+  team_merge: (worker) => (worker ? `Merging ${worker}’s branch` : "Merging a worker branch"),
+  team_revert_merge: (worker) => (worker ? `Reverting ${worker}’s merge` : "Reverting a merge"),
+  team_stop_all: () => "Stopping all workers",
+  message_parent: () => "Sending an update to the lead",
+};
+
+/**
+ * A team tool's phrase ("Reading team status", "Delegating to …") or null for
+ * every other tool. Lives beside {@link actionPhrase} because an MCP-wrapped
+ * `mcp__plugin_mnemo_mnemo__team_status` call reuses it.
+ */
+export function teamPhrase(
+  toolName: string,
+  args: string,
+  nameOf: (workerId: string) => string,
+): string | null {
+  const workerId = stringArg(args, "worker_id");
+  const worker = workerId ? nameOf(workerId) : null;
+  if (toolName !== "team_dispatch") return teamPhrases[toolName]?.(worker) ?? null;
+  const brief = stringArg(args, "brief");
+  const target = worker ? `Delegating to ${worker}` : "Delegating";
+  return brief ? `${target}: ${brief}` : worker ? target : "Delegating a task";
+}
+
+/** The `git` tool's subcommand phrases, shared with the bare-command
+ *  classifier (`git commit …` → "Committing"). */
+const gitVerbPhrases: Record<string, string> = {
+  commit: "Committing",
+  status: "Checking git status",
+  log: "Reading the git log",
+  diff: "Reviewing a diff",
+  merge: "Merging",
+  push: "Pushing",
+  restore: "Restoring files",
+  stash: "Stashing changes",
+  checkout: "Switching branches",
+  branch: "Managing branches",
+  create: "Creating a branch",
+  delete: "Deleting a branch",
+  pop: "Popping the stash",
+  drop: "Dropping the stash",
+};
+
+/** The imperative verbs a command description commonly starts with, in their
+ *  -ing form (`Run the workspace tests` → `Running the workspace tests`). */
+const gerunds: Record<string, string> = {
+  run: "Running",
+  build: "Building",
+  check: "Checking",
+  list: "Listing",
+  show: "Showing",
+  install: "Installing",
+  create: "Creating",
+  remove: "Removing",
+  delete: "Deleting",
+  find: "Finding",
+  read: "Reading",
+  start: "Starting",
+  stop: "Stopping",
+  count: "Counting",
+  compare: "Comparing",
+  commit: "Committing",
+  format: "Formatting",
+  test: "Testing",
+  search: "Searching",
+  print: "Printing",
+  copy: "Copying",
+  move: "Moving",
+  update: "Updating",
+  write: "Writing",
+  fetch: "Fetching",
+  open: "Opening",
+  verify: "Verifying",
+  confirm: "Confirming",
+  inspect: "Inspecting",
+  get: "Getting",
+  look: "Looking",
+  time: "Timing",
+  wait: "Waiting",
+  rebuild: "Rebuilding",
+  clean: "Cleaning",
+  kill: "Killing",
+  launch: "Launching",
+  measure: "Measuring",
+  view: "Viewing",
+  diff: "Diffing",
+  rerun: "Rerunning",
+  "re-run": "Re-running",
+};
+
+/**
+ * A command description as a gerund sentence: a leading known imperative verb
+ * becomes its -ing form and the rest is kept as written ("Run the workspace
+ * tests" → "Running the workspace tests"); any other description is used as
+ * written with its first letter capitalized.
+ */
+export function gerundSentence(description: string): string {
+  const text = description.trim();
+  if (text === "") return text;
+  const space = text.search(/\s/);
+  const first = space < 0 ? text : text.slice(0, space);
+  const rest = space < 0 ? "" : text.slice(space);
+  const gerund = gerunds[first.toLowerCase()];
+  if (gerund !== undefined) return `${gerund}${rest}`;
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+}
+
+/** A command token's program name: quotes, its directory and a `.exe` suffix
+ *  dropped (`C:\tools\foo.exe` → `foo`), lowercased for comparison. */
+function programName(token: string): string {
+  const bare = token.replace(/^["']|["']$/g, "");
+  const name = basename(bare).toLowerCase();
+  return name.endsWith(".exe") ? name.slice(0, -4) : name;
+}
+
+/** The interpreters rule 3 names a script after (`python scripts/make.py` →
+ *  "Running make.py"). */
+const interpreters = new Set(["node", "python", "python3", "py", "bash", "sh", "pwsh", "powershell"]);
+
+/** The first simple command of a shell line: `cd <dir> &&`/`;` prefixes and
+ *  `NAME=value` environment assignments are dropped, and the line is cut at
+ *  its first `&&`, `;` or `|` so a later command cannot label the call. Only
+ *  the first line of a multi-line command counts. */
+function firstCommandSegment(command: string): string {
+  let rest = command.split(/\r?\n/, 1)[0].trim();
+  for (;;) {
+    const cd = /^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*/i.exec(rest);
+    if (cd === null) break;
+    rest = rest.slice(cd[0].length);
+  }
+  for (;;) {
+    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/.exec(rest);
+    if (assignment === null) break;
+    rest = rest.slice(assignment[0].length);
+  }
+  return rest.split(/&&|;|\|\|?/, 1)[0].trim();
+}
+
+/**
+ * What a bare shell command is for, from its first program and arguments:
+ * "Running tests" for `cargo test --workspace`, "Building" for
+ * `npm run build`, "Running make_level.py" for `python scripts/make_level.py`
+ * — anything else is "Running <program>".
+ */
+export function commandPhrase(command: string): string {
+  const tokens = firstCommandSegment(command).split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return "Running a command";
+  const program = programName(tokens[0]);
+  const args = tokens.map((token) => token.toLowerCase());
+  const second = args[1];
+  const third = args[2];
+  if (program === "git") {
+    const sub = args.slice(1).find((token) => !token.startsWith("-"));
+    return sub === undefined ? "Running git" : (gitVerbPhrases[sub] ?? `Running git ${sub}`);
+  }
+  if (
+    program === "pytest" ||
+    (program === "cargo" && second === "test") ||
+    (program === "go" && second === "test") ||
+    (program === "dotnet" && second === "test") ||
+    (program === "npm" && (second === "test" || (second === "run" && third === "test"))) ||
+    (program === "npx" && second === "vitest")
+  ) {
+    return "Running tests";
+  }
+  if (
+    (program === "cargo" && second === "build") ||
+    (program === "dotnet" && second === "build") ||
+    (program === "npm" && second === "run" && third !== undefined && third.startsWith("build")) ||
+    (program === "npx" && second === "vite" && third === "build") ||
+    (program === "tsc" && second === "-b")
+  ) {
+    return "Building";
+  }
+  if (
+    (program === "cargo" && (second === "clippy" || second === "check")) ||
+    program === "eslint" ||
+    (program === "npm" && second === "run" && (third === "check" || third === "lint")) ||
+    (program === "tsc" && args.includes("--noemit"))
+  ) {
+    return "Checking the code";
+  }
+  if (
+    (program === "cargo" && second === "fmt") ||
+    program === "prettier" ||
+    (program === "npx" && second === "prettier")
+  ) {
+    return "Formatting code";
+  }
+  if (
+    (program === "npm" && (second === "ci" || second === "install")) ||
+    (program === "pnpm" && second === "install")
+  ) {
+    return "Installing dependencies";
+  }
+  if (interpreters.has(program)) {
+    const script = tokens[1];
+    if (script !== undefined && !script.startsWith("-")) return `Running ${programName(script)}`;
+    return `Running ${program}`;
+  }
+  return `Running ${program}`;
+}
+
+/** The MCP server that fronts Mnemo's own tools. */
+const MNEMO_MCP_SERVER = "plugin_mnemo_mnemo";
+
+/**
+ * The tool behind an MCP-wrapped Mnemo call: `mcp__plugin_mnemo_mnemo__shell`
+ * is Mnemo's own `shell`, so it keeps the phrase it has under its own name.
+ * Null for every other name.
+ */
+export function mnemoMcpTool(toolName: string): string | null {
+  const prefix = `mcp__${MNEMO_MCP_SERVER}__`;
+  if (!toolName.startsWith(prefix)) return null;
+  const tool = toolName.slice(prefix.length);
+  return tool === "" ? null : tool;
+}
+
+/** A URL's host (`example.com`), or null when the URL does not parse. */
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A Claude Code agent tool's phrase, from Claude's own tool name and input
+ * shape (`Read` {file_path}, `Bash` {command, description}, …) — a worker that
+ * runs as a Claude Code agent streams those names into its transcript. Null
+ * for every other tool.
+ */
+function claudeToolPhrase(toolName: string, input: Record<string, unknown>): string | null {
+  const text = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() ? value.trim() : null;
+  const filePath = text(input.file_path);
+  switch (toolName) {
+    case "Bash":
+    case "PowerShell": {
+      const description = text(input.description);
+      if (description !== null) return gerundSentence(description);
+      const command = text(input.command);
+      return command !== null ? commandPhrase(command) : "Running a command";
+    }
+    case "Read":
+      return filePath !== null ? `Reading ${basename(filePath)}` : "Reading a file";
+    case "Edit":
+    case "MultiEdit":
+      return filePath !== null ? `Editing ${basename(filePath)}` : "Editing a file";
+    case "Write":
+      return filePath !== null ? `Writing ${basename(filePath)}` : "Writing a file";
+    case "NotebookEdit": {
+      const notebook = text(input.notebook_path);
+      return notebook !== null ? `Editing ${basename(notebook)}` : "Editing a notebook";
+    }
+    case "Grep": {
+      const pattern = text(input.pattern);
+      if (pattern === null) return "Searching the code";
+      const glob = text(input.glob);
+      return glob !== null ? `Searching for "${pattern}" in ${glob}` : `Searching for "${pattern}"`;
+    }
+    case "Glob": {
+      const pattern = text(input.pattern);
+      return pattern !== null ? `Finding files matching ${pattern}` : "Finding files";
+    }
+    case "WebFetch": {
+      const host = hostOf(text(input.url) ?? "");
+      return host !== null ? `Fetching ${host}` : "Fetching a page";
+    }
+    case "WebSearch": {
+      const query = text(input.query);
+      return query !== null ? `Searching the web for "${query}"` : "Searching the web";
+    }
+    case "TodoWrite":
+      return "Updating its task list";
+    case "Task":
+    case "Agent": {
+      const description = text(input.description);
+      return description !== null
+        ? `Starting a helper agent: ${description}`
+        : "Starting a helper agent";
+    }
+    case "ToolSearch":
+      return "Loading tools";
+    default:
+      return null;
+  }
+}
+
 /**
  * A human sentence for the ToolCard header's COLLAPSED state — what the call
  * is doing, derived from its args (e.g. `Searching for "WorkflowState"`,
@@ -1123,12 +1444,15 @@ function entryCount(value: unknown): number {
  *
  * The raw tool name (search, file_edit, shell, …) is deliberately NOT part of
  * the phrase: the expanded detail renders it, so a collapsed transcript reads
- * like a narrative instead of a list of tool identifiers.
+ * like a narrative instead of a list of tool identifiers. That includes a
+ * Claude Code agent worker's own tool names (`Bash`, `Read`, …) and MCP
+ * `mcp__server__tool` calls: a Mnemo tool behind Mnemo's MCP server keeps the
+ * phrase it has under its own name, any other server's tool reads
+ * `Using <tool> (<server>)`.
  *
- * Returns `null` when the tool is unknown (incl. MCP `mcp__server__tool`
- * names) or the args cannot be parsed — the caller falls back to
- * {@link prettyToolName}. React-free so the node-env unit tests can exercise
- * it directly.
+ * Returns `null` only when the tool is unknown and not MCP-wrapped, or the
+ * args cannot be parsed — the caller falls back to {@link prettyToolName}.
+ * React-free so the node-env unit tests can exercise it directly.
  */
 export function actionPhrase(toolName: string, argsJson: string): string | null {
   // A legacy saved call may predate the per-call `name` field (see the /load
@@ -1143,6 +1467,25 @@ export function actionPhrase(toolName: string, argsJson: string): string | null 
   }
   const str = (v: unknown): string | null =>
     typeof v === "string" && v.trim() ? v.trim() : null;
+
+  // A Claude Code agent worker's transcript uses Claude's own tool names and
+  // inputs — the same sentence a Mnemo tool call gets, from that shape.
+  const claude = claudeToolPhrase(toolName, parsed);
+  if (claude !== null) return claude;
+  // An MCP tool: Mnemo's own keep the phrase they have under their own name;
+  // any other server's tool has none of its own, so name it and its server.
+  const mnemoTool = mnemoMcpTool(toolName);
+  if (mnemoTool !== null) {
+    return (
+      teamPhrase(mnemoTool, argsJson, (workerId) => workerId) ?? actionPhrase(mnemoTool, argsJson)
+    );
+  }
+  const mcp = /^mcp__(.+)__(.+)$/.exec(toolName);
+  if (mcp !== null) {
+    const server = mcp[1].replace(/_/g, " ");
+    const tool = mcp[2].replace(/_/g, " ");
+    return `Using ${tool} (${server})`;
+  }
 
   // Read surface.
   if (toolName === "search" || toolName === "search_read") {
@@ -1173,34 +1516,20 @@ export function actionPhrase(toolName: string, argsJson: string): string | null 
   if (toolName === "convert_line_endings") return "Converting line endings";
 
   // Shell / git.
-  if (toolName === "shell") {
+  if (toolName === "shell" || toolName === "job") {
     // A purpose is already a gerund phrase ("running tests") — capitalizing it
-    // IS the sentence; prefixing "Running" would double the verb.
+    // IS the sentence; prefixing "Running" would double the verb. Without one,
+    // the command's own program classifies the call ("cargo test" → "Running
+    // tests").
     const purpose = str(parsed.purpose);
-    return purpose !== null
-      ? purpose.charAt(0).toUpperCase() + purpose.slice(1)
-      : "Running a command";
+    if (purpose !== null) return purpose.charAt(0).toUpperCase() + purpose.slice(1);
+    const command = str(parsed.command);
+    return command !== null ? commandPhrase(command) : "Running a command";
   }
   if (toolName === "git") {
     const sub = str(parsed.subcommand) ?? str(parsed.action);
     if (sub === null) return "Running git";
-    const verbs: Record<string, string> = {
-      commit: "Committing",
-      status: "Checking git status",
-      log: "Reading the git log",
-      diff: "Reviewing a diff",
-      merge: "Merging",
-      push: "Pushing",
-      restore: "Restoring files",
-      stash: "Stashing changes",
-      checkout: "Switching branches",
-      branch: "Managing branches",
-      create: "Creating a branch",
-      delete: "Deleting a branch",
-      pop: "Popping the stash",
-      drop: "Dropping the stash",
-    };
-    return verbs[sub] ?? `Running git ${sub}`;
+    return gitVerbPhrases[sub] ?? `Running git ${sub}`;
   }
   if (toolName === "git_read") {
     const op = str(parsed.op);

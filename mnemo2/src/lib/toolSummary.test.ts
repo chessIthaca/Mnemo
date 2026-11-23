@@ -34,7 +34,32 @@ describe("human tool summaries", () => {
 
   it("falls back honestly for partial arguments and unknown tools", () => {
     expect(toolSummary("shell", '{"command":')).toBe("Using Shell");
-    expect(toolSummary("mcp__github__search", "{}")).toBe("Using Github search");
+    expect(toolSummary("totally_new_tool", "{}")).toBe("Using Totally new tool");
+  });
+
+  it("names another server's MCP tool and its server", () => {
+    expect(toolSummary("mcp__github__search", "{}")).toBe("Using search (github)");
+    expect(toolSummary("mcp__some_server__do_thing", "{}")).toBe("Using do thing (some server)");
+  });
+
+  it("keeps a Mnemo tool's own phrase behind the plugin's MCP server", () => {
+    expect(toolSummary("mcp__plugin_mnemo_mnemo__shell", '{"purpose":"running tests"}')).toBe("Running tests");
+    expect(toolSummary("mcp__plugin_mnemo_mnemo__team_status", "{}")).toBe("Reading team status");
+    // The worker name still comes from the call's own arguments.
+    expect(
+      toolSummary("mcp__plugin_mnemo_mnemo__team_status", '{"worker_id":"w1"}', (id) =>
+        id === "w1" ? "ghostai0001" : id,
+      ),
+    ).toBe("Reading ghostai0001’s status");
+  });
+
+  it("describes a Claude Code agent's own tools by what they are for", () => {
+    expect(
+      toolSummary("Bash", '{"command":"cargo test --workspace","description":"Run the workspace tests"}'),
+    ).toBe("Running the workspace tests");
+    expect(toolSummary("Read", '{"file_path":"src-tauri/src/mnemo2/team/agent_watch.rs"}')).toBe(
+      "Reading agent_watch.rs",
+    );
   });
 
   it("keeps a long or multiline headline compact", () => {

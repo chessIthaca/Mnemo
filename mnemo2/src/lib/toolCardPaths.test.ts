@@ -14,7 +14,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { actionPhrase, argLabel, argPathLines, argPaths, basename, browserResultInfo, buildPathChips, dedupePaths, fileEditDiff, graphCallLabel, groupPhrase, isBrowserToolName, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, prettyToolName, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchLabel, webFetchUrl } from "./toolCardPaths";
+import { actionPhrase, argLabel, argPathLines, argPaths, basename, browserResultInfo, buildPathChips, commandPhrase, dedupePaths, fileEditDiff, gerundSentence, graphCallLabel, groupPhrase, isBrowserToolName, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, prettyToolName, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchLabel, webFetchUrl } from "./toolCardPaths";
 
 describe("basename", () => {
   it("returns the last path segment (forward + back slashes)", () => {
@@ -1182,8 +1182,172 @@ describe("actionPhrase — collapsed card headlines", () => {
 
   it("returns null for malformed args or an unknown tool (caller falls back)", () => {
     expect(actionPhrase("search", "{not json")).toBeNull();
-    expect(actionPhrase("mcp__github__search", "{}")).toBeNull();
     expect(actionPhrase("totally_new_tool", "{}")).toBeNull();
+  });
+
+  it("classifies a Mnemo shell or job command when it has no purpose", () => {
+    expect(phrase("shell", { command: "cargo test --workspace" })).toBe("Running tests");
+    expect(phrase("job", { command: "npm run build", purpose: "building game" })).toBe("Building game");
+    expect(phrase("job", { command: "npm run build" })).toBe("Building");
+    expect(phrase("shell", {})).toBe("Running a command");
+  });
+});
+
+describe("gerundSentence — a command description as a sentence", () => {
+  it("turns a leading imperative verb into its -ing form, keeping the rest", () => {
+    expect(gerundSentence("Run the workspace tests")).toBe("Running the workspace tests");
+    expect(gerundSentence("build the app")).toBe("Building the app");
+    expect(gerundSentence("Check git status")).toBe("Checking git status");
+    expect(gerundSentence("Re-run the failing test")).toBe("Re-running the failing test");
+    expect(gerundSentence("rerun it")).toBe("Rerunning it");
+    expect(gerundSentence("Commit the change")).toBe("Committing the change");
+  });
+
+  it("capitalizes a description whose first word is not a known verb", () => {
+    expect(gerundSentence("make a level script")).toBe("Make a level script");
+    expect(gerundSentence("already phrased")).toBe("Already phrased");
+    expect(gerundSentence("")).toBe("");
+  });
+});
+
+describe("commandPhrase — what a bare command is for", () => {
+  it("classifies the test, build, check, format and install commands", () => {
+    expect(commandPhrase("cargo test --workspace")).toBe("Running tests");
+    expect(commandPhrase("npm test --workspace mnemo2")).toBe("Running tests");
+    expect(commandPhrase("npm run test")).toBe("Running tests");
+    expect(commandPhrase("npx vitest run")).toBe("Running tests");
+    expect(commandPhrase("pytest -q")).toBe("Running tests");
+    expect(commandPhrase("go test ./...")).toBe("Running tests");
+    expect(commandPhrase("dotnet test")).toBe("Running tests");
+    expect(commandPhrase("cargo build -p mnemo2-app")).toBe("Building");
+    expect(commandPhrase("npm run build")).toBe("Building");
+    expect(commandPhrase("npm run build:mnemo2")).toBe("Building");
+    expect(commandPhrase("npx vite build")).toBe("Building");
+    expect(commandPhrase("tsc -b")).toBe("Building");
+    expect(commandPhrase("dotnet build")).toBe("Building");
+    expect(commandPhrase("cargo clippy --workspace")).toBe("Checking the code");
+    expect(commandPhrase("cargo check --features embeddings")).toBe("Checking the code");
+    expect(commandPhrase("npm run check --workspace mnemo2")).toBe("Checking the code");
+    expect(commandPhrase("npm run lint")).toBe("Checking the code");
+    expect(commandPhrase("eslint src")).toBe("Checking the code");
+    expect(commandPhrase("tsc --noEmit")).toBe("Checking the code");
+    expect(commandPhrase("cargo fmt --all")).toBe("Formatting code");
+    expect(commandPhrase("prettier --write .")).toBe("Formatting code");
+    expect(commandPhrase("npm ci --no-audit")).toBe("Installing dependencies");
+    expect(commandPhrase("npm install")).toBe("Installing dependencies");
+    expect(commandPhrase("pnpm install")).toBe("Installing dependencies");
+  });
+
+  it("reads a git subcommand through the git tool's own verb map", () => {
+    expect(commandPhrase("git commit -m x")).toBe("Committing");
+    expect(commandPhrase("git status")).toBe("Checking git status");
+    expect(commandPhrase("git push origin HEAD")).toBe("Pushing");
+    expect(commandPhrase("git frobnicate")).toBe("Running git frobnicate");
+  });
+
+  it("looks past cd prefixes, env assignments and later commands", () => {
+    expect(commandPhrase("cd mnemo2 && npm run build")).toBe("Building");
+    expect(commandPhrase("cd mnemo2; npm test")).toBe("Running tests");
+    expect(commandPhrase("CI=1 RUST_LOG=info cargo test")).toBe("Running tests");
+    expect(commandPhrase("cargo test && echo done")).toBe("Running tests");
+    expect(commandPhrase("cargo test 2>&1 | tail -5")).toBe("Running tests");
+  });
+
+  it("names the script an interpreter runs, else the program", () => {
+    expect(commandPhrase("python scripts/make_level.py")).toBe("Running make_level.py");
+    expect(commandPhrase("node tools/build.mjs --watch")).toBe("Running build.mjs");
+    expect(commandPhrase("bash scripts/ci.sh")).toBe("Running ci.sh");
+    expect(commandPhrase("C:\\tools\\foo.exe --x")).toBe("Running foo");
+    expect(commandPhrase("node --version")).toBe("Running node");
+    expect(commandPhrase("some_tool --flag")).toBe("Running some_tool");
+    expect(commandPhrase("   ")).toBe("Running a command");
+  });
+});
+
+describe("actionPhrase — a Claude Code agent worker's tools", () => {
+  const phrase = (name: string, args: Record<string, unknown> = {}) =>
+    actionPhrase(name, JSON.stringify(args));
+
+  it("turns a Bash call's description into the sentence it is for", () => {
+    expect(
+      phrase("Bash", { command: "cargo test --workspace", description: "Run the workspace tests" }),
+    ).toBe("Running the workspace tests");
+    expect(phrase("PowerShell", { command: "npm run build", description: "Build the app" })).toBe(
+      "Building the app",
+    );
+    expect(phrase("Bash", { command: "ls", description: "check the output dir" })).toBe(
+      "Checking the output dir",
+    );
+    expect(phrase("Bash", { command: "x", description: "make a level" })).toBe("Make a level");
+  });
+
+  it("classifies the bare command when there is no description", () => {
+    expect(phrase("Bash", { command: "cargo test --workspace" })).toBe("Running tests");
+    expect(phrase("Bash", { command: "cd mnemo2 && npm run build" })).toBe("Building");
+  });
+
+  it("names the file a file tool touches", () => {
+    expect(phrase("Read", { file_path: "src-tauri/src/mnemo2/team/agent_watch.rs" })).toBe(
+      "Reading agent_watch.rs",
+    );
+    expect(phrase("Read", { file_path: "C:\\repo\\src\\main.rs" })).toBe("Reading main.rs");
+    expect(phrase("Edit", { file_path: "mnemo2/src/App.svelte" })).toBe("Editing App.svelte");
+    expect(phrase("MultiEdit", { file_path: "mnemo2/src/App.svelte" })).toBe("Editing App.svelte");
+    expect(phrase("Write", { file_path: "C:\\tmp\\new.ts" })).toBe("Writing new.ts");
+    expect(phrase("NotebookEdit", { notebook_path: "nb/analysis.ipynb" })).toBe(
+      "Editing analysis.ipynb",
+    );
+  });
+
+  it("names the pattern of a search tool", () => {
+    expect(phrase("Grep", { pattern: "engine" })).toBe('Searching for "engine"');
+    expect(phrase("Grep", { pattern: "engine", glob: "**/*.rs" })).toBe(
+      'Searching for "engine" in **/*.rs',
+    );
+    expect(phrase("Glob", { pattern: "**/*.ts" })).toBe("Finding files matching **/*.ts");
+  });
+
+  it("names the page or query of a web tool", () => {
+    expect(phrase("WebFetch", { url: "https://docs.anthropic.com/x" })).toBe(
+      "Fetching docs.anthropic.com",
+    );
+    expect(phrase("WebFetch", { url: "not a url" })).toBe("Fetching a page");
+    expect(phrase("WebSearch", { query: "vitest mock" })).toBe('Searching the web for "vitest mock"');
+  });
+
+  it("covers the remaining Claude Code tools", () => {
+    expect(phrase("TodoWrite", { todos: [] })).toBe("Updating its task list");
+    expect(phrase("Task", { description: "Explore the repo", prompt: "…" })).toBe(
+      "Starting a helper agent: Explore the repo",
+    );
+    expect(phrase("Agent", {})).toBe("Starting a helper agent");
+    expect(phrase("ToolSearch", { query: "select:mcp__x" })).toBe("Loading tools");
+  });
+
+  it("never falls back to the raw Bash name", () => {
+    for (const args of [{}, { command: "…" }, { description: "Run it" }]) {
+      expect(phrase("Bash", args)).not.toContain("Bash");
+    }
+  });
+});
+
+describe("actionPhrase — MCP-wrapped tools", () => {
+  it("reuses the Mnemo phrase for a tool behind the plugin's MCP server", () => {
+    expect(
+      actionPhrase("mcp__plugin_mnemo_mnemo__shell", JSON.stringify({ purpose: "running tests" })),
+    ).toBe("Running tests");
+    expect(actionPhrase("mcp__plugin_mnemo_mnemo__team_status", "{}")).toBe("Reading team status");
+    expect(actionPhrase("mcp__plugin_mnemo_mnemo__team_dispatch", JSON.stringify({ brief: "x" }))).toBe(
+      "Delegating: x",
+    );
+    expect(
+      actionPhrase("mcp__plugin_mnemo_mnemo__read_files", JSON.stringify({ path: "src/a.rs" })),
+    ).toBe("Reading a file");
+  });
+
+  it("names another server's tool and its server", () => {
+    expect(actionPhrase("mcp__github__search", "{}")).toBe("Using search (github)");
+    expect(actionPhrase("mcp__some_server__do_thing", "{}")).toBe("Using do thing (some server)");
   });
 });
 
@@ -1233,8 +1397,12 @@ describe("groupPhrase — ONE headline per run", () => {
 
   it("an unknown tool joins as Using <pretty> instead of dropping the leg", () => {
     expect(
+      groupPhrase([call("search", { pattern: "x" }), { name: "totally_new_tool", args: "{}" }]),
+    ).toBe('Searching for "x" and using Totally new tool');
+    // Another server's MCP tool joins with its own phrase.
+    expect(
       groupPhrase([call("search", { pattern: "x" }), { name: "mcp__github__search", args: "{}" }]),
-    ).toBe('Searching for "x" and using Github search');
+    ).toBe('Searching for "x" and using search (github)');
   });
 
   it("returns null for an empty run (the caller falls back to Using …)", () => {

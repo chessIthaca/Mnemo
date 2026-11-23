@@ -145,7 +145,7 @@ describe("worker live activity in the store", () => {
 
     expect(get(app).workers[0]).toMatchObject({
       createdAtMs: 1_787_399_935_000,
-      activity: { phase: "starting", toolName: null, turnStartedAtMs: null },
+      activity: { phase: "starting", toolName: null, toolArgs: null, turnStartedAtMs: null },
     });
   });
 

@@ -77,10 +77,10 @@ pub const EXTERNAL_LEAD_CHANNEL: &str = "mnemo2://external-lead";
 
 /// The short lead brief MCP `initialize` returns. `{helper}` becomes the
 /// helper executable's path, so the lead can start the waiter without PATH.
-pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers (trivial/routine/medium/high/escalate); you plan, dispatch, review and merge with the team_* tools.\n\
-- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs; memory_write SPEC:/DECISION:/HOW: what the repository cannot show.\n\
+pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers; you plan, dispatch, review and merge with the team_* tools.\n\
+- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs, recording its regression_test as the bare test name (no file path or module prefix); memory_write SPEC:/DECISION:/HOW: what the repository cannot show.\n\
 - For code use search (or search_read) and graph_* before Grep or Glob; for project history and decisions use memory_search first.\n\
-- Plan first: plan_create (then plan_show, plan_update, plan_step_done). Each team_dispatch needs a plan_id and step; one worker per step with a precise brief and `tier` (tier beats model).\n\
+- Plan first: plan_create. Each team_dispatch needs a plan_id and step; one worker per step with a precise brief and `tier` (tier beats model).\n\
 - A finished worker sends a notice: team_check, then team_review; close findings with team_resolve_finding; team_merge after the review passes.\n\
 - If a worker fails, team_resume it (worker_id + tier) and team_message it to continue.\n\
 - Notices arrive appended to Mnemo results (\"Since your last call:\") and through hooks. While a worker runs, keep the waiter in the background so a report wakes you; restart it after it returns. Bash: \"{helper}\" wait \u{2014} PowerShell: & \"{helper}\" wait. If a hook gave you a waiter command with --session, use that one.\n\
@@ -3076,6 +3076,22 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "unlisted tools named: {missing:?}");
+    }
+
+    #[test]
+    fn lead_instructions_ask_for_the_bare_regression_test_name() {
+        // Plan 5520c914: a bug plan's regression test is looked up as a symbol
+        // at close, so a file path or module prefix leaves the plan open. The
+        // external Claude Code lead reads LEAD_INSTRUCTIONS, so the rule rides
+        // its memory-workflow bullet.
+        assert!(
+            LEAD_INSTRUCTIONS.contains("regression_test as the bare test name"),
+            "LEAD_INSTRUCTIONS must ask for the bare regression-test name"
+        );
+        assert!(
+            LEAD_INSTRUCTIONS.contains("no file path or module prefix"),
+            "the rule must forbid a file path and a module prefix explicitly"
+        );
     }
 
     #[tokio::test]

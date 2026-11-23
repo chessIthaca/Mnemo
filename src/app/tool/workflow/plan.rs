@@ -58,7 +58,8 @@ const BUG_FIXING_SKELETON: [&str; 4] = [
     "**Minimal fix** — Apply the minimal fix that makes the regression test \
      pass. Do not refactor unrelated code.",
     "**Verify** — Run the regression test + the full test suite (cargo test \
-     unpiped, warning-free). Record the regression test name via update_plan \
+     unpiped, warning-free). Record the regression test's bare name, exactly \
+     as in the source and with no file path or module prefix, via update_plan \
      (regression_test field) — finish is blocked without it. If the fix \
      turned out FEATURE-SCALE (new pub types or cross-module surface): \
      amend the plan context via update_plan append with a paragraph \
@@ -1051,7 +1052,7 @@ impl Tool for UpdatePlanTool {
                     "title": {"type": ["string", "null"], "description": "New title (omit or empty to keep current)."},
                     "goal": {"type": ["string", "null"], "description": "New goal (omit or empty to keep current)."},
                     "context": {"type": ["string", "null"], "description": "New context (omit or empty to keep current); with append=true it is EXTENDED instead of replaced. The gate checks the effective post-update text (≥40 chars). Write it in detail: name new functions, types and fields with their signatures; mark code that does not exist yet as new."},
-                    "regression_test": {"type": ["string", "null"], "description": "The regression test name recorded by a bug_fixing plan's verify step (finish is blocked without it; validated against the code graph)."},
+                    "regression_test": {"type": ["string", "null"], "description": "The regression test's bare name exactly as written in the source: the test function name (for example retry_stops_after_three_attempts) or, for a string-titled test, the exact it()/test()/describe() title. No file path, module path (a::b::) or note in parentheses: the plan cannot close until this exact name is found in the code."},
                     "landed_design": {"type": "boolean", "description": "Set true when a bug_fixing fix turned out feature-scale (new pub types / cross-module surface) — the finish gate then requires a 'Landed design' context amendment (agent.md 'Documentation expectations')."},
                     "steps": {
                         "type": "array",
@@ -2263,7 +2264,7 @@ impl Tool for FinishTool {
                     },
                     "regression_test": {
                         "type": "string",
-                        "description": "Optional: the regression test name for bug_fixing plans, instead of recording it with update_plan."
+                        "description": "Optional, instead of recording it with update_plan: the regression test's bare name exactly as written in the source: the test function name (for example retry_stops_after_three_attempts) or, for a string-titled test, the exact it()/test()/describe() title. No file path, module path (a::b::) or note in parentheses: the plan cannot close until this exact name is found in the code."
                     }
                 },
                 "required": ["review_report"]
@@ -2670,6 +2671,39 @@ mod tests {
         assert!(!upd.append);
         assert!(upd.title.is_none());
         assert!(upd.steps.is_none());
+    }
+
+    #[test]
+    fn regression_test_descriptions_ask_for_the_bare_name() {
+        // Plan 5520c914: bug plans stayed open because the recorded test
+        // carried a file path (or a module prefix), and the close gate looks
+        // the string up as a symbol. Every regression_test parameter
+        // description must ask for the bare name.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let board = Arc::new(crate::app::plan_board::PlanBoard::new(
+            dir.path().join("plans"),
+            dir.path().join("reviews"),
+        ));
+        let schemas = [
+            (
+                "plan_update",
+                crate::app::tool::workflow::board::PlanUpdateTool::new(board).schema(),
+            ),
+            ("update_plan", UpdatePlanTool::new(wf.clone()).schema()),
+            (
+                "finish",
+                FinishTool::new(wf, dir.path().join("reviews")).schema(),
+            ),
+        ];
+        for (tool, schema) in schemas {
+            let description = schema.parameters["properties"]["regression_test"]
+                ["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool}: regression_test description missing"));
+            assert!(description.contains("bare name"), "{tool}: {description}");
+            assert!(description.contains("No file path"), "{tool}: {description}");
+        }
     }
 
     #[test]

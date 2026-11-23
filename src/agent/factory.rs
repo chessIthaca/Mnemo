@@ -3085,7 +3085,12 @@ mod tests {
             // (PlanFrozen = Executing ∪ finish); measures PlanFrozen at 33_799
             // chars after their descriptions were trimmed. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 34_700),
+            // 34_700 → 35_500 (2026-11-23): plan 5520c914 — the regression_test
+            // descriptions in plan_update (+292), update_plan (+196) and
+            // finish (+284) now ask for the bare test name (PlanFrozen =
+            // Executing ∪ finish, so all three ride here); measures PlanFrozen
+            // at 34_712 chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 35_500),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -3161,7 +3166,13 @@ mod tests {
             // ride the shell surface into the research set too; measures
             // ExecutingResearch at 24_423 chars. Ceiling = measured + headroom,
             // deliberate raise.
-            (ToolFilter::ExecutingResearch, 25_400),
+            // 25_400 → 26_000 (2026-11-23): plan 5520c914 — the same
+            // regression_test description growth as the PlanFrozen raise above
+            // (plan_update +292, update_plan +196; the research filters carry
+            // both, finish does not ride them), on top of drift since the
+            // 2026-11-19 baseline; workspace-unified measures ExecutingResearch
+            // at 25_452 chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::ExecutingResearch, 26_000),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -3260,7 +3271,12 @@ mod tests {
             // schema), on top of drift since the 26_923 figure pinned at the
             // 2026-11-19 pass; workspace-unified measures Reviewing at 27_756
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Reviewing, 28_000),
+            // 28_000 → 28_800 (2026-11-23): plan 5520c914 — the same
+            // regression_test description growth as the PlanFrozen raise above
+            // (plan_update +292, update_plan +196; Reviewing carries both);
+            // workspace-unified measures Reviewing at 28_236 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 28_800),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —

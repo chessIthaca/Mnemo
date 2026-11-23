@@ -91,14 +91,22 @@ struct Observed {
     fingerprint: Option<(u64, u64)>,
     tool_calls: u64,
     tokens: u64,
-    /// When Mnemo first saw this registration: the silence clock before a
-    /// transcript exists.
+    /// When Mnemo first saw this registration: the silence clock when
+    /// neither a transcript nor the record says anything.
     registered_ms: u128,
     /// A stall notice went out for the current silent spell.
     stall_noticed: bool,
-    /// The agent's finish was handed to the runtime to finish the worker; a
-    /// continued agent that runs again clears it.
-    finish_noticed: bool,
+    /// The worker turn whose run's finish was handed to the runtime: each
+    /// run (agent and turn) is finished once, however short it was.
+    handled_turns: Option<u32>,
+    /// The transcript's length when the current run was started by a
+    /// continuation or fix round: a finish counts only once the transcript
+    /// grew past it, so the previous run's finished flag is not taken for
+    /// this run's.
+    run_floor: Option<u64>,
+    /// When the current run was started by a continuation or fix round: the
+    /// silence clock starts there, not at the old transcript's last write.
+    run_start_ms: u128,
 }
 
 /// An agent run Mnemo finished itself, as the completed record shows it:
@@ -199,10 +207,36 @@ impl AgentWatch {
     /// runtime could take it.
     fn retry_finish(&self, run: &FinishedRun) {
         if let Some(observed) = self.lock().states.get_mut(&run.worker_id) {
-            if observed.agent_id == run.agent_id {
-                observed.finish_noticed = false;
+            if observed.agent_id == run.agent_id && observed.handled_turns == Some(run.turns) {
+                observed.handled_turns = None;
             }
         }
+    }
+
+    /// A registered agent worker went back to work (a continuation or a fix
+    /// round): its next finish must come from the transcript growing past
+    /// where it is now, and its silence counts from now.
+    pub(super) fn note_run_start(&self, worker: &WorkerRecord, now: u128) {
+        let Some(agent_id) = worker.claude_agent_id.clone() else {
+            return;
+        };
+        let len = worker
+            .claude_agent_transcript
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |meta| meta.len());
+        let mut inner = self.lock();
+        let observed = inner.states.entry(worker.id.clone()).or_default();
+        if observed.agent_id != agent_id {
+            *observed = Observed {
+                agent_id,
+                registered_ms: now,
+                ..Observed::default()
+            };
+        }
+        observed.run_floor = Some(len);
+        observed.run_start_ms = now;
+        observed.stall_noticed = false;
     }
 
     /// Stop the watcher task.
@@ -236,11 +270,23 @@ impl AgentWatch {
         if let Some(root) = self.lock().projects_root.clone() {
             return Some(root);
         }
+        #[cfg(test)]
+        if let Some(root) = TEST_PROJECTS_ROOT.with(|root| root.borrow().clone()) {
+            return Some(root);
+        }
         let home = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
             .filter(|home| !home.is_empty())?;
         Some(PathBuf::from(home).join(".claude").join("projects"))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The projects folder every watch on this test thread uses unless it
+    /// was given its own: lets a test reach `TeamRuntime::open`'s watch.
+    pub(super) static TEST_PROJECTS_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Whether `id` can be part of a transcript file name: Claude Code's agent
@@ -572,7 +618,14 @@ pub(super) fn look(watch: &AgentWatch, worker: &WorkerRecord, now: u128) -> Opti
         }
         finished = meta_finished(path);
     }
-    let last = last_activity.unwrap_or(observed.registered_ms);
+    // With a transcript, its last write (or the current run's start, when
+    // later); without one, the record's last activity, which survives a
+    // restart, so an agent whose transcript is gone can still stall.
+    let last = match last_activity {
+        Some(written) => written.max(observed.run_start_ms),
+        None if worker.last_activity_ms > 0 => worker.last_activity_ms.max(observed.run_start_ms),
+        None => observed.registered_ms.max(observed.run_start_ms),
+    };
     let running = matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing);
     let stalled = running && !finished && now.saturating_sub(last) >= STALL_MS;
     Some(Looked {
@@ -621,18 +674,12 @@ impl TeamRuntime {
         inner.task = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(WATCH_INTERVAL).await;
-                let (keep, finished) = tick(&records, &signals, &watch).await;
-                if !finished.is_empty() {
-                    match limits.team() {
-                        Some(team) => {
-                            for run in &finished {
-                                team.finish_agent_run(run).await;
-                            }
-                        }
-                        None => {
-                            for run in &finished {
-                                watch.retry_finish(run);
-                            }
+                let (keep, finished, stalled) = tick(&records, &signals, &watch).await;
+                match limits.team() {
+                    Some(team) => team.after_agent_watch(&finished, stalled).await,
+                    None => {
+                        for run in &finished {
+                            watch.retry_finish(run);
                         }
                     }
                 }
@@ -646,9 +693,21 @@ impl TeamRuntime {
     /// One pass of the watcher. Tests call it instead of waiting a minute.
     #[cfg(test)]
     pub(super) async fn agent_watch_tick(&self) {
-        let (_, finished) = tick(&self.records, &self.signals, &self.agent_watch).await;
-        for run in &finished {
+        let (_, finished, stalled) = tick(&self.records, &self.signals, &self.agent_watch).await;
+        self.after_agent_watch(&finished, stalled).await;
+    }
+
+    /// What a watcher pass leaves to the runtime: finish the runs that
+    /// ended, and, when an agent stalled while no Claude Code lead is
+    /// attached to run it, hand such workers back.
+    async fn after_agent_watch(&self, finished: &[FinishedRun], stalled: bool) {
+        for run in finished {
             self.finish_agent_run(run).await;
+        }
+        if stalled && !self.external_lead_attached() {
+            if let Err(error) = self.hand_back_agent_workers().await {
+                eprintln!("team: could not hand back stalled agent workers: {error}");
+            }
         }
     }
 
@@ -699,13 +758,13 @@ async fn refresh(
 }
 
 /// One pass: look at every watched worker, send the notices that are due.
-/// Returns whether the watcher should keep running, and the agent runs that
-/// ended, for the runtime to finish.
+/// Returns whether the watcher should keep running, the agent runs that
+/// ended, for the runtime to finish, and whether any agent is stalled.
 async fn tick(
     records: &Arc<Mutex<Vec<WorkerRecord>>>,
     signals: &broadcast::Sender<BoardSignal>,
     watch: &AgentWatch,
-) -> (bool, Vec<FinishedRun>) {
+) -> (bool, Vec<FinishedRun>, bool) {
     let workers: Vec<WorkerRecord> = records
         .lock()
         .await
@@ -719,12 +778,13 @@ async fn tick(
         let mut inner = watch.lock();
         let again = records.try_lock().map(|r| r.iter().any(watched)).unwrap_or(true);
         if again {
-            return (true, Vec::new());
+            return (true, Vec::new(), false);
         }
         inner.task = None;
-        return (false, Vec::new());
+        return (false, Vec::new(), false);
     }
     let mut finished = Vec::new();
+    let mut any_stalled = false;
     for worker in workers {
         let Some(view) = refresh(records, watch, &worker).await else {
             continue;
@@ -736,15 +796,15 @@ async fn tick(
             let Some(observed) = inner.states.get_mut(&worker.id) else {
                 continue;
             };
-            if !view.finished {
-                // A continued agent can finish again.
-                observed.finish_noticed = false;
-            }
             if view.finished {
                 // Once per agent run (worker, agent, turn): the runtime
                 // finishes the worker, and the lead gets its finished notice.
-                if !observed.finish_noticed {
-                    observed.finish_noticed = true;
+                // A continued run counts once its transcript grew past where
+                // the run started, even if no pass saw it unfinished.
+                let new_run = observed.handled_turns != Some(worker.turns);
+                let grown = observed.run_floor.is_none_or(|floor| observed.offset > floor);
+                if new_run && grown {
+                    observed.handled_turns = Some(worker.turns);
                     finished.push(FinishedRun {
                         worker_id: worker.id.clone(),
                         agent_id: view.id.clone(),
@@ -753,6 +813,7 @@ async fn tick(
                     });
                 }
             } else if view.stalled {
+                any_stalled = true;
                 if !observed.stall_noticed {
                     observed.stall_noticed = true;
                     let last = view.last_activity_ms.unwrap_or(observed.registered_ms);
@@ -760,7 +821,7 @@ async fn tick(
                     notice = Some((
                         format!("agent-stall:{}:{now}", worker.id),
                         format!(
-                            "worker_id={id}\n{id}'s Claude Code agent has written nothing for {minutes} minutes; it may have stalled or stopped. Check it, then continue it with SendMessage or call team_agent_done.",
+                            "worker_id={id}\n{id}'s Claude Code agent has written nothing for {minutes} minutes; it may have stalled or stopped. Check it, then continue it with SendMessage, or mark the run failed with team_agent_done.",
                             id = worker.id
                         ),
                     ));
@@ -774,7 +835,7 @@ async fn tick(
             let _ = signals.send(BoardSignal::Notice { key, text });
         }
     }
-    (true, finished)
+    (true, finished, any_stalled)
 }
 
 /// Makes every progress notice key unique, so two notes in one millisecond
@@ -926,7 +987,7 @@ impl TeamRuntime {
             .collect();
         (running.len() >= AGENT_WORKER_CAP).then(|| {
             format!(
-                "{AGENT_WORKER_CAP} Claude Code agent workers are already running ({}); wait for one to finish (team_agent_done) before starting another.",
+                "{AGENT_WORKER_CAP} Claude Code agent workers are already running ({}); wait for one to finish (Mnemo finishes it when its agent ends) before starting another.",
                 running.join(", ")
             )
         })
@@ -978,6 +1039,9 @@ impl TeamRuntime {
             };
             record.claude_agent_id = Some(agent_id.to_string());
             record.claude_agent_transcript = transcript.clone();
+            // The launch is activity: an agent whose transcript never shows
+            // up stalls ten minutes from now, also across a restart.
+            record.last_activity_ms = record.last_activity_ms.max(phase3::now_ms());
         }
         // A new registration reads its transcript from the start.
         self.agent_watch.forget(worker_id);

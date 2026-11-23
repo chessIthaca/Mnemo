@@ -917,7 +917,7 @@ impl TeamRuntime {
             WorkerStatus::Completed | WorkerStatus::InReview | WorkerStatus::Conflict => {}
             WorkerStatus::Fixing => {
                 return Err(format!(
-                    "{} is already fixing a finding: call team_agent_done when its agent finishes",
+                    "{} is already fixing a finding: wait for its agent to end; Mnemo then finishes the fix round",
                     worker.id
                 ));
             }
@@ -950,8 +950,11 @@ impl TeamRuntime {
         })
         .await;
         self.persist().await?;
+        let fixing = self.worker(&worker.id).await?;
+        // A new run: its finish is the transcript's next one.
+        self.agent_watch.note_run_start(&fixing, now_key());
         self.ensure_agent_watch().await;
-        self.worker(&worker.id).await
+        Ok(fixing)
     }
 }
 

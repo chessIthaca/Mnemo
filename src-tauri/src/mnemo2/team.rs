@@ -541,9 +541,10 @@ impl TeamRuntime {
             .unwrap_or_default();
         let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
         // Mnemo2 starts with no external lead: an agent worker whose agent
-        // was never launched, or has stalled, goes back to Mnemo before
-        // recovery interrupts it as an agent worker (plan a2b8ee89 decision
-        // 3). A running agent stays an agent worker.
+        // was never launched, or has stalled (judged by the record's last
+        // activity when its transcript is gone), goes back to Mnemo (plan
+        // a2b8ee89 decision 3). A running agent stays an agent worker at
+        // work; recovery leaves it so and the agent watch follows it.
         let agent_watch = agent_watch::AgentWatch::default();
         let handed_back = {
             let now = phase3::now_ms();
@@ -653,7 +654,9 @@ impl TeamRuntime {
         // App start: a checkout a previous run could not remove (something
         // held it) is retried now, and the branch it was blocking goes with it.
         runtime.retry_leftover_cleanups().await;
-        // A registered agent that was running when the app closed is watched again.
+        // A registered agent that still runs (recovery kept its worker at
+        // work) is watched again: its finish is processed, and a later stall
+        // with no lead attached hands it back.
         runtime.ensure_agent_watch().await;
         Ok(runtime)
     }

@@ -27,6 +27,13 @@
 //! functions stay for worker records dispatched before pool checkouts
 //! existed; their recorded `worktree` paths keep today's semantics.
 //!
+//! Every checkout Mnemo prepares also writes the offscreen browser's
+//! screenshot folder into the repository's SHARED exclude file
+//! ([`ensure_screenshot_exclude`]): a worker's PNGs are untracked, and git
+//! must not report them as dirty checkout state. A project's `.gitignore` is
+//! never touched, and an exclude only covers untracked paths — a tracked
+//! screenshot stays tracked.
+//!
 //! All functions run blocking git subprocesses on the blocking thread
 //! pool (see `git_ops` for why). Unlike the rest of `git_ops`, the tests
 //! here use REAL git in tempdir repos — worktrees are filesystem-level
@@ -130,7 +137,92 @@ fn provision_worktree_impl(
             base_ref,
         ],
     )?;
+    ignore_screenshots(&worktree);
     Ok(worktree)
+}
+
+// ===========================================================================
+// Shared Git exclude — screenshots never dirty a checkout (see the module doc)
+// ===========================================================================
+
+/// The line Mnemo appends to the repository's shared exclude file: the
+/// offscreen browser writes its PNGs into `.coding/browser/screenshots/` (the
+/// app crate's `SCREENSHOT_DIR`). Untracked screenshots would otherwise make a
+/// worker's checkout dirty and refuse its check run, merge and release gates.
+const SCREENSHOT_EXCLUDE_LINE: &str = "/.coding/browser/screenshots/";
+
+/// Make the repository's SHARED exclude file ignore the offscreen browser's
+/// screenshot folder, for `checkout_or_root` (a main checkout or any of its
+/// linked worktrees).
+///
+/// The exclude lives at `<git common dir>/info/exclude`, one file for the
+/// whole repository, so every pool checkout and legacy worktree picks it up
+/// and no user project has to commit a `.gitignore` line. Idempotent: the
+/// line is only appended when no existing line already equals it after
+/// trimming, and it never glues itself onto a file without a trailing
+/// newline. A tracked screenshot stays tracked — an exclude only covers
+/// untracked paths.
+pub(crate) fn ensure_screenshot_exclude(checkout_or_root: &Path) -> Result<(), String> {
+    let common = git_raw(checkout_or_root, &["rev-parse", "--git-common-dir"])?;
+    let common = common.trim();
+    if common.is_empty() {
+        return Err(format!(
+            "git reported no common directory for {}",
+            checkout_or_root.display()
+        ));
+    }
+    let common = PathBuf::from(common);
+    // A relative answer is relative to the directory git ran in.
+    let common = if common.is_absolute() {
+        common
+    } else {
+        checkout_or_root.join(common)
+    };
+    let info = common.join("info");
+    std::fs::create_dir_all(&info)
+        .map_err(|error| format!("cannot create {}: {error}", info.display()))?;
+    let exclude = info.join("exclude");
+    let existing = match std::fs::read(&exclude) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot read {}: {error}", exclude.display())),
+    };
+    if existing.as_deref().is_some_and(|text| {
+        text.lines()
+            .any(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+    }) {
+        return Ok(());
+    }
+    let mut append = String::new();
+    // Keep the file's last line intact when it has no trailing newline.
+    if existing
+        .as_deref()
+        .is_some_and(|text| !text.is_empty() && !text.ends_with('\n'))
+    {
+        append.push('\n');
+    }
+    append.push_str(SCREENSHOT_EXCLUDE_LINE);
+    append.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&exclude)
+        .map_err(|error| format!("cannot open {}: {error}", exclude.display()))?;
+    file.write_all(append.as_bytes())
+        .map_err(|error| format!("cannot write {}: {error}", exclude.display()))?;
+    Ok(())
+}
+
+/// Best-effort wrapper for checkout provisioning: the exclude is a
+/// convenience for the worker's clean-checkout gates, never a reason to refuse
+/// a dispatch — a failure is logged and swallowed.
+fn ignore_screenshots(checkout_or_root: &Path) {
+    if let Err(error) = ensure_screenshot_exclude(checkout_or_root) {
+        eprintln!(
+            "mnemo: could not make Git ignore the browser screenshots in {}: {error}",
+            checkout_or_root.display()
+        );
+    }
 }
 
 /// Remove a worker's worktree WITHOUT deleting its branch — the branch
@@ -633,6 +725,7 @@ fn reuse_pool_checkout(
     base_ref: &str,
 ) -> Result<(), String> {
     ensure_registered_pool_checkout(main_root, pool)?;
+    ignore_screenshots(pool);
     git_raw(pool, &["switch", "--detach", base_ref])?;
     git_raw(
         pool,
@@ -1116,6 +1209,196 @@ mod tests {
             }
             std::fs::write(path, contents).unwrap();
         }
+    }
+
+    /// Write an untracked file the way the offscreen browser does: a PNG under
+    /// `.coding/browser/screenshots/`.
+    fn write_screenshot(checkout: &Path, name: &str) -> PathBuf {
+        let path = checkout
+            .join(".coding")
+            .join("browser")
+            .join("screenshots")
+            .join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"png").unwrap();
+        path
+    }
+
+    #[test]
+    fn screenshot_exclude_is_added_once() {
+        let repo = init_repo();
+        ensure_screenshot_exclude(repo.path()).expect("first ensure");
+        ensure_screenshot_exclude(repo.path()).expect("second ensure");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let text = std::fs::read_to_string(&exclude).expect("the exclude file exists");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "a second call must not duplicate the line: {text:?}"
+        );
+        write_screenshot(repo.path(), "a.png");
+        assert!(
+            git_raw(
+                repo.path(),
+                &["check-ignore", "-q", ".coding/browser/screenshots/a.png"]
+            )
+            .is_ok(),
+            "git ignores a screenshot once the exclude is in place"
+        );
+    }
+
+    #[test]
+    fn screenshot_exclude_keeps_existing_lines() {
+        let repo = init_repo();
+        let info = repo.path().join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        // No trailing newline — the appended line must start its own line.
+        std::fs::write(&exclude, "foo").unwrap();
+        ensure_screenshot_exclude(repo.path()).expect("ensure");
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        assert!(
+            text.starts_with("foo\n"),
+            "foo keeps its own line: {text:?}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "{text:?}"
+        );
+        ensure_screenshot_exclude(repo.path()).expect("second ensure");
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        assert!(
+            text.starts_with("foo\n"),
+            "foo is still intact: {text:?}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "an existing line is never duplicated: {text:?}"
+        );
+    }
+
+    #[test]
+    fn screenshot_exclude_works_from_a_linked_worktree() {
+        let repo = init_repo();
+        let holder = tempfile::tempdir().unwrap();
+        let linked = holder.path().join("linked");
+        git_raw(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wt/linked",
+                linked.to_str().expect("UTF-8 worktree path"),
+                "main",
+            ],
+        )
+        .expect("linked worktree");
+        ensure_screenshot_exclude(&linked).expect("ensure from a linked worktree");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let text = std::fs::read_to_string(&exclude).expect("the main repo's exclude file");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "the line lands in the main repository's .git/info/exclude: {text:?}"
+        );
+        write_screenshot(&linked, "b.png");
+        assert!(
+            git_raw(
+                &linked,
+                &["check-ignore", "-q", ".coding/browser/screenshots/b.png"]
+            )
+            .is_ok(),
+            "the shared exclude covers a linked worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_screenshots_leave_a_pool_checkout_clean() {
+        // The defect: the offscreen browser's PNGs were untracked, so a
+        // worker's checkout showed up dirty and every clean-checkout gate
+        // (check run, merge, release) refused it until someone deleted them.
+        let repo = init_repo();
+        let (checkout, _branch) = provision_agent_checkout(
+            repo.path().to_path_buf(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision");
+        write_screenshot(&checkout, "shot.png");
+        assert_eq!(
+            git_raw(&checkout, &["status", "--porcelain", "-uall"])
+                .expect("status")
+                .trim(),
+            "",
+            "a screenshot must not dirty the worker checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_pool_regains_the_screenshot_exclude() {
+        // A pool first provisioned by an older Mnemo (before the exclude
+        // existed) must not hand out a checkout that a screenshot dirties.
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let (pool, branch) = provision_agent_checkout(
+            main.clone(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision");
+        // Simulate the old Mnemo: the exclude line is gone.
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let stripped: String = std::fs::read_to_string(&exclude)
+            .expect("the exclude file")
+            .lines()
+            .filter(|line| line.trim() != SCREENSHOT_EXCLUDE_LINE)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(&exclude, stripped).expect("strip the exclude line");
+        release_pool_checkout(main.clone(), pool.clone(), branch)
+            .await
+            .expect("release");
+        // No record holds it: the next worker gets the SAME pool.
+        let (reused, _branch) = provision_agent_checkout(
+            main,
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("reuse");
+        assert_eq!(reused, pool, "the released pool is reused");
+        let text = std::fs::read_to_string(&exclude).expect("the exclude file");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "the reused checkout re-adds the exclude line: {text:?}"
+        );
+        write_screenshot(&reused, "reused.png");
+        assert_eq!(
+            git_raw(&reused, &["status", "--porcelain", "-uall"])
+                .expect("status")
+                .trim(),
+            "",
+            "a screenshot must not dirty a reused checkout"
+        );
     }
 
     #[tokio::test]

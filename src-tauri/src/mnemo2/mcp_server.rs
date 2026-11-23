@@ -16,8 +16,9 @@
 //!   Claude session works in; `X-Mnemo-Helper` the helper executable, which
 //!   the lead instructions use as the waiter command; `X-Mnemo-Bridge` one
 //!   helper process's random id, fixed for that process's lifetime.
-//! - `/lead/notices`, `/lead/wait`, `/lead/gate-agent`, `/lead/detach`: what
-//!   the plugin's hooks and the background waiter need.
+//! - `/lead/notices`, `/lead/wait`, `/lead/gate-agent`, `/lead/detach`,
+//!   `/lead/worktree-claim`: what the plugin's hooks and the background
+//!   waiter need.
 //!
 //! The first `/mcp` `tools/call` (or `/lead/wait`) for a project attaches an
 //! external lead to its team (see [`TeamRuntime::attach_external_lead`]); from
@@ -696,9 +697,8 @@ impl Shared {
                 Response::json(200, &json!({ "shown": true }))
             }
             "/mcp" => self.mcp(request).await,
-            "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
-                self.lead_route(request).await
-            }
+            "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach"
+            | "/lead/worktree-claim" => self.lead_route(request).await,
             "/lead/summary" | "/lead/show-worker" => self.lead_route(request).await,
             "/lead/open" => self.lead_open(request).await,
             _ => Response::error(404, "unknown route"),
@@ -2450,6 +2450,20 @@ mod tests {
         fixture.rpc(initialize()).await;
         fixture.attach().await;
         assert_eq!(fixture.host.changes(), vec![true]);
+        fixture.shutdown().await;
+    }
+
+    /// Regression: the route table left out `/lead/worktree-claim`, so the
+    /// WorktreeCreate hook got a 404 and every isolated agent failed to start.
+    #[tokio::test]
+    async fn the_worktree_claim_route_is_served() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        // No external lead: not Mnemo work, so the hook falls back.
+        let reply = fixture
+            .lead_post("/lead/worktree-claim", json!({ "root": root, "name": "agent-x1" }))
+            .await;
+        assert_eq!(reply, json!({ "fallback": true }));
         fixture.shutdown().await;
     }
 

@@ -908,11 +908,17 @@ impl Shared {
             .workers
             .iter()
             .map(|worker| {
-                let model = worker
-                    .model
-                    .clone()
-                    .or_else(|| worker.model_id.clone())
-                    .unwrap_or_default();
+                // A Claude Code agent worker keeps its tier's Mnemo model in
+                // the record for a hand-back, but its agent does the work:
+                // name the agent, spelled as team_status does.
+                let model = match worker.claude_agent.as_deref() {
+                    Some(agent) if !agent.is_empty() => format!("claude-code/{agent}"),
+                    _ => worker
+                        .model
+                        .clone()
+                        .or_else(|| worker.model_id.clone())
+                        .unwrap_or_default(),
+                };
                 let model_short = short_model_name(&model);
                 json!({
                     "id": worker.id,
@@ -2623,6 +2629,87 @@ mod tests {
                 .contains(&json!("keep this notice")),
             "neither read-only route may drain the queue: {notices}"
         );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_summary_names_a_claude_code_agent_workers_agent() {
+        use crate::mnemo2::runtime::LeadModel;
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        fixture.rpc(initialize()).await;
+
+        // The high tier runs as a Claude Code agent; its Mnemo model stays in
+        // the worker record for a hand-back.
+        let mut dto = mnemo::headless::TiersDto::default();
+        dto.tiers[0].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].claude_agent = Some("opus".to_string());
+        team.set_catalog(
+            vec![LeadModel {
+                endpoint: "test".to_string(),
+                model: "scripted-a".to_string(),
+                spec: "test/scripted-a".to_string(),
+                is_default: true,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            dto,
+            Vec::new(),
+        );
+        let searched = fixture
+            .call("memory_search", json!({"query": "external lead planning"}))
+            .await;
+        ok_text(&searched);
+        let (_, reply) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": "plan_create", "arguments": {
+                    "title": "Agent summary plan",
+                    "goal": "Prove the summary names the agent model",
+                    "context": "The lead's own agent runs this step; src/lib.rs is the anchor file for the change.",
+                    "steps": ["**One** - edit src/lib.rs"]
+                } }
+            }))
+            .await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let plan_id = reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .strip_prefix("Created plan ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("a plan id")
+            .to_string();
+        let dispatched = fixture
+            .call("team_dispatch", json!({
+                "worker_id": "sumagent001",
+                "plan_id": plan_id,
+                "step": 1,
+                "tier": "high",
+                "brief": "write src/lib.rs"
+            }))
+            .await;
+        assert_eq!(dispatched["result"]["isError"], false, "{dispatched}");
+        let record = team.worker("sumagent001").await.expect("worker record");
+        assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+        assert_eq!(record.model.as_deref(), Some("test/scripted-a"));
+
+        let summary = fixture
+            .lead_post("/lead/summary", json!({ "root": root }))
+            .await;
+        let entry = summary["workers"]
+            .as_array()
+            .expect("workers")
+            .iter()
+            .find(|entry| entry["id"] == "sumagent001")
+            .expect("agent worker");
+        assert_eq!(entry["model"], "claude-code/opus", "{entry}");
+        assert_eq!(entry["model_short"], "opus", "{entry}");
+        // The record keeps the tier's Mnemo model for a hand-back.
+        let record = team.worker("sumagent001").await.expect("worker record");
+        assert_eq!(record.model.as_deref(), Some("test/scripted-a"));
         fixture.shutdown().await;
     }
 

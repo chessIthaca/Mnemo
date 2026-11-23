@@ -21,7 +21,7 @@
     "esbuild": true
   },
   "overrides": {
-    "jsdom": "31.0.0",
+    "jsdom": "31.0.1",
     "postcss-selector-parser": "^6.1.5"
   }
 }

@@ -1,5 +1,6 @@
 import { insertActivityCard, type ActivityCard } from "../teamActivity";
 import {
+  agentPhaseFrom,
   findingFromWire,
   inboxFromWire,
   reviewEvidenceFrom,
@@ -219,6 +220,7 @@ export function buildWorker(
           stalled: record.agent.stalled,
         }
       : undefined,
+    agentPhase: agentPhaseFrom(record.agent_phase),
     screenshots: workerScreenshotPaths(record.transcript),
     timeline: workerTimeline(record),
     diff: record.merge

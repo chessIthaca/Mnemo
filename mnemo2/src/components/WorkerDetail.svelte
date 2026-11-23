@@ -14,7 +14,7 @@
   import { workerPlanLabel } from "../lib/boardState";
   import { actions, app } from "../lib/store";
   import { canMerge, isAuditWorker } from "../lib/review";
-  import { workerStatusText, type TaskWorkflowStepId, type Worker } from "../lib/types";
+  import { workerAgentPhaseText, workerStatusText, type TaskWorkflowStepId, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
   import FindingsPanel from "./FindingsPanel.svelte";
   import Markdown from "./Markdown.svelte";
@@ -51,6 +51,8 @@
   const workflow = $derived(deriveTaskWorkflow(worker));
   const mergeEligibility = $derived(canMerge(worker));
   const audit = $derived(isAuditWorker(worker));
+  /** The Claude Code agent phase, while the worker waits on or runs one. */
+  const agentPhaseText = $derived(workerAgentPhaseText(worker.agentPhase));
   /** An audit that delivered its report is over: it cannot be steered,
    * compacted, resumed or messaged — the lead adjudicates the report. */
   const auditFinished = $derived(
@@ -138,9 +140,9 @@
         <div class="worker-heading">
           <div class="worker-title">
             <h2>{worker.name}</h2>
-            <span class="status-pill" data-status={worker.status}>
+            <span class="status-pill" data-status={worker.status} data-agent-phase={worker.agentPhase ?? undefined}>
               {#if worker.status === "working" || worker.status === "dispatching"}<LoaderCircle size={9} class="spin" />{/if}
-              {workerStatusText(worker)}
+              {agentPhaseText ?? workerStatusText(worker)}
             </span>
             {#if audit}<span class="kind-badge" data-kind="audit">Audit</span>{/if}
             {#if highRisk}<span class="kind-badge" data-risk="high">High risk</span>{/if}

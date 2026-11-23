@@ -546,24 +546,36 @@ impl TeamRuntime {
     }
 
     /// Give back a closed audit's pool checkout the way a merge releases a
-    /// pool: it is read-only, so there is nothing to keep.
+    /// pool: it is read-only, so there is nothing to keep. A released pool is
+    /// followed by the idle-pool trim — AFTER the checkout pool lock guard is
+    /// dropped, because the trim takes that lock itself.
     async fn release_audit_checkout(&self, audit_id: &str, checkout: PathBuf, branch: String) {
-        let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
-        if self.live.lock().await.contains_key(audit_id) {
-            return;
-        }
-        match release_pool_checkout(self.workspace_root.clone(), checkout.clone(), branch).await {
-            Ok(()) => {
-                self.update_worker(audit_id, |worker| worker.worktree = PathBuf::new())
-                    .await;
-                if let Err(error) = self.persist().await {
-                    eprintln!("team: could not save the closed audit {audit_id}: {error}");
+        let released = {
+            let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
+            if self.live.lock().await.contains_key(audit_id) {
+                return;
+            }
+            match release_pool_checkout(self.workspace_root.clone(), checkout.clone(), branch).await
+            {
+                Ok(()) => {
+                    self.update_worker(audit_id, |worker| worker.worktree = PathBuf::new())
+                        .await;
+                    if let Err(error) = self.persist().await {
+                        eprintln!("team: could not save the closed audit {audit_id}: {error}");
+                    }
+                    true
+                }
+                Err(error) => {
+                    eprintln!(
+                        "team: kept the pool checkout {} of the closed audit {audit_id}: {error}",
+                        checkout.display()
+                    );
+                    false
                 }
             }
-            Err(error) => eprintln!(
-                "team: kept the pool checkout {} of the closed audit {audit_id}: {error}",
-                checkout.display()
-            ),
+        };
+        if released {
+            self.trim_idle_pools().await;
         }
     }
 }

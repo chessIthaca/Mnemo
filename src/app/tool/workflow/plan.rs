@@ -2264,7 +2264,7 @@ impl Tool for FinishTool {
                     },
                     "regression_test": {
                         "type": "string",
-                        "description": "Optional, instead of recording it with update_plan: The regression test's bare name exactly as written in the source: the test function name (for example retry_stops_after_three_attempts) or, for a string-titled test, the exact it()/test()/describe() title. No file path, module path (a::b::) or note in parentheses: the plan cannot close until this exact name is found in the code."
+                        "description": "Optional, instead of recording it with update_plan: the regression test's bare name exactly as written in the source: the test function name (for example retry_stops_after_three_attempts) or, for a string-titled test, the exact it()/test()/describe() title. No file path, module path (a::b::) or note in parentheses: the plan cannot close until this exact name is found in the code."
                     }
                 },
                 "required": ["review_report"]

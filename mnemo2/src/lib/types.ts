@@ -47,6 +47,15 @@ export type WorkerStatus =
 /** What a running worker is doing right now, derived from its streamed events. */
 export type WorkerPhase = "starting" | "thinking" | "writing" | "tool" | "waiting";
 
+/**
+ * The phase of a worker's Claude Code agent, derived by the host at snapshot
+ * time and never persisted: "awaiting_launch" until the lead launches its
+ * Agent, "running" while it works, "stalled" after ten silent minutes, and
+ * "finished" for the moment between the agent ending and Mnemo finishing the
+ * worker.
+ */
+export type WorkerAgentPhase = "awaiting_launch" | "running" | "stalled" | "finished";
+
 /** The live activity of one running worker: its phase, and how long it has been going on. */
 export interface WorkerActivity {
   phase: WorkerPhase;
@@ -79,6 +88,25 @@ export const workerStatusLabel: Record<WorkerStatus, string> = {
 /** A worker's status as shown: a landed merge that was later reverted reads "Reverted". */
 export function workerStatusText(worker: Pick<Worker, "status" | "merge">): string {
   return worker.status === "merged" && worker.merge?.revertCommit ? "Reverted" : workerStatusLabel[worker.status];
+}
+
+/**
+ * The status line Mission Control shows for a Claude Code agent worker: its
+ * agent phase in place of the plain worker status, or null when the ordinary
+ * status text shows instead. A finished agent keeps the worker's own status —
+ * Mnemo is completing it — and a worker without a phase is not an agent worker.
+ */
+export function workerAgentPhaseText(phase: WorkerAgentPhase | null | undefined): string | null {
+  switch (phase) {
+    case "awaiting_launch":
+      return "Waiting for Claude Code agent";
+    case "running":
+      return "Claude Code agent running";
+    case "stalled":
+      return "Claude Code agent silent for 10+ min";
+    default:
+      return null;
+  }
 }
 
 export type StepStatus = "done" | "active" | "queued" | "failed";
@@ -352,6 +380,8 @@ export interface Worker {
   inbox: InboxEntry[];
   /** A worker that runs as a Claude Code agent: where its log is and how it is doing. */
   agent?: WorkerAgent;
+  /** Its Claude Code agent's derived phase; absent (or null) for every other worker. */
+  agentPhase?: WorkerAgentPhase | null;
   screenshots: string[];
   timeline: TimelineStep[];
   diff: DiffStats;

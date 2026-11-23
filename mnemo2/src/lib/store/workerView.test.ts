@@ -69,4 +69,12 @@ describe("workerView", () => {
   it("formats the worker's elapsed time through elapsedFromMs", () => {
     expect(buildWorker(record({ elapsed_ms: 61_000 }), 0, [], "working", null).elapsed).toBe("1m");
   });
+
+  it("maps the Claude Code agent phase and reads a missing one as no phase", () => {
+    expect(buildWorker(record({ agent_phase: "awaiting_launch" }), 0, [], "working", null).agentPhase).toBe(
+      "awaiting_launch",
+    );
+    expect(buildWorker(record({ agent_phase: "stalled" }), 0, [], "working", null).agentPhase).toBe("stalled");
+    expect(buildWorker(record(), 0, [], "working", null).agentPhase).toBeNull();
+  });
 });

@@ -7,6 +7,7 @@ import type {
   ProjectUsage,
   ReviewEvidence,
   ReviewRisk,
+  WorkerAgentPhase,
   WorkerKind,
   WorkerRouting,
 } from "./types";
@@ -168,6 +169,12 @@ export interface TeamWorkerRecord {
   inbox?: TeamInboxEntry[];
   /** The registered Claude Code agent's state; the store fills it from the snapshot's `agents`. */
   agent?: TeamAgentView | null;
+  /**
+   * The Claude Code agent phase the host derived for this worker at snapshot
+   * time — "awaiting_launch", "running", "stalled" or "finished" — or null for
+   * a worker that is not a Claude Code agent worker. Derived, never persisted.
+   */
+  agent_phase?: string | null;
 }
 
 /**
@@ -470,6 +477,19 @@ export function inboxFromWire(entry: TeamInboxEntry): InboxEntry {
  */
 export function workerKindFrom(value: string | null | undefined): WorkerKind {
   return value === "audit" ? "audit" : "implementation";
+}
+
+/**
+ * Normalize the host's Claude Code agent phase.
+ *
+ * Absent or unrecognized values read as no phase: the worker is not a Claude
+ * Code agent worker (or its host predates the field), and it renders as it
+ * always has.
+ */
+export function agentPhaseFrom(value: string | null | undefined): WorkerAgentPhase | null {
+  return value === "awaiting_launch" || value === "running" || value === "stalled" || value === "finished"
+    ? value
+    : null;
 }
 
 /**

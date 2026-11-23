@@ -184,6 +184,16 @@ fn parse_hook(command: &str, rest: &[String]) -> Result<Hook, String> {
     }
 }
 
+/// Whether `command` names a hook, so `main` hands it to the hook path.
+/// Every name `parse_hook` accepts must be here, or that hook answers with
+/// the usage text when Claude Code passes its `args`.
+fn is_hook_command(command: &str) -> bool {
+    matches!(
+        command,
+        "notices" | "gate-agent" | "hint" | "worktree-create" | "worktree-remove"
+    )
+}
+
 /// The hook a Claude Code hook event runs, for a call without arguments.
 ///
 /// Claude Code 2.1.138 ignores the `args` of an exec-form hook and runs the
@@ -232,7 +242,7 @@ fn main() -> ExitCode {
     let command = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or_default();
     match command {
-        "notices" | "gate-agent" | "hint" => run_hook_command(command, rest, &args),
+        command if is_hook_command(command) => run_hook_command(command, rest, &args),
         // A bare call with a hook's JSON on stdin (see `hook_for_event`).
         "" if !std::io::stdin().is_terminal() => run_event_hook(),
         "serve" => {
@@ -494,10 +504,16 @@ mod tests {
             Hook::Notices(NoticesMode::StopCheck),
             Hook::GateAgent,
             Hook::Hint,
+            Hook::WorktreeCreate,
+            Hook::WorktreeRemove,
         ] {
             let args = hook_args(hook);
             assert_eq!(parse_hook(&args[0], &args[1..]), Ok(hook));
+            // `main` must route the explicit form to the hook path, not usage.
+            assert!(is_hook_command(&args[0]), "{} is not routed", args[0]);
         }
+        assert!(!is_hook_command("wait"));
+        assert!(!is_hook_command("serve"));
     }
 
     fn touch(path: &Path, age: Duration) {

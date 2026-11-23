@@ -15,6 +15,7 @@ const event = (kind: string, extra: Record<string, unknown> = {}): TeamEvent => 
 const activity = (phase: WorkerActivity["phase"], extra: Partial<WorkerActivity> = {}): WorkerActivity => ({
   phase,
   toolName: null,
+  toolArgs: null,
   turnStartedAtMs: null,
   phaseSinceMs: NOW,
   ...extra,
@@ -23,7 +24,7 @@ const activity = (phase: WorkerActivity["phase"], extra: Partial<WorkerActivity>
 describe("applyWorkerEvent", () => {
   it("starts the turn with `starting` and anchors the turn timer", () => {
     const next = applyWorkerEvent(null, event("started"), NOW);
-    expect(next).toEqual({ phase: "starting", toolName: null, turnStartedAtMs: NOW, phaseSinceMs: NOW });
+    expect(next).toEqual({ phase: "starting", toolName: null, toolArgs: null, turnStartedAtMs: NOW, phaseSinceMs: NOW });
   });
 
   it("moves to `thinking` on reasoning deltas", () => {
@@ -40,7 +41,40 @@ describe("applyWorkerEvent", () => {
 
   it("moves to `tool` with the tool's name on a tool call", () => {
     const next = applyWorkerEvent(activity("thinking"), event("tool_call_start", { name: "shell" }), NOW);
-    expect(next).toEqual({ phase: "tool", toolName: "shell", turnStartedAtMs: null, phaseSinceMs: NOW });
+    expect(next).toEqual({ phase: "tool", toolName: "shell", toolArgs: "", turnStartedAtMs: null, phaseSinceMs: NOW });
+  });
+
+  it("builds a shell call's phrase from its streamed argument fragments", () => {
+    const args = '{"command":"cargo test","purpose":"running tests"}';
+    let live = applyWorkerEvent(activity("thinking"), event("tool_call_start", { name: "shell", id: "c1" }), NOW);
+    // Nothing readable yet — the raw name is the honest fallback.
+    expect(workerPhaseLabel(live!)).toBe("Running shell…");
+    live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment: args.slice(0, 16) }), NOW);
+    expect(workerPhaseLabel(live!)).toBe("Running shell…");
+    // The complete purpose is in the body even before the JSON closes.
+    live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment: args.slice(16, -1) }), NOW);
+    expect(live?.toolArgs).toBe(args.slice(0, -1));
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+    live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment: "}" }), NOW);
+    expect(live?.toolArgs).toBe(args);
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+    // The arguments survive the execution start and the output stream.
+    live = applyWorkerEvent(live, event("tool_execution_start", { tool_call_id: "c1" }), NOW + 500);
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+    live = applyWorkerEvent(live, event("tool_output_delta", { tool_call_id: "c1", text: "3 passing" }), NOW + 900);
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+  });
+
+  it("builds a Bash call's phrase from the same fragment stream", () => {
+    const args = '{"command":"cargo test --workspace","description":"Run the workspace tests"}';
+    let live = applyWorkerEvent(activity("thinking"), event("tool_call_start", { name: "Bash", id: "c2" }), NOW);
+    for (const fragment of [args.slice(0, 24), args.slice(24, -1), "}"]) {
+      live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment }), NOW);
+    }
+    live = applyWorkerEvent(live, event("tool_execution_start", { tool_call_id: "c2" }), NOW + 500);
+    expect(live?.toolArgs).toBe(args);
+    expect(workerPhaseLabel(live!)).toBe("Running the workspace tests…");
+    expect(workerPhaseLabel(live!)).not.toContain("Using Bash");
   });
 
   it("holds the tool phase through argument, execution, and output deltas", () => {
@@ -85,14 +119,14 @@ describe("applyWorkerEvent", () => {
   it("re-anchors the turn timer when a new turn starts", () => {
     const writing = activity("writing", { turnStartedAtMs: NOW - 30_000, phaseSinceMs: NOW - 5_000 });
     const next = applyWorkerEvent(writing, event("started"), NOW);
-    expect(next).toEqual({ phase: "starting", toolName: null, turnStartedAtMs: NOW, phaseSinceMs: NOW });
+    expect(next).toEqual({ phase: "starting", toolName: null, toolArgs: null, turnStartedAtMs: NOW, phaseSinceMs: NOW });
   });
 });
 
 describe("applyWorkerStatus", () => {
   it("shows `starting` while the worker is still dispatching, with no turn anchor yet", () => {
     const next = applyWorkerStatus(null, "dispatching", NOW);
-    expect(next).toEqual({ phase: "starting", toolName: null, turnStartedAtMs: null, phaseSinceMs: NOW });
+    expect(next).toEqual({ phase: "starting", toolName: null, toolArgs: null, turnStartedAtMs: null, phaseSinceMs: NOW });
   });
 
   it("keeps an existing `starting` record when the snapshot repeats `dispatching`", () => {
@@ -142,10 +176,28 @@ describe("workerPhaseLabel", () => {
     expect(workerPhaseLabel(activity("waiting"))).toBe("Waiting on you");
   });
 
-  it("names the running tool, with its friendly phrase when one exists", () => {
+  it("names what the running tool is for, with the raw name as the fallback", () => {
     expect(workerPhaseLabel(activity("tool", { toolName: "shell" }))).toBe("Running shell…");
     expect(workerPhaseLabel(activity("tool", { toolName: "team_status" }))).toBe("Reading team status…");
     expect(workerPhaseLabel(activity("tool", { toolName: "team_message" }))).toBe("Messaging a worker…");
     expect(workerPhaseLabel(activity("tool"))).toBe("Running a tool…");
+  });
+
+  it("uses the running call's arguments: a shell purpose and a Bash description", () => {
+    const purpose = activity("tool", { toolName: "shell", toolArgs: JSON.stringify({ purpose: "building game" }) });
+    expect(workerPhaseLabel(purpose)).toBe("Building game…");
+    const bash = activity("tool", {
+      toolName: "Bash",
+      toolArgs: JSON.stringify({ command: "cargo test --workspace", description: "Run the workspace tests" }),
+    });
+    expect(workerPhaseLabel(bash)).toBe("Running the workspace tests…");
+    expect(workerPhaseLabel(bash)).not.toContain("Using Bash");
+  });
+
+  it("falls back to the command's own program without a purpose or description", () => {
+    const shell = activity("tool", { toolName: "shell", toolArgs: JSON.stringify({ command: "cargo test --workspace" }) });
+    expect(workerPhaseLabel(shell)).toBe("Running tests…");
+    const bash = activity("tool", { toolName: "Bash", toolArgs: JSON.stringify({ command: "cargo test --workspace" }) });
+    expect(workerPhaseLabel(bash)).toBe("Running tests…");
   });
 });

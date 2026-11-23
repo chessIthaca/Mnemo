@@ -11,13 +11,23 @@ function moveTo(
   activity: WorkerActivity | null,
   phase: WorkerPhase,
   nowMs: number,
-  overrides: { toolName?: string | null; turnStartedAtMs?: number | null } = {},
+  overrides: {
+    toolName?: string | null;
+    toolArgs?: string | null;
+    turnStartedAtMs?: number | null;
+  } = {},
 ): WorkerActivity {
   const toolName =
     overrides.toolName !== undefined
       ? overrides.toolName
       : phase === "tool"
         ? (activity?.toolName ?? null)
+        : null;
+  const toolArgs =
+    overrides.toolArgs !== undefined
+      ? overrides.toolArgs
+      : phase === "tool"
+        ? (activity?.toolArgs ?? null)
         : null;
   const turnStartedAtMs =
     overrides.turnStartedAtMs !== undefined ? overrides.turnStartedAtMs : (activity?.turnStartedAtMs ?? null);
@@ -26,11 +36,12 @@ function moveTo(
     activity !== null &&
     activity.phase === phase &&
     activity.toolName === toolName &&
+    activity.toolArgs === toolArgs &&
     activity.turnStartedAtMs === turnStartedAtMs
   ) {
     return activity;
   }
-  return { phase, toolName, turnStartedAtMs, phaseSinceMs };
+  return { phase, toolName, toolArgs, turnStartedAtMs, phaseSinceMs };
 }
 
 /**
@@ -47,7 +58,9 @@ export function applyWorkerEvent(
   event: TeamEvent,
   nowMs: number,
 ): WorkerActivity | null {
-  const payload = event.event?.event as { kind?: string; name?: unknown } | undefined;
+  const payload = event.event?.event as
+    | { kind?: string; name?: unknown; fragment?: unknown }
+    | undefined;
   switch (payload?.kind) {
     case "started":
       return moveTo(activity, "starting", nowMs, { toolName: null, turnStartedAtMs: nowMs });
@@ -56,13 +69,26 @@ export function applyWorkerEvent(
     case "text_delta":
       return moveTo(activity, "writing", nowMs);
     case "tool_call_start":
+      // The call's arguments stream in AFTER this event, as
+      // `tool_call_arg_delta` fragments: start from an empty body so those
+      // fragments build what the call is FOR — a Bash call's description, a
+      // shell call's purpose — instead of the status line naming the tool.
       return moveTo(activity, "tool", nowMs, {
         toolName: typeof payload.name === "string" && payload.name ? payload.name : null,
+        toolArgs: "",
       });
-    case "tool_call_arg_delta":
+    case "tool_call_arg_delta": {
+      const fragment = typeof payload.fragment === "string" ? payload.fragment : "";
+      if (!fragment) return moveTo(activity, "tool", nowMs);
+      // The same fragments the transcript and lead reducers append; the phrase
+      // builders read a still-incomplete body (`stringArg` salvages it).
+      return moveTo(activity, "tool", nowMs, {
+        toolArgs: `${activity?.toolArgs ?? ""}${fragment}`,
+      });
+    }
     case "tool_execution_start":
     case "tool_output_delta":
-      // All three stream while one tool runs — hold the tool phase.
+      // Both stream while the call runs — hold the tool phase and its arguments.
       return moveTo(activity, "tool", nowMs);
     case "tool_result":
       return moveTo(activity, "thinking", nowMs);
@@ -95,13 +121,25 @@ export function applyWorkerStatus(
   switch (status) {
     case "dispatching":
       if (activity?.phase === "starting") return activity;
-      return { phase: "starting", toolName: null, turnStartedAtMs: null, phaseSinceMs: nowMs };
+      return {
+        phase: "starting",
+        toolName: null,
+        toolArgs: null,
+        turnStartedAtMs: null,
+        phaseSinceMs: nowMs,
+      };
     case "working":
     case "fixing":
     case "merging":
       // The answer arrived and the turn continues: waiting hands back to thinking.
       if (activity?.phase === "waiting") return moveTo(activity, "thinking", nowMs);
-      return activity ?? { phase: "starting", toolName: null, turnStartedAtMs: null, phaseSinceMs: nowMs };
+      return activity ?? {
+        phase: "starting",
+        toolName: null,
+        toolArgs: null,
+        turnStartedAtMs: null,
+        phaseSinceMs: nowMs,
+      };
     case "needs_you":
       return moveTo(activity, "waiting", nowMs);
     default:
@@ -109,10 +147,16 @@ export function applyWorkerStatus(
   }
 }
 
-/** The label for the `tool` phase: the team tools' phrase when one exists, the raw name otherwise. */
-function toolPhaseLabel(toolName: string | null): string {
+/**
+ * The label for the `tool` phase: what the running call is for, from its
+ * arguments as they stream in — a Bash call's description ("Running the
+ * workspace tests…"), a shell call's purpose (“Building game…”), a bare
+ * command's program ("Running tests…"). The raw name is the fallback only
+ * ("Running Bash…").
+ */
+function toolPhaseLabel(toolName: string | null, toolArgs: string | null): string {
   if (!toolName) return "Running a tool…";
-  const summary = toolSummary(toolName, "");
+  const summary = toolSummary(toolName, toolArgs ?? "");
   // toolSummary's fallback is "Using <pretty name>" — the raw name reads friendlier there.
   return summary.startsWith("Using ") ? `Running ${toolName}…` : `${summary}…`;
 }
@@ -127,7 +171,7 @@ export function workerPhaseLabel(activity: WorkerActivity): string {
     case "writing":
       return "Writing…";
     case "tool":
-      return toolPhaseLabel(activity.toolName);
+      return toolPhaseLabel(activity.toolName, activity.toolArgs);
     case "waiting":
       return "Waiting on you";
   }

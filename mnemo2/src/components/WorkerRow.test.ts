@@ -75,6 +75,7 @@ describe("WorkerRow", () => {
       activity: {
         phase: "tool",
         toolName: "shell",
+        toolArgs: null,
         turnStartedAtMs: Date.now() - 72_000,
         phaseSinceMs: Date.now() - 5_000,
       },
@@ -100,6 +101,7 @@ describe("WorkerRow", () => {
       activity: {
         phase: "waiting",
         toolName: null,
+        toolArgs: null,
         turnStartedAtMs: Date.now() - 30_000,
         phaseSinceMs: Date.now() - 1_000,
       },
@@ -159,6 +161,7 @@ describe("WorkerRow", () => {
       activity: {
         phase: "tool",
         toolName: "shell",
+        toolArgs: null,
         turnStartedAtMs: Date.now() - 72_000,
         phaseSinceMs: Date.now() - 5_000,
       },

@@ -1981,6 +1981,44 @@ mod tests {
         }
     }
 
+    /// Hang guard for [`await_event`]. Not a budget: the wait returns the
+    /// moment its event arrives; this bound only turns a real hang into a
+    /// failure that names the awaited event instead of stalling the suite.
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Drain the fan-in channel until an event matching `is_target` arrives
+    /// and return every event received up to and including it.
+    ///
+    /// Waits on the event itself, never on a quiet gap between events: the
+    /// first event of a turn can come seconds after the prompt on a loaded
+    /// box (plan 250d11ff). Panics naming `what` when the channel closes or
+    /// [`HANG_GUARD`] passes first.
+    async fn await_event(
+        rx: &mut mpsc::Receiver<(u64, AgentEvent)>,
+        what: &str,
+        is_target: impl Fn(&AgentEvent) -> bool,
+    ) -> Vec<AgentEvent> {
+        let guard = tokio::time::Instant::now() + HANG_GUARD;
+        let mut seen = Vec::new();
+        loop {
+            match tokio::time::timeout_at(guard, rx.recv()).await {
+                Ok(Some((_agent_id, event))) => {
+                    let hit = is_target(&event);
+                    seen.push(event);
+                    if hit {
+                        return seen;
+                    }
+                }
+                Ok(None) => panic!(
+                    "fan-in channel closed while waiting for {what}; events seen: {seen:?}"
+                ),
+                Err(_) => panic!(
+                    "no {what} within the {HANG_GUARD:?} hang guard; events seen: {seen:?}"
+                ),
+            }
+        }
+    }
+
     /// Regression (plan a4837353): an event that arrives 800ms after the
     /// previous one must still be delivered. The old drain loops broke on the
     /// first 500ms gap between fan-in events — exactly the flake this helper
@@ -5845,43 +5883,20 @@ mod tests {
             .unwrap();
 
         // Wait for the ApprovalRequest (after create_plan completes), then
-        // send Cancel.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(2000), fanin_rx.recv())
-                .await
-            {
-                Ok(Some((_id, event))) => {
-                    if matches!(event, AgentEvent::ApprovalRequest { .. }) {
-                        // Send Cancel while awaiting approval.
-                        cmd_tx.send(AgentCommand::Cancel).await.unwrap();
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
+        // send Cancel while the agent awaits approval.
+        await_event(&mut fanin_rx, "ApprovalRequest for file_write", |e| {
+            matches!(e, AgentEvent::ApprovalRequest { .. })
+        })
+        .await;
+        cmd_tx.send(AgentCommand::Cancel).await.unwrap();
 
         // Exited must fire — Cancel terminates the agent.
-        let mut saw_exited = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(2000), fanin_rx.recv())
-                .await
-            {
-                Ok(Some((_id, event))) => {
-                    if matches!(event, AgentEvent::Exited) {
-                        saw_exited = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(
-            saw_exited,
-            "Cancel during approval must emit Exited (agent terminates)"
-        );
+        await_event(
+            &mut fanin_rx,
+            "Exited after Cancel during approval (agent terminates)",
+            |e| matches!(e, AgentEvent::Exited),
+        )
+        .await;
         // The file must NOT have been written (the tool was never approved).
         assert!(
             !dir.path().join("x.txt").exists(),
@@ -5942,49 +5957,24 @@ mod tests {
             .unwrap();
 
         // Wait for the ApprovalRequest (after create_plan completes), then
-        // send Interrupt.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(2000), fanin_rx.recv())
-                .await
-            {
-                Ok(Some((_id, event))) => {
-                    if matches!(event, AgentEvent::ApprovalRequest { .. }) {
-                        cmd_tx.send(AgentCommand::Interrupt).await.unwrap();
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
+        // send Interrupt while the agent awaits approval.
+        await_event(&mut fanin_rx, "ApprovalRequest for file_write", |e| {
+            matches!(e, AgentEvent::ApprovalRequest { .. })
+        })
+        .await;
+        cmd_tx.send(AgentCommand::Interrupt).await.unwrap();
 
-        // Finished must fire (turn ended). Exited must NOT fire (agent alive).
-        let mut saw_finished = false;
-        let mut saw_exited = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(2000), fanin_rx.recv())
-                .await
-            {
-                Ok(Some((_id, event))) => {
-                    if matches!(event, AgentEvent::Finished { .. }) {
-                        saw_finished = true;
-                        break;
-                    }
-                    if matches!(event, AgentEvent::Exited) {
-                        saw_exited = true;
-                    }
-                }
-                _ => break,
-            }
-        }
+        // Finished must fire (turn ended). Exited must NOT fire (agent alive):
+        // stop at whichever comes first and require it to be Finished.
+        let events = await_event(
+            &mut fanin_rx,
+            "Finished after Interrupt during approval (turn ends)",
+            |e| matches!(e, AgentEvent::Finished { .. } | AgentEvent::Exited),
+        )
+        .await;
         assert!(
-            saw_finished,
-            "Interrupt during approval must end the turn (Finished)"
-        );
-        assert!(
-            !saw_exited,
-            "Interrupt during approval must NOT exit the agent (no Exited)"
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "Interrupt during approval must end the turn with Finished, NOT exit the agent; events: {events:?}"
         );
         // The file must NOT have been written.
         assert!(

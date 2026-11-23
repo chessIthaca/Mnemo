@@ -1374,23 +1374,61 @@ function hostOf(url: string): string | null {
   }
 }
 
+/** Reads one string argument of a call: its value from the complete input, or
+ *  one salvaged from the fragments of a call whose arguments are still
+ *  streaming in. */
+type ArgReader = (key: string) => string | null;
+
+/** An argument reader over a call's complete, parsed input. */
+function parsedReader(parsed: Record<string, unknown>): ArgReader {
+  return (key) => {
+    const value = parsed[key];
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  };
+}
+
+/** An argument reader over a call's still-streaming argument fragments. */
+function fragmentReader(args: string): ArgReader {
+  return (key) => {
+    const value = stringArg(args, key);
+    return value !== null && value.trim() ? value.trim() : null;
+  };
+}
+
+/** `running tests` → `Running tests` — a purpose is already a gerund phrase. */
+function capitalizeFirst(text: string): string {
+  return `${text.charAt(0).toUpperCase()}${text.slice(1)}`;
+}
+
+/** Shell / job: the purpose says what the command is for; without one the
+ *  command's own program classifies it. Null when neither has arrived. */
+function shellPhrase(read: ArgReader): string | null {
+  const purpose = read("purpose");
+  if (purpose !== null) return capitalizeFirst(purpose);
+  const command = read("command");
+  return command !== null ? commandPhrase(command) : null;
+}
+
+/** The git tool's subcommand phrase; null when the subcommand has not arrived. */
+function gitPhrase(read: ArgReader): string | null {
+  const sub = read("subcommand") ?? read("action");
+  return sub === null ? null : (gitVerbPhrases[sub] ?? `Running git ${sub}`);
+}
+
 /**
  * A Claude Code agent tool's phrase, from Claude's own tool name and input
  * shape (`Read` {file_path}, `Bash` {command, description}, …) — a worker that
  * runs as a Claude Code agent streams those names into its transcript. Null
  * for every other tool.
  */
-function claudeToolPhrase(toolName: string, input: Record<string, unknown>): string | null {
-  const text = (value: unknown): string | null =>
-    typeof value === "string" && value.trim() ? value.trim() : null;
-  const filePath = text(input.file_path);
+function claudeToolPhrase(toolName: string, read: ArgReader): string | null {
+  const filePath = read("file_path");
   switch (toolName) {
     case "Bash":
     case "PowerShell": {
-      const description = text(input.description);
+      const description = read("description");
       if (description !== null) return gerundSentence(description);
-      const command = text(input.command);
-      return command !== null ? commandPhrase(command) : "Running a command";
+      return shellPhrase(read) ?? "Running a command";
     }
     case "Read":
       return filePath !== null ? `Reading ${basename(filePath)}` : "Reading a file";
@@ -1400,32 +1438,32 @@ function claudeToolPhrase(toolName: string, input: Record<string, unknown>): str
     case "Write":
       return filePath !== null ? `Writing ${basename(filePath)}` : "Writing a file";
     case "NotebookEdit": {
-      const notebook = text(input.notebook_path);
+      const notebook = read("notebook_path");
       return notebook !== null ? `Editing ${basename(notebook)}` : "Editing a notebook";
     }
     case "Grep": {
-      const pattern = text(input.pattern);
+      const pattern = read("pattern");
       if (pattern === null) return "Searching the code";
-      const glob = text(input.glob);
+      const glob = read("glob");
       return glob !== null ? `Searching for "${pattern}" in ${glob}` : `Searching for "${pattern}"`;
     }
     case "Glob": {
-      const pattern = text(input.pattern);
+      const pattern = read("pattern");
       return pattern !== null ? `Finding files matching ${pattern}` : "Finding files";
     }
     case "WebFetch": {
-      const host = hostOf(text(input.url) ?? "");
+      const host = hostOf(read("url") ?? "");
       return host !== null ? `Fetching ${host}` : "Fetching a page";
     }
     case "WebSearch": {
-      const query = text(input.query);
+      const query = read("query");
       return query !== null ? `Searching the web for "${query}"` : "Searching the web";
     }
     case "TodoWrite":
       return "Updating its task list";
     case "Task":
     case "Agent": {
-      const description = text(input.description);
+      const description = read("description");
       return description !== null
         ? `Starting a helper agent: ${description}`
         : "Starting a helper agent";
@@ -1435,6 +1473,29 @@ function claudeToolPhrase(toolName: string, input: Record<string, unknown>): str
     default:
       return null;
   }
+}
+
+/**
+ * The phrase for a call whose argument JSON is still streaming: incomplete JSON
+ * cannot parse, but the fragments already received often name the action —
+ * `stringArg` reads a string that has arrived in full, so
+ * `{"command":"cargo test","purpose":"running tests"` already yields
+ * "Running tests". Null when nothing readable has arrived yet, so the caller
+ * falls back to the tool name.
+ */
+function streamingPhrase(toolName: string, args: string): string | null {
+  const read = fragmentReader(args);
+  const claude = claudeToolPhrase(toolName, read);
+  if (claude !== null) return claude;
+  // An MCP wrapper names a Mnemo tool even while its arguments stream.
+  const mnemoTool = mnemoMcpTool(toolName);
+  if (mnemoTool !== null) {
+    return teamPhrase(mnemoTool, args, (workerId) => workerId) ?? streamingPhrase(mnemoTool, args);
+  }
+  const mcp = /^mcp__(.+)__(.+)$/.exec(toolName);
+  if (mcp !== null) return `Using ${mcp[2].replace(/_/g, " ")} (${mcp[1].replace(/_/g, " ")})`;
+  if (toolName === "shell" || toolName === "job") return shellPhrase(read);
+  return toolName === "git" ? gitPhrase(read) : null;
 }
 
 /**
@@ -1450,8 +1511,12 @@ function claudeToolPhrase(toolName: string, input: Record<string, unknown>): str
  * phrase it has under its own name, any other server's tool reads
  * `Using <tool> (<server>)`.
  *
- * Returns `null` only when the tool is unknown and not MCP-wrapped, or the
- * args cannot be parsed — the caller falls back to {@link prettyToolName}.
+ * The args of a RUNNING call arrive as fragments: a still-incomplete body gets
+ * a phrase from the part already received (see {@link streamingPhrase}), so
+ * the live status line can say what the call is for before it is complete.
+ *
+ * Returns `null` when the tool is unknown and not MCP-wrapped, or nothing in
+ * the args names the action — the caller falls back to {@link prettyToolName}.
  * React-free so the node-env unit tests can exercise it directly.
  */
 export function actionPhrase(toolName: string, argsJson: string): string | null {
@@ -1461,16 +1526,21 @@ export function actionPhrase(toolName: string, argsJson: string): string | null 
   if (typeof toolName !== "string" || toolName === "") return null;
   let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(argsJson);
+    const value: unknown = JSON.parse(argsJson);
+    // A running call's arguments stream in fragments: incomplete JSON cannot
+    // parse, and the part already received still names the action.
+    if (value === null || typeof value !== "object") return streamingPhrase(toolName, argsJson);
+    parsed = value as Record<string, unknown>;
   } catch {
-    return null;
+    return streamingPhrase(toolName, argsJson);
   }
+  const read = parsedReader(parsed);
   const str = (v: unknown): string | null =>
     typeof v === "string" && v.trim() ? v.trim() : null;
 
   // A Claude Code agent worker's transcript uses Claude's own tool names and
   // inputs — the same sentence a Mnemo tool call gets, from that shape.
-  const claude = claudeToolPhrase(toolName, parsed);
+  const claude = claudeToolPhrase(toolName, read);
   if (claude !== null) return claude;
   // An MCP tool: Mnemo's own keep the phrase they have under their own name;
   // any other server's tool has none of its own, so name it and its server.
@@ -1521,15 +1591,10 @@ export function actionPhrase(toolName: string, argsJson: string): string | null 
     // IS the sentence; prefixing "Running" would double the verb. Without one,
     // the command's own program classifies the call ("cargo test" → "Running
     // tests").
-    const purpose = str(parsed.purpose);
-    if (purpose !== null) return purpose.charAt(0).toUpperCase() + purpose.slice(1);
-    const command = str(parsed.command);
-    return command !== null ? commandPhrase(command) : "Running a command";
+    return shellPhrase(read) ?? "Running a command";
   }
   if (toolName === "git") {
-    const sub = str(parsed.subcommand) ?? str(parsed.action);
-    if (sub === null) return "Running git";
-    return gitVerbPhrases[sub] ?? `Running git ${sub}`;
+    return gitPhrase(read) ?? "Running git";
   }
   if (toolName === "git_read") {
     const op = str(parsed.op);

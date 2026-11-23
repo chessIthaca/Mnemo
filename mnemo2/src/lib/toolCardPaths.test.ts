@@ -1351,6 +1351,31 @@ describe("actionPhrase — MCP-wrapped tools", () => {
   });
 });
 
+describe("actionPhrase — a running call's argument fragments", () => {
+  it("reads a shell purpose from a still-incomplete argument body", () => {
+    expect(actionPhrase("shell", '{"command":"cargo test","purpose":"running tests"')).toBe(
+      "Running tests",
+    );
+    expect(actionPhrase("job", '{"command":"npm run build"')).toBe("Building");
+  });
+
+  it("reads a Bash description from a still-incomplete argument body", () => {
+    expect(
+      actionPhrase("Bash", '{"command":"cargo test --workspace","description":"Run the workspace tests"'),
+    ).toBe("Running the workspace tests");
+    expect(actionPhrase("Bash", '{"command":"cargo test --workspace"')).toBe("Running tests");
+  });
+
+  it("names the file of a streaming file tool", () => {
+    expect(actionPhrase("Read", '{"file_path":"src/lib/a.rs"')).toBe("Reading a.rs");
+  });
+
+  it("still falls back when nothing readable has arrived", () => {
+    expect(actionPhrase("shell", '{"command":"car')).toBeNull();
+    expect(actionPhrase("search", '{"pattern":"eng')).toBeNull();
+  });
+});
+
 describe("prettyToolName — the fallback humanizer", () => {
   it("drops the MCP prefix and humanizes separators", () => {
     expect(prettyToolName("mcp__github__search")).toBe("Github search");

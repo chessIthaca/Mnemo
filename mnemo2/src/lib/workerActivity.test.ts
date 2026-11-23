@@ -41,14 +41,40 @@ describe("applyWorkerEvent", () => {
 
   it("moves to `tool` with the tool's name on a tool call", () => {
     const next = applyWorkerEvent(activity("thinking"), event("tool_call_start", { name: "shell" }), NOW);
-    expect(next).toEqual({ phase: "tool", toolName: "shell", toolArgs: null, turnStartedAtMs: null, phaseSinceMs: NOW });
+    expect(next).toEqual({ phase: "tool", toolName: "shell", toolArgs: "", turnStartedAtMs: null, phaseSinceMs: NOW });
   });
 
-  it("keeps the call's arguments so the status line can say what it is for", () => {
-    const args = JSON.stringify({ command: "cargo test --workspace", description: "Run the workspace tests" });
-    const next = applyWorkerEvent(activity("thinking"), event("tool_call_start", { name: "Bash", arguments: args }), NOW);
-    expect(next).toEqual({ phase: "tool", toolName: "Bash", toolArgs: args, turnStartedAtMs: null, phaseSinceMs: NOW });
-    expect(workerPhaseLabel(next!)).toBe("Running the workspace tests…");
+  it("builds a shell call's phrase from its streamed argument fragments", () => {
+    const args = '{"command":"cargo test","purpose":"running tests"}';
+    let live = applyWorkerEvent(activity("thinking"), event("tool_call_start", { name: "shell", id: "c1" }), NOW);
+    // Nothing readable yet — the raw name is the honest fallback.
+    expect(workerPhaseLabel(live!)).toBe("Running shell…");
+    live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment: args.slice(0, 16) }), NOW);
+    expect(workerPhaseLabel(live!)).toBe("Running shell…");
+    // The complete purpose is in the body even before the JSON closes.
+    live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment: args.slice(16, -1) }), NOW);
+    expect(live?.toolArgs).toBe(args.slice(0, -1));
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+    live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment: "}" }), NOW);
+    expect(live?.toolArgs).toBe(args);
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+    // The arguments survive the execution start and the output stream.
+    live = applyWorkerEvent(live, event("tool_execution_start", { tool_call_id: "c1" }), NOW + 500);
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+    live = applyWorkerEvent(live, event("tool_output_delta", { tool_call_id: "c1", text: "3 passing" }), NOW + 900);
+    expect(workerPhaseLabel(live!)).toBe("Running tests…");
+  });
+
+  it("builds a Bash call's phrase from the same fragment stream", () => {
+    const args = '{"command":"cargo test --workspace","description":"Run the workspace tests"}';
+    let live = applyWorkerEvent(activity("thinking"), event("tool_call_start", { name: "Bash", id: "c2" }), NOW);
+    for (const fragment of [args.slice(0, 24), args.slice(24, -1), "}"]) {
+      live = applyWorkerEvent(live, event("tool_call_arg_delta", { index: 0, fragment }), NOW);
+    }
+    live = applyWorkerEvent(live, event("tool_execution_start", { tool_call_id: "c2" }), NOW + 500);
+    expect(live?.toolArgs).toBe(args);
+    expect(workerPhaseLabel(live!)).toBe("Running the workspace tests…");
+    expect(workerPhaseLabel(live!)).not.toContain("Using Bash");
   });
 
   it("holds the tool phase through argument, execution, and output deltas", () => {

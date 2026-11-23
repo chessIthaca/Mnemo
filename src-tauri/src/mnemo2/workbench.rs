@@ -22,6 +22,22 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 const MAX_UNTRACKED_BYTES: u64 = 1024 * 1024;
 const MAX_SCREENSHOT_BYTES: u64 = 20 * 1024 * 1024;
 
+/// The sub-directory of a checkout the offscreen browser writes its
+/// screenshots into; the same path under the team's state dir is the archive.
+const SCREENSHOT_DIR: &str = ".coding/browser/screenshots";
+
+/// The sub-directory (beside `team.json`) holding one screenshot archive
+/// folder per worker id.
+const SCREENSHOT_ARCHIVE_DIR: &str = "screenshots";
+
+/// The bytes every PNG file starts with.
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+
+/// The answer for a screenshot neither a live checkout nor the archive holds:
+/// the worker merged before Mnemo kept screenshots, so there is nothing left
+/// to open.
+const SCREENSHOT_NO_LONGER_AVAILABLE: &str = "This screenshot is no longer available: the worker's checkout was released before Mnemo kept screenshots.";
+
 /// The image formats a tool card can show, by lower-cased extension.
 const TOOL_IMAGE_TYPES: [(&str, &str); 6] = [
     ("png", "image/png"),
@@ -627,28 +643,80 @@ pub async fn worker_diff(root: &Path, worker: &WorkerRecord) -> Result<DiffSnaps
 }
 
 /// Read one genuine worker screenshot as a data URL, never an arbitrary file.
+///
+/// The worker's checkout is read first, while the record still holds one. Once
+/// that checkout was released, `archive` (see [`screenshot_archive_dir`])
+/// holds the copy Mnemo kept at release time; every path and format guard
+/// applies to both bases.
 pub async fn worker_screenshot(
     root: &Path,
     worker: &WorkerRecord,
     relative: &str,
+    archive: Option<&Path>,
 ) -> Result<String, String> {
     let path = Path::new(relative);
-    let expected = Path::new(".coding/browser/screenshots");
-    if !path.starts_with(expected)
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-        || path.extension().and_then(|ext| ext.to_str()) != Some("png")
-    {
+    if !is_worker_screenshot_path(relative) {
         return Err("not a worker screenshot path".to_string());
     }
-    let checkout = checkout_path(root, worker)?;
-    let screenshot = checkout.join(path);
+    validate_worker_identity(worker)?;
+    let archive_relative = path
+        .strip_prefix(Path::new(SCREENSHOT_DIR))
+        .map_err(|_| "not a worker screenshot path".to_string())?;
+    // The live checkout first: a worker that still holds one shows the file it
+    // has now, even when an older copy also sits in the archive.
+    if let Ok(checkout) = checkout_path(root, worker) {
+        let screenshot = checkout.join(path);
+        if std::fs::symlink_metadata(&screenshot).is_ok() {
+            return read_screenshot(&checkout, screenshot, "the worker checkout").await;
+        }
+    }
+    if let Some(archive) = archive {
+        let screenshot = archive.join(archive_relative);
+        if std::fs::symlink_metadata(&screenshot).is_ok() {
+            return read_screenshot(archive, screenshot, "the worker screenshot archive").await;
+        }
+    }
+    Err(SCREENSHOT_NO_LONGER_AVAILABLE.to_string())
+}
+
+/// Whether a path a tool reported names a screenshot: a relative path under
+/// `.coding/browser/screenshots`, plain components only, ending in `.png`.
+pub(crate) fn is_worker_screenshot_path(relative: &str) -> bool {
+    let path = Path::new(relative);
+    path.starts_with(Path::new(SCREENSHOT_DIR))
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        && path.extension().and_then(|ext| ext.to_str()) == Some("png")
+}
+
+/// The folder that holds one worker's archived screenshots, inside the team's
+/// state dir.
+///
+/// `None` for an id that cannot safely name a folder: the archive is only ever
+/// written for a validated id, so an invalid one cannot have one.
+pub(crate) fn screenshot_archive_dir(state_dir: &Path, worker_id: &str) -> Option<PathBuf> {
+    if worker_id.len() < 8 || !worker_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(state_dir.join(SCREENSHOT_ARCHIVE_DIR).join(worker_id))
+}
+
+/// Read a screenshot as a data URL, enforcing every path and format guard
+/// against `base`.
+async fn read_screenshot(
+    base: &Path,
+    screenshot: PathBuf,
+    outside: &'static str,
+) -> Result<String, String> {
+    let base = base.to_path_buf();
     let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let base = dunce::canonicalize(&base)
+            .map_err(|err| format!("could not resolve the screenshot folder: {err}"))?;
         let canonical = dunce::canonicalize(&screenshot)
             .map_err(|err| format!("could not resolve the screenshot: {err}"))?;
-        if !canonical.starts_with(&checkout) {
-            return Err("the screenshot is outside the worker checkout".to_string());
+        if !canonical.starts_with(&base) {
+            return Err(format!("the screenshot is outside {outside}"));
         }
         let metadata = std::fs::symlink_metadata(&canonical)
             .map_err(|err| format!("could not inspect the screenshot: {err}"))?;
@@ -660,7 +728,7 @@ pub async fn worker_screenshot(
         }
         let bytes = read_regular_file(&canonical, MAX_SCREENSHOT_BYTES)
             .map_err(|err| format!("could not read the screenshot: {err}"))?;
-        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        if !bytes.starts_with(&PNG_SIGNATURE) {
             return Err("the screenshot is not a PNG file".to_string());
         }
         Ok(bytes)
@@ -671,6 +739,208 @@ pub async fn worker_screenshot(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     ))
+}
+
+/// Copy a worker's screenshots out of its checkout into `archive`.
+///
+/// Every regular PNG file under `<checkout>/.coding/browser/screenshots` is
+/// copied to the same relative path under `archive`. Links (symlinks and
+/// Windows junctions), files over the preview limit and files that do not
+/// start with the PNG signature are skipped. The copy is idempotent: an
+/// existing archive file of the same size is kept. Returns how many files the
+/// worker's archive holds afterwards; 0 when there is no screenshot folder.
+pub(crate) async fn archive_worker_screenshots(
+    checkout: &Path,
+    archive: &Path,
+) -> Result<usize, String> {
+    let checkout = checkout.to_path_buf();
+    let archive = archive.to_path_buf();
+    tokio::task::spawn_blocking(move || copy_screenshots(&checkout, &archive))
+        .await
+        .map_err(|err| format!("screenshot archive task failed: {err}"))?
+}
+
+/// Distinguishes the temp files of concurrent archive copies.
+static SCREENSHOT_COPY_SEQUENCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn copy_screenshots(checkout: &Path, archive: &Path) -> Result<usize, String> {
+    let source = checkout.join(SCREENSHOT_DIR);
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(format!("could not inspect {}: {err}", source.display())),
+    };
+    if !metadata.is_dir() || pool_is_link_or_junction(&metadata) {
+        return Ok(0);
+    }
+    let mut archived = 0;
+    copy_screenshot_dir(&source, &source, archive, &mut archived)?;
+    Ok(archived)
+}
+
+/// Copy every PNG under `dir` (itself under `root`) to the same relative path
+/// under `archive`, counting what the archive holds.
+fn copy_screenshot_dir(
+    root: &Path,
+    dir: &Path,
+    archive: &Path,
+    archived: &mut usize,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|err| format!("could not read {}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("could not read {}: {err}", dir.display()))?;
+        let path = entry.path();
+        // `symlink_metadata` never follows a link, so a symlink or junction is
+        // skipped instead of copied out of the screenshot folder.
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|err| format!("could not inspect {}: {err}", path.display()))?;
+        if pool_is_link_or_junction(&metadata) {
+            continue;
+        }
+        if metadata.is_dir() {
+            copy_screenshot_dir(root, &path, archive, archived)?;
+            continue;
+        }
+        let is_png = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+        if !metadata.is_file() || !is_png || metadata.len() > MAX_SCREENSHOT_BYTES {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| format!("{} is outside the screenshot folder", path.display()))?;
+        let bytes = read_regular_file(&path, MAX_SCREENSHOT_BYTES)
+            .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+        if !bytes.starts_with(&PNG_SIGNATURE) {
+            continue;
+        }
+        copy_archived_png(&bytes, &archive.join(relative))?;
+        *archived += 1;
+    }
+    Ok(())
+}
+
+/// Write one archived PNG through a temp file and a rename, keeping an
+/// existing copy of the same size.
+fn copy_archived_png(bytes: &[u8], target: &Path) -> Result<(), String> {
+    if let Ok(existing) = std::fs::symlink_metadata(target) {
+        if existing.is_file() && existing.len() == bytes.len() as u64 {
+            return Ok(());
+        }
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("{} has no parent folder", target.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    let sequence = SCREENSHOT_COPY_SEQUENCE
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = parent.join(format!(".archive-{}-{sequence}.tmp", std::process::id()));
+    std::fs::write(&temp, bytes)
+        .map_err(|err| format!("could not write {}: {err}", temp.display()))?;
+    let renamed = std::fs::rename(&temp, target).or_else(|_| {
+        // Windows cannot rename over an existing file: drop the stale copy (or
+        // link) and retry once.
+        let _ = std::fs::remove_file(target);
+        std::fs::rename(&temp, target)
+    });
+    if let Err(err) = renamed {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("could not archive {}: {err}", target.display()));
+    }
+    Ok(())
+}
+
+/// Remove the screenshot files Git does not track from a checkout, once their
+/// archive copy exists.
+///
+/// `git clean` is scoped to the screenshot folder and only ever deletes
+/// untracked (or ignored) files there, so a tracked screenshot survives. A
+/// folder without its own `.git` is skipped: Git would otherwise walk up to
+/// the project root and clean the lead's checkout instead.
+pub(crate) async fn clean_checkout_screenshots(checkout: &Path) -> Result<(), String> {
+    let checkout = checkout.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if !checkout.join(SCREENSHOT_DIR).is_dir() || !checkout.join(".git").exists() {
+            return Ok(());
+        }
+        let output = std::process::Command::new("git")
+            .args(["clean", "-fdx", "--", SCREENSHOT_DIR])
+            .current_dir(&checkout)
+            .output()
+            .map_err(|err| format!("could not run git clean in {}: {err}", checkout.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git clean failed in {}: {}",
+                checkout.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| format!("screenshot clean task failed: {err}"))?
+}
+
+/// Keep a worker's screenshots before its checkout is released or removed.
+///
+/// The files are copied into the team's state dir and only then dropped from
+/// the checkout, so the next pool reuse cannot wipe the only copy - and the
+/// release no longer refuses over work Git does not track. Best effort on
+/// purpose: an archive failure is logged and the release goes ahead as
+/// before, with the screenshots still in the checkout.
+pub(crate) async fn keep_worker_screenshots(
+    worker_id: &str,
+    checkout: &Path,
+    state_dir: &Path,
+) {
+    let Some(archive) = screenshot_archive_dir(state_dir, worker_id) else {
+        return;
+    };
+    match archive_worker_screenshots(checkout, &archive).await {
+        Ok(archived) => {
+            if archived > 0 {
+                eprintln!(
+                    "mnemo2: archived {archived} screenshot(s) of {worker_id} in {}",
+                    archive.display()
+                );
+            }
+            if let Err(error) = clean_checkout_screenshots(checkout).await {
+                eprintln!(
+                    "mnemo2: could not remove the archived screenshots from {}: {error}",
+                    checkout.display()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "mnemo2: could not archive the screenshots of {worker_id} from {}: {error}",
+            checkout.display()
+        ),
+    }
+}
+
+/// Read an image a worker's tool call reported, as a `data:` URL for the tool
+/// card.
+///
+/// A screenshot path resolves like [`worker_screenshot`]: the checkout first,
+/// then the archive kept when that checkout was released. Every other path
+/// keeps resolving against the checkout alone.
+pub async fn worker_tool_image(
+    root: &Path,
+    worker: &WorkerRecord,
+    requested: &str,
+    archive: Option<&Path>,
+) -> Result<String, String> {
+    let normalized = requested.replace('\\', "/");
+    if is_worker_screenshot_path(&normalized) {
+        return worker_screenshot(root, worker, &normalized, archive).await;
+    }
+    let checkout = worker_checkout(root, worker)?;
+    read_tool_image(checkout, requested).await
 }
 
 /// The MIME type an image file's extension names, or None for anything the
@@ -916,11 +1186,11 @@ mod tests {
             .files
             .iter()
             .any(|file| file.path == "file.txt" && file.additions == 1));
-        let image = worker_screenshot(root, &worker, ".coding/browser/screenshots/test.png")
+        let image = worker_screenshot(root, &worker, ".coding/browser/screenshots/test.png", None)
             .await
             .expect("screenshot data");
         assert!(image.starts_with("data:image/png;base64,"));
-        assert!(worker_screenshot(root, &worker, "../file.txt")
+        assert!(worker_screenshot(root, &worker, "../file.txt", None)
             .await
             .is_err());
 
@@ -1052,5 +1322,168 @@ mod tests {
         let resolved = checkout_path(root.path(), &record).expect("pool checkout path");
 
         assert_eq!(resolved, dunce::canonicalize(pool).expect("canonical pool"));
+    }
+
+    /// Decode a `data:image/png;base64,` URL back to its bytes.
+    fn decode_png(data: &str) -> Vec<u8> {
+        let payload = data
+            .strip_prefix("data:image/png;base64,")
+            .expect("png data url");
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .expect("base64 payload")
+    }
+
+    /// A root and its legacy checkout folder, the layout `checkout_path`
+    /// derives from a worker record.
+    fn legacy_checkout() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().expect("workspace");
+        let checkout = root.path().join(".worktrees/agent-abcd1234");
+        std::fs::create_dir_all(&checkout).expect("checkout");
+        (root, checkout)
+    }
+
+    #[tokio::test]
+    async fn archive_copies_pngs_and_skips_links_large_and_non_png_files() {
+        let (checkout_dir, checkout) = canonical_tempdir();
+        let (_archive_dir, archive) = canonical_tempdir();
+        let shots = checkout.join(SCREENSHOT_DIR);
+        std::fs::create_dir_all(shots.join("nested")).expect("screenshot folders");
+        std::fs::write(shots.join("shot-1.png"), b"\x89PNG\r\n\x1a\nfirst").expect("png");
+        std::fs::write(shots.join("nested/shot-2.png"), b"\x89PNG\r\n\x1a\nsecond")
+            .expect("nested png");
+        std::fs::write(shots.join("notes.txt"), b"not a png").expect("text");
+        std::fs::write(shots.join("fake.png"), b"GIF89a not a png").expect("fake png");
+        let large = std::fs::File::create(shots.join("large.png")).expect("large png");
+        large
+            .set_len(MAX_SCREENSHOT_BYTES + 1)
+            .expect("sparse large png");
+        // A directory link must be skipped, not followed (following it would
+        // loop back into the checkout forever).
+        let link = checkout_dir
+            .path()
+            .join(".coding")
+            .join("browser")
+            .join("screenshots")
+            .join("loop");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(checkout_dir.path(), &link).expect("directory symlink");
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(checkout_dir.path())
+                .output()
+                .expect("mklink process");
+            assert!(
+                output.status.success(),
+                "mklink failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let archived = archive_worker_screenshots(&checkout, &archive)
+            .await
+            .expect("archive screenshots");
+        assert_eq!(archived, 2, "only genuine PNG files are archived");
+        assert_eq!(
+            std::fs::read(archive.join("shot-1.png")).expect("archived png"),
+            b"\x89PNG\r\n\x1a\nfirst"
+        );
+        assert_eq!(
+            std::fs::read(archive.join("nested/shot-2.png")).expect("archived nested png"),
+            b"\x89PNG\r\n\x1a\nsecond"
+        );
+        assert!(!archive.join("notes.txt").exists());
+        assert!(!archive.join("fake.png").exists());
+        assert!(!archive.join("large.png").exists());
+        assert!(!archive.join("loop").exists());
+
+        // Idempotent: a second run keeps the archived copies.
+        assert_eq!(
+            archive_worker_screenshots(&checkout, &archive)
+                .await
+                .expect("second archive"),
+            2
+        );
+        // A checkout without a screenshot folder archives nothing.
+        let (_empty_dir, empty) = canonical_tempdir();
+        let (_other_dir, other_archive) = canonical_tempdir();
+        assert_eq!(
+            archive_worker_screenshots(&empty, &other_archive)
+                .await
+                .expect("no screenshot folder"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_screenshot_in_a_held_checkout_is_read_from_the_checkout() {
+        let (root, checkout) = legacy_checkout();
+        let shots = checkout.join(SCREENSHOT_DIR);
+        std::fs::create_dir_all(&shots).expect("checkout screenshots");
+        std::fs::write(shots.join("shot.png"), b"\x89PNG\r\n\x1a\nfrom checkout")
+            .expect("checkout png");
+        let archive = root.path().join("archive");
+        std::fs::create_dir_all(&archive).expect("archive");
+        std::fs::write(archive.join("shot.png"), b"\x89PNG\r\n\x1a\nfrom archive")
+            .expect("archived png");
+        let record = worker(root.path(), &checkout);
+
+        let data = worker_screenshot(
+            root.path(),
+            &record,
+            ".coding/browser/screenshots/shot.png",
+            Some(&archive),
+        )
+        .await
+        .expect("held checkout screenshot");
+
+        assert_eq!(decode_png(&data), b"\x89PNG\r\n\x1a\nfrom checkout");
+    }
+
+    #[tokio::test]
+    async fn a_released_workers_missing_screenshot_says_it_is_no_longer_available() {
+        let (root, _checkout) = legacy_checkout();
+        let archive = root.path().join("archive");
+        std::fs::create_dir_all(&archive).expect("archive");
+        let mut record = worker(root.path(), &root.path().join(".worktrees/agent-abcd1234"));
+        record.status = crate::mnemo2::team::WorkerStatus::Merged;
+        record.worktree = PathBuf::new();
+
+        let error = worker_screenshot(
+            root.path(),
+            &record,
+            ".coding/browser/screenshots/shot.png",
+            Some(&archive),
+        )
+        .await
+        .expect_err("a screenshot merged before the archive existed is gone");
+
+        assert_eq!(error, SCREENSHOT_NO_LONGER_AVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_merged_workers_screenshot_thumbnail_still_loads() {
+        let (root, _checkout) = legacy_checkout();
+        let archive = root.path().join("archive");
+        std::fs::create_dir_all(&archive).expect("archive");
+        std::fs::write(archive.join("shot.png"), b"\x89PNG\r\n\x1a\nthumb")
+            .expect("archived png");
+        let mut record = worker(root.path(), &root.path().join(".worktrees/agent-abcd1234"));
+        record.status = crate::mnemo2::team::WorkerStatus::Merged;
+        record.worktree = PathBuf::new();
+
+        let data = worker_tool_image(
+            root.path(),
+            &record,
+            ".coding/browser/screenshots/shot.png",
+            Some(&archive),
+        )
+        .await
+        .expect("the tool card's screenshot thumbnail loads from the archive");
+
+        assert_eq!(decode_png(&data), b"\x89PNG\r\n\x1a\nthumb");
     }
 }

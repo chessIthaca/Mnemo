@@ -505,7 +505,13 @@ impl TeamRuntime {
                 .filter(|(id, _)| id != &worker.id)
                 .map(|(_, checkout)| checkout.clone())
                 .collect();
-            recover_worker(&options.workspace_root, worker, &other_worktrees).await?;
+            recover_worker(
+                &options.workspace_root,
+                worker,
+                &other_worktrees,
+                &options.state_dir,
+            )
+            .await?;
         }
         // A proof a hard kill interrupted leaves its checkout reverse-applied;
         // the claim marker names the tip to repair it back to (finding
@@ -584,6 +590,15 @@ impl TeamRuntime {
     /// Subscribe to plan-board signals (UI refreshes and lead notices).
     pub fn subscribe_board(&self) -> broadcast::Receiver<BoardSignal> {
         self.signals.subscribe()
+    }
+
+    /// The folder the team's ledger, transcripts and archived screenshots
+    /// live in.
+    pub(crate) fn state_dir(&self) -> &Path {
+        self.persistence
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
     }
 
     /// Tell subscribers the board may have changed.

@@ -98,9 +98,14 @@ async fn phase_two_ledgers_load_with_phase_three_defaults() {
     assert!(worker.inbox.is_empty());
     // Legacy ledgers predate review risk: they decode as standard.
     assert_eq!(worker.review_risk, "standard");
-    recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0], &[])
-        .await
-        .expect("legacy recovery");
+    recover_worker(
+        std::path::Path::new("unused"),
+        &mut persisted.workers[0],
+        &[],
+        std::path::Path::new("unused"),
+    )
+    .await
+    .expect("legacy recovery");
     assert!(persisted.workers[0].error.is_none());
     assert_eq!(persisted.workers[0].total_tokens, 120);
     assert_eq!(persisted.workers[0].prompt_tokens, 120);
@@ -2611,6 +2616,7 @@ fn create_directory_link(link: &std::path::Path, target: &std::path::Path) {
 #[tokio::test]
 async fn a_half_removed_checkout_is_finished_after_merge() {
     let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
     init_git(root.path());
     let worker = worker(root.path(), "00000001000000000001");
     provision_agent_worktree(
@@ -2623,7 +2629,7 @@ async fn a_half_removed_checkout_is_finished_after_merge() {
     deregister_worktree(root.path(), &worker.id);
     assert!(worker.worktree.join(".git").is_file());
 
-    cleanup_agent_worktree(root.path(), &worker, &[])
+    cleanup_agent_worktree(root.path(), &worker, &[], state.path())
         .await
         .expect("finish removing the half-removed checkout");
 
@@ -2921,6 +2927,7 @@ async fn a_held_checkout_falls_back_to_the_foreground_removal_and_reports_it() {
 async fn leftover_removal_never_leaves_the_worker_folder() {
     let root = tempfile::tempdir().expect("workspace");
     let outside = tempfile::tempdir().expect("outside");
+    let state = tempfile::tempdir().expect("state");
     init_git(root.path());
     let leftover = worker(root.path(), "00000001000000000001");
     std::fs::create_dir_all(&leftover.worktree).expect("leftover checkout");
@@ -2931,7 +2938,7 @@ async fn leftover_removal_never_leaves_the_worker_folder() {
     let main_marker = root.path().join("README.md");
     let original_main = std::fs::read(&main_marker).expect("main checkout marker");
 
-    cleanup_agent_worktree(root.path(), &leftover, &[])
+    cleanup_agent_worktree(root.path(), &leftover, &[], state.path())
         .await
         .expect("remove only the leftover checkout");
     assert!(!leftover.worktree.exists());
@@ -2945,7 +2952,7 @@ async fn leftover_removal_never_leaves_the_worker_folder() {
     let outside_marker = outside.path().join("keep.txt");
     std::fs::write(&outside_marker, "outside\n").expect("outside marker");
     create_directory_link(&linked.worktree, outside.path());
-    let error = cleanup_agent_worktree(root.path(), &linked, &[])
+    let error = cleanup_agent_worktree(root.path(), &linked, &[], state.path())
         .await
         .expect_err("a junction or symlink at the checkout path is refused");
     assert!(error.contains("refus"), "unexpected error: {error}");
@@ -12356,6 +12363,119 @@ async fn a_merged_workers_pool_is_reused_by_the_next_dispatch() {
     assert_eq!(
         mnemo::app::worktrees::current_branch(&pool).expect("reused pool branch"),
         second.branch
+    );
+    team.shutdown().await;
+}
+
+/// The regression for a Landed worker's screenshots: the checkout is released
+/// on merge, the next dispatch reuses and cleans the pool folder, and the
+/// preview must still open the screenshot from Mnemo's own archive.
+#[tokio::test]
+async fn a_merged_workers_screenshot_still_opens() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    run_git(root.path(), &["checkout", "-b", "wt/mnemo"]);
+    std::fs::write(
+        root.path().join(".git/info/exclude"),
+        "target/\nnode_modules/\n",
+    )
+    .expect("ignore build caches");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let first = provision_pool_worker(&team, "shotsa0001").await;
+    let pool = first.worktree.clone();
+    // The offscreen browser writes its PNG inside the worker's checkout.
+    let relative = ".coding/browser/screenshots/shot-1.png";
+    let screenshot = pool.join(relative);
+    std::fs::create_dir_all(screenshot.parent().expect("screenshot folder"))
+        .expect("screenshot folder");
+    std::fs::write(&screenshot, b"\x89PNG\r\n\x1a\nreal worker screenshot")
+        .expect("worker screenshot");
+    make_worker_reviewable(&team, &first).await;
+
+    let merged = team.merge(&first.id).await.expect("merge pool worker");
+    assert_eq!(
+        merged.error, None,
+        "archiving keeps the release from refusing over the screenshot"
+    );
+    assert!(merged.worktree.as_os_str().is_empty());
+    assert!(
+        !screenshot.exists(),
+        "the archived screenshot leaves the checkout"
+    );
+    let archive = crate::mnemo2::workbench::screenshot_archive_dir(state.path(), &merged.id);
+    assert!(archive.is_some(), "the worker id names an archive folder");
+    let opened = crate::mnemo2::workbench::worker_screenshot(
+        root.path(),
+        &merged,
+        relative,
+        archive.as_deref(),
+    )
+    .await
+    .expect("a merged worker's screenshot opens from the archive");
+    assert!(opened.starts_with("data:image/png;base64,"));
+
+    // The next dispatch reuses the pool; its clean wipes whatever the first
+    // worker left there, and the archived copy must still open.
+    let second = provision_pool_worker(&team, "shotsb0001").await;
+    assert_eq!(second.worktree, pool);
+    let reopened = crate::mnemo2::workbench::worker_screenshot(
+        root.path(),
+        &merged,
+        relative,
+        archive.as_deref(),
+    )
+    .await
+    .expect("the screenshot survives the pool reuse");
+    assert!(reopened.starts_with("data:image/png;base64,"));
+    team.shutdown().await;
+
+    // A restarted Mnemo2 reads the same archive from disk.
+    let saved = TeamPersistence::new(state.path())
+        .load()
+        .expect("load the merged ledger")
+        .expect("saved merged ledger");
+    let team = open_test_team(root.path(), state.path(), saved.workers).await;
+    let restarted = team.worker(&first.id).await.expect("merged worker");
+    let after_restart = crate::mnemo2::workbench::worker_screenshot(
+        root.path(),
+        &restarted,
+        relative,
+        archive.as_deref(),
+    )
+    .await
+    .expect("the screenshot survives a restart");
+    assert!(after_restart.starts_with("data:image/png;base64,"));
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_a_worker_removes_its_screenshot_archive() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    std::fs::write(
+        root.path().join(".git/info/exclude"),
+        "target/\nnode_modules/\n",
+    )
+    .expect("ignore build caches");
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let worker = provision_pool_worker(&team, "shotdel001").await;
+    team.update_worker(&worker.id, |current| current.status = WorkerStatus::Failed)
+        .await;
+    let archive = crate::mnemo2::workbench::screenshot_archive_dir(state.path(), &worker.id)
+        .expect("the worker id names an archive folder");
+    std::fs::create_dir_all(&archive).expect("archive folder");
+    std::fs::write(archive.join("shot.png"), b"\x89PNG\r\n\x1a\npng")
+        .expect("archived screenshot");
+
+    team.delete_workers(std::slice::from_ref(&worker.id), true)
+        .await
+        .expect("delete the worker");
+
+    assert!(
+        !archive.exists(),
+        "deleting a worker deletes its archived screenshots"
     );
     team.shutdown().await;
 }

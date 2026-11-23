@@ -13269,23 +13269,29 @@ async fn drain_notice_within(
     }
 }
 
-/// The next lead notice whose text contains `needle`, however long the work
-/// behind it takes: no wall-clock budget, so a loaded machine cannot fail
-/// the wait. For a check run, whose notice always comes: the run's own
-/// notice, or the supervisor's when the run panics or is cancelled.
+/// The next lead notice whose text contains `needle`, for a background run
+/// (a check run, a proof) whose notice always comes. It wakes on the board
+/// event itself, not on a poll. The 120 s bound only turns a run that never
+/// sends its notice into a failure instead of a hung suite; it is no
+/// estimate of how long the run takes on a loaded machine.
 async fn next_notice(
     receiver: &mut tokio::sync::broadcast::Receiver<BoardSignal>,
     needle: &str,
 ) -> String {
-    loop {
-        match receiver.recv().await {
-            Ok(BoardSignal::Notice { text, .. }) if text.contains(needle) => return text,
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                panic!("the board closed before a notice containing {needle:?}")
+    let wait = async {
+        loop {
+            match receiver.recv().await {
+                Ok(BoardSignal::Notice { text, .. }) if text.contains(needle) => return text,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("the board closed before a notice containing {needle:?}")
+                }
             }
         }
-    }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), wait)
+        .await
+        .unwrap_or_else(|_| panic!("no notice containing {needle:?} within 120 s"))
 }
 
 /// A team whose board holds a `bug_fixing` plan naming `regression_proves_red`
@@ -13479,9 +13485,7 @@ async fn red_outcome_records_a_passed_check_and_notice() {
     team.prove_regression_tool(&worker_id)
         .await
         .expect("start the red proof");
-    let notice = drain_notice(&mut notices, "regression proof for")
-        .await
-        .expect("the proof finishes with a notice");
+    let notice = next_notice(&mut notices, "regression proof for").await;
     assert!(notice.contains("red (fails without the fix)"), "{notice}");
     let check = eventually(|| async {
         team.worker(&worker_id).await.ok().and_then(|worker| {
@@ -13518,9 +13522,7 @@ async fn not_red_outcome_opens_a_high_finding() {
     team.prove_regression_tool(&worker_id)
         .await
         .expect("start the red proof");
-    let notice = drain_notice(&mut notices, "regression proof for")
-        .await
-        .expect("the proof finishes with a notice");
+    let notice = next_notice(&mut notices, "regression proof for").await;
     assert!(
         notice.contains("NOT red, finding regression-not-red opened"),
         "{notice}"

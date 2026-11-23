@@ -67,11 +67,14 @@
   /**
    * A worker can move to another model unless its task is over. An audit
    * moves like any worker until it delivers its report; once it has
-   * reported it is locked. A worker mid-run switches live: the current
-   * call finishes, the next one uses the new model.
+   * reported it is locked. A Claude Code agent worker never ran the tier's
+   * Mnemo model, so its choice comes from its tier's agent setting and the
+   * picker stays locked. A worker mid-run switches live: the current call
+   * finishes, the next one uses the new model.
    */
   const modelChangeable = $derived(
-    (!audit || !auditFinished) &&
+    !worker.runsAsAgent &&
+      (!audit || !auditFinished) &&
       models.some((model) => model.spec === modelSpec) &&
       !["merging", "merged", "cancelled"].includes(worker.status),
   );
@@ -159,7 +162,11 @@
               {:else}
                 <span
                   class="model-locked"
-                  title={auditFinished ? "This audit has reported, so its model cannot change" : "This worker's task is over, so its model cannot change"}
+                  title={worker.runsAsAgent
+                    ? "This worker runs as a Claude Code agent; its tier's agent setting chooses the model"
+                    : auditFinished
+                      ? "This audit has reported, so its model cannot change"
+                      : "This worker's task is over, so its model cannot change"}
                 ><ModelBadge model={worker.model} /></span>
               {/if}
             </span>

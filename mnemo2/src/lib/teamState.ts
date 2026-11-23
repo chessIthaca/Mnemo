@@ -150,6 +150,14 @@ export interface TeamWorkerRecord {
   plan_step?: number | null;
   /** The model tier the lead dispatched by, when it used one. */
   tier?: string | null;
+  /**
+   * The Claude Code model this worker runs as (`opus`, `sonnet`, `haiku`,
+   * `fable`), when the step was handed to the lead's own Claude Code agent
+   * instead of a Mnemo worker session; absent on a worker that runs on Mnemo.
+   */
+  claude_agent?: string | null;
+  /** The Claude Code effort such an agent runs at; null when its tier sets none. */
+  claude_agent_effort?: string | null;
   merge: TeamMergeRecord | null;
   error: string | null;
   /** Serde-defaulted on the host: absent means an implementation worker. */

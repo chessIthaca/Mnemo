@@ -32,6 +32,17 @@ export function elapsedFromMs(milliseconds: number): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
+/**
+ * The model a worker actually runs on: a Claude Code agent worker runs as
+ * `claude-code/<agent>` (the spelling `team_status` uses), while its record
+ * keeps the tier's Mnemo model on purpose so a handed-back worker resumes on
+ * it. Null for a worker that runs on a Mnemo session.
+ */
+function agentModel(record: TeamWorkerRecord): string | null {
+  const agent = record.claude_agent;
+  return typeof agent === "string" && agent.length > 0 ? `claude-code/${agent}` : null;
+}
+
 export function mergeFromRecord(worker: TeamWorkerRecord, merge: TeamMergeRecord): MergeRecord {
   return {
     id: `merge-${worker.id}-${merge.commit}`,
@@ -44,7 +55,7 @@ export function mergeFromRecord(worker: TeamWorkerRecord, merge: TeamMergeRecord
     deletions: merge.deletions,
     checks: merge.checks,
     reviewSummary: merge.review_summary,
-    model: merge.worker_model ?? worker.model_id ?? worker.model ?? "",
+    model: agentModel(worker) ?? merge.worker_model ?? worker.model_id ?? worker.model ?? "",
     tokens: merge.worker_tokens,
     cost: merge.cost_micros == null ? null : merge.cost_micros / 1_000_000,
     time: timeFromMs(merge.merged_at_ms),
@@ -153,6 +164,10 @@ export function buildWorker(
     failed: 70,
     cancelled: 0,
   };
+  // A Claude Code agent worker has no Mnemo session: the tier's model never
+  // ran, so the view shows the agent it actually runs as instead.
+  const agent = agentModel(record);
+  const effort = agent !== null ? record.claude_agent_effort : record.reasoning_effort;
   return {
     id: record.id,
     name: workerDisplayName(record.id, record.name),
@@ -162,10 +177,11 @@ export function buildWorker(
     summary: record.error ?? "",
     error: record.error ?? null,
     status,
-    model: record.model_id ?? record.model ?? "",
+    model: agent ?? record.model_id ?? record.model ?? "",
     modelSpec: record.model,
+    runsAsAgent: agent !== null,
     tier: record.tier ?? undefined,
-    reasoningEffort: record.reasoning_effort ?? undefined,
+    reasoningEffort: effort ?? undefined,
     branch: record.branch,
     worktree: record.worktree,
     files: [],

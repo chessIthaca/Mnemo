@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { TeamWorkerRecord } from "../teamState";
-import { buildWorker, elapsedFromMs, timeFromMs } from "./workerView";
+import type { TeamMergeRecord, TeamWorkerRecord } from "../teamState";
+import { buildWorker, elapsedFromMs, mergeFromRecord, timeFromMs } from "./workerView";
 
 /**
  * Characterization tests for the pure worker-view mapping that `store.ts`
@@ -68,5 +68,60 @@ describe("workerView", () => {
 
   it("formats the worker's elapsed time through elapsedFromMs", () => {
     expect(buildWorker(record({ elapsed_ms: 61_000 }), 0, [], "working", null).elapsed).toBe("1m");
+  });
+
+  it("maps the Claude Code agent phase and reads a missing one as no phase", () => {
+    expect(buildWorker(record({ agent_phase: "awaiting_launch" }), 0, [], "working", null).agentPhase).toBe(
+      "awaiting_launch",
+    );
+    expect(buildWorker(record({ agent_phase: "stalled" }), 0, [], "working", null).agentPhase).toBe("stalled");
+    expect(buildWorker(record(), 0, [], "working", null).agentPhase).toBeNull();
+  });
+
+  it("an agent worker shows its Claude Code agent as its model", () => {
+    const worker = buildWorker(
+      record({ model: "Ollama Cloud/glm-5.3", claude_agent: "opus", claude_agent_effort: "medium" }),
+      0,
+      [],
+      "working",
+      null,
+    );
+    // The tier's Mnemo model never ran; the view names the agent that did.
+    expect(worker.model).toBe("claude-code/opus");
+    expect(worker.reasoningEffort).toBe("medium");
+    expect(worker.runsAsAgent).toBe(true);
+    // The record keeps the tier's Mnemo model so a handed-back worker resumes on it.
+    expect(worker.modelSpec).toBe("Ollama Cloud/glm-5.3");
+  });
+
+  it("a Mnemo worker keeps its session model", () => {
+    const worker = buildWorker(record(), 0, [], "working", null);
+    expect(worker.model).toBe("scripted-a");
+    expect(worker.modelSpec).toBe("test/scripted-a");
+    expect(worker.reasoningEffort).toBeUndefined();
+    expect(worker.runsAsAgent).toBe(false);
+  });
+
+  it("a merged agent worker's merge card names the agent model", () => {
+    const merge: TeamMergeRecord = {
+      commit: "abc123",
+      worker_tip: "tip-1",
+      branch: "wt/agent-w1",
+      target: "wt/mnemo",
+      checks: ["workspace tests"],
+      review_summary: "reviewed",
+      files: 1,
+      additions: 2,
+      deletions: 3,
+      worker_model: "Ollama Cloud/glm-5.3",
+      worker_tokens: 10,
+      cost_micros: null,
+      merged_at_ms: 1_787_400_000_000,
+    };
+    const card = mergeFromRecord(record({ claude_agent: "opus" }), merge);
+    expect(card.model).toBe("claude-code/opus");
+
+    const mnemoCard = mergeFromRecord(record(), merge);
+    expect(mnemoCard.model).toBe("Ollama Cloud/glm-5.3");
   });
 });

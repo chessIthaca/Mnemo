@@ -77,10 +77,10 @@ pub const EXTERNAL_LEAD_CHANNEL: &str = "mnemo2://external-lead";
 
 /// The short lead brief MCP `initialize` returns. `{helper}` becomes the
 /// helper executable's path, so the lead can start the waiter without PATH.
-pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers (trivial/routine/medium/high/escalate); you plan, dispatch, review and merge with the team_* tools.\n\
-- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs; memory_write SPEC:/DECISION:/HOW: what the repository cannot show.\n\
+pub const LEAD_INSTRUCTIONS: &str = "You lead a Mnemo2 team for this project: workers run on the user's own endpoints in tiers; you plan, dispatch, review and merge with the team_* tools.\n\
+- Mandatory memory workflow: memory_search before planning and before diagnosing bugs; plan_create kind bug_fixing for bugs, recording its regression_test as the bare test name (no file path or module prefix); memory_write SPEC:/DECISION:/HOW: what the repository cannot show.\n\
 - For code use search (or search_read) and graph_* before Grep or Glob; for project history and decisions use memory_search first.\n\
-- Plan first: plan_create (then plan_show, plan_update, plan_step_done). Each team_dispatch needs a plan_id and step; one worker per step with a precise brief and `tier` (tier beats model).\n\
+- Plan first: plan_create. Each team_dispatch needs a plan_id and step; one worker per step with a precise brief and `tier` (tier beats model).\n\
 - A finished worker sends a notice: team_check, then team_review; close findings with team_resolve_finding; team_merge after the review passes.\n\
 - If a worker fails, team_resume it (worker_id + tier) and team_message it to continue.\n\
 - Notices arrive appended to Mnemo results (\"Since your last call:\") and through hooks. While a worker runs, keep the waiter in the background so a report wakes you; restart it after it returns. Bash: \"{helper}\" wait \u{2014} PowerShell: & \"{helper}\" wait. If a hook gave you a waiter command with --session, use that one.\n\
@@ -908,11 +908,17 @@ impl Shared {
             .workers
             .iter()
             .map(|worker| {
-                let model = worker
-                    .model
-                    .clone()
-                    .or_else(|| worker.model_id.clone())
-                    .unwrap_or_default();
+                // A Claude Code agent worker keeps its tier's Mnemo model in
+                // the record for a hand-back, but its agent does the work:
+                // name the agent, spelled as team_status does.
+                let model = match worker.claude_agent.as_deref() {
+                    Some(agent) if !agent.is_empty() => format!("claude-code/{agent}"),
+                    _ => worker
+                        .model
+                        .clone()
+                        .or_else(|| worker.model_id.clone())
+                        .unwrap_or_default(),
+                };
                 let model_short = short_model_name(&model);
                 json!({
                     "id": worker.id,
@@ -965,7 +971,9 @@ impl Shared {
     /// ([`TeamRuntime::reattach_idle_external_lead`]) — a hook from any other
     /// session must never take the lead. The counters are read first and the
     /// queue is drained last, so the notices are the freshest thing in the
-    /// answer and nothing is held while the board is summarised.
+    /// answer. The team summary is built only for a real SessionStart
+    /// (`session_start` true); every other hook mode sends `"summary": ""`
+    /// and never pays for the records lock and the board read behind it.
     async fn notices(&self, target: Option<Target>, body: Value) -> Response {
         let Some(target) = target else {
             return Response::json(
@@ -997,21 +1005,26 @@ impl Shared {
         };
         let active_workers = team.live_worker_turns().await;
         let waiter_alive = team.external_waiter_alive();
-        // The knowledge map rides only a real SessionStart (plan 373dec00 step
-        // 6): a PostToolUse drain sends the same "drain" mode without the
-        // flag, so it never pays for the file read. A missing INDEX.md (a
-        // project without a corpus, or before the first pass) adds nothing.
+        // The summary and the knowledge map ride only a real SessionStart
+        // (plan 373dec00 step 6): a PostToolUse drain sends the same "drain"
+        // mode without the flag and ignores the summary, so it never pays for
+        // the records lock, the board read or the knowledge file read. A
+        // missing INDEX.md (a project without a corpus, or before the first
+        // pass) adds nothing.
         let session_start = body
             .get("session_start")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut summary = team.external_summary().await;
-        if session_start {
+        let summary = if session_start {
+            let mut summary = team.external_summary().await;
             if let Some(map) = mnemo::memory::knowledge_index::knowledge_map_at(&target.root) {
                 summary.push_str("\n\n");
                 summary.push_str(&map);
             }
-        }
+            summary
+        } else {
+            String::new()
+        };
         let notices = if peek {
             team.current_notices(team.peek_external_notices()).await
         } else {
@@ -2620,6 +2633,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_summary_names_a_claude_code_agent_workers_agent() {
+        use crate::mnemo2::runtime::LeadModel;
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        fixture.rpc(initialize()).await;
+
+        // The high tier runs as a Claude Code agent; its Mnemo model stays in
+        // the worker record for a hand-back.
+        let mut dto = mnemo::headless::TiersDto::default();
+        dto.tiers[0].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].claude_agent = Some("opus".to_string());
+        team.set_catalog(
+            vec![LeadModel {
+                endpoint: "test".to_string(),
+                model: "scripted-a".to_string(),
+                spec: "test/scripted-a".to_string(),
+                is_default: true,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            dto,
+            Vec::new(),
+        );
+        let searched = fixture
+            .call("memory_search", json!({"query": "external lead planning"}))
+            .await;
+        ok_text(&searched);
+        let (_, reply) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": "plan_create", "arguments": {
+                    "title": "Agent summary plan",
+                    "goal": "Prove the summary names the agent model",
+                    "context": "The lead's own agent runs this step; src/lib.rs is the anchor file for the change.",
+                    "steps": ["**One** - edit src/lib.rs"]
+                } }
+            }))
+            .await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let plan_id = reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .strip_prefix("Created plan ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("a plan id")
+            .to_string();
+        let dispatched = fixture
+            .call("team_dispatch", json!({
+                "worker_id": "sumagent001",
+                "plan_id": plan_id,
+                "step": 1,
+                "tier": "high",
+                "brief": "write src/lib.rs"
+            }))
+            .await;
+        assert_eq!(dispatched["result"]["isError"], false, "{dispatched}");
+        let record = team.worker("sumagent001").await.expect("worker record");
+        assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+        assert_eq!(record.model.as_deref(), Some("test/scripted-a"));
+
+        let summary = fixture
+            .lead_post("/lead/summary", json!({ "root": root }))
+            .await;
+        let entry = summary["workers"]
+            .as_array()
+            .expect("workers")
+            .iter()
+            .find(|entry| entry["id"] == "sumagent001")
+            .expect("agent worker");
+        assert_eq!(entry["model"], "claude-code/opus", "{entry}");
+        assert_eq!(entry["model_short"], "opus", "{entry}");
+        // The record keeps the tier's Mnemo model for a hand-back.
+        let record = team.worker("sumagent001").await.expect("worker record");
+        assert_eq!(record.model.as_deref(), Some("test/scripted-a"));
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn show_worker_rejects_an_unknown_worker_without_showing_the_window() {
         let fixture = Fixture::new(true, true, ServerOptions::default()).await;
         let body = json!({
@@ -3076,6 +3170,22 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "unlisted tools named: {missing:?}");
+    }
+
+    #[test]
+    fn lead_instructions_ask_for_the_bare_regression_test_name() {
+        // Plan 5520c914: a bug plan's regression test is looked up as a symbol
+        // at close, so a file path or module prefix leaves the plan open. The
+        // external Claude Code lead reads LEAD_INSTRUCTIONS, so the rule rides
+        // its memory-workflow bullet.
+        assert!(
+            LEAD_INSTRUCTIONS.contains("regression_test as the bare test name"),
+            "LEAD_INSTRUCTIONS must ask for the bare regression-test name"
+        );
+        assert!(
+            LEAD_INSTRUCTIONS.contains("no file path or module prefix"),
+            "the rule must forbid a file path and a module prefix explicitly"
+        );
     }
 
     #[tokio::test]
@@ -3844,7 +3954,14 @@ mod tests {
         let team = fixture.team().await;
         let root = fixture.root.to_string_lossy().into_owned();
 
-        let before = fixture.lead_post("/lead/notices", json!({ "root": root, "mode": "drain" })).await;
+        // The team summary rides only a SessionStart (plan 200ac7a9 step 2):
+        // name the flag here to keep checking what the board reports.
+        let before = fixture
+            .lead_post(
+                "/lead/notices",
+                json!({ "root": root, "mode": "drain", "session_start": true }),
+            )
+            .await;
         assert_eq!(before["attached"], false);
         assert_eq!(before["active_workers"], 0);
         assert_eq!(before["waiter_alive"], false);
@@ -3909,9 +4026,49 @@ mod tests {
             .await;
         let summary = start["summary"].as_str().expect("summary");
         assert!(
+            summary.starts_with("Mnemo2 team:"),
+            "a SessionStart still gets the team summary: {summary}"
+        );
+        assert!(
             summary.contains("Project knowledge (7 records): src/agent 3, general 4."),
             "a SessionStart carries the map: {summary}"
         );
+        fixture.shutdown().await;
+    }
+
+    /// Regression (plan 200ac7a9 step 2): a PostToolUse drain used to build
+    /// the whole team summary — locking the worker records and listing every
+    /// plan from disk — even though the hook reads it only on SessionStart.
+    /// A drain or peek now sends an empty summary; a SessionStart keeps it.
+    #[tokio::test]
+    async fn notices_drain_without_session_start_sends_no_summary() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+
+        let drained = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "drain" }))
+            .await;
+        assert_eq!(drained["summary"], "", "a PostToolUse drain gets no summary");
+        assert_eq!(drained["notices"], json!([]));
+        assert_eq!(drained["attached"], false);
+
+        let peeked = fixture
+            .lead_post("/lead/notices", json!({ "root": root, "mode": "peek" }))
+            .await;
+        assert_eq!(peeked["summary"], "", "a Stop peek gets no summary");
+
+        let start = fixture
+            .lead_post(
+                "/lead/notices",
+                json!({ "root": root, "mode": "drain", "session_start": true }),
+            )
+            .await;
+        let summary = start["summary"].as_str().expect("summary");
+        assert!(
+            summary.starts_with("Mnemo2 team:"),
+            "a SessionStart still gets the team summary: {summary}"
+        );
+        assert!(summary.contains("0 worker(s) running"), "{summary}");
         fixture.shutdown().await;
     }
 

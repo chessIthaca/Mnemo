@@ -75,6 +75,7 @@ describe("WorkerRow", () => {
       activity: {
         phase: "tool",
         toolName: "shell",
+        toolArgs: null,
         turnStartedAtMs: Date.now() - 72_000,
         phaseSinceMs: Date.now() - 5_000,
       },
@@ -100,6 +101,7 @@ describe("WorkerRow", () => {
       activity: {
         phase: "waiting",
         toolName: null,
+        toolArgs: null,
         turnStartedAtMs: Date.now() - 30_000,
         phaseSinceMs: Date.now() - 1_000,
       },
@@ -159,6 +161,7 @@ describe("WorkerRow", () => {
       activity: {
         phase: "tool",
         toolName: "shell",
+        toolArgs: null,
         turnStartedAtMs: Date.now() - 72_000,
         phaseSinceMs: Date.now() - 5_000,
       },
@@ -258,5 +261,48 @@ describe("WorkerRow", () => {
     expect(container.querySelector(".worker-route")).toBeNull();
     // …and the model still sits on the name line.
     expect(container.querySelector(".worker-name .model-badge")?.textContent).toContain("kimi-k3.1-pro");
+  });
+
+  it("shows a worker waiting for its Claude Code agent in place of the working status", () => {
+    const waiting: Worker = { ...worker(), status: "working", agentPhase: "awaiting_launch" };
+    const { container } = render(WorkerRow, { worker: waiting, onSelect: vi.fn() });
+    const label = container.querySelector<HTMLElement>(".status-label");
+    expect(label?.textContent).toBe("Waiting for Claude Code agent");
+    expect(label?.getAttribute("data-agent-phase")).toBe("awaiting_launch");
+    expect(label?.title).toBe("Waiting for Claude Code agent");
+  });
+
+  it("shows a worker whose Claude Code agent is running in place of the working status", () => {
+    const running: Worker = { ...worker(), status: "working", agentPhase: "running" };
+    const { container } = render(WorkerRow, { worker: running, onSelect: vi.fn() });
+    const label = container.querySelector<HTMLElement>(".status-label");
+    expect(label?.textContent).toBe("Claude Code agent running");
+    expect(label?.getAttribute("data-agent-phase")).toBe("running");
+  });
+
+  it("shows a stalled Claude Code agent in place of the working status", () => {
+    const stalled: Worker = { ...worker(), status: "working", agentPhase: "stalled" };
+    const { container } = render(WorkerRow, { worker: stalled, onSelect: vi.fn() });
+    const label = container.querySelector<HTMLElement>(".status-label");
+    expect(label?.textContent).toBe("Claude Code agent silent for 10+ min");
+    expect(label?.getAttribute("data-agent-phase")).toBe("stalled");
+  });
+
+  it("keeps the plain status text once the agent finished", () => {
+    const finished: Worker = { ...worker(), status: "working", agentPhase: "finished" };
+    const { container } = render(WorkerRow, { worker: finished, onSelect: vi.fn() });
+    const label = container.querySelector<HTMLElement>(".status-label");
+    expect(label?.textContent).toBe("Working");
+    expect(label?.getAttribute("data-agent-phase")).toBe("finished");
+    expect(label?.hasAttribute("title")).toBe(false);
+  });
+
+  it("renders a worker with no agent phase exactly as before", () => {
+    const plain: Worker = { ...worker(), status: "working" };
+    const { container } = render(WorkerRow, { worker: plain, onSelect: vi.fn() });
+    const label = container.querySelector<HTMLElement>(".status-label");
+    expect(label?.textContent).toBe("Working");
+    expect(label?.hasAttribute("data-agent-phase")).toBe(false);
+    expect(label?.hasAttribute("title")).toBe(false);
   });
 });

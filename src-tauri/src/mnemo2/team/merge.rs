@@ -19,6 +19,7 @@ use mnemo::app::worktrees::{
 use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
 use crate::mnemo2::ledger::{self, RecordsLedger};
 use crate::mnemo2::phase3::{self, MergeRecord};
+use crate::mnemo2::workbench::keep_worker_screenshots;
 
 use super::audit::validate_audit_linkage;
 use super::deletion::{
@@ -85,18 +86,18 @@ pub(super) async fn cleanup_agent_worktree(
     root: &Path,
     worker: &WorkerRecord,
     other_worktrees: &[PathBuf],
+    state_dir: &Path,
 ) -> Result<(), String> {
     validate_worker_id(&worker.id)?;
     let worktree = match worker_checkout(root, worker) {
         Some(CheckoutKind::Pool(_)) => {
             return match validated_checkout(root, worker, other_worktrees)? {
                 Some(CheckoutKind::Pool(canonical)) => {
-                    release_pool_checkout(
-                        root.to_path_buf(),
-                        canonical,
-                        worker.branch.clone(),
-                    )
-                    .await
+                    // Keep the screenshots before the checkout goes back to the
+                    // pool: the next dispatch's clean would otherwise wipe them.
+                    keep_worker_screenshots(&worker.id, &canonical, state_dir).await;
+                    release_pool_checkout(root.to_path_buf(), canonical, worker.branch.clone())
+                        .await
                 }
                 Some(CheckoutKind::Legacy(_)) => unreachable!("pool record changed kind"),
                 None => Ok(()),
@@ -105,6 +106,9 @@ pub(super) async fn cleanup_agent_worktree(
         Some(CheckoutKind::Legacy(worktree)) => worktree,
         None => return Ok(()),
     };
+    // The checkout is removed (or falls to the leftover path): keep the
+    // screenshots first, so neither a removal nor a retry can lose them.
+    keep_worker_screenshots(&worker.id, &worktree, state_dir).await;
     match std::fs::symlink_metadata(&worktree) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -322,6 +326,9 @@ impl TeamRuntime {
     /// `by_lead` is true when the lead itself asked, from inside its turn.
     pub(super) async fn merge_as(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
         let worker = self.merge_locked(worker_id, by_lead).await?;
+        // A reported audit of the merged worker has nothing left to do; an
+        // unreported one keeps running (plan aa4903ac).
+        self.close_audits_of(worker_id, false).await;
         self.after_merge(&worker).await;
         self.signal_board_changed();
         Ok(worker)
@@ -509,7 +516,14 @@ impl TeamRuntime {
             Some(CheckoutKind::Pool(_))
         );
         let other_worktrees = self.other_held_checkouts(&worker.id).await;
-        match cleanup_agent_worktree(&self.workspace_root, &worker, &other_worktrees).await {
+        match cleanup_agent_worktree(
+            &self.workspace_root,
+            &worker,
+            &other_worktrees,
+            self.state_dir(),
+        )
+        .await
+        {
             Err(err) => {
                 self.update_worker(worker_id, |worker| {
                     worker.error = Some(format!("{WORKTREE_CLEANUP_ERROR}: {err}"));
@@ -524,6 +538,10 @@ impl TeamRuntime {
                     })
                     .await;
                     self.persist().await?;
+                    // The record no longer holds the pool: drop the free pools
+                    // above the slot count (plan 2e15085a). The merge lock is
+                    // held; the trim takes the checkout pool lock after it.
+                    self.trim_idle_pools().await;
                 }
                 // The checkout no longer holds the branch. The
                 // merge commit keeps the worker's tip as its second parent, so
@@ -609,9 +627,14 @@ impl TeamRuntime {
                 Some(CheckoutKind::Pool(_))
             );
             let other_worktrees = self.other_held_checkouts(&candidate.id).await;
-            if cleanup_agent_worktree(&self.workspace_root, &candidate, &other_worktrees)
-                .await
-                .is_err()
+            if cleanup_agent_worktree(
+                &self.workspace_root,
+                &candidate,
+                &other_worktrees,
+                self.state_dir(),
+            )
+            .await
+            .is_err()
             {
                 continue;
             }

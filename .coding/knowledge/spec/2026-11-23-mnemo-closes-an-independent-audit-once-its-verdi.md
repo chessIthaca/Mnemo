@@ -1,0 +1,7 @@
++++
+title = "Mnemo closes an independent audit once its verdict is used"
+created = "2026-11-23"
+evidence = "Tests an_adjudicated_audit_is_closed_and_frees_its_slot, an_audit_closes_when_its_target_merges, an_unreported_audit_stays_open_after_its_target_merges, deleting_a_target_stops_its_audit, merge_and_stop_refresh_the_board; lead checks green 2026-11-23."
++++
+
+An audit worker stays live after reporting so the lead can ask follow-ups, but Mnemo closes it itself: (a) right after a team_review on its target that links it as independent_reviewer_id, (b) when its target is merged or stopped, if the audit has reported (an unreported audit keeps running), (c) when its target is deleted, reported or not. Closing ends the session (frees the slot), releases its pool checkout, keeps the record (report, findings, routing) and leaves it Stopped, with no lead notice and no routing outcome row; failures are logged and never fail the triggering review/merge. The window labels a reported audit 'Reported' while Completed and 'Audit used' once Stopped, both under Done. team_stop now also emits the board-changed signal. So a lead must ask any follow-up questions before recording the review that links the audit. Code: src-tauri/src/mnemo2/team/audit.rs close_used_audit / close_audits_of, review.rs review wrapper, merge.rs merge_as, control.rs stop, deletion.rs; mnemo2/src/lib/types.ts workerStatusText.

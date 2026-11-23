@@ -5,18 +5,19 @@
 //! Independent audits: the read-only audit worker dispatch plus the
 //! brief and linkage helpers that path needs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use mnemo::app::worktrees::{
-    agent_branch, agent_short_id, provision_agent_checkout, rollback_agent_checkout,
+    agent_branch, agent_short_id, is_pool_checkout, provision_agent_checkout,
+    release_pool_checkout, rollback_agent_checkout,
 };
 
 use crate::mnemo2::phase3;
 use crate::mnemo2::phase3::ReviewEvidence;
 
-use super::record::{validate_worker_id, WorkerRecord, WorkerStatus};
+use super::record::{audit_finished, validate_worker_id, WorkerRecord, WorkerStatus};
 use super::routing::tier_ids;
 use super::TeamRuntime;
 
@@ -465,5 +466,116 @@ impl TeamRuntime {
             });
         }
         self.start_worker(record).await
+    }
+
+    /// Close an audit whose verdict is used (plan aa4903ac): end its session
+    /// the way `team_stop` does (its slot frees), give back its read-only
+    /// pool checkout, and leave it `Stopped` with its report, findings and
+    /// routing kept for history. No lead notice: the lead caused it.
+    ///
+    /// Takes the merge lock, so a trigger (review, merge, stop) calls it
+    /// after its own change is persisted and its guard released. A missing,
+    /// non-audit or already-closed record is a no-op, and a failure is only
+    /// logged: it never fails the review or merge that triggered it.
+    pub(super) async fn close_used_audit(&self, audit_id: &str) {
+        let _guard = self.merge_lock.lock().await;
+        self.close_used_audit_locked(audit_id).await;
+    }
+
+    /// Close the audits of `target_id` once the target is merged, stopped or
+    /// deleted: a reported audit always, an unreported one only when
+    /// `include_unreported` (a deleted target can no longer be adjudicated).
+    /// Takes the merge lock, like [`TeamRuntime::close_used_audit`].
+    pub(super) async fn close_audits_of(&self, target_id: &str, include_unreported: bool) {
+        let _guard = self.merge_lock.lock().await;
+        self.close_audits_of_locked(target_id, include_unreported).await;
+    }
+
+    /// [`TeamRuntime::close_audits_of`] for a caller already holding the
+    /// merge lock.
+    pub(super) async fn close_audits_of_locked(&self, target_id: &str, include_unreported: bool) {
+        let audits: Vec<String> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|record| {
+                record.kind == "audit"
+                    && record.audit_target.as_deref() == Some(target_id)
+                    && (include_unreported || audit_finished(record))
+            })
+            .map(|record| record.id.clone())
+            .collect();
+        for audit_id in audits {
+            self.close_used_audit_locked(&audit_id).await;
+        }
+    }
+
+    /// [`TeamRuntime::close_used_audit`] for a caller already holding the
+    /// merge lock. Lock order: the merge lock, then the checkout pool lock,
+    /// as audit dispatch takes them.
+    async fn close_used_audit_locked(&self, audit_id: &str) {
+        let Ok(audit) = self.worker(audit_id).await else {
+            return;
+        };
+        if audit.kind != "audit"
+            || matches!(
+                audit.status,
+                WorkerStatus::Cancelled | WorkerStatus::Merged | WorkerStatus::Merging
+            )
+        {
+            return;
+        }
+        let live = self.live.lock().await.contains_key(audit_id);
+        let holds_pool = is_pool_checkout(&audit.worktree);
+        if audit.status == WorkerStatus::Stopped && !live && !holds_pool {
+            return;
+        }
+        if audit.status != WorkerStatus::Stopped || live {
+            if let Err(error) = self.stop_inner(audit_id).await {
+                eprintln!("team: could not close the used audit {audit_id}: {error}");
+                self.signal_board_changed();
+                return;
+            }
+        }
+        if holds_pool {
+            self.release_audit_checkout(audit_id, audit.worktree, audit.branch)
+                .await;
+        }
+        self.signal_board_changed();
+    }
+
+    /// Give back a closed audit's pool checkout the way a merge releases a
+    /// pool: it is read-only, so there is nothing to keep. A released pool is
+    /// followed by the idle-pool trim — AFTER the checkout pool lock guard is
+    /// dropped, because the trim takes that lock itself.
+    async fn release_audit_checkout(&self, audit_id: &str, checkout: PathBuf, branch: String) {
+        let released = {
+            let _checkout_pool_guard = self.checkout_pool_lock.lock().await;
+            if self.live.lock().await.contains_key(audit_id) {
+                return;
+            }
+            match release_pool_checkout(self.workspace_root.clone(), checkout.clone(), branch).await
+            {
+                Ok(()) => {
+                    self.update_worker(audit_id, |worker| worker.worktree = PathBuf::new())
+                        .await;
+                    if let Err(error) = self.persist().await {
+                        eprintln!("team: could not save the closed audit {audit_id}: {error}");
+                    }
+                    true
+                }
+                Err(error) => {
+                    eprintln!(
+                        "team: kept the pool checkout {} of the closed audit {audit_id}: {error}",
+                        checkout.display()
+                    );
+                    false
+                }
+            }
+        };
+        if released {
+            self.trim_idle_pools().await;
+        }
     }
 }

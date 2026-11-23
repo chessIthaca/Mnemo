@@ -18,6 +18,7 @@ use serde::Serialize;
 use crate::mnemo2::dispatch_routing::RoutingMode;
 use crate::mnemo2::lock_holders;
 use crate::mnemo2::phase3;
+use crate::mnemo2::workbench::{keep_worker_screenshots, screenshot_archive_dir};
 
 use super::merge::{landing_worker_name, owns_its_branch};
 use super::nudge::nudge_ignored_row;
@@ -737,6 +738,10 @@ pub async fn cleanup_workspace(
             ));
             continue;
         }
+        // Keep the screenshots before the checkout is released or removed, and
+        // before the cleanliness check below: an untracked screenshot would
+        // otherwise retain the checkout and block its release.
+        keep_worker_screenshots(&id, &checkout, state_dir).await;
         if std::fs::symlink_metadata(&checkout).is_ok() {
             let registered = checkout_is_registered(root, &checkout).await?;
             let mut removal_error = None;
@@ -958,11 +963,25 @@ impl TeamRuntime {
             }
         }
         // Phase D: delete each worker — one failure never stops the rest.
+        let mut deleted = Vec::new();
         for (position, deletion) in deletions {
-            if let Err(error) = self.delete_one(&deletion).await {
-                outcomes[position].error = Some(error.clone());
+            match self.delete_one(&deletion).await {
+                Ok(()) => deleted.push(deletion.worker_id),
+                Err(error) => outcomes[position].error = Some(error.clone()),
             }
             on_result(outcomes[position].clone());
+        }
+        // A deleted target can no longer be adjudicated, so its audits are
+        // closed, reported or not (plan aa4903ac). This runs after the whole
+        // batch, so an audit deleted in the same batch is already gone.
+        for worker_id in &deleted {
+            self.close_audits_of_locked(worker_id, true).await;
+        }
+        // The deletion released those pools: drop the free pools above the
+        // slot count as well (plan 2e15085a). The merge lock is held, and the
+        // trim takes the checkout pool lock after it.
+        if !deleted.is_empty() {
+            self.trim_idle_pools().await;
         }
         Ok(TeamDeleteOutcome {
             results: outcomes,
@@ -1194,7 +1213,21 @@ impl TeamRuntime {
             .lock()
             .await
             .retain(|message| message.worker_id != record.id);
-        self.persist().await
+        self.persist().await?;
+        // The record is gone from the ledger, so the worker's archived
+        // screenshots go with it - best effort, like the transcript sweep
+        // `persist` just did.
+        if let Some(archive) = screenshot_archive_dir(self.state_dir(), &record.id) {
+            if let Err(error) = std::fs::remove_dir_all(&archive) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "mnemo2: could not remove the screenshot archive {}: {error}",
+                        archive.display()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Release a pool checkout in place, or rename a legacy checkout into

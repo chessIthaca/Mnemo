@@ -258,7 +258,7 @@ describe("LeadChat", () => {
     setLeadEntries(entries);
     render(LeadChat);
 
-    const shellSummary = screen.getByText("Running a command").closest("summary")!;
+    const shellSummary = screen.getByText("Running tests").closest("summary")!;
     expect(shellSummary.textContent).not.toContain("shell");
     expect(shellSummary.textContent).toContain("0:09");
     expect(shellSummary.textContent).not.toContain("now");
@@ -266,7 +266,7 @@ describe("LeadChat", () => {
     expect(screen.getByText("Writing README.md")).toBeTruthy();
     // The status cell carries no status word now — the card's own label still does.
     expect(shellSummary.querySelector(".tool-status")?.textContent?.trim()).toBe("0:09");
-    expect(screen.getByLabelText("Running a command — Running")).toBeTruthy();
+    expect(screen.getByLabelText("Running tests — Running")).toBeTruthy();
     expect(screen.getByText("Reading README.md").closest("summary")?.textContent).not.toContain("Completed");
     expect(screen.getByLabelText("Reading README.md — Completed")).toBeTruthy();
     expect(screen.getByText("Failed")).toBeTruthy();
@@ -274,8 +274,8 @@ describe("LeadChat", () => {
     expect(screen.getByText("permission denied")).toBeTruthy();
     expect(screen.queryByText("read 42 lines")).toBeNull();
 
-    await fireEvent.click(screen.getByText("Running a command"));
-    const shellCard = screen.getByLabelText("Running a command — Running");
+    await fireEvent.click(screen.getByText("Running tests"));
+    const shellCard = screen.getByLabelText("Running tests — Running");
     expect(shellCard.querySelector("details")?.open).toBe(true);
     expect(await within(shellCard).findByText("shell")).toBeTruthy();
     // the command block is the body now; the raw JSON call sits behind the toggle
@@ -345,7 +345,7 @@ describe("LeadChat", () => {
     expect(finished.textContent).not.toContain("0:05");
     const finishedTime = finished.querySelector<HTMLElement>(".elapsed-time")!;
     expect(finishedTime.getAttribute("title")).toBe("Turn time 0:04 · this call 0:04");
-    const running = screen.getByText("Running a command").closest("summary")!;
+    const running = screen.getByText("Running tests").closest("summary")!;
     expect(running.textContent).toContain("0:07");
     // The call's own 3 s (6000 → 9000), not the 8 s wait since the batch was announced.
     const runningTime = running.querySelector<HTMLElement>(".elapsed-time")!;

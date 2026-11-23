@@ -1,0 +1,7 @@
++++
+title = "The `job` tool starts a long command and waits for it in one call; the window shows job calls like shell calls"
+created = "2026-11-23"
+evidence = "Lead checks pass on the combined tree 2026-11-23; field and state names verified on both sides (jobs.rs job_data / JobStatus::word vs jobCards.ts jobOutcome); tests job_waits_for_a_short_command_and_returns_its_result, job_start_is_not_a_registered_tool, jobCards.test.ts."
++++
+
+Workers run long builds/tests with `job {command, purpose, cwd?, wait_s?, pattern?}`: it starts a background job (no silence limit, 3-hour cap) and waits server-side (wait_s default 600, clamped to 1800; 0 returns the id at once). It returns when the job ends, when a NEW output line matches `pattern`, or with 'still running' plus the id for `job_wait`. `job_start` was renamed, not aliased. job_wait/job_tail/job_kill act on an id. Every job tool's result data is {job_id, purpose, command, state: running|exited|killed|failed, exit_code when exited}; `job` adds waited_s. The executor guardrail (integration/stash denies) and the audit exclude list name `job`. The window (mnemo2/src/lib/jobCards.ts, used by ToolActivity.svelte) titles these calls `job · <purpose> — <state>` and renders job/job_start bodies like shell; old job_start transcripts fall back to their arguments. Code: src/tool/agent/jobs.rs (JobStartTool now named job, job_data, wait_report), src-tauri/src/mnemo2/team/guardrails.rs, src/agent/prompt.rs worker bullet.

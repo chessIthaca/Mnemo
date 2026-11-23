@@ -3,15 +3,14 @@
 //
 // - `mnemo2/plugin/bin/` is what the plugin's MCP server and hooks run
 //   (`${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp`). `claude plugin install` copies
-//   the plugin into Claude Code's plugin cache, so an installed plugin keeps
-//   the helper it was installed with.
+//   the plugin into Claude Code's plugin cache, so each installed copy keeps
+//   the helper it was installed with; `refreshInstalledPlugin()` below
+//   refreshes those copies' `bin/` too, so a rebuild needs no reinstall.
 // - `<config>/bin/` ($MNEMO_HOME or ~/.mnemo) holds the current helper — and
 //   `mnemo-models` (plan d3336a8a step 2), the machine-wide shared
 //   embedding-model host the instances spawn from this dir when it is not a
 //   sibling of their own executable. The plugin never runs the models host,
-//   so it is not copied into the plugin bin. Any older helper copy (e.g. the
-//   cached plugin's) hands its arguments to this one, so a rebuild takes
-//   effect without reinstalling the plugin.
+//   so it is not copied into the plugin bin.
 // - A running Claude session keeps the old helper open, a running models
 //   host keeps serving from the old host binary, and Windows refuses to
 //   overwrite a running executable. The old file is renamed aside first;
@@ -100,9 +99,10 @@ console.log(`  starts ${app}`);
 
 // The command-line `claude` runs the Mnemo plugin from the copy
 // `claude plugin install` made in its plugin cache, so refresh that copy's
-// hooks, skills and manifest too (plan 4d920eec decision 9); the Claude
-// desktop app reads the plugin straight from this repository. Best effort:
-// a missing cache or file is skipped silently.
+// hooks, skills, manifest and helper binary too (plan 4d920eec decision 9;
+// helper: plan 0fa5cad0); the Claude desktop app reads the plugin straight
+// from this repository. Best effort: a missing cache, file or locked helper
+// is logged, never fatal.
 function refreshInstalledPlugin() {
   const registry = join(homedir(), ".claude", "plugins", "installed_plugins.json");
   if (!existsSync(registry)) return;
@@ -126,6 +126,16 @@ function refreshInstalledPlugin() {
         } catch (error) {
           console.error(`install-mnemo2-mcp: could not refresh ${join(target, name)}: ${error.message}`);
         }
+      }
+      // A rebuild must reach the copy Claude Code actually runs: its hooks
+      // call helper commands, so an older bin/ prints its usage text and
+      // nothing runs. install() rolls a running helper aside and refreshes
+      // mnemo2-path.txt beside it. Like the files above, best effort: a
+      // locked or missing cache copy is logged, never fatal.
+      try {
+        install(join(target, "bin"));
+      } catch (error) {
+        console.error(`install-mnemo2-mcp: could not refresh ${join(target, "bin")}: ${error.message}`);
       }
       console.log(`install-mnemo2-mcp: refreshed the installed plugin copy ${target}`);
     }

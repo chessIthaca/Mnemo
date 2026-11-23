@@ -302,3 +302,76 @@ describe("WorkerDetail hand-overs stay on the team tab", () => {
     expect(get(app).workbenchTab).toBe("diff");
   });
 });
+
+describe("WorkerDetail agent phase", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  const statusPill = (container: HTMLElement): HTMLElement | null =>
+    container.querySelector<HTMLElement>(".status-pill");
+
+  it("shows the Claude Code agent phase in place of the plain worker status", async () => {
+    const base = createWorkers()[1];
+    const { container, rerender } = render(WorkerDetail, { worker: { ...base, agentPhase: "awaiting_launch" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Waiting for Claude Code agent");
+    expect(statusPill(container)?.getAttribute("data-agent-phase")).toBe("awaiting_launch");
+
+    await rerender({ worker: { ...base, agentPhase: "running" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Claude Code agent running");
+
+    await rerender({ worker: { ...base, agentPhase: "stalled" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Claude Code agent silent for 10+ min");
+
+    await rerender({ worker: { ...base, agentPhase: "finished" } });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Working");
+  });
+
+  it("keeps the plain status pill for a worker that is not a Claude Code agent worker", () => {
+    const { container } = render(WorkerDetail, { worker: createWorkers()[1] });
+    expect(statusPill(container)?.textContent?.trim()).toBe("Working");
+    expect(statusPill(container)?.hasAttribute("data-agent-phase")).toBe(false);
+  });
+});
+
+describe("WorkerDetail agent model", () => {
+  beforeEach(() => {
+    const state = fixtureState();
+    app.set({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        models: [
+          {
+            endpoint: "Ollama Cloud",
+            model: "glm-5.3",
+            spec: "Ollama Cloud/glm-5.3",
+            is_default: true,
+            reasoning_efforts: [],
+          },
+        ],
+      },
+    });
+  });
+
+  it("an agent worker's model is shown locked, not as a picker", () => {
+    const agentWorker: Worker = {
+      ...createWorkers()[0],
+      model: "claude-code/opus",
+      modelSpec: "Ollama Cloud/glm-5.3",
+      runsAsAgent: true,
+      reasoningEffort: "medium",
+    };
+
+    render(WorkerDetail, { worker: agentWorker });
+
+    // The tier's Mnemo model has a picker, but an agent worker never ran it.
+    expect(screen.queryByRole("combobox", { name: /model$/ })).toBeNull();
+    const badge = screen.getByLabelText("Worker model: claude-code/opus");
+    expect(badge.textContent).toContain("claude-code/opus");
+    const locked = badge.closest(".model-locked") as HTMLElement;
+    expect(locked.title).toBe(
+      "This worker runs as a Claude Code agent; its tier's agent setting chooses the model",
+    );
+    // The agent effort shows beside the locked model.
+    expect(screen.getByText("effort: medium")).toBeTruthy();
+  });
+});

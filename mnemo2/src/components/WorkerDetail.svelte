@@ -14,7 +14,7 @@
   import { workerPlanLabel } from "../lib/boardState";
   import { actions, app } from "../lib/store";
   import { canMerge, isAuditWorker } from "../lib/review";
-  import { workerStatusText, type TaskWorkflowStepId, type Worker } from "../lib/types";
+  import { workerAgentPhaseText, workerStatusText, type TaskWorkflowStepId, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
   import FindingsPanel from "./FindingsPanel.svelte";
   import Markdown from "./Markdown.svelte";
@@ -51,6 +51,8 @@
   const workflow = $derived(deriveTaskWorkflow(worker));
   const mergeEligibility = $derived(canMerge(worker));
   const audit = $derived(isAuditWorker(worker));
+  /** The Claude Code agent phase, while the worker waits on or runs one. */
+  const agentPhaseText = $derived(workerAgentPhaseText(worker.agentPhase));
   /** An audit that delivered its report is over: it cannot be steered,
    * compacted, resumed or messaged — the lead adjudicates the report. */
   const auditFinished = $derived(
@@ -65,11 +67,14 @@
   /**
    * A worker can move to another model unless its task is over. An audit
    * moves like any worker until it delivers its report; once it has
-   * reported it is locked. A worker mid-run switches live: the current
-   * call finishes, the next one uses the new model.
+   * reported it is locked. A Claude Code agent worker never ran the tier's
+   * Mnemo model, so its choice comes from its tier's agent setting and the
+   * picker stays locked. A worker mid-run switches live: the current call
+   * finishes, the next one uses the new model.
    */
   const modelChangeable = $derived(
-    (!audit || !auditFinished) &&
+    !worker.runsAsAgent &&
+      (!audit || !auditFinished) &&
       models.some((model) => model.spec === modelSpec) &&
       !["merging", "merged", "cancelled"].includes(worker.status),
   );
@@ -138,9 +143,9 @@
         <div class="worker-heading">
           <div class="worker-title">
             <h2>{worker.name}</h2>
-            <span class="status-pill" data-status={worker.status}>
+            <span class="status-pill" data-status={worker.status} data-agent-phase={worker.agentPhase ?? undefined}>
               {#if worker.status === "working" || worker.status === "dispatching"}<LoaderCircle size={9} class="spin" />{/if}
-              {workerStatusText(worker)}
+              {agentPhaseText ?? workerStatusText(worker)}
             </span>
             {#if audit}<span class="kind-badge" data-kind="audit">Audit</span>{/if}
             {#if highRisk}<span class="kind-badge" data-risk="high">High risk</span>{/if}
@@ -157,7 +162,11 @@
               {:else}
                 <span
                   class="model-locked"
-                  title={auditFinished ? "This audit has reported, so its model cannot change" : "This worker's task is over, so its model cannot change"}
+                  title={worker.runsAsAgent
+                    ? "This worker runs as a Claude Code agent; its tier's agent setting chooses the model"
+                    : auditFinished
+                      ? "This audit has reported, so its model cannot change"
+                      : "This worker's task is over, so its model cannot change"}
                 ><ModelBadge model={worker.model} /></span>
               {/if}
             </span>

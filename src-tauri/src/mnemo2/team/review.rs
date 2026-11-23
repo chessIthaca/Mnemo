@@ -183,7 +183,31 @@ impl TeamRuntime {
     /// (`independent_reviewer_id` plus a written `audit_adjudication`)
     /// linked at the exact reviewed tip. The answer reports which lane the
     /// change landed in.
+    ///
+    /// A review that links an audit uses its verdict, so that audit is
+    /// closed once the review is persisted (plan aa4903ac); a close failure
+    /// is logged and never fails the review.
     pub async fn review(
+        &self,
+        worker_id: &str,
+        summary: String,
+        findings: Vec<Finding>,
+        evidence: ReviewEvidence,
+    ) -> Result<WorkerRecord, String> {
+        let used_audit = evidence
+            .independent_reviewer_id
+            .clone()
+            .filter(|id| !id.trim().is_empty());
+        let reviewed = self
+            .review_locked(worker_id, summary, findings, evidence)
+            .await?;
+        if let Some(audit_id) = used_audit {
+            self.close_used_audit(&audit_id).await;
+        }
+        Ok(reviewed)
+    }
+
+    async fn review_locked(
         &self,
         worker_id: &str,
         summary: String,
@@ -917,7 +941,7 @@ impl TeamRuntime {
             WorkerStatus::Completed | WorkerStatus::InReview | WorkerStatus::Conflict => {}
             WorkerStatus::Fixing => {
                 return Err(format!(
-                    "{} is already fixing a finding: call team_agent_done when its agent finishes",
+                    "{} is already fixing a finding: wait for its agent to end; Mnemo then finishes the fix round",
                     worker.id
                 ));
             }
@@ -930,6 +954,10 @@ impl TeamRuntime {
             .ok_or_else(|| format!("unknown open finding '{finding_id}'"))?
             .clone();
         let brief = route_fix_brief(worker, &finding);
+        // A new run, recorded before the worker is back at work: no watcher
+        // pass may see it fixing without the new run's floor and take the
+        // previous run's finish for this one.
+        self.agent_watch.note_run_start(worker, now_key());
         self.update_worker(&worker.id, |worker| {
             worker.status = WorkerStatus::Fixing;
             worker.fixer_finding_id = Some(finding_id.to_string());
@@ -949,6 +977,8 @@ impl TeamRuntime {
             );
         })
         .await;
+        #[cfg(test)]
+        self.probe_run_start().await;
         self.persist().await?;
         self.ensure_agent_watch().await;
         self.worker(&worker.id).await

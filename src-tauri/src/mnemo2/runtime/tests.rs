@@ -807,6 +807,37 @@ async fn wait_for_calls(llm: &Arc<ScriptedLlm>, expected: usize) {
     );
 }
 
+/// How long a condition wait may take before the test calls it a hang.
+///
+/// This is a guard against a genuinely stuck test, never a deadline: under a
+/// loaded machine (several suites and builds in parallel) a worker's terminal
+/// transcript refresh can land seconds after its `Completed` status, and that
+/// is not a defect.
+const HANG_GUARD: Duration = Duration::from_secs(120);
+
+/// Poll the team snapshot until `ready` holds, and return that snapshot.
+///
+/// Only [`HANG_GUARD`] bounds the wait, so the test fails when the condition
+/// never arrives and not when the machine is merely busy. The panic names
+/// `what` it waited for and carries the last snapshot.
+async fn wait_for_snapshot(
+    team: &crate::mnemo2::team::TeamRuntime,
+    what: &str,
+    mut ready: impl FnMut(&crate::mnemo2::team::TeamSnapshot) -> bool,
+) -> crate::mnemo2::team::TeamSnapshot {
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
+    loop {
+        let snapshot = team.snapshot().await;
+        if ready(&snapshot) {
+            return snapshot;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the team never reached {what} within {HANG_GUARD:?}: {snapshot:#?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// One raw model row of the persisted usage accumulator, read from the
 /// project ledger: `(prompt_tokens, cached_tokens, output_tokens)`.
 fn ledger_usage_row(state_dir: &Path, model: &str) -> Option<(u64, u64, u64)> {
@@ -2236,13 +2267,18 @@ async fn team_runs_two_workers_concurrently_without_cross_talk() {
         .collect::<std::collections::HashSet<_>>();
     let mut finished = std::collections::HashSet::new();
     let mut texts = std::collections::HashMap::<String, String>::new();
-    for _ in 0..100 {
-        let event = match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+    // Wait on the events themselves: creating a worker's worktree and
+    // delivering its first event takes seconds on a loaded machine, so only
+    // the hang guard bounds this loop.
+    let event_deadline = tokio::time::Instant::now() + HANG_GUARD;
+    while finished.len() < expected.len() {
+        let event = match tokio::time::timeout_at(event_deadline, rx.recv()).await {
             Ok(Ok(event)) => event,
-            other => {
+            Ok(Err(error)) => panic!("the team event bus closed: {error}"),
+            Err(_) => {
                 let snapshot = team.snapshot().await;
                 panic!(
-                    "a team event arrives: {other:?}; llm_calls={}; snapshot={snapshot:#?}",
+                    "both workers finish within {HANG_GUARD:?}: llm_calls={}; snapshot={snapshot:#?}",
                     llm.calls()
                 );
             }
@@ -2261,9 +2297,6 @@ async fn team_runs_two_workers_concurrently_without_cross_talk() {
             }
             SerializableAgentEvent::Finished { .. } | SerializableAgentEvent::Exited => {
                 finished.insert(event.worker_id.clone());
-                if finished.len() == expected.len() {
-                    break;
-                }
             }
             _ => {}
         }
@@ -2281,19 +2314,20 @@ async fn team_runs_two_workers_concurrently_without_cross_talk() {
         "each worker kept its own response"
     );
 
-    let mut snapshot = team.snapshot().await;
-    for _ in 0..100 {
-        let ready = snapshot.workers.len() == 2
-            && snapshot.workers.iter().all(|worker| {
-                worker.status == WorkerStatus::Completed
-                    && !worker.transcript.messages.is_empty()
-            });
-        if ready {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        snapshot = team.snapshot().await;
-    }
+    // The terminal refresh that attaches each worker's transcript runs after
+    // an event: wait for the snapshot itself instead of giving it a budget.
+    let snapshot = wait_for_snapshot(
+        &team,
+        "both workers Completed with their own transcript",
+        |snapshot| {
+            snapshot.workers.len() == 2
+                && snapshot.workers.iter().all(|worker| {
+                    worker.status == WorkerStatus::Completed
+                        && !worker.transcript.messages.is_empty()
+                })
+        },
+    )
+    .await;
     assert_eq!(snapshot.workers.len(), 2);
     assert_eq!(snapshot.active, 2, "both worker sessions are live");
     for worker in &snapshot.workers {

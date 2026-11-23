@@ -111,6 +111,12 @@ impl TeamRuntime {
             | WorkerStatus::Conflict => true,
             _ => return Err(agent_worker_refusal(record).unwrap_or_default()),
         };
+        if idle {
+            // A new run, recorded before the worker is back at work: no
+            // watcher pass may see it working without the new run's floor
+            // and take the previous run's finish for this one.
+            self.agent_watch.note_run_start(record, now_key());
+        }
         self.update_worker(&record.id, |worker| {
             append_inbox(
                 worker,
@@ -132,6 +138,8 @@ impl TeamRuntime {
             }
         })
         .await;
+        #[cfg(test)]
+        self.probe_run_start().await;
         self.persist().await?;
         // A registered agent back at work is watched again.
         self.ensure_agent_watch().await;
@@ -430,7 +438,17 @@ impl TeamRuntime {
     /// audit; `resume` can reattach the saved transcript later. A worker that
     /// was not already stopped has reached a terminal status, so its `outcome`
     /// row (design §4.7) is appended beside the record.
+    ///
+    /// A reported audit of the stopped worker is closed with it (plan
+    /// aa4903ac), and the board is told to refresh.
     pub async fn stop(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        let record = self.stop_locked(worker_id).await?;
+        self.close_audits_of(worker_id, false).await;
+        self.signal_board_changed();
+        Ok(record)
+    }
+
+    async fn stop_locked(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let before = self.worker(worker_id).await?;
         let record = self.stop_inner(worker_id).await?;
@@ -526,7 +544,7 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         // A Claude Code agent worker has no session to reattach: the lead
-        // continues it with its own agent and closes it with team_agent_done.
+        // continues it with its own agent, and Mnemo finishes it when that agent ends.
         if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
@@ -557,7 +575,7 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         // A Claude Code agent worker has no session to reroute: the lead
-        // continues it with its own agent and closes it with team_agent_done.
+        // continues it with its own agent, and Mnemo finishes it when that agent ends.
         if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
@@ -669,7 +687,7 @@ impl TeamRuntime {
         self.notify_lead(
             format!("agent-handoff:{}:{}", worker.id, worker.generation),
             format!(
-                "{opening}{id} moved to tier {tier}, which runs as a Claude Code agent: launch your Agent with this block, then call team_agent_done.\n{block}",
+                "{opening}{id} moved to tier {tier}, which runs as a Claude Code agent: launch your Agent with this block; Mnemo finishes the worker when the agent ends.\n{block}",
                 id = worker.id
             ),
         );
@@ -889,7 +907,7 @@ impl TeamRuntime {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         // A Claude Code agent worker has no session to reroute: the lead
-        // continues it with its own agent and closes it with team_agent_done.
+        // continues it with its own agent, and Mnemo finishes it when that agent ends.
         if let Some(refusal) = agent_worker_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
@@ -1038,7 +1056,7 @@ impl TeamRuntime {
         self.proving_guard(worker_id)?;
         let mut record = self.worker(worker_id).await?;
         // A Claude Code agent worker has no session to compact: the lead
-        // continues it with its own agent and closes it with team_agent_done.
+        // continues it with its own agent, and Mnemo finishes it when that agent ends.
         if let Some(refusal) = agent_resume_refusal(&record) {
             return Err(refusal);
         }
@@ -1125,6 +1143,7 @@ pub(super) async fn recover_worker(
     root: &std::path::Path,
     worker: &mut WorkerRecord,
     other_worktrees: &[PathBuf],
+    state_dir: &std::path::Path,
 ) -> Result<(), String> {
     worker.brief_sent = true;
     worker.compacting = false;
@@ -1213,7 +1232,7 @@ pub(super) async fn recover_worker(
             worker.merge = Some(record);
             worker.error = None;
             let pool = matches!(worker_checkout(root, worker), Some(CheckoutKind::Pool(_)));
-            match cleanup_agent_worktree(root, worker, other_worktrees).await {
+            match cleanup_agent_worktree(root, worker, other_worktrees, state_dir).await {
                 Ok(()) if pool => worker.worktree = PathBuf::new(),
                 Ok(()) => {}
                 Err(err) => {
@@ -1254,6 +1273,15 @@ pub(super) async fn recover_worker(
         worker.checks.clear();
         worker.merge = None;
         worker.fixer_finding_id = None;
+    } else if worker.claude_agent.is_some()
+        && worker.claude_agent_id.is_some()
+        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+    {
+        // A registered Claude Code agent has no Mnemo session to lose: it
+        // may still run (or have finished) outside Mnemo2. It stays at work
+        // and the agent watch follows it (finishing it, or handing it back
+        // once it stalls with no lead); `TeamRuntime::open` already handed
+        // back the unlaunched and stalled ones.
     } else if matches!(
         worker.status,
         WorkerStatus::Dispatching

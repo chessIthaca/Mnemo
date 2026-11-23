@@ -509,7 +509,7 @@ pub(super) fn agent_worker_refusal(worker: &WorkerRecord) -> Option<String> {
         let id = &worker.id;
         match worker.status {
             WorkerStatus::Working | WorkerStatus::Interrupted => format!(
-                "{id} runs as a Claude Code agent: continue it with your own Agent (SendMessage to it), then call team_agent_done."
+                "{id} runs as a Claude Code agent: continue it with your own Agent (SendMessage to it); Mnemo finishes the worker when the agent ends."
             ),
             WorkerStatus::Failed | WorkerStatus::Stopped | WorkerStatus::Cancelled => format!(
                 "{id} runs as a Claude Code agent and has ended: dispatch the step again with a new worker_id."
@@ -548,13 +548,14 @@ pub(super) fn agent_resume_refusal(worker: &WorkerRecord) -> Option<String> {
 
 /// The refusal checks, review and merge give while a Claude Code agent
 /// worker is still Working or Interrupted. Unlike session-driving tools,
-/// these operations become valid as soon as `team_agent_done` closes it.
+/// these operations become valid as soon as Mnemo finishes it (its agent
+/// ended) or `team_agent_done` marks the run.
 pub(super) fn unfinished_agent_error(worker: &WorkerRecord) -> Option<String> {
     (worker.claude_agent.is_some()
         && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Interrupted))
     .then(|| {
         format!(
-            "{} runs as a Claude Code agent: call team_agent_done when it has finished",
+            "{} runs as a Claude Code agent that has not finished: wait for the agent to end; Mnemo then finishes the worker",
             worker.id
         )
     })

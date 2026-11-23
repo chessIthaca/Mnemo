@@ -1,0 +1,7 @@
++++
+title = "write tests that stay green under a loaded machine (wait on the event, not on the clock)"
+created = "2026-11-23"
+evidence = "Fixes on 2026-11-23: resume_refuses_an_idle_live_worker_once_closing (1/30 -> 0/30), mnemo_check_run_refuses_a_configured_core_operation (16/30 -> 0/30), cancel_during_approval_exits_agent (1/30 -> 0/30), plus two proof tests; Mnemo check runs failed on four unrelated tips that day before the fixes."
++++
+
+Mnemo's check runs execute `cargo test --workspace` while other cargo builds run, so any test that waits on a wall-clock budget (a 2-10 s deadline, a per-recv timeout that ends a drain loop, a `sleep` to "let the other task get there") flakes. Patterns that fixed today's flakes: (1) await the specific event itself and keep only a generous hang guard (~120 s) that panics naming the awaited event and what was seen — e.g. `await_event` in src/runtime/agent.rs tests, `next_notice` in src-tauri/src/mnemo2/team/tests.rs; never break a drain loop on a quiet gap; (2) before reading persisted state, force the save it depends on (`team.persist().await`) instead of trusting a fixture that only waited for the in-memory change; (3) replace a sleep that positions a racing task with a lock handshake on a current_thread runtime (yield until the task holds lock A; acquire the fair lock B it awaits next). Prove a flake fix with a 30-run loop of the test binary while a test suite runs beside it as load, before and after.

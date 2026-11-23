@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  agentPhaseFrom,
   applyTeamEvent,
   applyTeamSnapshot,
   emptyProjectUsageView,
@@ -498,5 +499,20 @@ describe("inboxFromWire", () => {
     expect(
       inboxFromWire({ sender: "claude_agent", kind: "progress", text: "built", at_ms: 5 }),
     ).toEqual({ sender: "claude_agent", kind: "progress", text: "built", atMs: 5 });
+  });
+});
+
+describe("agentPhaseFrom", () => {
+  it("keeps the four known phases", () => {
+    for (const phase of ["awaiting_launch", "running", "stalled", "finished"]) {
+      expect(agentPhaseFrom(phase)).toBe(phase);
+    }
+  });
+
+  it("reads a missing or unknown phase as no phase, so the worker renders as it always has", () => {
+    expect(agentPhaseFrom(undefined)).toBeNull();
+    expect(agentPhaseFrom(null)).toBeNull();
+    expect(agentPhaseFrom("")).toBeNull();
+    expect(agentPhaseFrom("working")).toBeNull();
   });
 });

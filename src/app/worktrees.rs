@@ -27,6 +27,13 @@
 //! functions stay for worker records dispatched before pool checkouts
 //! existed; their recorded `worktree` paths keep today's semantics.
 //!
+//! Every checkout Mnemo prepares also writes the offscreen browser's
+//! screenshot folder into the repository's SHARED exclude file
+//! ([`ensure_screenshot_exclude`]): a worker's PNGs are untracked, and git
+//! must not report them as dirty checkout state. A project's `.gitignore` is
+//! never touched, and an exclude only covers untracked paths — a tracked
+//! screenshot stays tracked.
+//!
 //! All functions run blocking git subprocesses on the blocking thread
 //! pool (see `git_ops` for why). Unlike the rest of `git_ops`, the tests
 //! here use REAL git in tempdir repos — worktrees are filesystem-level
@@ -130,7 +137,92 @@ fn provision_worktree_impl(
             base_ref,
         ],
     )?;
+    ignore_screenshots(&worktree);
     Ok(worktree)
+}
+
+// ===========================================================================
+// Shared Git exclude — screenshots never dirty a checkout (see the module doc)
+// ===========================================================================
+
+/// The line Mnemo appends to the repository's shared exclude file: the
+/// offscreen browser writes its PNGs into `.coding/browser/screenshots/` (the
+/// app crate's `SCREENSHOT_DIR`). Untracked screenshots would otherwise make a
+/// worker's checkout dirty and refuse its check run, merge and release gates.
+const SCREENSHOT_EXCLUDE_LINE: &str = "/.coding/browser/screenshots/";
+
+/// Make the repository's SHARED exclude file ignore the offscreen browser's
+/// screenshot folder, for `checkout_or_root` (a main checkout or any of its
+/// linked worktrees).
+///
+/// The exclude lives at `<git common dir>/info/exclude`, one file for the
+/// whole repository, so every pool checkout and legacy worktree picks it up
+/// and no user project has to commit a `.gitignore` line. Idempotent: the
+/// line is only appended when no existing line already equals it after
+/// trimming, and it never glues itself onto a file without a trailing
+/// newline. A tracked screenshot stays tracked — an exclude only covers
+/// untracked paths.
+pub(crate) fn ensure_screenshot_exclude(checkout_or_root: &Path) -> Result<(), String> {
+    let common = git_raw(checkout_or_root, &["rev-parse", "--git-common-dir"])?;
+    let common = common.trim();
+    if common.is_empty() {
+        return Err(format!(
+            "git reported no common directory for {}",
+            checkout_or_root.display()
+        ));
+    }
+    let common = PathBuf::from(common);
+    // A relative answer is relative to the directory git ran in.
+    let common = if common.is_absolute() {
+        common
+    } else {
+        checkout_or_root.join(common)
+    };
+    let info = common.join("info");
+    std::fs::create_dir_all(&info)
+        .map_err(|error| format!("cannot create {}: {error}", info.display()))?;
+    let exclude = info.join("exclude");
+    let existing = match std::fs::read(&exclude) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot read {}: {error}", exclude.display())),
+    };
+    if existing.as_deref().is_some_and(|text| {
+        text.lines()
+            .any(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+    }) {
+        return Ok(());
+    }
+    let mut append = String::new();
+    // Keep the file's last line intact when it has no trailing newline.
+    if existing
+        .as_deref()
+        .is_some_and(|text| !text.is_empty() && !text.ends_with('\n'))
+    {
+        append.push('\n');
+    }
+    append.push_str(SCREENSHOT_EXCLUDE_LINE);
+    append.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&exclude)
+        .map_err(|error| format!("cannot open {}: {error}", exclude.display()))?;
+    file.write_all(append.as_bytes())
+        .map_err(|error| format!("cannot write {}: {error}", exclude.display()))?;
+    Ok(())
+}
+
+/// Best-effort wrapper for checkout provisioning: the exclude is a
+/// convenience for the worker's clean-checkout gates, never a reason to refuse
+/// a dispatch — a failure is logged and swallowed.
+fn ignore_screenshots(checkout_or_root: &Path) {
+    if let Err(error) = ensure_screenshot_exclude(checkout_or_root) {
+        eprintln!(
+            "mnemo: could not make Git ignore the browser screenshots in {}: {error}",
+            checkout_or_root.display()
+        );
+    }
 }
 
 /// Remove a worker's worktree WITHOUT deleting its branch — the branch
@@ -460,6 +552,24 @@ fn existing_pool_entries(main_root: &Path) -> Result<Vec<(u32, PathBuf, bool)>, 
     Ok(pools)
 }
 
+/// The free-pool test [`provision_pool_checkout`] and
+/// [`trim_pool_checkouts`] share: the checkout is a registered pool worktree,
+/// its HEAD is detached, and it carries no uncommitted or untracked work.
+/// Ignored build caches — the point of a pool — do not count as work. `Err`
+/// names the first precondition that failed.
+fn pool_is_free(main_root: &Path, pool: &Path) -> Result<(), String> {
+    ensure_registered_pool_checkout(main_root, pool)?;
+    let head = git_raw(pool, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if head.trim() != "HEAD" {
+        return Err(format!("pool is on branch {}", head.trim()));
+    }
+    let dirty = git_raw(pool, &["status", "--porcelain", "-uall"])?;
+    if !dirty.trim().is_empty() {
+        return Err("pool has uncommitted work".to_string());
+    }
+    Ok(())
+}
+
 /// Provision a POOL checkout for a new worker on `branch`, forked from
 /// `base_ref` (the lead branch tip): the lowest-indexed
 /// `<main_root>/.worktrees/pool-<n>` that is FREE — not `held` by any live
@@ -513,18 +623,6 @@ fn provision_pool_checkout_impl(
     // stale metadata would make `git worktree add` refuse to create the
     // next pool folder (same hygiene as `remove_worktree_only_impl`).
     let _ = git_raw(main_root, &["worktree", "prune"]);
-    let free = |pool: &Path| -> Result<(), String> {
-        ensure_registered_pool_checkout(main_root, pool)?;
-        let head = git_raw(pool, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-        if head.trim() != "HEAD" {
-            return Err(format!("pool is on branch {}", head.trim()));
-        }
-        let dirty = git_raw(pool, &["status", "--porcelain", "-uall"])?;
-        if !dirty.trim().is_empty() {
-            return Err("pool has uncommitted work".to_string());
-        }
-        Ok(())
-    };
     let pools = existing_pool_entries(main_root)?;
     for (_, pool, is_dir) in &pools {
         if let Err(error) = ensure_pool_checkout(main_root, pool) {
@@ -541,7 +639,7 @@ fn provision_pool_checkout_impl(
         if held.iter().any(|held_path| same_checkout_path(held_path, pool)) {
             continue; // held by a live worker record — the expected case
         }
-        if let Err(error) = free(pool) {
+        if let Err(error) = pool_is_free(main_root, pool) {
             eprintln!(
                 "mnemo: pool checkout {} is not free: {error}; skipped",
                 pool.display()
@@ -566,7 +664,7 @@ fn provision_pool_checkout_impl(
             }
         };
         // Another instance may have changed the checkout before our claim.
-        if let Err(error) = free(pool) {
+        if let Err(error) = pool_is_free(main_root, pool) {
             eprintln!(
                 "mnemo: pool checkout {} changed after claiming: {error}; skipped",
                 pool.display()
@@ -622,6 +720,200 @@ fn provision_pool_checkout_impl(
     ))
 }
 
+/// Remove every FREE pool checkout whose index is above `keep` — the current
+/// worker slot count — highest index first, and return the removed paths. The
+/// cap is SOFT: dispatch never depends on it, so a new pool above `keep` may
+/// still be created while the lower pools are held.
+///
+/// A pool is removed only when ALL of these hold: its index is above `keep`;
+/// no path in `held` is it (the checkouts of unmerged worker records);
+/// [`pool_is_free`] passes (registered with git, detached HEAD, no uncommitted
+/// or untracked work); and the cross-instance claim [`acquire_pool_claim`] is
+/// obtained and the free test still passes with the claim held. Anything else
+/// is reported on stderr and left untouched: uncommitted work is never
+/// discarded, another instance's pool is never raced, and a pool at or below
+/// `keep` stays as a warm cache.
+///
+/// Removal never deletes the caches inline: the folder is RENAMED to
+/// `.worktrees/trash-pool-<n>-<ms>` — a metadata operation, so a trim never
+/// stalls under the team locks for the minutes a 10-15 GB delete takes — the
+/// registration the moved folder left dangling is pruned, and a DETACHED thread
+/// deletes the trash with `std::fs::remove_dir_all`, which never follows a
+/// symlink or junction (it removes the link itself), so a link's target outside
+/// the pool survives. A failed rename leaves the pool untouched, and every trim
+/// sweeps the `trash-pool-*` folders an earlier delete did not finish. One
+/// failed removal is reported and skipped; only a failure to LIST the pools is
+/// an error.
+///
+/// Runs the blocking git subprocesses on the blocking thread pool (see the
+/// module doc). Owns its arguments so the closure is `'static + Send`.
+pub async fn trim_pool_checkouts(
+    main_root: PathBuf,
+    keep: u32,
+    held: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    tokio::task::spawn_blocking(move || trim_pool_checkouts_impl(&main_root, keep, &held))
+        .await
+        .map_err(|e| format!("pool checkout trim task failed: {e}"))?
+}
+
+/// The synchronous core of [`trim_pool_checkouts`].
+fn trim_pool_checkouts_impl(
+    main_root: &Path,
+    keep: u32,
+    held: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    // Leftover trash goes first, so a delete that did not finish is retried
+    // even when no pool is above `keep`.
+    sweep_pool_trash(main_root);
+    let mut pools = existing_pool_entries(main_root)?;
+    // Highest index first, so the cap lands as close to `keep` as the pools
+    // allow even when one of them cannot go.
+    pools.retain(|(index, _, _)| *index > keep);
+    pools.sort_by_key(|(index, _, _)| std::cmp::Reverse(*index));
+    let mut removed = Vec::new();
+    for (index, pool, is_dir) in &pools {
+        if held
+            .iter()
+            .any(|held_path| same_checkout_path(held_path, pool))
+        {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: a worker record holds it",
+                pool.display()
+            );
+            continue;
+        }
+        if !is_dir {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: it is not a directory",
+                pool.display()
+            );
+            continue;
+        }
+        if let Err(error) = pool_is_free(main_root, pool) {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: it is not free: {error}",
+                pool.display()
+            );
+            continue;
+        }
+        let _claim = match acquire_pool_claim(pool) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                eprintln!(
+                    "mnemo: idle pool checkout {} stays: it has a live claim",
+                    pool.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "mnemo: idle pool checkout {} stays: it cannot be claimed: {error}",
+                    pool.display()
+                );
+                continue;
+            }
+        };
+        // Another instance may have changed the checkout before our claim.
+        if let Err(error) = pool_is_free(main_root, pool) {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: it changed after claiming: {error}",
+                pool.display()
+            );
+            continue;
+        }
+        match remove_pool_checkout(main_root, *index, pool) {
+            Ok(()) => removed.push(pool.clone()),
+            Err(error) => eprintln!(
+                "mnemo: could not remove idle pool checkout {}: {error}; skipped",
+                pool.display()
+            ),
+        }
+    }
+    Ok(removed)
+}
+
+/// The `.worktrees` entry name prefix of a pool folder being deleted.
+const POOL_TRASH_PREFIX: &str = "trash-pool-";
+
+/// Where a pool being deleted is moved to: `.worktrees/trash-pool-<n>-<ms>`.
+/// The name never parses as a pool (`pool-<n>`), so a trash folder reserves no
+/// pool index while it is still being deleted.
+fn pool_trash_path(main_root: &Path, index: u32) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    worktrees_dir(main_root).join(format!("{POOL_TRASH_PREFIX}{index}-{millis}"))
+}
+
+/// Remove one claimed, free pool checkout without deleting its caches on the
+/// caller's thread: rename the folder to [`pool_trash_path`] (fast, and a failed
+/// rename leaves the pool untouched), prune the registration the moved folder
+/// left dangling, then hand the trash to [`delete_pool_trash_in_background`].
+fn remove_pool_checkout(main_root: &Path, index: u32, pool: &Path) -> Result<(), String> {
+    let trash = pool_trash_path(main_root, index);
+    std::fs::rename(pool, &trash)
+        .map_err(|error| format!("could not move it to {}: {error}", trash.display()))?;
+    if let Err(error) = git_raw(main_root, &["worktree", "prune"]) {
+        eprintln!(
+            "mnemo: could not prune the moved pool checkout {}: {error}",
+            trash.display()
+        );
+    }
+    delete_pool_trash_in_background(trash);
+    Ok(())
+}
+
+/// Delete a trashed pool folder on a detached thread: its caches are 10-15 GB,
+/// so the deletion must never block the caller or the team locks it holds. A
+/// deletion this process never finishes is completed by the next trim's sweep.
+fn delete_pool_trash_in_background(trash: PathBuf) {
+    std::thread::spawn(move || {
+        if let Err(error) = std::fs::remove_dir_all(&trash) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "mnemo: could not delete the trashed pool checkout {}: {error}",
+                    trash.display()
+                );
+            }
+        }
+    });
+}
+
+/// Hand every leftover `trash-pool-*` folder to
+/// [`delete_pool_trash_in_background`] — the trash of a trim (or an app run)
+/// whose deletion did not finish. Best effort: a listing problem is reported and
+/// the trim goes on.
+fn sweep_pool_trash(main_root: &Path) {
+    let directory = worktrees_dir(main_root);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "mnemo: could not list {} to sweep the trashed pool checkouts: {error}",
+                directory.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(POOL_TRASH_PREFIX)
+        {
+            continue;
+        }
+        let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        if !is_directory {
+            continue;
+        }
+        delete_pool_trash_in_background(entry.path());
+    }
+}
+
 /// Reuse one free pool for a new worker: re-point its detached HEAD at
 /// `base_ref`, sweep the previous worker's ignored leftovers (keeping the
 /// warm caches) and create `branch` there. The caller has already checked
@@ -633,6 +925,7 @@ fn reuse_pool_checkout(
     base_ref: &str,
 ) -> Result<(), String> {
     ensure_registered_pool_checkout(main_root, pool)?;
+    ignore_screenshots(pool);
     git_raw(pool, &["switch", "--detach", base_ref])?;
     git_raw(
         pool,
@@ -1116,6 +1409,196 @@ mod tests {
             }
             std::fs::write(path, contents).unwrap();
         }
+    }
+
+    /// Write an untracked file the way the offscreen browser does: a PNG under
+    /// `.coding/browser/screenshots/`.
+    fn write_screenshot(checkout: &Path, name: &str) -> PathBuf {
+        let path = checkout
+            .join(".coding")
+            .join("browser")
+            .join("screenshots")
+            .join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"png").unwrap();
+        path
+    }
+
+    #[test]
+    fn screenshot_exclude_is_added_once() {
+        let repo = init_repo();
+        ensure_screenshot_exclude(repo.path()).expect("first ensure");
+        ensure_screenshot_exclude(repo.path()).expect("second ensure");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let text = std::fs::read_to_string(&exclude).expect("the exclude file exists");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "a second call must not duplicate the line: {text:?}"
+        );
+        write_screenshot(repo.path(), "a.png");
+        assert!(
+            git_raw(
+                repo.path(),
+                &["check-ignore", "-q", ".coding/browser/screenshots/a.png"]
+            )
+            .is_ok(),
+            "git ignores a screenshot once the exclude is in place"
+        );
+    }
+
+    #[test]
+    fn screenshot_exclude_keeps_existing_lines() {
+        let repo = init_repo();
+        let info = repo.path().join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        // No trailing newline — the appended line must start its own line.
+        std::fs::write(&exclude, "foo").unwrap();
+        ensure_screenshot_exclude(repo.path()).expect("ensure");
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        assert!(
+            text.starts_with("foo\n"),
+            "foo keeps its own line: {text:?}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "{text:?}"
+        );
+        ensure_screenshot_exclude(repo.path()).expect("second ensure");
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        assert!(
+            text.starts_with("foo\n"),
+            "foo is still intact: {text:?}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "an existing line is never duplicated: {text:?}"
+        );
+    }
+
+    #[test]
+    fn screenshot_exclude_works_from_a_linked_worktree() {
+        let repo = init_repo();
+        let holder = tempfile::tempdir().unwrap();
+        let linked = holder.path().join("linked");
+        git_raw(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "wt/linked",
+                linked.to_str().expect("UTF-8 worktree path"),
+                "main",
+            ],
+        )
+        .expect("linked worktree");
+        ensure_screenshot_exclude(&linked).expect("ensure from a linked worktree");
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let text = std::fs::read_to_string(&exclude).expect("the main repo's exclude file");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "the line lands in the main repository's .git/info/exclude: {text:?}"
+        );
+        write_screenshot(&linked, "b.png");
+        assert!(
+            git_raw(
+                &linked,
+                &["check-ignore", "-q", ".coding/browser/screenshots/b.png"]
+            )
+            .is_ok(),
+            "the shared exclude covers a linked worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_screenshots_leave_a_pool_checkout_clean() {
+        // The defect: the offscreen browser's PNGs were untracked, so a
+        // worker's checkout showed up dirty and every clean-checkout gate
+        // (check run, merge, release) refused it until someone deleted them.
+        let repo = init_repo();
+        let (checkout, _branch) = provision_agent_checkout(
+            repo.path().to_path_buf(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision");
+        write_screenshot(&checkout, "shot.png");
+        assert_eq!(
+            git_raw(&checkout, &["status", "--porcelain", "-uall"])
+                .expect("status")
+                .trim(),
+            "",
+            "a screenshot must not dirty the worker checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reused_pool_regains_the_screenshot_exclude() {
+        // A pool first provisioned by an older Mnemo (before the exclude
+        // existed) must not hand out a checkout that a screenshot dirties.
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let (pool, branch) = provision_agent_checkout(
+            main.clone(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("provision");
+        // Simulate the old Mnemo: the exclude line is gone.
+        let exclude = repo.path().join(".git").join("info").join("exclude");
+        let stripped: String = std::fs::read_to_string(&exclude)
+            .expect("the exclude file")
+            .lines()
+            .filter(|line| line.trim() != SCREENSHOT_EXCLUDE_LINE)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(&exclude, stripped).expect("strip the exclude line");
+        release_pool_checkout(main.clone(), pool.clone(), branch)
+            .await
+            .expect("release");
+        // No record holds it: the next worker gets the SAME pool.
+        let (reused, _branch) = provision_agent_checkout(
+            main,
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("reuse");
+        assert_eq!(reused, pool, "the released pool is reused");
+        let text = std::fs::read_to_string(&exclude).expect("the exclude file");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.trim() == SCREENSHOT_EXCLUDE_LINE)
+                .count(),
+            1,
+            "the reused checkout re-adds the exclude line: {text:?}"
+        );
+        write_screenshot(&reused, "reused.png");
+        assert_eq!(
+            git_raw(&reused, &["status", "--porcelain", "-uall"])
+                .expect("status")
+                .trim(),
+            "",
+            "a screenshot must not dirty a reused checkout"
+        );
     }
 
     #[tokio::test]
@@ -1842,5 +2325,335 @@ mod tests {
         .await
         .expect("reuse");
         assert_eq!(reused, pool);
+    }
+
+    /// The `.worktrees/trash-pool-<index>-*` folders present right now.
+    fn trash_folders(main_root: &Path, index: u32) -> Vec<PathBuf> {
+        let prefix = format!("{POOL_TRASH_PREFIX}{index}-");
+        let entries = match std::fs::read_dir(worktrees_dir(main_root)) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+        entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Wait, bounded (~10 s), until the DETACHED delete of pool `<index>`'s
+    /// trash folder has finished — a trim only renames the pool away.
+    async fn wait_for_trash_removal(main_root: &Path, index: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !trash_folders(main_root, index).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trashed pool-{index} folder is still being deleted after 10 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn trim_removes_free_pools_above_the_keep_count() {
+        let repo = init_repo_ignoring_pool_caches();
+        let main = repo.path().to_path_buf();
+        // Three attached pools reserve pool-1, pool-2 and pool-3 in turn.
+        let mut pools = Vec::new();
+        for id in ["aaaaaaaa1111", "bbbbbbbb2222", "cccccccc3333"] {
+            let (pool, branch) = provision_agent_checkout(
+                main.clone(),
+                id.to_string(),
+                "main".to_string(),
+                vec![],
+            )
+            .await
+            .expect("provision");
+            assert_eq!(pool_index(&pool), Some(pools.len() as u32 + 1));
+            pools.push((pool, branch));
+        }
+        // pool-1 keeps the previous worker's warm, ignored build cache.
+        write_all(&[(pools[0].0.join("target/x"), "x")]);
+        for (pool, branch) in &pools {
+            release_pool_checkout(main.clone(), pool.clone(), branch.clone())
+                .await
+                .expect("release");
+        }
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert_eq!(
+            removed,
+            vec![pools[2].0.clone(), pools[1].0.clone()],
+            "highest index first"
+        );
+        assert!(!pools[1].0.exists(), "pool-2 is removed");
+        assert!(!pools[2].0.exists(), "pool-3 is removed");
+        assert!(pools[0].0.is_dir(), "a pool at the keep count stays");
+        assert!(
+            pools[0].0.join("target/x").exists(),
+            "its warm build cache stays"
+        );
+        let listed = registered_worktrees(repo.path()).expect("registered worktrees");
+        for (pool, _) in &pools[1..] {
+            assert!(
+                !listed
+                    .iter()
+                    .any(|path| same_checkout_path(path, pool)),
+                "{} is absent from git worktree list",
+                pool.display()
+            );
+        }
+        assert!(
+            listed
+                .iter()
+                .any(|path| same_checkout_path(path, &pools[0].0)),
+            "pool-1 stays registered"
+        );
+        // The folders are renamed away at once; the 10-15 GB of caches go on a
+        // detached thread, so wait for it here.
+        wait_for_trash_removal(&main, 2).await;
+        wait_for_trash_removal(&main, 3).await;
+    }
+
+    #[tokio::test]
+    async fn trim_never_removes_held_dirty_or_attached_pools() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let mut pools = Vec::new();
+        for id in ["aaaaaaaa1111", "bbbbbbbb2222", "cccccccc3333", "dddddddd4444"] {
+            let (pool, branch) = provision_agent_checkout(
+                main.clone(),
+                id.to_string(),
+                "main".to_string(),
+                vec![],
+            )
+            .await
+            .expect("provision");
+            pools.push((pool, branch));
+        }
+        // pool-2 is free but held by a record; pool-3 is free but dirty;
+        // pool-4 still belongs to a worker on its branch.
+        release_pool_checkout(main.clone(), pools[1].0.clone(), pools[1].1.clone())
+            .await
+            .expect("release pool-2");
+        release_pool_checkout(main.clone(), pools[2].0.clone(), pools[2].1.clone())
+            .await
+            .expect("release pool-3");
+        std::fs::write(pools[2].0.join("untracked.txt"), "keep\n").expect("untracked work");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![pools[1].0.clone()])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "nothing is removed: {removed:?}");
+        for (pool, _) in &pools[1..] {
+            assert!(pool.is_dir(), "{} stays", pool.display());
+        }
+        assert_eq!(
+            current_branch(&pools[3].0).expect("branch"),
+            pools[3].1,
+            "the attached pool is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn trim_skips_a_pool_with_a_live_claim() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let (pool_1, _) = provision_agent_checkout(
+            main.clone(),
+            "aaaaaaaa1111".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("first provision");
+        let (pool_2, branch_2) = provision_agent_checkout(
+            main.clone(),
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("second provision");
+        release_pool_checkout(main.clone(), pool_2.clone(), branch_2)
+            .await
+            .expect("release");
+        // Another instance holds the claim: a fresh claim owned by this live
+        // process must keep the trim away from the pool.
+        let claim = pool_2.with_file_name("pool-2.claim");
+        std::fs::write(&claim, format!("{}\n", std::process::id())).expect("claim file");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "nothing is removed: {removed:?}");
+        assert!(pool_1.is_dir(), "pool-1 stays");
+        assert!(pool_2.is_dir(), "a claimed pool stays");
+        assert!(claim.exists(), "another instance's claim is left alone");
+    }
+
+    #[tokio::test]
+    async fn trim_removes_a_pool_whose_link_points_outside_without_following_it() {
+        let repo = init_repo_ignoring_pool_caches();
+        let main = repo.path().to_path_buf();
+        let (pool_1, _) = provision_agent_checkout(
+            main.clone(),
+            "aaaaaaaa1111".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("first provision");
+        let (pool_2, branch_2) = provision_agent_checkout(
+            main.clone(),
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("second provision");
+        // A dependency linked in from OUTSIDE the pool — the npm workspace
+        // junction that outlives git's own removal on Windows.
+        let outside = tempfile::tempdir().expect("outside folder");
+        std::fs::write(outside.path().join("keep.txt"), "keep\n").expect("outside file");
+        let link = pool_2.join("node_modules").join("linked");
+        std::fs::create_dir_all(link.parent().expect("link parent")).expect("node_modules");
+        create_directory_link(&link, outside.path()).expect("directory link");
+        release_pool_checkout(main.clone(), pool_2.clone(), branch_2)
+            .await
+            .expect("release");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert_eq!(removed, vec![pool_2.clone()]);
+        assert!(!pool_2.exists(), "the pool folder is gone, link included");
+        assert!(
+            !registered_worktrees(repo.path())
+                .expect("registered worktrees")
+                .iter()
+                .any(|path| same_checkout_path(path, &pool_2)),
+            "the moved pool is deregistered right away"
+        );
+        // The trash folder is deleted on a detached thread: wait for it before
+        // asserting the link's target survived.
+        wait_for_trash_removal(&main, 2).await;
+        assert!(
+            outside.path().join("keep.txt").exists(),
+            "removal never follows the link: its target survives"
+        );
+        assert!(pool_1.is_dir(), "a pool at the keep count stays");
+    }
+
+    #[tokio::test]
+    async fn trim_with_keep_at_or_above_the_highest_index_removes_nothing() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let mut pools = Vec::new();
+        for id in ["aaaaaaaa1111", "bbbbbbbb2222"] {
+            let (pool, branch) = provision_agent_checkout(
+                main.clone(),
+                id.to_string(),
+                "main".to_string(),
+                vec![],
+            )
+            .await
+            .expect("provision");
+            release_pool_checkout(main.clone(), pool.clone(), branch)
+                .await
+                .expect("release");
+            pools.push(pool);
+        }
+        let removed = trim_pool_checkouts(main.clone(), 5, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "nothing is removed: {removed:?}");
+        for pool in &pools {
+            assert!(pool.is_dir(), "{} stays below a higher keep", pool.display());
+        }
+        let removed = trim_pool_checkouts(main.clone(), 2, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "keep == the highest index: {removed:?}");
+        for pool in &pools {
+            assert!(pool.is_dir(), "{} stays at the keep count", pool.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn trim_sweeps_leftover_trash_folders() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        // A trim (or an app run) that stopped before its background delete
+        // finished leaves a trash folder behind.
+        let leftover = worktrees_dir(&main).join("trash-pool-9-1");
+        write_all(&[(leftover.join("leftover"), "x")]);
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "no pool is removed: {removed:?}");
+        wait_for_trash_removal(&main, 9).await;
+        assert!(!leftover.exists(), "the leftover trash is swept");
+    }
+
+    /// Windows only: a handle opened without sharing makes the rename of the
+    /// pool folder fail, and a failed rename must leave the pool untouched
+    /// (never half-deleted).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn trim_skips_a_pool_whose_rename_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let repo = init_repo_ignoring_pool_caches();
+        let main = repo.path().to_path_buf();
+        let (pool_1, _) = provision_agent_checkout(
+            main.clone(),
+            "aaaaaaaa1111".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("first provision");
+        let (pool_2, branch_2) = provision_agent_checkout(
+            main.clone(),
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("second provision");
+        release_pool_checkout(main.clone(), pool_2.clone(), branch_2)
+            .await
+            .expect("release");
+        // An ignored file (a target/ cache) held open without sharing blocks
+        // the folder rename while keeping the checkout clean.
+        let held = pool_2.join("target").join("held.txt");
+        write_all(&[(held.clone(), "held\n")]);
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&held)
+            .expect("hold the cache file open");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "the pool is skipped: {removed:?}");
+        assert!(pool_2.is_dir(), "the pool stays intact");
+        assert!(held.exists(), "its files stay");
+        assert!(
+            registered_worktrees(repo.path())
+                .expect("registered worktrees")
+                .iter()
+                .any(|path| same_checkout_path(path, &pool_2)),
+            "the pool stays registered"
+        );
+        assert!(
+            trash_folders(&main, 2).is_empty(),
+            "a failed rename leaves no trash behind"
+        );
+        assert!(pool_1.is_dir(), "pool-1 stays");
+        drop(handle);
     }
 }

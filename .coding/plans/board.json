@@ -2438,10 +2438,10 @@
     },
     {
       "id": "22002e68",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794493017194,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795432090325,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-22002e68-20261123-110810.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -2449,10 +2449,10 @@
     },
     {
       "id": "e1d2d242",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794496690741,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795432092557,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e1d2d242-20261123-110812.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -2691,10 +2691,10 @@
     },
     {
       "id": "969cb173",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794823873101,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795415853179,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-969cb173-20261123-063733.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -2724,10 +2724,10 @@
     },
     {
       "id": "e1529a36",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794833540411,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795432072969,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e1529a36-20261123-110752.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -2832,10 +2832,10 @@
     },
     {
       "id": "3c2ec71c",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1794931735010,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795439132162,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-3c2ec71c-20261123-130532.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -3044,10 +3044,10 @@
     },
     {
       "id": "5b498359",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795301607351,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795430715637,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-5b498359-20261123-104515.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -3965,6 +3965,273 @@
       ],
       "schema": "spec-driven@1",
       "sections": {}
+    },
+    {
+      "id": "7027e7bf",
+      "status": "closed",
+      "created_at_ms": 1795430848583,
+      "closed_at_ms": 1795433798383,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-7027e7bf-20261123-113638.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Where Mnemo2 keeps worker screenshots for the preview is not specified by any capability; review, merge and checkout behaviour are unchanged apart from removing untracked screenshot files after they are archived."
+    },
+    {
+      "id": "5520c914",
+      "status": "closed",
+      "created_at_ms": 1795432235661,
+      "closed_at_ms": 1795441787884,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-5520c914-20261123-134947.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Prompt and tool-description wording only; the close gate's behaviour and every specified capability are unchanged."
+    },
+    {
+      "id": "a2b8ee89",
+      "status": "closed",
+      "created_at_ms": 1795433980603,
+      "closed_at_ms": 1795443637129,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-a2b8ee89-20261123-142037.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "Agent workers are handed back when their lead leaves",
+              "text": "When the external lead detaches, or Mnemo2 starts without one, every agent worker whose agent was never launched or has stalled SHALL be handed back: it stops being an agent worker, becomes interrupted with the reason, keeps its record, branch, checkout and commits, and can be resumed on a Mnemo model. An agent that is still running SHALL be left alone.",
+              "scenarios": [
+                {
+                  "name": "Lead leaves before launching",
+                  "when": [
+                    "an agent worker waits for its agent",
+                    "the external lead detaches"
+                  ],
+                  "then": [
+                    "the worker is interrupted with the reason and is no longer an agent worker"
+                  ],
+                  "and": [
+                    "team_resume restarts it on its tier's Mnemo model with its branch and commits"
+                  ]
+                },
+                {
+                  "name": "Running agent survives a detach",
+                  "when": [
+                    "an agent worker's agent is running and not stalled",
+                    "the external lead detaches"
+                  ],
+                  "then": [
+                    "the worker stays an agent worker and keeps working"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [
+            {
+              "requirement": "The lead finishes a Claude Code agent worker",
+              "text": "A worker handed to a Claude Code agent SHALL be finished by Mnemo when its registered agent's transcript says it finished, with the agent's last message as its report, marking the worker completed and delivering the finished notice to the external lead. The lead MAY still call team_agent_done to report a failed run or to replace the report; after Mnemo finished the same run it SHALL NOT deliver a second notice. While such a worker is working, the agent gate SHALL allow the lead's Agent calls without asking.",
+              "scenarios": [
+                {
+                  "name": "Agent worker reaches review",
+                  "when": [
+                    "the lead's agent committed in the worker's worktree",
+                    "the agent's transcript says it finished"
+                  ],
+                  "then": [
+                    "the worker is completed with the agent's last message as its report",
+                    "one finished notice reaches the lead"
+                  ],
+                  "and": [
+                    "team_check, team_review and team_merge work as for any worker"
+                  ]
+                },
+                {
+                  "name": "Lead reports after Mnemo finished the run",
+                  "when": [
+                    "Mnemo finished an agent worker's run",
+                    "the lead calls team_agent_done with a report for that run"
+                  ],
+                  "then": [
+                    "the worker keeps its completed state with the lead's report",
+                    "no second finished notice is sent"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Gate lets the agent run",
+                  "when": [
+                    "an agent-tier worker is working",
+                    "the gate-agent hook asks about subagent_type general-purpose"
+                  ],
+                  "then": [
+                    "the decision is allow"
+                  ],
+                  "and": []
+                }
+              ]
+            },
+            {
+              "requirement": "Agent workers are observable",
+              "text": "Every Claude Code agent worker SHALL show its agent phase (awaiting_launch, running, stalled or finished) in team_status and Mission Control from the moment it is handed to an agent. The lead SHALL be able to register a running Claude Code agent for a worker with team_agent_started. Mnemo SHALL then report the agent's transcript, last activity, tool calls, tokens and finish state in team_status, flag it stalled after ten silent minutes and notify the lead once per stall. The agent MAY post progress notes with team_progress, which land in the worker's log and as notices.",
+              "scenarios": [
+                {
+                  "name": "Agent not launched yet",
+                  "when": [
+                    "a dispatch lands on a tier that runs as a Claude Code agent",
+                    "the lead has not launched the agent"
+                  ],
+                  "then": [
+                    "team_status and Mission Control show the worker waiting for its Claude Code agent"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Stalled agent",
+                  "when": [
+                    "an agent worker is registered",
+                    "its transcript has not changed for ten minutes"
+                  ],
+                  "then": [
+                    "team_status shows it stalled"
+                  ],
+                  "and": [
+                    "the lead gets one notice"
+                  ]
+                },
+                {
+                  "name": "Progress note",
+                  "when": [
+                    "the agent calls team_progress with a note"
+                  ],
+                  "then": [
+                    "the note is in the worker's log and reaches the lead"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Only external-lead behaviour changes (its delta is attached). dispatch-routing, tier-ladder and worker-brief govern the same files, but routing, tier choice and the worker prompt are unchanged."
+    },
+    {
+      "id": "9e87b60b",
+      "status": "closed",
+      "created_at_ms": 1795435209401,
+      "closed_at_ms": 1795442098616,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-9e87b60b-20261123-135458.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Display wording of tool calls in the window only; no governed capability specifies these labels."
+    },
+    {
+      "id": "5ef34ca0",
+      "status": "closed",
+      "created_at_ms": 1795435809770,
+      "closed_at_ms": 1795441021555,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-5ef34ca0-20261123-133701.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test synchronization only; no specified behaviour changes. If the diagnosis finds a product race, the fix keeps the specified behaviour."
+    },
+    {
+      "id": "3d167bca",
+      "status": "closed",
+      "created_at_ms": 1795441830935,
+      "closed_at_ms": 1795444529991,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-3d167bca-20261123-143529.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Only the ordering and filtering of the failure summary text for a failed check; which checks run, their pass/fail result and the notice flow are unchanged."
+    },
+    {
+      "id": "aa4903ac",
+      "status": "closed",
+      "created_at_ms": 1795442324900,
+      "closed_at_ms": 1795446612638,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-aa4903ac-20261123-151012.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Closing an already-reported read-only audit and its window label are not specified by any capability; review, merge and audit-dispatch rules are unchanged."
+    },
+    {
+      "id": "250d11ff",
+      "status": "closed",
+      "created_at_ms": 1795443967774,
+      "closed_at_ms": 1795446054407,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-250d11ff-20261123-150054.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test synchronization only; no specified behaviour changes."
+    },
+    {
+      "id": "200ac7a9",
+      "status": "closed",
+      "created_at_ms": 1795455922528,
+      "closed_at_ms": 1795459883872,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-200ac7a9-20261123-185123.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Internal robustness fixes: the lead check guard, notice-drain cost and a git exclude line change no specified behaviour of a capability; the reply shapes stay the same."
+    },
+    {
+      "id": "0908a4d0",
+      "status": "closed",
+      "created_at_ms": 1795460296731,
+      "closed_at_ms": 1795463499602,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-0908a4d0-20261123-195139.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test synchronization only; no specified behaviour changes."
+    },
+    {
+      "id": "2e15085a",
+      "status": "closed",
+      "created_at_ms": 1795465028337,
+      "closed_at_ms": 1795468030584,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-2e15085a-20261123-210710.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Internal pool housekeeping; no OpenSpec capability covers pool folder lifetime (it is recorded in the .coding/knowledge spec record, which the step updates)."
+    },
+    {
+      "id": "b1251d3c",
+      "status": "closed",
+      "created_at_ms": 1795469514175,
+      "closed_at_ms": 1795471270419,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-b1251d3c-20261123-220110.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Display-only change in the Mnemo2 window; the host record and the lead-facing team_status contract are unchanged."
+    },
+    {
+      "id": "0fa5cad0",
+      "status": "closed",
+      "created_at_ms": 1795470881532,
+      "closed_at_ms": 1795471788169,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-0fa5cad0-20261123-220948.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Developer install script only; no product behavior or governed capability changes."
     }
   ]
 }

@@ -180,8 +180,9 @@ static TRANSCRIPT_REVS: AtomicU64 = AtomicU64::new(1);
 /// is detected by pointer identity alone.
 type TranscriptRevisionCache = HashMap<String, (Arc<Transcript>, u64)>;
 
-/// The team's public snapshot.
-#[derive(Clone, Debug, Serialize)]
+/// The team's public snapshot. Each serialized worker also carries its
+/// derived `agent_phase` (see [`TeamSnapshot::agent_phases`]).
+#[derive(Clone, Debug)]
 pub struct TeamSnapshot {
     /// Every worker, including completed/stopped ones.
     pub workers: Vec<WorkerRecord>,
@@ -197,13 +198,58 @@ pub struct TeamSnapshot {
     pub transcript_revs: HashMap<String, u64>,
     /// Workers whose transcript was left out (sent empty) because the caller
     /// already holds that revision.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub omitted_transcripts: Vec<String>,
     /// What Mnemo knows about each registered Claude Code agent, by worker
     /// id (the `agent` object of `team_status`). Such a worker's transcript
     /// above is the agent's own log, converted.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub agents: HashMap<String, serde_json::Value>,
+    /// Each Claude Code agent worker's phase, by worker id: `awaiting_launch`,
+    /// `running`, `stalled` or `finished`. Serialized onto the worker as
+    /// `agent_phase`, never onto the record, so it never reaches team.json.
+    pub agent_phases: HashMap<String, &'static str>,
+}
+
+/// One worker as the snapshot sends it: the record and its derived phase.
+#[derive(Serialize)]
+struct SnapshotWorker<'a> {
+    #[serde(flatten)]
+    record: &'a WorkerRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_phase: Option<&'static str>,
+}
+
+impl Serialize for TeamSnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            workers: Vec<SnapshotWorker<'a>>,
+            slots: usize,
+            active: usize,
+            usage: &'a ProjectUsageView,
+            transcript_revs: &'a HashMap<String, u64>,
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            omitted_transcripts: &'a [String],
+            #[serde(skip_serializing_if = "HashMap::is_empty")]
+            agents: &'a HashMap<String, serde_json::Value>,
+        }
+        Wire {
+            workers: self
+                .workers
+                .iter()
+                .map(|record| SnapshotWorker {
+                    record,
+                    agent_phase: self.agent_phases.get(&record.id).copied(),
+                })
+                .collect(),
+            slots: self.slots,
+            active: self.active,
+            usage: &self.usage,
+            transcript_revs: &self.transcript_revs,
+            omitted_transcripts: &self.omitted_transcripts,
+            agents: &self.agents,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// One event forwarded from a worker session, tagged with its worker id.
@@ -457,6 +503,47 @@ impl TeamRuntime {
         }
     }
 
+    /// Remove the FREE pool checkouts whose index is above the worker slot
+    /// count (plan 2e15085a): the pools stop accumulating above the slots, and
+    /// at rest the pool count is at most the slot count. The cap is SOFT —
+    /// dispatch never waits for a trim, and a pool above the slot count may
+    /// still be created while the lower ones are held. A pool is kept when a
+    /// worker record holds it, when it is on a branch or has uncommitted work,
+    /// when another instance claims it, and always when its index is at or
+    /// below the slot count (those are the warm caches). The removal itself is
+    /// cheap: the pool folder is renamed to a `trash-pool-*` name under
+    /// `.worktrees` and its 10-15 GB of caches are deleted on a DETACHED thread
+    /// (see `trim_pool_checkouts`), so a trim never deletes them while the
+    /// caller holds the merge lock.
+    ///
+    /// Takes the checkout pool lock itself, so a caller that holds the merge
+    /// lock may call it (merge and trim both lock `merge_lock ->
+    /// checkout_pool_lock`); NEVER call it while the checkout pool lock is
+    /// already held. Reads the held checkouts after taking the lock and never
+    /// fails its caller: a listing or removal problem goes to stderr.
+    pub(super) async fn trim_idle_pools(&self) {
+        let _pools = self.checkout_pool_lock.lock().await;
+        let keep = self.persistence.slots.load(Ordering::SeqCst);
+        let held = self.held_checkouts().await;
+        match mnemo::app::worktrees::trim_pool_checkouts(
+            self.workspace_root.clone(),
+            keep as u32,
+            held,
+        )
+        .await
+        {
+            Ok(removed) => {
+                for pool in removed {
+                    eprintln!(
+                        "team: removed idle pool checkout {} above the {keep} slots",
+                        pool.display()
+                    );
+                }
+            }
+            Err(error) => eprintln!("team: could not trim the idle pool checkouts: {error}"),
+        }
+    }
+
     /// Every checkout held by a record other than `worker_id`.
     async fn other_held_checkouts(&self, worker_id: &str) -> Vec<PathBuf> {
         self.records
@@ -494,6 +581,30 @@ impl TeamRuntime {
             .map(|team| team.usage.clone())
             .unwrap_or_default();
         let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
+        // Mnemo2 starts with no external lead: an agent worker whose agent
+        // was never launched, or has stalled (judged by the record's last
+        // activity when its transcript is gone), goes back to Mnemo (plan
+        // a2b8ee89 decision 3). A running agent stays an agent worker at
+        // work; recovery leaves it so and the agent watch follows it.
+        let agent_watch = agent_watch::AgentWatch::default();
+        let handed_back = {
+            let now = phase3::now_ms();
+            let mut handed_back = Vec::new();
+            for worker in &mut workers {
+                if worker.claude_agent.is_none()
+                    || !matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+                {
+                    continue;
+                }
+                let view = agent_watch::look(&agent_watch, worker, now).map(|looked| looked.view);
+                if agent_watch::hand_back_due(worker, view.as_ref()) {
+                    agent_watch::hand_back(worker);
+                    agent_watch.forget(&worker.id);
+                    handed_back.push(worker.id.clone());
+                }
+            }
+            handed_back
+        };
         let held: Vec<(String, PathBuf)> = workers
             .iter()
             .filter(|worker| !worker.worktree.as_os_str().is_empty())
@@ -505,7 +616,13 @@ impl TeamRuntime {
                 .filter(|(id, _)| id != &worker.id)
                 .map(|(_, checkout)| checkout.clone())
                 .collect();
-            recover_worker(&options.workspace_root, worker, &other_worktrees).await?;
+            recover_worker(
+                &options.workspace_root,
+                worker,
+                &other_worktrees,
+                &options.state_dir,
+            )
+            .await?;
         }
         // A proof a hard kill interrupted leaves its checkout reverse-applied;
         // the claim marker names the tip to repair it back to (finding
@@ -557,13 +674,20 @@ impl TeamRuntime {
             board: std::sync::Mutex::new(None),
             proving: proving::Proving::default(),
             check_runs: check_run::CheckRuns::default(),
-            agent_watch: agent_watch::AgentWatch::default(),
+            agent_watch,
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
             external: std::sync::Mutex::new(ExternalLead::default()),
             external_wake: tokio::sync::Notify::new(),
         };
+        // The in-app lead (or the next external lead) learns of each one.
+        runtime.restore_undelivered_notices(
+            handed_back
+                .iter()
+                .map(|id| agent_watch::handed_back_notice(id))
+                .collect(),
+        );
         runtime.persist().await?;
         // App start: sweep checkouts a previous run renamed into the
         // trash folder but could not remove yet (something held them).
@@ -571,7 +695,13 @@ impl TeamRuntime {
         // App start: a checkout a previous run could not remove (something
         // held it) is retried now, and the branch it was blocking goes with it.
         runtime.retry_leftover_cleanups().await;
-        // A registered agent that was running when the app closed is watched again.
+        // Recovery released the pools of the workers it closed: drop the free
+        // pools above the slot count, so a started app converges on the slots
+        // (plan 2e15085a).
+        runtime.trim_idle_pools().await;
+        // A registered agent that still runs (recovery kept its worker at
+        // work) is watched again: its finish is processed, and a later stall
+        // with no lead attached hands it back.
         runtime.ensure_agent_watch().await;
         Ok(runtime)
     }
@@ -584,6 +714,15 @@ impl TeamRuntime {
     /// Subscribe to plan-board signals (UI refreshes and lead notices).
     pub fn subscribe_board(&self) -> broadcast::Receiver<BoardSignal> {
         self.signals.subscribe()
+    }
+
+    /// The folder the team's ledger, transcripts and archived screenshots
+    /// live in.
+    pub(crate) fn state_dir(&self) -> &Path {
+        self.persistence
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
     }
 
     /// Tell subscribers the board may have changed.
@@ -854,6 +993,8 @@ impl TeamRuntime {
             let _ = self.persist().await;
             return Err(error);
         }
+        // The lower cap is persisted: the free pools above it go now.
+        self.trim_idle_pools().await;
         Ok(self.snapshot().await)
     }
 
@@ -894,6 +1035,9 @@ impl TeamRuntime {
         .await?;
         let restored = self.persistence.load()?.unwrap_or_default();
         *self.records.lock().await = restored.workers;
+        // The cleanup released the pools whose records are gone; the free
+        // pools above the slot count go with them (plan 2e15085a).
+        self.trim_idle_pools().await;
         Ok(report)
     }
 
@@ -985,9 +1129,18 @@ impl TeamRuntime {
             workers
         };
         let mut agents = HashMap::new();
-        for worker in workers.iter().filter(|worker| worker.claude_agent_id.is_some()) {
-            if let Some(view) = self.agent_view(worker).await {
+        let mut agent_phases = HashMap::new();
+        for worker in workers.iter().filter(|worker| worker.claude_agent.is_some()) {
+            let view = if worker.claude_agent_id.is_some() {
+                self.agent_view(worker).await
+            } else {
+                None
+            };
+            if let Some(view) = &view {
                 agents.insert(worker.id.clone(), view.to_json());
+            }
+            if let Some(phase) = agent_watch::agent_phase(worker, view.as_ref()) {
+                agent_phases.insert(worker.id.clone(), phase);
             }
         }
         let active = self.live.lock().await.len();
@@ -1005,6 +1158,7 @@ impl TeamRuntime {
             transcript_revs,
             omitted_transcripts,
             agents,
+            agent_phases,
         }
     }
 

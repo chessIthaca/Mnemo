@@ -110,7 +110,10 @@ required bug:{symptom} param, BUG: memory auto-captured at finish — EXCEPT \
 bug-triggered FEATURES (the fix adds capabilities, new dependencies, or \
 spans multiple modules): file those as kind:\"implementation\" with the bug \
 documented as motivation in goal/context; bug_fixing is for CONTAINED \
-defect fixes. The plan \
+defect fixes. Record its regression test (update_plan regression_test) as \
+the bare test name exactly as in the source, never with a file path, \
+module prefix or note in parentheses: finish refuses a name it cannot \
+find in the code. The plan \
 file is the CRASH-RESUMPTION document: detail out the bug (symptom, root \
 cause, code locations, fix + test design) in bug + context + steps so a \
 mid-fix restart continues smoothly — provided steps persist as the \
@@ -1145,8 +1148,11 @@ mod tests {
         // the checkout root counts in `shell`.
         // Bumped 2026-11-20 (plan d3336a8a step 11): the find_code bullet —
         // describe what you look for in words before you know a name.
+        // Bumped 2026-11-23 (plan 5520c914 step 1): the PLAN KIND paragraph
+        // tells the lead to record a bug plan's regression test by its bare
+        // name — never a file path, module prefix or note in parentheses.
         const GOLDEN_HEAD: &str =
-            "len=13962|sha256=0719497d9c8306d9d3702806e6e051264459ae8dbfc7605408720c2adb80aa64";
+            "len=14179|sha256=e27808377197cc8c29c636c163a7a0cdd483cf1366572349a52e811b2076a245";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",
@@ -1167,6 +1173,23 @@ mod tests {
             ),
             GOLDEN_HEAD,
             "stable head bytes drifted — fill GOLDEN_HEAD from the left side"
+        );
+    }
+
+    #[test]
+    fn stable_head_tells_the_lead_to_record_the_bare_regression_test_name() {
+        // Plan 5520c914: the close gate looks the recorded regression test up
+        // as a symbol, so a path suffix or a module prefix keeps a finished
+        // bug plan open. The stable head must carry the bare-name rule where
+        // the lead reads PLAN KIND.
+        let head = build_stable_head(&Constitution::default());
+        assert!(
+            head.contains("bare test name"),
+            "the PLAN KIND paragraph must ask for the bare test name"
+        );
+        assert!(
+            head.contains("never with a file path"),
+            "the rule must forbid a file path explicitly"
         );
     }
 

@@ -9,10 +9,11 @@
 //! raw wall of output, and hope the host counted the run. `run_checks` runs
 //! EVERY allow-listed check command of the session, in order, from the checkout
 //! root, and answers with one block per command — `PASS`/`FAIL`, the exit code
-//! and the run time — followed by the failing lines pulled out of the output
-//! (a compiler `error`/`warning` header with its ` --> file:line:col`, failing
-//! test names, jest/vitest failures, svelte-check errors), then a
-//! `N passed, M failed` summary.
+//! and the run time — followed by the failing lines pulled out of the output,
+//! ranked: the failing tests, their panics and jest/vitest failures first, then
+//! a compiler `error`/`warning` header with its ` --> file:line:col` and
+//! svelte-check errors, with git's line-ending chatter never matched at all —
+//! then a `N passed, M failed` summary.
 //!
 //! # Recorded checks
 //!
@@ -425,15 +426,53 @@ fn seconds(elapsed: Duration) -> String {
     format!("{:.1}s", elapsed.as_secs_f64())
 }
 
-/// The failure detail for a FAIL block: up to [`MAX_DIAGNOSTIC_LINES`] matched
-/// diagnostic lines, or — when nothing matched — the last
-/// [`FALLBACK_TAIL_LINES`] lines of the raw output. `None` when the output is
-/// empty.
+/// The rank a diagnostic line belongs to (plan 3d167bca). The tiers are
+/// emitted in this order BEFORE the [`MAX_DIAGNOSTIC_LINES`] cap applies, so a
+/// wall of warnings can never push a failing test's name out of the summary.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DiagnosticTier {
+    /// A failing test, its panic, and the other marks a test failure leaves.
+    Failure,
+    /// An `error`-level diagnostic: rustc's, a check tool's.
+    Error,
+    /// A `warning`-level diagnostic: the first thing the cap may drop.
+    Warning,
+}
+
+/// One diagnostic line of a FAIL block, with the tier that ranks it.
+struct DiagnosticLine {
+    /// The line as the output printed it.
+    text: String,
+    /// The tier it is emitted in.
+    tier: DiagnosticTier,
+}
+
+impl DiagnosticLine {
+    /// `text` at `tier`.
+    fn new(text: &str, tier: DiagnosticTier) -> Self {
+        Self {
+            text: text.to_string(),
+            tier,
+        }
+    }
+}
+
+/// The failure detail for a FAIL block: the highest-ranked
+/// [`MAX_DIAGNOSTIC_LINES`] matched diagnostic lines, or — when nothing matched
+/// — the last [`FALLBACK_TAIL_LINES`] lines of the raw output. `None` when the
+/// output is empty.
 fn diagnostics_block(text: &str) -> Option<String> {
-    let matched = diagnostic_lines(text);
+    let mut matched = diagnostic_lines(text);
     if !matched.is_empty() {
         let total = matched.len();
-        let mut lines: Vec<String> = matched.into_iter().take(MAX_DIAGNOSTIC_LINES).collect();
+        // Rank BEFORE the cap (plan 3d167bca): `sort_by_key` is stable, so lines
+        // of one tier keep their order of appearance in the output.
+        matched.sort_by_key(|line| line.tier);
+        let mut lines: Vec<String> = matched
+            .into_iter()
+            .take(MAX_DIAGNOSTIC_LINES)
+            .map(|line| line.text)
+            .collect();
         if total > MAX_DIAGNOSTIC_LINES {
             let dropped = total - MAX_DIAGNOSTIC_LINES;
             if let Some(last) = lines.last_mut() {
@@ -446,16 +485,23 @@ fn diagnostics_block(text: &str) -> Option<String> {
     (!tail.trim().is_empty()).then_some(tail)
 }
 
-/// Every diagnostic line in `text`, in order of appearance.
+/// Every diagnostic line in `text`, in order of appearance, each with the tier
+/// that ranks it.
 ///
-/// Recognised: a `rustc`/clippy `error`/`warning` header (and the ` --> line`
-/// that follows it), a failing cargo test (`test <name> ... FAILED`), the test
-/// names under a `failures:` marker, a jest/vitest failure line (`FAIL <file>`,
-/// `✗`/`×`), and a svelte-check `Error:` line with the `file:line:col` printed
-/// above it.
-fn diagnostic_lines(text: &str) -> Vec<String> {
+/// The failure tier is a failing cargo test (`test <name> ... FAILED`), the
+/// test names under a `failures:` marker, a `---- <name> stdout ----` section
+/// header, a `panicked at` line with the message below it, and a jest/vitest
+/// failure line (`FAIL <file>`, `✗`/`×`). A svelte-check `Error:` line with the
+/// `file:line:col` printed above it is the error tier, like a `rustc`/clippy
+/// `error` header with the ` --> line` that follows it; their `warning`
+/// header is the warning tier.
+///
+/// Git's line-ending chatter is never a diagnostic (plan 3d167bca): every
+/// `git add` on a Windows checkout warns about CRLF, and those lines used to
+/// take every slot of a failing test run's summary.
+fn diagnostic_lines(text: &str) -> Vec<DiagnosticLine> {
     let lines: Vec<&str> = text.lines().collect();
-    let mut matched: Vec<String> = Vec::new();
+    let mut matched: Vec<DiagnosticLine> = Vec::new();
     // Set by a `failures:` marker: the indented names under it are the failing
     // tests, and a blank line (or the next unindented line) ends the list.
     let mut in_failures = false;
@@ -463,9 +509,13 @@ fn diagnostic_lines(text: &str) -> Vec<String> {
     while index < lines.len() {
         let line = lines[index];
         let trimmed = line.trim_start();
+        if is_git_crlf_noise(trimmed) {
+            index += 1;
+            continue;
+        }
         if trimmed == "failures:" {
             in_failures = true;
-            matched.push(line.to_string());
+            matched.push(DiagnosticLine::new(line, DiagnosticTier::Failure));
             index += 1;
             continue;
         }
@@ -473,45 +523,76 @@ fn diagnostic_lines(text: &str) -> Vec<String> {
             if trimmed.is_empty() {
                 in_failures = false;
             } else if line.starts_with(char::is_whitespace) {
-                matched.push(line.to_string());
+                matched.push(DiagnosticLine::new(line, DiagnosticTier::Failure));
                 index += 1;
                 continue;
             } else {
                 in_failures = false;
             }
         }
-        if is_rustc_header(trimmed) {
-            matched.push(line.to_string());
+        if let Some(tier) = rustc_header_tier(trimmed) {
+            matched.push(DiagnosticLine::new(line, tier));
             // rustc prints the location on one of the next two lines.
             for candidate in lines.iter().skip(index + 1).take(2) {
                 if candidate.trim_start().starts_with("-->") {
-                    matched.push((*candidate).to_string());
+                    matched.push(DiagnosticLine::new(candidate, tier));
                     break;
                 }
             }
-        } else if is_failing_test(trimmed) || is_js_failure(trimmed) {
-            matched.push(line.to_string());
+        } else if is_failing_test(trimmed)
+            || is_js_failure(trimmed)
+            || is_test_section_header(trimmed)
+        {
+            matched.push(DiagnosticLine::new(line, DiagnosticTier::Failure));
+        } else if trimmed.contains("panicked at") {
+            matched.push(DiagnosticLine::new(line, DiagnosticTier::Failure));
+            // The panic message is the line under the `panicked at` one.
+            if let Some(message) = lines.get(index + 1) {
+                if !message.trim().is_empty() {
+                    matched.push(DiagnosticLine::new(message, DiagnosticTier::Failure));
+                    index += 1;
+                }
+            }
         } else if trimmed.starts_with("Error:") {
             // svelte-check prints `path:line:col` on the line above the error.
             if let Some(previous) = index.checked_sub(1).map(|previous| lines[previous]) {
                 if looks_like_location(previous.trim()) {
-                    matched.push(previous.to_string());
+                    matched.push(DiagnosticLine::new(previous, DiagnosticTier::Error));
                 }
             }
-            matched.push(line.to_string());
+            matched.push(DiagnosticLine::new(line, DiagnosticTier::Error));
         }
         index += 1;
     }
     matched
 }
 
-/// A `rustc`/clippy diagnostic header: `error: ...`, `error[E0425]: ...`,
-/// `warning: ...`, `warning[...]: ...`.
-fn is_rustc_header(line: &str) -> bool {
-    ["error", "warning"].iter().any(|prefix| {
+/// The diagnostic tier of a `rustc`/clippy header: `error: ...`,
+/// `error[E0425]: ...` is an error, `warning: ...`, `warning[...]: ...` a
+/// warning. `None` when the line is neither.
+fn rustc_header_tier(line: &str) -> Option<DiagnosticTier> {
+    [
+        ("error", DiagnosticTier::Error),
+        ("warning", DiagnosticTier::Warning),
+    ]
+    .into_iter()
+    .find_map(|(prefix, tier)| {
         line.strip_prefix(prefix)
             .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('['))
+            .then_some(tier)
     })
+}
+
+/// Git's line-ending chatter — the two phrasings a `git add` prints on a
+/// checkout with CRLF conversion — which is never a diagnostic.
+fn is_git_crlf_noise(line: &str) -> bool {
+    line.starts_with("warning: in the working copy of '")
+        || line.starts_with("warning: LF will be replaced by CRLF")
+}
+
+/// A cargo test section header: `---- <name> stdout ----`.
+fn is_test_section_header(line: &str) -> bool {
+    line.starts_with("---- ") && line.ends_with(" ----")
 }
 
 /// A failing cargo test line: `test <name> ... FAILED` (the `test result:`
@@ -713,6 +794,99 @@ mod tests {
             block.contains("    module::broken"),
             "the failure name is missing: {block}"
         );
+    }
+
+    /// Regression (plan 3d167bca): the checks run real git, whose CRLF
+    /// warnings filled every diagnostic slot on a Windows checkout, so a
+    /// failing test's name never reached the summary and every failure needed
+    /// a manual rerun to identify.
+    #[test]
+    fn failing_tests_outrank_git_warnings_in_the_summary() {
+        let mut text = String::new();
+        for index in 0..30 {
+            text.push_str(&format!(
+                "warning: in the working copy of 'tracked{index}.txt', LF will be \
+                 replaced by CRLF the next time Git touches it\n"
+            ));
+        }
+        text.push_str(
+            "test a::b ... FAILED\n\
+             \n\
+             failures:\n\
+             \n\
+             ---- a::b stdout ----\n\
+             thread 'a::b' panicked at src/x.rs:1:2:\n\
+             assertion `left == right` failed\n\
+             \n\
+             failures:\n\
+             \x20   a::b\n\
+             \x20   c::d\n\
+             \n\
+             test result: FAILED. 0 passed; 2 failed\n",
+        );
+
+        let block = diagnostics_block(&text).expect("diagnostics");
+
+        assert!(block.contains("test a::b ... FAILED"), "{block}");
+        assert!(
+            block.contains("    a::b"),
+            "the first failing name is missing: {block}"
+        );
+        assert!(
+            block.contains("    c::d"),
+            "the second failing name is missing: {block}"
+        );
+        assert!(
+            block.contains("src/x.rs:1:2"),
+            "the panic location is missing: {block}"
+        );
+        assert!(
+            block.contains("assertion `left == right` failed"),
+            "the panic message is missing: {block}"
+        );
+        assert!(
+            block
+                .lines()
+                .all(|line| !line.contains("in the working copy of")),
+            "git's CRLF noise took a slot: {block}"
+        );
+    }
+
+    /// Decision 1 (plan 3d167bca): a compiler error outranks a warning whichever
+    /// came first, so a wall of warnings can never bury the error.
+    #[test]
+    fn rustc_errors_come_before_warnings() {
+        let mut text = String::new();
+        for index in 0..MAX_DIAGNOSTIC_LINES {
+            text.push_str(&format!("warning: unused variable `value{index}`\n"));
+        }
+        text.push_str(
+            "error[E0425]: cannot find value `missing` in this scope\n\
+             --> src/a.rs:3:5\n",
+        );
+
+        let block = diagnostics_block(&text).expect("diagnostics");
+        let lines: Vec<&str> = block.lines().collect();
+
+        assert!(lines[0].starts_with("error[E0425]"), "{block}");
+        assert!(
+            lines[1].contains("--> src/a.rs:3:5"),
+            "the error's location does not follow it: {block}"
+        );
+    }
+
+    /// Decision 2 (plan 3d167bca): both of git's line-ending phrasings are
+    /// noise, never a diagnostic.
+    #[test]
+    fn git_crlf_warnings_are_not_diagnostics() {
+        let text = "warning: in the working copy of 'tracked.txt', LF will be \
+                    replaced by CRLF the next time Git touches it\n\
+                    warning: LF will be replaced by CRLF in tracked.txt.\n\
+                    error: the only real diagnostic\n";
+
+        let block = diagnostics_block(text).expect("diagnostics");
+
+        assert_eq!(block, "error: the only real diagnostic");
     }
 
     #[tokio::test]

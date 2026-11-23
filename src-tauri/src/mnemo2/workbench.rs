@@ -745,14 +745,16 @@ async fn read_screenshot(
 ///
 /// Every regular PNG file under `<checkout>/.coding/browser/screenshots` is
 /// copied to the same relative path under `archive`. Links (symlinks and
-/// Windows junctions), files over the preview limit and files that do not
-/// start with the PNG signature are skipped. The copy is idempotent: an
-/// existing archive file of the same size is kept. Returns how many files the
-/// worker's archive holds afterwards; 0 when there is no screenshot folder.
+/// Windows junctions), files over the preview limit, files that are not PNGs
+/// and files that do not start with the PNG signature are skipped. The copy is
+/// idempotent: an existing archive file of the same size is kept. Returns the
+/// screenshot-folder-relative paths the archive now holds, so a caller can
+/// drop exactly those files from the checkout and leave everything it could
+/// not archive in place.
 pub(crate) async fn archive_worker_screenshots(
     checkout: &Path,
     archive: &Path,
-) -> Result<usize, String> {
+) -> Result<Vec<PathBuf>, String> {
     let checkout = checkout.to_path_buf();
     let archive = archive.to_path_buf();
     tokio::task::spawn_blocking(move || copy_screenshots(&checkout, &archive))
@@ -764,28 +766,28 @@ pub(crate) async fn archive_worker_screenshots(
 static SCREENSHOT_COPY_SEQUENCE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-fn copy_screenshots(checkout: &Path, archive: &Path) -> Result<usize, String> {
+fn copy_screenshots(checkout: &Path, archive: &Path) -> Result<Vec<PathBuf>, String> {
     let source = checkout.join(SCREENSHOT_DIR);
     let metadata = match std::fs::symlink_metadata(&source) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(format!("could not inspect {}: {err}", source.display())),
     };
     if !metadata.is_dir() || pool_is_link_or_junction(&metadata) {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let mut archived = 0;
+    let mut archived = Vec::new();
     copy_screenshot_dir(&source, &source, archive, &mut archived)?;
     Ok(archived)
 }
 
 /// Copy every PNG under `dir` (itself under `root`) to the same relative path
-/// under `archive`, counting what the archive holds.
+/// under `archive`, recording what the archive holds.
 fn copy_screenshot_dir(
     root: &Path,
     dir: &Path,
     archive: &Path,
-    archived: &mut usize,
+    archived: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|err| format!("could not read {}: {err}", dir.display()))?;
@@ -819,7 +821,7 @@ fn copy_screenshot_dir(
             continue;
         }
         copy_archived_png(&bytes, &archive.join(relative))?;
-        *archived += 1;
+        archived.push(relative.to_path_buf());
     }
     Ok(())
 }
@@ -855,30 +857,69 @@ fn copy_archived_png(bytes: &[u8], target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove the screenshot files Git does not track from a checkout, once their
-/// archive copy exists.
+/// Remove the screenshots the archive holds from a checkout.
 ///
-/// `git clean` is scoped to the screenshot folder and only ever deletes
-/// untracked (or ignored) files there, so a tracked screenshot survives. A
-/// folder without its own `.git` is skipped: Git would otherwise walk up to
-/// the project root and clean the lead's checkout instead.
-pub(crate) async fn clean_checkout_screenshots(checkout: &Path) -> Result<(), String> {
+/// `archived` lists the screenshot-folder-relative paths whose archive copy
+/// exists, and only those files are removed: a file the archive skipped (an
+/// oversized or non-PNG file, a link) stays in the checkout, and so does
+/// anything Git tracks, so a committed screenshot survives. A folder without
+/// its own `.git` is skipped: Git would otherwise walk up to the project root
+/// and answer for the lead's checkout instead.
+pub(crate) async fn clean_checkout_screenshots(
+    checkout: &Path,
+    archived: &[PathBuf],
+) -> Result<(), String> {
+    if archived.is_empty() {
+        return Ok(());
+    }
     let checkout = checkout.to_path_buf();
+    let archived = archived.to_vec();
     tokio::task::spawn_blocking(move || {
-        if !checkout.join(SCREENSHOT_DIR).is_dir() || !checkout.join(".git").exists() {
+        if !checkout.join(".git").exists() {
             return Ok(());
         }
         let output = std::process::Command::new("git")
-            .args(["clean", "-fdx", "--", SCREENSHOT_DIR])
+            .args(["ls-files", "-z", "--", SCREENSHOT_DIR])
             .current_dir(&checkout)
             .output()
-            .map_err(|err| format!("could not run git clean in {}: {err}", checkout.display()))?;
+            .map_err(|err| {
+                format!(
+                    "could not list the tracked screenshots in {}: {err}",
+                    checkout.display()
+                )
+            })?;
         if !output.status.success() {
             return Err(format!(
-                "git clean failed in {}: {}",
+                "git ls-files failed in {}: {}",
                 checkout.display(),
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
+        }
+        let tracked = String::from_utf8_lossy(&output.stdout);
+        let tracked: Vec<&str> = tracked
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .collect();
+        for relative in &archived {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let repo_relative = format!("{SCREENSHOT_DIR}/{relative}");
+            if tracked.iter().any(|path| *path == repo_relative) {
+                continue;
+            }
+            let path = checkout.join(SCREENSHOT_DIR).join(&relative);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() && !pool_is_link_or_junction(&metadata) => {
+                    std::fs::remove_file(&path).map_err(|err| {
+                        format!(
+                            "could not remove the archived screenshot {}: {err}",
+                            path.display()
+                        )
+                    })?;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("could not inspect {}: {err}", path.display())),
+            }
         }
         Ok(())
     })
@@ -889,10 +930,10 @@ pub(crate) async fn clean_checkout_screenshots(checkout: &Path) -> Result<(), St
 /// Keep a worker's screenshots before its checkout is released or removed.
 ///
 /// The files are copied into the team's state dir and only then dropped from
-/// the checkout, so the next pool reuse cannot wipe the only copy - and the
-/// release no longer refuses over work Git does not track. Best effort on
-/// purpose: an archive failure is logged and the release goes ahead as
-/// before, with the screenshots still in the checkout.
+/// the checkout - and only the ones the archive actually holds, so anything it
+/// skipped stays where it was. Best effort on purpose: an archive failure is
+/// logged and the release goes ahead as before, with the screenshots still in
+/// the checkout.
 pub(crate) async fn keep_worker_screenshots(
     worker_id: &str,
     checkout: &Path,
@@ -903,13 +944,14 @@ pub(crate) async fn keep_worker_screenshots(
     };
     match archive_worker_screenshots(checkout, &archive).await {
         Ok(archived) => {
-            if archived > 0 {
+            if !archived.is_empty() {
                 eprintln!(
-                    "mnemo2: archived {archived} screenshot(s) of {worker_id} in {}",
+                    "mnemo2: archived {} screenshot(s) of {worker_id} in {}",
+                    archived.len(),
                     archive.display()
                 );
             }
-            if let Err(error) = clean_checkout_screenshots(checkout).await {
+            if let Err(error) = clean_checkout_screenshots(checkout, &archived).await {
                 eprintln!(
                     "mnemo2: could not remove the archived screenshots from {}: {error}",
                     checkout.display()
@@ -1386,7 +1428,12 @@ mod tests {
         let archived = archive_worker_screenshots(&checkout, &archive)
             .await
             .expect("archive screenshots");
-        assert_eq!(archived, 2, "only genuine PNG files are archived");
+        assert_eq!(archived.len(), 2, "only genuine PNG files are archived");
+        assert!(archived.contains(&PathBuf::from("shot-1.png")), "{archived:?}");
+        assert!(
+            archived.contains(&PathBuf::from("nested/shot-2.png")),
+            "{archived:?}"
+        );
         assert_eq!(
             std::fs::read(archive.join("shot-1.png")).expect("archived png"),
             b"\x89PNG\r\n\x1a\nfirst"
@@ -1404,17 +1451,87 @@ mod tests {
         assert_eq!(
             archive_worker_screenshots(&checkout, &archive)
                 .await
-                .expect("second archive"),
+                .expect("second archive")
+                .len(),
             2
         );
         // A checkout without a screenshot folder archives nothing.
         let (_empty_dir, empty) = canonical_tempdir();
         let (_other_dir, other_archive) = canonical_tempdir();
+        assert!(archive_worker_screenshots(&empty, &other_archive)
+            .await
+            .expect("no screenshot folder")
+            .is_empty());
+    }
+
+    /// Run one Git command in a test repository, asserting it succeeded.
+    fn git_in(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git process");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_worker_screenshots_removes_only_archived_files() {
+        let checkout_dir = tempfile::tempdir().expect("checkout");
+        let state_dir = tempfile::tempdir().expect("state");
+        let checkout = checkout_dir.path();
+        git_in(checkout, &["init"]);
+        git_in(checkout, &["config", "user.email", "test@example.com"]);
+        git_in(checkout, &["config", "user.name", "Test"]);
+        std::fs::write(checkout.join("README.md"), "repo\n").expect("readme");
+        git_in(checkout, &["add", "README.md"]);
+        git_in(checkout, &["commit", "-m", "initial"]);
+        let shots = checkout.join(SCREENSHOT_DIR);
+        std::fs::create_dir_all(shots.join("tracked")).expect("screenshot folders");
+        std::fs::write(shots.join("shot-1.png"), b"\x89PNG\r\n\x1a\narchived").expect("png");
+        // A committed screenshot must never be deleted, even though it is
+        // archived too.
+        std::fs::write(shots.join("tracked/shot-2.png"), b"\x89PNG\r\n\x1a\ntracked")
+            .expect("tracked png");
+        git_in(
+            checkout,
+            &["add", ".coding/browser/screenshots/tracked/shot-2.png"],
+        );
+        git_in(checkout, &["commit", "-m", "track a screenshot"]);
+        // Files the archive has to skip must stay in the checkout.
+        let large = std::fs::File::create(shots.join("large.png")).expect("large png");
+        large
+            .set_len(MAX_SCREENSHOT_BYTES + 1)
+            .expect("sparse large png");
+        std::fs::write(shots.join("notes.txt"), b"notes").expect("notes");
+
+        keep_worker_screenshots("shotsa0001", checkout, state_dir.path()).await;
+
+        let archive = screenshot_archive_dir(state_dir.path(), "shotsa0001")
+            .expect("the worker id names an archive folder");
         assert_eq!(
-            archive_worker_screenshots(&empty, &other_archive)
-                .await
-                .expect("no screenshot folder"),
-            0
+            std::fs::read(archive.join("shot-1.png")).expect("archived png"),
+            b"\x89PNG\r\n\x1a\narchived"
+        );
+        assert!(archive.join("tracked/shot-2.png").is_file());
+        assert!(
+            !shots.join("shot-1.png").exists(),
+            "an archived screenshot leaves the checkout"
+        );
+        assert!(
+            shots.join("large.png").exists(),
+            "an oversized PNG the archive skipped stays in the checkout"
+        );
+        assert!(
+            shots.join("notes.txt").exists(),
+            "a non-PNG the archive skipped stays in the checkout"
+        );
+        assert!(
+            shots.join("tracked/shot-2.png").exists(),
+            "a tracked screenshot stays in the checkout"
         );
     }
 

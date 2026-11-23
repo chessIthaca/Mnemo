@@ -4177,6 +4177,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Test synchronization only; no specified behaviour changes."
+    },
+    {
+      "id": "200ac7a9",
+      "status": "open",
+      "created_at_ms": 1795455922528,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Internal robustness fixes: the lead check guard, notice-drain cost and a git exclude line change no specified behaviour of a capability; the reply shapes stay the same."
     }
   ]
 }

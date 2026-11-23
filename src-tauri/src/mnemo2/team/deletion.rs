@@ -977,6 +977,12 @@ impl TeamRuntime {
         for worker_id in &deleted {
             self.close_audits_of_locked(worker_id, true).await;
         }
+        // The deletion released those pools: drop the free pools above the
+        // slot count as well (plan 2e15085a). The merge lock is held, and the
+        // trim takes the checkout pool lock after it.
+        if !deleted.is_empty() {
+            self.trim_idle_pools().await;
+        }
         Ok(TeamDeleteOutcome {
             results: outcomes,
             snapshot: self.snapshot().await,

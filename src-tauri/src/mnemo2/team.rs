@@ -503,6 +503,43 @@ impl TeamRuntime {
         }
     }
 
+    /// Remove the FREE pool checkouts whose index is above the worker slot
+    /// count (plan 2e15085a): the pools stop accumulating above the slots, and
+    /// at rest the pool count is at most the slot count. The cap is SOFT —
+    /// dispatch never waits for a trim, and a pool above the slot count may
+    /// still be created while the lower ones are held. A pool is kept when a
+    /// worker record holds it, when it is on a branch or has uncommitted work,
+    /// when another instance claims it, and always when its index is at or
+    /// below the slot count (those are the warm caches).
+    ///
+    /// Takes the checkout pool lock itself, so a caller that holds the merge
+    /// lock may call it (merge and trim both lock `merge_lock ->
+    /// checkout_pool_lock`); NEVER call it while the checkout pool lock is
+    /// already held. Reads the held checkouts after taking the lock and never
+    /// fails its caller: a listing or removal problem goes to stderr.
+    pub(super) async fn trim_idle_pools(&self) {
+        let _pools = self.checkout_pool_lock.lock().await;
+        let keep = self.persistence.slots.load(Ordering::SeqCst);
+        let held = self.held_checkouts().await;
+        match mnemo::app::worktrees::trim_pool_checkouts(
+            self.workspace_root.clone(),
+            keep as u32,
+            held,
+        )
+        .await
+        {
+            Ok(removed) => {
+                for pool in removed {
+                    eprintln!(
+                        "team: removed idle pool checkout {} above the {keep} slots",
+                        pool.display()
+                    );
+                }
+            }
+            Err(error) => eprintln!("team: could not trim the idle pool checkouts: {error}"),
+        }
+    }
+
     /// Every checkout held by a record other than `worker_id`.
     async fn other_held_checkouts(&self, worker_id: &str) -> Vec<PathBuf> {
         self.records
@@ -654,6 +691,10 @@ impl TeamRuntime {
         // App start: a checkout a previous run could not remove (something
         // held it) is retried now, and the branch it was blocking goes with it.
         runtime.retry_leftover_cleanups().await;
+        // Recovery released the pools of the workers it closed: drop the free
+        // pools above the slot count, so a started app converges on the slots
+        // (plan 2e15085a).
+        runtime.trim_idle_pools().await;
         // A registered agent that still runs (recovery kept its worker at
         // work) is watched again: its finish is processed, and a later stall
         // with no lead attached hands it back.
@@ -948,6 +989,8 @@ impl TeamRuntime {
             let _ = self.persist().await;
             return Err(error);
         }
+        // The lower cap is persisted: the free pools above it go now.
+        self.trim_idle_pools().await;
         Ok(self.snapshot().await)
     }
 
@@ -988,6 +1031,9 @@ impl TeamRuntime {
         .await?;
         let restored = self.persistence.load()?.unwrap_or_default();
         *self.records.lock().await = restored.workers;
+        // The cleanup released the pools whose records are gone; the free
+        // pools above the slot count go with them (plan 2e15085a).
+        self.trim_idle_pools().await;
         Ok(report)
     }
 

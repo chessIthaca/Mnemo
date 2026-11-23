@@ -19789,3 +19789,32 @@ async fn merge_and_stop_refresh_the_board() {
     assert!(drained_board_changed(&mut signals), "a stop refreshes the board");
     team.shutdown().await;
 }
+
+#[tokio::test]
+async fn lowering_slots_trims_idle_pools_above_the_new_count() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    team.set_slots(3).await.expect("three worker slots");
+    // Three RELEASED pools: detached, clean, held by no worker record.
+    let mut pools = Vec::new();
+    for index in 1..=3 {
+        let pool = root.path().join(".worktrees").join(format!("pool-{index}"));
+        let pool_path = pool.to_str().expect("pool path").to_string();
+        run_git(root.path(), &["worktree", "add", "--detach", &pool_path, "main"]);
+        pools.push(pool);
+    }
+    // The warm build cache of the pool at the slot count must survive.
+    let warm = pools[0].join("target").join("warm");
+    std::fs::create_dir_all(warm.parent().expect("target")).expect("target folder");
+    std::fs::write(&warm, "warm\n").expect("warm cache");
+
+    team.set_slots(1).await.expect("one worker slot");
+
+    assert!(!pools[1].exists(), "pool-2 is removed with the lower cap");
+    assert!(!pools[2].exists(), "pool-3 is removed with the lower cap");
+    assert!(pools[0].is_dir(), "pool-1 stays: it is at the slot count");
+    assert!(warm.exists(), "pool-1 keeps its warm target/");
+    team.shutdown().await;
+}

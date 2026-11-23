@@ -538,6 +538,10 @@ impl TeamRuntime {
                     })
                     .await;
                     self.persist().await?;
+                    // The record no longer holds the pool: drop the free pools
+                    // above the slot count (plan 2e15085a). The merge lock is
+                    // held; the trim takes the checkout pool lock after it.
+                    self.trim_idle_pools().await;
                 }
                 // The checkout no longer holds the branch. The
                 // merge commit keeps the worker's tip as its second parent, so

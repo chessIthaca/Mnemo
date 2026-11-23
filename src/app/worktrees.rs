@@ -552,6 +552,24 @@ fn existing_pool_entries(main_root: &Path) -> Result<Vec<(u32, PathBuf, bool)>, 
     Ok(pools)
 }
 
+/// The free-pool test [`provision_pool_checkout`] and
+/// [`trim_pool_checkouts`] share: the checkout is a registered pool worktree,
+/// its HEAD is detached, and it carries no uncommitted or untracked work.
+/// Ignored build caches — the point of a pool — do not count as work. `Err`
+/// names the first precondition that failed.
+fn pool_is_free(main_root: &Path, pool: &Path) -> Result<(), String> {
+    ensure_registered_pool_checkout(main_root, pool)?;
+    let head = git_raw(pool, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if head.trim() != "HEAD" {
+        return Err(format!("pool is on branch {}", head.trim()));
+    }
+    let dirty = git_raw(pool, &["status", "--porcelain", "-uall"])?;
+    if !dirty.trim().is_empty() {
+        return Err("pool has uncommitted work".to_string());
+    }
+    Ok(())
+}
+
 /// Provision a POOL checkout for a new worker on `branch`, forked from
 /// `base_ref` (the lead branch tip): the lowest-indexed
 /// `<main_root>/.worktrees/pool-<n>` that is FREE — not `held` by any live
@@ -605,18 +623,6 @@ fn provision_pool_checkout_impl(
     // stale metadata would make `git worktree add` refuse to create the
     // next pool folder (same hygiene as `remove_worktree_only_impl`).
     let _ = git_raw(main_root, &["worktree", "prune"]);
-    let free = |pool: &Path| -> Result<(), String> {
-        ensure_registered_pool_checkout(main_root, pool)?;
-        let head = git_raw(pool, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-        if head.trim() != "HEAD" {
-            return Err(format!("pool is on branch {}", head.trim()));
-        }
-        let dirty = git_raw(pool, &["status", "--porcelain", "-uall"])?;
-        if !dirty.trim().is_empty() {
-            return Err("pool has uncommitted work".to_string());
-        }
-        Ok(())
-    };
     let pools = existing_pool_entries(main_root)?;
     for (_, pool, is_dir) in &pools {
         if let Err(error) = ensure_pool_checkout(main_root, pool) {
@@ -633,7 +639,7 @@ fn provision_pool_checkout_impl(
         if held.iter().any(|held_path| same_checkout_path(held_path, pool)) {
             continue; // held by a live worker record — the expected case
         }
-        if let Err(error) = free(pool) {
+        if let Err(error) = pool_is_free(main_root, pool) {
             eprintln!(
                 "mnemo: pool checkout {} is not free: {error}; skipped",
                 pool.display()
@@ -658,7 +664,7 @@ fn provision_pool_checkout_impl(
             }
         };
         // Another instance may have changed the checkout before our claim.
-        if let Err(error) = free(pool) {
+        if let Err(error) = pool_is_free(main_root, pool) {
             eprintln!(
                 "mnemo: pool checkout {} changed after claiming: {error}; skipped",
                 pool.display()
@@ -712,6 +718,135 @@ fn provision_pool_checkout_impl(
         "could not allocate a new pool checkout after 5 attempts: {}",
         last_error.unwrap_or_else(|| "pool paths kept appearing".to_string())
     ))
+}
+
+/// Remove every FREE pool checkout whose index is above `keep` — the current
+/// worker slot count — highest index first, and return the removed paths. The
+/// cap is SOFT: dispatch never depends on it, so a new pool above `keep` may
+/// still be created while the lower pools are held.
+///
+/// A pool is removed only when ALL of these hold: its index is above `keep`;
+/// no path in `held` is it (the checkouts of unmerged worker records);
+/// [`pool_is_free`] passes (registered with git, detached HEAD, no uncommitted
+/// or untracked work); and the cross-instance claim [`acquire_pool_claim`] is
+/// obtained and the free test still passes with the claim held. Anything else
+/// is reported on stderr and left untouched: uncommitted work is never
+/// discarded, another instance's pool is never raced, and a pool at or below
+/// `keep` stays as a warm cache.
+///
+/// Removal is `git worktree remove --force` from `main_root` (the free test
+/// already proved there is no tracked or untracked work), then — when the
+/// folder survives with its ignored caches (Windows: an npm workspace junction
+/// outlives git's removal) — `std::fs::remove_dir_all` and a `worktree prune`.
+/// That removal never follows a symlink or junction (Rust removes the link
+/// itself), so a link's target outside the pool survives. One failed removal is
+/// reported and skipped; only a failure to LIST the pools is an error.
+///
+/// Runs the blocking git subprocesses on the blocking thread pool (see the
+/// module doc). Owns its arguments so the closure is `'static + Send`.
+pub async fn trim_pool_checkouts(
+    main_root: PathBuf,
+    keep: u32,
+    held: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    tokio::task::spawn_blocking(move || trim_pool_checkouts_impl(&main_root, keep, &held))
+        .await
+        .map_err(|e| format!("pool checkout trim task failed: {e}"))?
+}
+
+/// The synchronous core of [`trim_pool_checkouts`].
+fn trim_pool_checkouts_impl(
+    main_root: &Path,
+    keep: u32,
+    held: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mut pools = existing_pool_entries(main_root)?;
+    // Highest index first, so the cap lands as close to `keep` as the pools
+    // allow even when one of them cannot go.
+    pools.retain(|(index, _, _)| *index > keep);
+    pools.sort_by_key(|(index, _, _)| std::cmp::Reverse(*index));
+    let mut removed = Vec::new();
+    let mut attempted = false;
+    for (_, pool, is_dir) in &pools {
+        if held
+            .iter()
+            .any(|held_path| same_checkout_path(held_path, pool))
+        {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: a worker record holds it",
+                pool.display()
+            );
+            continue;
+        }
+        if !is_dir {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: it is not a directory",
+                pool.display()
+            );
+            continue;
+        }
+        if let Err(error) = pool_is_free(main_root, pool) {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: it is not free: {error}",
+                pool.display()
+            );
+            continue;
+        }
+        let _claim = match acquire_pool_claim(pool) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                eprintln!(
+                    "mnemo: idle pool checkout {} stays: it has a live claim",
+                    pool.display()
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                    "mnemo: idle pool checkout {} stays: it cannot be claimed: {error}",
+                    pool.display()
+                );
+                continue;
+            }
+        };
+        // Another instance may have changed the checkout before our claim.
+        if let Err(error) = pool_is_free(main_root, pool) {
+            eprintln!(
+                "mnemo: idle pool checkout {} stays: it changed after claiming: {error}",
+                pool.display()
+            );
+            continue;
+        }
+        attempted = true;
+        match remove_pool_checkout(main_root, pool) {
+            Ok(()) => removed.push(pool.clone()),
+            Err(error) => eprintln!(
+                "mnemo: could not remove idle pool checkout {}: {error}; skipped",
+                pool.display()
+            ),
+        }
+    }
+    if attempted {
+        let _ = git_raw(main_root, &["worktree", "prune"]);
+    }
+    Ok(removed)
+}
+
+/// Remove one claimed, free pool checkout: `git worktree remove --force` from
+/// `main_root`, then `std::fs::remove_dir_all` for a folder git leaves behind
+/// because of its ignored build caches (Windows: an npm workspace junction
+/// outlives the removal). `remove_dir_all` never follows a symlink or junction
+/// — it removes the link itself, so a link's target outside the pool survives.
+fn remove_pool_checkout(main_root: &Path, pool: &Path) -> Result<(), String> {
+    let path = pool.to_string_lossy();
+    git_raw(main_root, &["worktree", "remove", "--force", path.as_ref()])?;
+    match std::fs::symlink_metadata(pool) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    }
+    std::fs::remove_dir_all(pool)
+        .map_err(|error| format!("git deregistered it, but the folder remains: {error}"))
 }
 
 /// Reuse one free pool for a new worker: re-point its detached HEAD at
@@ -2125,5 +2260,215 @@ mod tests {
         .await
         .expect("reuse");
         assert_eq!(reused, pool);
+    }
+
+    #[tokio::test]
+    async fn trim_removes_free_pools_above_the_keep_count() {
+        let repo = init_repo_ignoring_pool_caches();
+        let main = repo.path().to_path_buf();
+        // Three attached pools reserve pool-1, pool-2 and pool-3 in turn.
+        let mut pools = Vec::new();
+        for id in ["aaaaaaaa1111", "bbbbbbbb2222", "cccccccc3333"] {
+            let (pool, branch) = provision_agent_checkout(
+                main.clone(),
+                id.to_string(),
+                "main".to_string(),
+                vec![],
+            )
+            .await
+            .expect("provision");
+            assert_eq!(pool_index(&pool), Some(pools.len() as u32 + 1));
+            pools.push((pool, branch));
+        }
+        // pool-1 keeps the previous worker's warm, ignored build cache.
+        write_all(&[(pools[0].0.join("target/x"), "x")]);
+        for (pool, branch) in &pools {
+            release_pool_checkout(main.clone(), pool.clone(), branch.clone())
+                .await
+                .expect("release");
+        }
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert_eq!(
+            removed,
+            vec![pools[2].0.clone(), pools[1].0.clone()],
+            "highest index first"
+        );
+        assert!(!pools[1].0.exists(), "pool-2 is removed");
+        assert!(!pools[2].0.exists(), "pool-3 is removed");
+        assert!(pools[0].0.is_dir(), "a pool at the keep count stays");
+        assert!(
+            pools[0].0.join("target/x").exists(),
+            "its warm build cache stays"
+        );
+        let listed = registered_worktrees(repo.path()).expect("registered worktrees");
+        for (pool, _) in &pools[1..] {
+            assert!(
+                !listed
+                    .iter()
+                    .any(|path| same_checkout_path(path, pool)),
+                "{} is absent from git worktree list",
+                pool.display()
+            );
+        }
+        assert!(
+            listed
+                .iter()
+                .any(|path| same_checkout_path(path, &pools[0].0)),
+            "pool-1 stays registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn trim_never_removes_held_dirty_or_attached_pools() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let mut pools = Vec::new();
+        for id in ["aaaaaaaa1111", "bbbbbbbb2222", "cccccccc3333", "dddddddd4444"] {
+            let (pool, branch) = provision_agent_checkout(
+                main.clone(),
+                id.to_string(),
+                "main".to_string(),
+                vec![],
+            )
+            .await
+            .expect("provision");
+            pools.push((pool, branch));
+        }
+        // pool-2 is free but held by a record; pool-3 is free but dirty;
+        // pool-4 still belongs to a worker on its branch.
+        release_pool_checkout(main.clone(), pools[1].0.clone(), pools[1].1.clone())
+            .await
+            .expect("release pool-2");
+        release_pool_checkout(main.clone(), pools[2].0.clone(), pools[2].1.clone())
+            .await
+            .expect("release pool-3");
+        std::fs::write(pools[2].0.join("untracked.txt"), "keep\n").expect("untracked work");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![pools[1].0.clone()])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "nothing is removed: {removed:?}");
+        for (pool, _) in &pools[1..] {
+            assert!(pool.is_dir(), "{} stays", pool.display());
+        }
+        assert_eq!(
+            current_branch(&pools[3].0).expect("branch"),
+            pools[3].1,
+            "the attached pool is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn trim_skips_a_pool_with_a_live_claim() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let (pool_1, _) = provision_agent_checkout(
+            main.clone(),
+            "aaaaaaaa1111".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("first provision");
+        let (pool_2, branch_2) = provision_agent_checkout(
+            main.clone(),
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("second provision");
+        release_pool_checkout(main.clone(), pool_2.clone(), branch_2)
+            .await
+            .expect("release");
+        // Another instance holds the claim: a fresh claim owned by this live
+        // process must keep the trim away from the pool.
+        let claim = pool_2.with_file_name("pool-2.claim");
+        std::fs::write(&claim, format!("{}\n", std::process::id())).expect("claim file");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "nothing is removed: {removed:?}");
+        assert!(pool_1.is_dir(), "pool-1 stays");
+        assert!(pool_2.is_dir(), "a claimed pool stays");
+        assert!(claim.exists(), "another instance's claim is left alone");
+    }
+
+    #[tokio::test]
+    async fn trim_removes_a_pool_whose_link_points_outside_without_following_it() {
+        let repo = init_repo_ignoring_pool_caches();
+        let main = repo.path().to_path_buf();
+        let (pool_1, _) = provision_agent_checkout(
+            main.clone(),
+            "aaaaaaaa1111".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("first provision");
+        let (pool_2, branch_2) = provision_agent_checkout(
+            main.clone(),
+            "bbbbbbbb2222".to_string(),
+            "main".to_string(),
+            vec![],
+        )
+        .await
+        .expect("second provision");
+        // A dependency linked in from OUTSIDE the pool — the npm workspace
+        // junction that outlives git's own removal on Windows.
+        let outside = tempfile::tempdir().expect("outside folder");
+        std::fs::write(outside.path().join("keep.txt"), "keep\n").expect("outside file");
+        let link = pool_2.join("node_modules").join("linked");
+        std::fs::create_dir_all(link.parent().expect("link parent")).expect("node_modules");
+        create_directory_link(&link, outside.path()).expect("directory link");
+        release_pool_checkout(main.clone(), pool_2.clone(), branch_2)
+            .await
+            .expect("release");
+        let removed = trim_pool_checkouts(main.clone(), 1, vec![])
+            .await
+            .expect("trim");
+        assert_eq!(removed, vec![pool_2.clone()]);
+        assert!(!pool_2.exists(), "the pool folder is gone, link included");
+        assert!(
+            outside.path().join("keep.txt").exists(),
+            "removal never follows the link: its target survives"
+        );
+        assert!(pool_1.is_dir(), "a pool at the keep count stays");
+    }
+
+    #[tokio::test]
+    async fn trim_with_keep_at_or_above_the_highest_index_removes_nothing() {
+        let repo = init_repo();
+        let main = repo.path().to_path_buf();
+        let mut pools = Vec::new();
+        for id in ["aaaaaaaa1111", "bbbbbbbb2222"] {
+            let (pool, branch) = provision_agent_checkout(
+                main.clone(),
+                id.to_string(),
+                "main".to_string(),
+                vec![],
+            )
+            .await
+            .expect("provision");
+            release_pool_checkout(main.clone(), pool.clone(), branch)
+                .await
+                .expect("release");
+            pools.push(pool);
+        }
+        let removed = trim_pool_checkouts(main.clone(), 5, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "nothing is removed: {removed:?}");
+        for pool in &pools {
+            assert!(pool.is_dir(), "{} stays below a higher keep", pool.display());
+        }
+        let removed = trim_pool_checkouts(main.clone(), 2, vec![])
+            .await
+            .expect("trim");
+        assert!(removed.is_empty(), "keep == the highest index: {removed:?}");
+        for pool in &pools {
+            assert!(pool.is_dir(), "{} stays at the keep count", pool.display());
+        }
     }
 }

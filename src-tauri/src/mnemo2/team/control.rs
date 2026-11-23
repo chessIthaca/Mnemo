@@ -438,7 +438,17 @@ impl TeamRuntime {
     /// audit; `resume` can reattach the saved transcript later. A worker that
     /// was not already stopped has reached a terminal status, so its `outcome`
     /// row (design §4.7) is appended beside the record.
+    ///
+    /// A reported audit of the stopped worker is closed with it (plan
+    /// aa4903ac), and the board is told to refresh.
     pub async fn stop(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        let record = self.stop_locked(worker_id).await?;
+        self.close_audits_of(worker_id, false).await;
+        self.signal_board_changed();
+        Ok(record)
+    }
+
+    async fn stop_locked(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         let before = self.worker(worker_id).await?;
         let record = self.stop_inner(worker_id).await?;

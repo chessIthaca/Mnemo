@@ -326,6 +326,9 @@ impl TeamRuntime {
     /// `by_lead` is true when the lead itself asked, from inside its turn.
     pub(super) async fn merge_as(&self, worker_id: &str, by_lead: bool) -> Result<WorkerRecord, String> {
         let worker = self.merge_locked(worker_id, by_lead).await?;
+        // A reported audit of the merged worker has nothing left to do; an
+        // unreported one keeps running (plan aa4903ac).
+        self.close_audits_of(worker_id, false).await;
         self.after_merge(&worker).await;
         self.signal_board_changed();
         Ok(worker)

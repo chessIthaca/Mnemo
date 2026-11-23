@@ -183,7 +183,31 @@ impl TeamRuntime {
     /// (`independent_reviewer_id` plus a written `audit_adjudication`)
     /// linked at the exact reviewed tip. The answer reports which lane the
     /// change landed in.
+    ///
+    /// A review that links an audit uses its verdict, so that audit is
+    /// closed once the review is persisted (plan aa4903ac); a close failure
+    /// is logged and never fails the review.
     pub async fn review(
+        &self,
+        worker_id: &str,
+        summary: String,
+        findings: Vec<Finding>,
+        evidence: ReviewEvidence,
+    ) -> Result<WorkerRecord, String> {
+        let used_audit = evidence
+            .independent_reviewer_id
+            .clone()
+            .filter(|id| !id.trim().is_empty());
+        let reviewed = self
+            .review_locked(worker_id, summary, findings, evidence)
+            .await?;
+        if let Some(audit_id) = used_audit {
+            self.close_used_audit(&audit_id).await;
+        }
+        Ok(reviewed)
+    }
+
+    async fn review_locked(
         &self,
         worker_id: &str,
         summary: String,

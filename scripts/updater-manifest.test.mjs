@@ -10,7 +10,11 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
+import { checkoutRootOf, isInside, samePath, targetTmpOf, testTmpRoot, tmpdirNow } from "./test-tmp.mjs";
 import { buildManifest, changelogNotes, findSignatures } from "./updater-manifest.mjs";
+
+// The temp dirs stay in the checkout's target/tmp, not the system temp folder.
+testTmpRoot();
 
 const SCRIPT = fileURLToPath(new URL("./updater-manifest.mjs", import.meta.url));
 
@@ -212,4 +216,16 @@ test("cli_names_a_missing_flag", () => {
   const result = runCli(["--tag", "v2.5.0"]);
   assert.equal(result.status, 1);
   assert.ok(result.stderr.includes("missing --repo"));
+});
+
+test("script tests keep os.tmpdir() inside the repo target/tmp", () => {
+  const actual = tmpdirNow();
+  assert.ok(
+    isInside(actual, checkoutRootOf(import.meta.url)),
+    `os.tmpdir() ${actual} must lie inside the checkout`,
+  );
+  assert.ok(
+    samePath(actual, targetTmpOf(import.meta.url)),
+    `os.tmpdir() ${actual} must be the checkout's target/tmp`,
+  );
 });

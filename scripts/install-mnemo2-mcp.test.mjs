@@ -12,6 +12,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
+import { testTmpRoot } from "./test-tmp.mjs";
+
+// The sandbox dirs stay in the checkout's target/tmp, not the system temp folder.
+testTmpRoot();
+
 const SCRIPT = fileURLToPath(new URL("./install-mnemo2-mcp.mjs", import.meta.url));
 const EXE = process.platform === "win32" ? ".exe" : "";
 

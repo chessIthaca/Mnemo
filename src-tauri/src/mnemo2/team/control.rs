@@ -23,6 +23,7 @@ use crate::mnemo2::dispatch_routing::{
 
 use serde_json::{Value, json};
 
+use super::agent_watch;
 use super::deletion::{CheckoutKind, validated_checkout, worker_checkout};
 use super::dispatch::claude_agent_block;
 use super::{
@@ -541,6 +542,17 @@ impl TeamRuntime {
     /// Reattach a stopped/interrupted worker from its saved transcript. The
     /// session comes back idle; the lead then sends it a message.
     pub async fn resume(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        self.resume_keeping(worker_id, false).await
+    }
+
+    /// [`Self::resume`]; `keep_changes` (only the external lead's
+    /// `team_resume` passes it) lets the Mnemo model take over a handed-back
+    /// worker's dirty checkout (plan ee73bd2f decision 3).
+    pub(super) async fn resume_keeping(
+        &self,
+        worker_id: &str,
+        keep_changes: bool,
+    ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
         // A Claude Code agent worker has no session to reattach: the lead
@@ -548,8 +560,34 @@ impl TeamRuntime {
         if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
-        self.resume_inner(worker_id).await
+        self.resume_session(worker_id, keep_changes).await
     }
+
+    /// Refuse a Mnemo session on a handed-back worker whose checkout has
+    /// uncommitted changes (plan ee73bd2f decision 3): the agent the lead
+    /// launched may still be writing there. The worker is left as it is
+    /// (Interrupted) and the lead gets a notice naming the checkout and the
+    /// recovery calls. `keep_changes` (the external lead's explicit choice)
+    /// allows the takeover.
+    pub(super) async fn handed_back_takeover_refusal(
+        &self,
+        record: &WorkerRecord,
+        keep_changes: bool,
+    ) -> Result<(), String> {
+        if record.handed_back.is_none() || keep_changes {
+            return Ok(());
+        }
+        if !agent_watch::checkout_dirty(&record.worktree).await {
+            return Ok(());
+        }
+        let refusal = agent_watch::handed_back_dirty_refusal(record);
+        self.notify_lead(
+            format!("handed-back-dirty:{}:{}", record.id, unix_ms()),
+            refusal.clone(),
+        );
+        Err(refusal)
+    }
+
 
     /// Move a worker onto the lead's `tier`/`model`/`reasoning_effort` choice
     /// and resume it there with its transcript: the path `team_resume` with a
@@ -569,6 +607,7 @@ impl TeamRuntime {
         model: Option<String>,
         reasoning_effort: Option<String>,
         source: ChangeSource,
+        keep_changes: bool,
     ) -> Result<TierResume, String> {
         let pinned = model.is_some();
         let model = self.lead_model_choice(tier, model);
@@ -584,9 +623,16 @@ impl TeamRuntime {
                 return Ok(handed);
             }
         }
-        self.resume_on_tier_locked(worker_id, tier, model?, reasoning_effort, source)
-            .await
-            .map(TierResume::switched)
+        self.resume_on_tier_locked_keeping(
+            worker_id,
+            tier,
+            model?,
+            reasoning_effort,
+            source,
+            keep_changes,
+        )
+        .await
+        .map(TierResume::switched)
     }
 
     /// The Claude Code agent `tier` hands a worker to, with the tier's agent
@@ -653,6 +699,8 @@ impl TeamRuntime {
             worker.tier = Some(tier.to_string());
             worker.status = WorkerStatus::Working;
             worker.error = None;
+            // An agent runs it again: a hand-back on record is over.
+            worker.handed_back = None;
             worker.reroutes.push(row.clone());
             if let Some(routing) = worker.routing.as_mut() {
                 routing.nudged = None;
@@ -704,13 +752,28 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         source: ChangeSource,
     ) -> Result<WorkerRecord, String> {
+        self.resume_on_tier_locked_keeping(worker_id, tier, model, reasoning_effort, source, false)
+            .await
+    }
+
+    /// [`Self::resume_on_tier_locked`]; `keep_changes` lets the Mnemo model
+    /// take over a handed-back worker's dirty checkout.
+    async fn resume_on_tier_locked_keeping(
+        &self,
+        worker_id: &str,
+        tier: Option<&str>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+        keep_changes: bool,
+    ) -> Result<WorkerRecord, String> {
         // An effort alone keeps the worker's model.
         let model = match model {
             Some(model) => Some(model),
             None => self.worker(worker_id).await.ok().and_then(|w| w.model),
         };
         let changed = self
-            .change_model_locked(worker_id, model, reasoning_effort, source)
+            .change_model_locked_keeping(worker_id, model, reasoning_effort, source, keep_changes)
             .await;
         match (changed, tier) {
             (Ok(_), Some(tier)) => {
@@ -722,6 +785,17 @@ impl TeamRuntime {
     }
 
     pub(super) async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        self.resume_session(worker_id, false).await
+    }
+
+    /// [`Self::resume_inner`]; `keep_changes` lets the Mnemo model take over
+    /// a handed-back worker's dirty checkout. A session that starts clears
+    /// the hand-back on record.
+    async fn resume_session(
+        &self,
+        worker_id: &str,
+        keep_changes: bool,
+    ) -> Result<WorkerRecord, String> {
         if self.persistence.closed.load(Ordering::SeqCst) {
             return Err(CLOSING_RESUME_ERROR.to_string());
         }
@@ -788,6 +862,8 @@ impl TeamRuntime {
                 record.worktree.display()
             ));
         }
+        self.handed_back_takeover_refusal(&record, keep_changes)
+            .await?;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let check_commands = load_check_commands(&self.workspace_root);
         let session = self
@@ -815,7 +891,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             worker_id.to_string(),
             generation,
-            self.engine.clone(),
+            self.engine()?,
             session_id,
             receiver,
             self.events.clone(),
@@ -870,6 +946,8 @@ impl TeamRuntime {
             worker.pending = None;
             worker.error = None;
             worker.compacting = false;
+            // A Mnemo model runs it now: a hand-back on record is over.
+            worker.handed_back = None;
             let model = session_model_spec(worker).to_string();
             note_model(worker, &model);
         })
@@ -922,6 +1000,21 @@ impl TeamRuntime {
         reasoning_effort: Option<String>,
         source: ChangeSource,
     ) -> Result<WorkerRecord, String> {
+        self.change_model_locked_keeping(worker_id, model, reasoning_effort, source, false)
+            .await
+    }
+
+    /// [`Self::change_model_locked`]; `keep_changes` lets the Mnemo model
+    /// take over a handed-back worker's dirty checkout (plan ee73bd2f
+    /// decision 3), which is refused otherwise.
+    async fn change_model_locked_keeping(
+        &self,
+        worker_id: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        source: ChangeSource,
+        keep_changes: bool,
+    ) -> Result<WorkerRecord, String> {
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Cancelled {
             return Err("a cleaned worker cannot change its model".to_string());
@@ -933,6 +1026,10 @@ impl TeamRuntime {
             return Err(audit_finished_error(worker_id));
         }
         self.validate_model(&model, &reasoning_effort)?;
+        // Decided before anything changes, so a refused worker keeps its
+        // model and stays Interrupted.
+        self.handed_back_takeover_refusal(&record, keep_changes)
+            .await?;
         let from_spec = session_model_spec(&record).to_string();
         let nudged = record
             .routing
@@ -1045,9 +1142,11 @@ impl TeamRuntime {
             if !record.worktree.is_dir() {
                 return Err(format!("worker '{worker_id}' has no recoverable worktree"));
             }
+            // A session that starts clears the hand-back on record.
             return self.start_worker(record).await;
         }
-        self.resume_inner(worker_id).await
+        // The takeover was decided above.
+        self.resume_session(worker_id, true).await
     }
 
     /// Compact a quiescent worker. Blocked or stopped sessions are resumed once.
@@ -1274,14 +1373,13 @@ pub(super) async fn recover_worker(
         worker.merge = None;
         worker.fixer_finding_id = None;
     } else if worker.claude_agent.is_some()
-        && worker.claude_agent_id.is_some()
         && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
     {
-        // A registered Claude Code agent has no Mnemo session to lose: it
-        // may still run (or have finished) outside Mnemo2. It stays at work
-        // and the agent watch follows it (finishing it, or handing it back
-        // once it stalls with no lead); `TeamRuntime::open` already handed
-        // back the unlaunched and stalled ones.
+        // A Claude Code agent worker has no Mnemo session to lose: its agent
+        // may still run (or have finished, or still be about to launch)
+        // outside Mnemo2. It stays at work and the agent watch follows it,
+        // finishing it, or handing it back once its lead has been away for
+        // the grace period while it is unlaunched or stalled (plan ee73bd2f).
     } else if matches!(
         worker.status,
         WorkerStatus::Dispatching

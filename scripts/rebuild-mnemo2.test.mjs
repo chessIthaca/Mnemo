@@ -8,6 +8,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { MARKER_NAME, helperPath, markerPath, rebuild, resolveConfigDir } from "./rebuild-mnemo2.mjs";
+import { testTmpRoot } from "./test-tmp.mjs";
+
+// The config dirs stay in the checkout's target/tmp, not the system temp folder.
+testTmpRoot();
 
 /** A throwaway config dir, removed when the test ends. */
 function tempConfig(t) {

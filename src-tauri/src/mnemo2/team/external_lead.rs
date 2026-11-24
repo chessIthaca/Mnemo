@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use mnemo::app::plan_board::BoardStatus;
 use mnemo::headless::SessionId;
 
+use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
 use crate::mnemo2::ledger;
 use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
 use crate::mnemo2::runtime::{finished_notice, TEAM_NOTICE_PREFIX};
@@ -64,6 +65,21 @@ pub(super) struct ExternalLead {
     /// the idle release, so that session's own hooks can re-attach it; a
     /// fresh anonymous claim or a forgotten idle lead clears it.
     session_id: Option<String>,
+    /// Since when no external lead has been attached (Unix epoch
+    /// milliseconds): set when one detaches or leaves, and at open (there is
+    /// no lead at app start); cleared when one attaches. The agent hand-back
+    /// waits for the grace period from here (plan ee73bd2f decision 1).
+    lead_away_since_ms: Option<u64>,
+}
+
+impl ExternalLead {
+    /// The state at app start: no lead attached, away since `now_ms`.
+    pub(super) fn away_since(now_ms: u64) -> Self {
+        Self {
+            lead_away_since_ms: Some(now_ms),
+            ..Self::default()
+        }
+    }
 }
 
 /// How a [`TeamRuntime::wait_external`] ended.
@@ -181,6 +197,8 @@ impl TeamRuntime {
         }
         state.since_ms = Some(state.last_activity_ms);
         state.idle_since_ms = None;
+        // A lead is here again: the hand-back clock stops.
+        state.lead_away_since_ms = None;
         state.queue = std::mem::take(&mut state.undelivered);
         state.memory_search_since_plan_create = false;
         state.bug_search_since_plan_create = false;
@@ -248,6 +266,10 @@ impl TeamRuntime {
         let was_attached = {
             let mut state = self.external_state();
             let was_attached = state.since_ms.take().is_some();
+            if was_attached {
+                // The hand-back clock starts (plan ee73bd2f decision 1).
+                state.lead_away_since_ms = Some(unix_ms());
+            }
             state.idle_since_ms = None;
             state.bridges.clear();
             // They are newer than anything already held back.
@@ -269,12 +291,16 @@ impl TeamRuntime {
 
     /// The external lead leaves (its session ended, it idled out, or the
     /// project closes): detach it as [`TeamRuntime::detach_external_lead`]
-    /// does, then hand back the agent workers it can no longer run
-    /// ([`TeamRuntime::hand_back_agent_workers`]). Returns `true` when an
-    /// external lead was attached; nothing is handed back otherwise.
+    /// does, which starts the hand-back clock. Nothing is handed back before
+    /// the grace period (`[routing] agent_hand_back_minutes`) has passed: the
+    /// agent watch keeps running for the agent workers and its passes run
+    /// the hand-back check ([`TeamRuntime::hand_back_agent_workers`]). One
+    /// check runs right away, so a grace of 0 hands back at once. Returns
+    /// `true` when an external lead was attached.
     pub async fn leave_external_lead(&self) -> bool {
         let was_attached = self.detach_external_lead();
         if was_attached {
+            self.ensure_agent_watch().await;
             if let Err(error) = self.hand_back_agent_workers().await {
                 eprintln!("team: could not hand back agent workers after the lead left: {error}");
             }
@@ -282,16 +308,54 @@ impl TeamRuntime {
         was_attached
     }
 
-    /// Hand back every agent worker no Claude Code lead runs any more: one
-    /// that waits for its agent to be launched, or whose agent stalled. Each
-    /// becomes an ordinary interrupted Mnemo worker with the reason (record,
-    /// branch, checkout and commits kept), and the next lead gets one notice
-    /// per worker. A running agent is left alone: its transcript may still be
-    /// written. Does nothing while an external lead is attached (it came back
-    /// before this ran). Returns the ids handed back.
+    /// The hand-back grace period in milliseconds, from `[routing]
+    /// agent_hand_back_minutes`.
+    fn hand_back_grace_ms(&self) -> u64 {
+        let minutes = self
+            .routing
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .agent_hand_back_minutes;
+        minutes.saturating_mul(60_000)
+    }
+
+    /// Whether the external lead has been away for the grace period now.
+    fn hand_back_grace_passed_now(&self) -> bool {
+        let away_since = self.external_state().lead_away_since_ms;
+        agent_watch::hand_back_grace_passed(away_since, unix_ms(), self.hand_back_grace_ms())
+    }
+
+    /// Move the hand-back clock back by `by_ms`, as if the lead had left
+    /// that much earlier. Tests only.
+    #[cfg(test)]
+    pub(super) fn backdate_lead_away_for_test(&self, by_ms: u64) {
+        let mut state = self.external_state();
+        if let Some(since) = state.lead_away_since_ms.as_mut() {
+            *since = since.saturating_sub(by_ms);
+        }
+    }
+
+    /// Since when no external lead has been attached. Tests only.
+    #[cfg(test)]
+    pub(super) fn lead_away_since_for_test(&self) -> Option<u64> {
+        self.external_state().lead_away_since_ms
+    }
+
+    /// Hand back every agent worker no Claude Code lead runs any more, once
+    /// the lead has been away for the grace period (plan ee73bd2f decision
+    /// 1): one that waits for its agent to be launched, or whose agent
+    /// stalled. Before an unlaunched worker goes back, its agent is looked
+    /// for under `~/.claude/projects` ([`agent_watch::find_launched_agent`]);
+    /// one that is found is registered instead (decision 2). Each worker
+    /// handed back becomes an ordinary interrupted Mnemo worker with the
+    /// reason and what it was before (record, branch, checkout and commits
+    /// kept), and the next lead gets one notice per worker. A running agent
+    /// is left alone: its transcript may still be written. Does nothing while
+    /// an external lead is attached or the grace has not passed. Returns the
+    /// ids handed back.
     pub(super) async fn hand_back_agent_workers(&self) -> Result<Vec<String>, String> {
         let _guard = self.merge_lock.lock().await;
-        if self.external_lead_attached() {
+        if self.external_lead_attached() || !self.hand_back_grace_passed_now() {
             return Ok(Vec::new());
         }
         let candidates: Vec<WorkerRecord> = self
@@ -308,14 +372,19 @@ impl TeamRuntime {
         let mut due = Vec::new();
         for worker in candidates {
             let view = self.agent_view(&worker).await;
-            if agent_watch::hand_back_due(&worker, view.as_ref()) {
-                due.push(worker);
+            if !agent_watch::hand_back_due(&worker, view.as_ref()) {
+                continue;
             }
+            if agent_watch::waits_for_agent(&worker) && self.register_launched_agent(&worker).await {
+                continue;
+            }
+            due.push(worker);
         }
         if due.is_empty() {
             return Ok(Vec::new());
         }
         let mut handed = Vec::new();
+        let now = unix_ms();
         {
             let mut records = self.records.lock().await;
             for seen in &due {
@@ -329,10 +398,16 @@ impl TeamRuntime {
                 {
                     continue;
                 }
-                agent_watch::hand_back(worker);
-                handed.push(worker.id.clone());
+                agent_watch::hand_back(worker, now);
+                handed.push(worker.clone());
             }
         }
+        let mut notices = Vec::new();
+        for worker in &handed {
+            let dirty = agent_watch::checkout_dirty(&worker.worktree).await;
+            notices.push(agent_watch::handed_back_notice(worker, dirty));
+        }
+        let handed: Vec<String> = handed.into_iter().map(|worker| worker.id).collect();
         for id in &handed {
             self.agent_watch.forget(id);
         }
@@ -348,14 +423,70 @@ impl TeamRuntime {
             &self.persistence,
         )
         .await;
-        let held: Vec<String> = handed
-            .iter()
-            .map(|id| agent_watch::handed_back_notice(id))
+        let held: Vec<String> = notices
+            .into_iter()
             .filter(|notice| !self.push_external_notice(notice.clone()))
             .collect();
         self.restore_undelivered_notices(held);
         let _ = self.signals.send(super::BoardSignal::Changed);
         saved.map(|()| handed)
+    }
+
+    /// Before an agent worker that awaits its launch is handed back, look
+    /// for the agent the lead did launch for it (plan ee73bd2f decision 2)
+    /// and register it as `team_agent_started` would. Returns whether one
+    /// was registered. The caller holds the merge lock.
+    async fn register_launched_agent(&self, worker: &WorkerRecord) -> bool {
+        // Newer than the dispatch, or than the last reroute onto the agent
+        // tier when the worker moved there later.
+        let since_ms = worker
+            .reroutes
+            .iter()
+            .filter_map(|row| match row {
+                DispatchRoutingRow::LeadReroute { ts, .. }
+                | DispatchRoutingRow::UserReroute { ts, .. } => Some(u128::from(*ts)),
+                _ => None,
+            })
+            .fold(worker.created_at_ms, u128::max);
+        let taken: Vec<String> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .filter(|other| other.id != worker.id)
+            .filter_map(|other| other.claude_agent_id.clone())
+            .collect();
+        let Some(launched) =
+            agent_watch::find_launched_agent(&self.agent_watch, worker, since_ms, &taken)
+        else {
+            return false;
+        };
+        if launched.matches > 1 {
+            eprintln!(
+                "team: {} launched agent transcripts name {}; registering the newest, agent {}",
+                launched.matches, worker.id, launched.agent_id
+            );
+        }
+        let path = launched.path.to_string_lossy().into_owned();
+        match self
+            .agent_started(&worker.id, &launched.agent_id, Some(&path))
+            .await
+        {
+            Ok(_) => {
+                eprintln!(
+                    "team: found the launched agent {} of {} under ~/.claude/projects and registered it instead of handing the worker back",
+                    launched.agent_id, worker.id
+                );
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "team: could not register the launched agent {} of {}: {error}",
+                    launched.agent_id, worker.id
+                );
+                false
+            }
+        }
     }
 
     /// Whether an external lead currently leads this team.
@@ -558,20 +689,6 @@ impl TeamRuntime {
         while state.undelivered.len() > EXTERNAL_QUEUE_CAP {
             state.undelivered.pop_front();
         }
-    }
-
-    /// A working Claude Code agent worker, for the agent gate: its id and
-    /// the settled tier it runs on, so the gate names what runs while the
-    /// lead's own Agent does the step.
-    pub async fn claude_agent_working(&self) -> Option<(String, String)> {
-        let records = self.records.lock().await;
-        records
-            .iter()
-            .find(|worker| {
-                worker.claude_agent.is_some()
-                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
-            })
-            .map(|worker| (worker.id.clone(), worker.tier.clone().unwrap_or_default()))
     }
 
     /// Finish a Claude Code agent worker (`team_agent_done`): record its

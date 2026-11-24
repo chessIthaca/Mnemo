@@ -63,7 +63,8 @@ use crate::mnemo2::project;
 use crate::mnemo2::runtime::LeadRuntime;
 use crate::mnemo2::run_file;
 use crate::mnemo2::team::{
-    MessageSender, TeamRuntime, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
+    AgentGateWorker, MessageSender, TeamRuntime, EXTERNAL_LEAD_IDLE_MS,
+    EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 
 /// Asks the frontend to open a registered project (`{"root": String}`).
@@ -111,10 +112,14 @@ pub const DEFAULT_AGENTS_WITHOUT_PROMPT: [&str; 2] = ["Explore", "claude-code-gu
 const GATE_REASON: &str =
     "This bypasses Mnemo's workers and runs on your Claude subscription. Allow?";
 
-/// The reason the agent gate asks while an agent worker waits for its launch
-/// and the Agent call lacks worktree isolation (plan 4d920eec decision 7).
-const WORKTREE_GATE_REASON: &str =
-    "Launch Mnemo agent workers with isolation \"worktree\" so they get their warm checkout.";
+/// The agent gate's deny for a launch that would leave a waiting agent worker
+/// without its checkout: the lead model relaunches correctly at once instead
+/// of a human answering a prompt (plan 1b038bb3 decision 3). [`waiting_launch_refusal`]
+/// fills in `{worker}` and `{checkout}`.
+const WAITING_LAUNCH_REFUSAL: &str = "Mnemo worker {worker} waits for its agent: relaunch with \
+     isolation \"worktree\" (the hook then hands the agent its warm checkout), or, if the \
+     worktree hook cannot place it, launch without isolation with a prompt that names its \
+     checkout {checkout}.";
 
 /// The tool that brings the Mnemo2 window to the front.
 const OPEN_MISSION_CONTROL: &str = "open_mission_control";
@@ -1117,22 +1122,75 @@ impl Shared {
         if !attached {
             return json!({ "decision": "allow", "reason": "" });
         }
-        // While a Claude Code agent worker runs the step the lead dispatched
-        // to it, the lead's own Agent is doing Mnemo's work: let it run. The
-        // launch for a worker that waits for its agent must use worktree
-        // isolation, or the agent would miss its warm checkout (plan
-        // 4d920eec decision 7).
-        if let Some(target) = target.as_ref() {
+        // Mnemo auto-approves only its own agent-worker launches, so the hook
+        // runs them without a permission prompt; any other Agent call keeps
+        // Claude Code's own permission rules (plan 1b038bb3 decisions 1 and 4,
+        // narrowed by the 2026-11-24 review). Agent workers launch as the
+        // general-purpose agent, so only that type (or no type) is ever one
+        // of those launches; any other type, and a Workflow call, keeps the
+        // allow list or the ask below (2026-11-24 step 1 audit).
+        let worker_type =
+            subagent_type.is_empty() || subagent_type.eq_ignore_ascii_case("general-purpose");
+        if let Some(target) = target.as_ref().filter(|_| worker_type) {
             let isolated = body.get("isolation").and_then(Value::as_str) == Some("worktree");
-            if !isolated && target.team.agent_worker_waiting().await.is_some() {
-                return json!({ "decision": "ask", "reason": WORKTREE_GATE_REASON });
+            let prompt = body
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // Worker records only, under one lock: no snapshot, no
+            // transcripts, so the hook gets its answer inside its timeout.
+            let view = target.team.agent_gate_view().await;
+            if let Some(waiting) = view.waiting {
+                // The launch for a worker that waits for its agent must use
+                // worktree isolation, or the agent would miss its warm
+                // checkout (plan 4d920eec decision 7): the isolated launch is
+                // Mnemo's own.
+                if isolated {
+                    return json!({
+                        "decision": "allow",
+                        "auto_approve": true,
+                        "reason": agent_worker_allow_reason(&waiting.id, &waiting.tier),
+                    });
+                }
+                // Without isolation, a prompt that names the checkout is a
+                // deliberate manual launch into it; otherwise the lead model
+                // gets a deny it can act on at once instead of a human
+                // answering a prompt (plan 1b038bb3 decision 3).
+                if prompt_names_checkout(prompt, &waiting.worktree) {
+                    return json!({
+                        "decision": "allow",
+                        "auto_approve": true,
+                        "reason": format!(
+                            "runs Mnemo worker {} in its checkout {}",
+                            waiting.id, waiting.worktree
+                        ),
+                    });
+                }
+                return json!({
+                    "decision": "deny",
+                    "reason": waiting_launch_refusal(&waiting.id, &waiting.worktree),
+                });
             }
-            if let Some((worker_id, tier)) = target.team.claude_agent_working().await {
+            // A launch that names a Working/Fixing agent worker's checkout or
+            // its `wt/agent-*` branch is that worker's own launch.
+            if let Some(worker) = view
+                .running
+                .iter()
+                .find(|worker| launch_names_worker(prompt, worker))
+            {
                 return json!({
                     "decision": "allow",
-                    "reason": format!(
-                        "runs Mnemo worker {worker_id} ({tier} tier) as a Claude Code agent"
-                    ),
+                    "auto_approve": true,
+                    "reason": agent_worker_allow_reason(&worker.id, &worker.tier),
+                });
+            }
+            // Any other agent the lead starts while workers run is allowed
+            // without `auto_approve`: Claude Code's own rules decide whether to
+            // ask.
+            if let Some(worker) = view.running.first() {
+                return json!({
+                    "decision": "allow",
+                    "reason": agent_worker_allow_reason(&worker.id, &worker.tier),
                 });
             }
         }
@@ -1559,7 +1617,10 @@ fn tool_list(target: &Target) -> Vec<Value> {
         .team
         .lead_host_tools()
         .into_iter()
-        .map(|spec| {
+        .map(|mut spec| {
+            if spec.name == "team_resume" {
+                external_team_resume(&mut spec.description, &mut spec.parameters);
+            }
             json!({
                 "name": spec.name,
                 "description": spec.description,
@@ -1594,6 +1655,26 @@ fn tool_list(target: &Target) -> Vec<Value> {
     tools
 }
 
+/// `team_resume` as the external lead sees it: with `keep_changes`, the one
+/// way to let a Mnemo model take over a handed-back agent worker's checkout
+/// while it has uncommitted changes (plan ee73bd2f decision 3). The in-app
+/// lead's tool has no such switch.
+fn external_team_resume(description: &mut String, parameters: &mut Value) {
+    description.push_str(" A worker Mnemo handed back from Claude Code is not resumed on a Mnemo model while its checkout has uncommitted changes (its agent may still be writing there): reclaim it with team_agent_started, resume it onto a tier that runs as a Claude Code agent, or pass keep_changes: true to let the Mnemo model take over the checkout as it is.");
+    if let Some(properties) = parameters
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "keep_changes".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Only for a worker handed back from Claude Code whose checkout has uncommitted changes: true lets a Mnemo model take over that checkout as it is. Default false. Pass it only when you know no Claude Code agent still writes there."
+            }),
+        );
+    }
+}
+
 /// The agent types allowed without a prompt: `[claude_lead]
 /// agents_without_prompt` in `<config>/config.toml`, else the defaults.
 pub fn agents_without_prompt(config_dir: &Path) -> Vec<String> {
@@ -1620,6 +1701,73 @@ pub fn agents_without_prompt(config_dir: &Path) -> Vec<String> {
             .collect(),
         None => defaults(),
     }
+}
+
+/// [`WAITING_LAUNCH_REFUSAL`] filled in for `worker` and its `checkout`.
+fn waiting_launch_refusal(worker: &str, checkout: &str) -> String {
+    WAITING_LAUNCH_REFUSAL
+        .replace("{worker}", worker)
+        .replace("{checkout}", checkout)
+}
+
+/// The gate's allow reason for a Claude Code agent worker's own launch: its
+/// id and the settled tier it runs on.
+fn agent_worker_allow_reason(worker: &str, tier: &str) -> String {
+    format!("runs Mnemo worker {worker} ({tier} tier) as a Claude Code agent")
+}
+
+/// Whether an Agent prompt names the checkout at `worktree`: a deliberate
+/// manual launch into that checkout, which the gate allows without worktree
+/// isolation (plan 1b038bb3 decision 3). Either slash style, case-insensitive,
+/// and not merely a longer path that starts with it (`pool-1` is not named by
+/// `pool-12` or `pool-1.bak`): no further path-name character may follow the
+/// match. A lone '.' that ends a sentence ("Work in <checkout>.") is
+/// punctuation, not part of the name.
+fn prompt_names_checkout(prompt: &str, worktree: &str) -> bool {
+    let plain = |text: &str| text.replace('\\', "/").to_lowercase();
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+    let checkout = plain(worktree);
+    let checkout = checkout.trim_end_matches('/');
+    if checkout.is_empty() {
+        return false;
+    }
+    let prompt = plain(prompt);
+    prompt.match_indices(checkout).any(|(index, _)| {
+        let mut after = prompt[index + checkout.len()..].chars();
+        match after.next() {
+            Some('.') => !after.next().is_some_and(name_char),
+            Some(c) => !name_char(c),
+            None => true,
+        }
+    })
+}
+
+/// Whether an Agent prompt names `branch` (case-insensitive), and not merely a
+/// longer branch that starts with it.
+fn prompt_names_branch(prompt: &str, branch: &str) -> bool {
+    if branch.is_empty() {
+        return false;
+    }
+    let prompt = prompt.to_lowercase();
+    let branch = branch.to_lowercase();
+    // A further branch-name character ('.' included, as in the checkout
+    // matcher) means a longer branch; a lone '.' ending a sentence does not.
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.');
+    prompt.match_indices(&branch).any(|(index, _)| {
+        let mut after = prompt[index + branch.len()..].chars();
+        match after.next() {
+            Some('.') => !after.next().is_some_and(name_char),
+            Some(c) => !name_char(c),
+            None => true,
+        }
+    })
+}
+
+/// Whether an Agent prompt is `worker`'s own launch: it names the worker's
+/// checkout or its `wt/agent-*` branch (lead review of plan 1b038bb3 decision
+/// 1, 2026-11-24).
+fn launch_names_worker(prompt: &str, worker: &AgentGateWorker) -> bool {
+    prompt_names_checkout(prompt, &worker.worktree) || prompt_names_branch(prompt, &worker.branch)
 }
 
 // ── Tauri glue ────────────────────────────────────────────────────────────
@@ -2807,6 +2955,9 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate tool names");
+        // The engine's tools hold its memory store and code graph: release
+        // them before the shutdown removes the project folder.
+        drop(engine_tools);
         fixture.shutdown().await;
     }
 
@@ -4242,23 +4393,40 @@ mod tests {
         );
 
         // The worker waits for its agent: a launch without worktree isolation
-        // is asked about, because the agent would miss its warm checkout.
+        // is denied with how to relaunch, because the agent would miss its
+        // warm checkout; the lead model corrects it at once instead of a
+        // human answering a prompt (plan 1b038bb3 decision 3).
         let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
-        assert_eq!(gate["decision"], "ask", "{gate}");
-        assert_eq!(gate["reason"], WORKTREE_GATE_REASON);
+        assert_eq!(gate["decision"], "deny", "{gate}");
+        assert!(gate.get("auto_approve").is_none(), "{gate}");
+        let reason = gate["reason"].as_str().expect("reason");
+        assert!(reason.contains("extagnt0001"), "{reason}");
+        assert!(reason.contains("isolation \"worktree\""), "{reason}");
         // With worktree isolation the gate allows, naming the worker.
+        let record = team.worker("extagnt0001").await.expect("worker record");
+        let checkout = record.worktree.to_string_lossy().into_owned();
         let mut isolated = ask("general-purpose");
         isolated["isolation"] = json!("worktree");
+        isolated["prompt"] = json!(format!("Work in {checkout} and commit when done."));
         let gate = fixture.lead_post("/lead/gate-agent", isolated).await;
         assert_eq!(gate["decision"], "allow", "{gate}");
+        assert_eq!(gate["auto_approve"], true, "{gate}");
         assert_eq!(
             gate["reason"],
             "runs Mnemo worker extagnt0001 (high tier) as a Claude Code agent"
         );
-        // Once the agent is launched (registered), any Agent call is allowed.
+        // Once the agent is launched (registered), a launch whose prompt names
+        // the worker is Mnemo's own and runs without a prompt.
         team.claim_agent_checkout("agent-a1b2c3", None).await.expect("the claim");
-        let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
+        let mut own = ask("general-purpose");
+        own["prompt"] = json!(format!("Resume your work in {checkout}."));
+        let gate = fixture.lead_post("/lead/gate-agent", own).await;
         assert_eq!(gate["decision"], "allow", "{gate}");
+        assert_eq!(gate["auto_approve"], true, "{gate}");
+        assert_eq!(
+            gate["reason"],
+            "runs Mnemo worker extagnt0001 (high tier) as a Claude Code agent"
+        );
 
         // team_agent_done closes the worker and the finished notice rides the
         // tool answer; the gate asks again.
@@ -4274,6 +4442,366 @@ mod tests {
         let gate = fixture.lead_post("/lead/gate-agent", ask("general-purpose")).await;
         assert_eq!(gate["decision"], "ask", "{gate}");
         fixture.shutdown().await;
+    }
+
+    /// A plan step on the high tier, which runs as a Claude Code agent, with
+    /// `worker_id` dispatched onto it: the worker waits for its agent in the
+    /// checkout path this returns.
+    async fn waiting_agent_worker(fixture: &Fixture, worker_id: &str) -> String {
+        use crate::mnemo2::runtime::LeadModel;
+        let team = fixture.team().await;
+        let mut dto = mnemo::headless::TiersDto::default();
+        dto.tiers[0].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].models = vec!["test/scripted-a".to_string()];
+        dto.tiers[3].claude_agent = Some("opus".to_string());
+        team.set_catalog(
+            vec![LeadModel {
+                endpoint: "test".to_string(),
+                model: "scripted-a".to_string(),
+                spec: "test/scripted-a".to_string(),
+                is_default: true,
+                reasoning_efforts: Vec::new(),
+                default_effort: None,
+            }],
+            dto,
+            Vec::new(),
+        );
+        fixture.rpc(initialize()).await;
+        let searched = fixture
+            .call("memory_search", json!({"query": "external lead planning"}))
+            .await;
+        ok_text(&searched);
+        let (_, reply) = fixture
+            .rpc(json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": "plan_create", "arguments": {
+                    "title": "Gate plan",
+                    "goal": "Prove the agent gate auto-approves a Mnemo agent launch",
+                    "context": "The lead's own agent runs this step; src/lib.rs is the anchor file for the change.",
+                    "steps": ["**One** - edit src/lib.rs"]
+                } }
+            }))
+            .await;
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let plan_id = reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .strip_prefix("Created plan ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("a plan id")
+            .to_string();
+        let dispatched = fixture
+            .call("team_dispatch", json!({
+                "worker_id": worker_id,
+                "plan_id": plan_id,
+                "step": 1,
+                "tier": "high",
+                "brief": "write src/lib.rs"
+            }))
+            .await;
+        assert_eq!(dispatched["result"]["isError"], false, "{dispatched}");
+        let record = team.worker(worker_id).await.expect("worker record");
+        assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+        record.worktree.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn gate_auto_approves_a_launch_for_a_working_agent_worker() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        waiting_agent_worker(&fixture, "extagnt0011").await;
+        team.claim_agent_checkout("agent-w0rk01", None)
+            .await
+            .expect("the claim");
+        let record = team.worker("extagnt0011").await.expect("worker record");
+        let checkout = record.worktree.to_string_lossy().into_owned();
+        let branch = record.branch.clone();
+
+        // A launch whose prompt names the worker's checkout is its own.
+        let gate = fixture
+            .lead_post(
+                "/lead/gate-agent",
+                json!({
+                    "root": root,
+                    "subagent_type": "general-purpose",
+                    "prompt": format!("Work on the step in {checkout}."),
+                }),
+            )
+            .await;
+        assert_eq!(gate["decision"], "allow", "{gate}");
+        assert_eq!(gate["auto_approve"], true, "{gate}");
+        assert_eq!(
+            gate["reason"],
+            "runs Mnemo worker extagnt0011 (high tier) as a Claude Code agent"
+        );
+
+        // So is one that names the worker's `wt/agent-*` branch, any case.
+        let gate = fixture
+            .lead_post(
+                "/lead/gate-agent",
+                json!({
+                    "root": root,
+                    "subagent_type": "general-purpose",
+                    "prompt": format!(
+                        "Commit on {} when the work is green.",
+                        branch.to_uppercase()
+                    ),
+                }),
+            )
+            .await;
+        assert_eq!(gate["decision"], "allow", "{gate}");
+        assert_eq!(gate["auto_approve"], true, "{gate}");
+        assert_eq!(
+            gate["reason"],
+            "runs Mnemo worker extagnt0011 (high tier) as a Claude Code agent"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_does_not_auto_approve_an_unrelated_agent_while_a_worker_runs() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let team = fixture.team().await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        waiting_agent_worker(&fixture, "extagnt0015").await;
+        team.claim_agent_checkout("agent-w0rk02", None)
+            .await
+            .expect("the claim");
+
+        // A general-purpose agent the lead starts for its own work names no
+        // worker: allowed, but Claude Code's own rules decide whether to ask.
+        let gate = fixture
+            .lead_post(
+                "/lead/gate-agent",
+                json!({
+                    "root": root,
+                    "subagent_type": "general-purpose",
+                    "prompt": "Summarise the repository layout for me.",
+                }),
+            )
+            .await;
+        assert_eq!(gate["decision"], "allow", "{gate}");
+        assert!(gate.get("auto_approve").is_none(), "{gate}");
+        assert!(
+            gate["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("extagnt0015")),
+            "{gate}"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_auto_approves_the_isolated_launch_for_a_waiting_agent_worker() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        let checkout = waiting_agent_worker(&fixture, "extagnt0012").await;
+        assert!(!checkout.is_empty(), "the waiting worker has a checkout");
+
+        let gate = fixture
+            .lead_post(
+                "/lead/gate-agent",
+                json!({
+                    "root": root,
+                    "subagent_type": "general-purpose",
+                    "isolation": "worktree",
+                    "prompt": "work in the checkout",
+                }),
+            )
+            .await;
+        assert_eq!(gate["decision"], "allow", "{gate}");
+        assert_eq!(gate["auto_approve"], true, "{gate}");
+        assert_eq!(
+            gate["reason"],
+            "runs Mnemo worker extagnt0012 (high tier) as a Claude Code agent"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_denies_a_non_isolated_launch_for_a_waiting_worker_with_a_fix_it_reason() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        let checkout = waiting_agent_worker(&fixture, "extagnt0013").await;
+
+        let gate = fixture
+            .lead_post(
+                "/lead/gate-agent",
+                json!({
+                    "root": root,
+                    "subagent_type": "general-purpose",
+                    "prompt": "start an agent for some other work",
+                }),
+            )
+            .await;
+        assert_eq!(gate["decision"], "deny", "{gate}");
+        assert!(gate.get("auto_approve").is_none(), "{gate}");
+        let reason = gate["reason"].as_str().expect("reason");
+        assert!(reason.contains("extagnt0013"), "{reason}");
+        assert!(reason.contains("isolation \"worktree\""), "{reason}");
+        assert!(reason.contains(&checkout), "{reason}");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_allows_a_manual_launch_that_names_the_waiting_checkout() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        let checkout = waiting_agent_worker(&fixture, "extagnt0014").await;
+        assert!(!checkout.is_empty(), "the waiting worker has a checkout");
+
+        // Either slash style and any case: the lead names the checkout it
+        // launches into, so the launch is deliberate.
+        for prompt in [
+            format!("Work in {checkout} and commit when done."),
+            format!(
+                "Work in {} and commit when done.",
+                checkout.replace('\\', "/").to_uppercase()
+            ),
+        ] {
+            let gate = fixture
+                .lead_post(
+                    "/lead/gate-agent",
+                    json!({
+                        "root": root,
+                        "subagent_type": "general-purpose",
+                        "prompt": prompt,
+                    }),
+                )
+                .await;
+            assert_eq!(gate["decision"], "allow", "{prompt}: {gate}");
+            assert_eq!(gate["auto_approve"], true, "{prompt}: {gate}");
+            assert!(
+                gate["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("extagnt0014")),
+                "{gate}"
+            );
+        }
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_never_auto_approves_without_an_agent_worker() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        let gate = |body: Value| fixture.lead_post("/lead/gate-agent", body);
+
+        // No external lead: allowed, and Claude Code's own rules still apply.
+        let reply = gate(json!({ "root": root, "subagent_type": "general-purpose" })).await;
+        assert_eq!(reply["decision"], "allow", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+
+        fixture.attach().await;
+        // A type on the allow list is allowed without asking, not by Mnemo.
+        let reply = gate(json!({ "root": root, "subagent_type": "Explore" })).await;
+        assert_eq!(reply["decision"], "allow", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+
+        std::fs::write(
+            fixture.host.config.join("config.toml"),
+            "[claude_lead]\nagents_without_prompt = [\"general-purpose\"]\n",
+        )
+        .expect("config");
+        let reply = gate(json!({ "root": root, "subagent_type": "general-purpose" })).await;
+        assert_eq!(reply["decision"], "allow", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+
+        // A general-purpose agent the lead starts for its own work still asks.
+        std::fs::write(fixture.host.config.join("config.toml"), "[general]\n").expect("config");
+        let reply = gate(json!({ "root": root, "subagent_type": "general-purpose" })).await;
+        assert_eq!(reply["decision"], "ask", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+        assert_eq!(
+            reply["reason"],
+            "This bypasses Mnemo's workers and runs on your Claude subscription. Allow?"
+        );
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_leaves_other_agent_types_alone_while_a_worker_waits() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        let checkout = waiting_agent_worker(&fixture, "extagnt0016").await;
+        assert!(!checkout.is_empty(), "the waiting worker has a checkout");
+        let gate = |body: Value| fixture.lead_post("/lead/gate-agent", body);
+
+        // An isolated Explore is no agent-worker launch: no auto-approval.
+        let reply = gate(json!({
+            "root": root,
+            "subagent_type": "Explore",
+            "isolation": "worktree",
+            "prompt": format!("Look around {checkout}."),
+        }))
+        .await;
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+        assert_eq!(reply["reason"], "Explore may run without asking", "{reply}");
+
+        // A non-isolated Explore keeps the allow list's allow, never a deny.
+        let reply = gate(json!({
+            "root": root,
+            "subagent_type": "Explore",
+            "prompt": "Find where the gate lives.",
+        }))
+        .await;
+        assert_eq!(reply["decision"], "allow", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+        assert_eq!(reply["reason"], "Explore may run without asking", "{reply}");
+
+        // A Workflow call asks as it did before Mnemo auto-approved anything.
+        let reply = gate(json!({
+            "root": root,
+            "subagent_type": "Workflow",
+            "prompt": format!("Run the checks in {checkout}."),
+        }))
+        .await;
+        assert_eq!(reply["decision"], "ask", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+        assert_eq!(reply["reason"], GATE_REASON, "{reply}");
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn checkout_matcher_does_not_match_a_longer_path() {
+        let checkout = r"D:\Repo\.worktrees\pool-1";
+        assert!(!prompt_names_checkout(r"Work in D:\Repo\.worktrees\pool-12 now.", checkout));
+        assert!(!prompt_names_checkout("Work in d:/repo/.worktrees/pool-1.bak", checkout));
+        assert!(!prompt_names_checkout("Work in d:/repo/.worktrees/pool-1_old", checkout));
+        assert!(!prompt_names_checkout("Work in d:/repo/.worktrees/pool-1-b", checkout));
+        // A separator, space, quote, sentence-ending period or the end of the
+        // text ends the name.
+        for prompt in [
+            r"Work in D:\Repo\.worktrees\pool-1\src now.",
+            "Work in d:/repo/.worktrees/pool-1/src now.",
+            "Work in D:/Repo/.worktrees/pool-1 now.",
+            "Work in \"D:/Repo/.worktrees/pool-1\".",
+            "Work in D:/Repo/.worktrees/pool-1. Then commit.",
+            "Work in D:/Repo/.worktrees/pool-1.",
+            "Work in D:/Repo/.worktrees/pool-1",
+            "Not pool-12: d:/repo/.worktrees/pool-12, but D:/Repo/.worktrees/pool-1 here.",
+        ] {
+            assert!(prompt_names_checkout(prompt, checkout), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn branch_matcher_does_not_match_a_longer_branch() {
+        assert!(!prompt_names_branch("Commit on wt/agent-foobar.", "wt/agent-foo"));
+        assert!(!prompt_names_branch("Commit on wt/agent-foo-2 now", "wt/agent-foo"));
+        assert!(prompt_names_branch("Commit on wt/agent-foo now.", "wt/agent-foo"));
+        assert!(prompt_names_branch("Commit on WT/AGENT-FOO", "wt/agent-foo"));
+        assert!(!prompt_names_branch("Commit on wt/agent-foo", ""));
+        // A longer dotted ref is another branch; a sentence-ending dot is not.
+        assert!(!prompt_names_branch("Commit on wt/agent-foo.2 now", "wt/agent-foo"));
+        assert!(prompt_names_branch("Commit on wt/agent-foo.", "wt/agent-foo"));
     }
 
     #[tokio::test]

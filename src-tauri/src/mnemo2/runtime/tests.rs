@@ -942,6 +942,44 @@ async fn shutdown_completes_with_an_open_project_and_team() {
         .expect("shutdown with an open project and team completes");
 }
 
+/// After `shutdown` and the drop of the runtime and its team, nothing may
+/// still hold the engine's memory store: its SQLite files must close so the
+/// project folder can be removed.
+#[tokio::test]
+async fn memory_store_is_released_after_lead_runtime_shutdown() {
+    let root = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config");
+    let state = tempfile::tempdir().expect("state");
+    write_config(config.path(), &["scripted-a"]);
+    let (lead, team) = open_git_lead(
+        &root,
+        &config,
+        &state,
+        Arc::new(ScriptedLlm::new(Vec::new())),
+    )
+    .await;
+    let store = lead
+        .memory_store_weak()
+        .await
+        .expect("the engine opened its own memory store");
+    lead.shutdown().await;
+    drop(team);
+    drop(lead);
+
+    // The agent tasks end on their next poll once their command channels
+    // close, so give the runtime a bounded chance to run them.
+    for _ in 0..200 {
+        if store.upgrade().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        store.upgrade().is_none(),
+        "the memory store outlived the lead runtime's shutdown and drop"
+    );
+}
+
 /// Design §6 step 2's disabled pin: with no `[general.laya]` table
 /// (the shipped default) — even with a pretend install present — the
 /// engine start leaves the classifier slot empty and the runtime
@@ -1248,7 +1286,7 @@ async fn a_new_project_holds_until_its_first_code_index_ends() {
     std::fs::create_dir_all(root.path().join("src")).expect("src");
     std::fs::write(root.path().join("src/lib.rs"), "pub fn indexed() {}\n").expect("source");
     write_config(config.path(), &["scripted-a"]);
-    let runtime = LeadRuntime::open_inner(
+    let runtime = LeadRuntime::open_inner_without_code_embedder(
         options(&root, &config, &state),
         Some(Arc::new(ScriptedLlm::new(Vec::new()))),
     )
@@ -1269,7 +1307,7 @@ async fn a_new_project_holds_until_its_first_code_index_ends() {
     runtime.shutdown().await;
 
     // The index now exists: reopening never holds the project.
-    let reopened = LeadRuntime::open_inner(
+    let reopened = LeadRuntime::open_inner_without_code_embedder(
         options(&root, &config, &state),
         Some(Arc::new(ScriptedLlm::new(Vec::new()))),
     )

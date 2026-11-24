@@ -253,6 +253,7 @@ impl TeamRuntime {
             claude_agent_effort: None,
             claude_agent_id: None,
             claude_agent_transcript: None,
+            handed_back: None,
             integrations: Vec::new(),
             integration_note: None,
             base_commit: Some(base_tip.clone()),
@@ -376,7 +377,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             id.clone(),
             generation,
-            self.engine.clone(),
+            self.engine()?,
             session_id,
             receiver,
             self.events.clone(),
@@ -433,6 +434,9 @@ impl TeamRuntime {
             worker.generation = generation;
             worker.brief_sent = true;
             worker.error = None;
+            // A Mnemo model runs it now: a hand-back on record is over, so
+            // team_agent_started no longer reclaims it (plan ee73bd2f).
+            worker.handed_back = None;
         })
         .await;
         if let Err(err) = self.persist().await {
@@ -482,7 +486,7 @@ impl TeamRuntime {
             check_commands,
         } = spec;
         let name = trace_identity.agent_name.clone();
-        self.engine
+        self.engine()?
             .spawn(SpawnOptions {
                 name: Some(name),
                 model,

@@ -71,6 +71,7 @@ use merge::{
 use persistence::TeamPersistence;
 use pump::{close_worker_session, save_workers_now, save_workers_soon};
 
+pub use agent_watch::{AgentGateView, AgentGateWorker};
 pub use deletion::{
     CleanupReport, DeletionPhase, DeletionProgress, TeamDeleteOutcome, WorkerDeletion,
     WorkerDeletionResult, cleanup_workspace,
@@ -85,8 +86,8 @@ pub use external_lead::{
     ExternalWait, ExternalWaitStatus, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 pub use record::{
-    ChangeSource, InboxEntry, InboxKind, MessageSender, ToolErrorNote, WorkerCheck, WorkerRecord,
-    WorkerRouting, WorkerStatus,
+    ChangeSource, HandedBack, InboxEntry, InboxKind, MessageSender, ToolErrorNote, WorkerCheck,
+    WorkerRecord, WorkerRouting, WorkerStatus,
 };
 
 /// The Tauri event channel emitted by the team runtime.
@@ -349,7 +350,11 @@ fn status_name(status: WorkerStatus) -> String {
 
 /// The shared team runtime: one engine, many real worker sessions.
 pub struct TeamRuntime {
-    engine: Arc<Engine>,
+    /// The lead's shared engine, borrowed until [`TeamRuntime::shutdown`]
+    /// releases it: a shut-down team may still be referenced (by the MCP
+    /// host, a pending tool call) and must not keep the engine — and with it
+    /// the project's SQLite stores — alive.
+    engine: std::sync::RwLock<Option<Arc<Engine>>>,
     workspace_root: PathBuf,
     records: Arc<Mutex<Vec<WorkerRecord>>>,
     live: Arc<Mutex<HashMap<String, LiveWorker>>>,
@@ -581,30 +586,12 @@ impl TeamRuntime {
             .map(|team| team.usage.clone())
             .unwrap_or_default();
         let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
-        // Mnemo2 starts with no external lead: an agent worker whose agent
-        // was never launched, or has stalled (judged by the record's last
-        // activity when its transcript is gone), goes back to Mnemo (plan
-        // a2b8ee89 decision 3). A running agent stays an agent worker at
-        // work; recovery leaves it so and the agent watch follows it.
+        // Mnemo2 starts with no external lead, so the hand-back clock starts
+        // now (plan ee73bd2f decision 1): an agent worker whose agent was
+        // never launched, or has stalled, goes back to Mnemo only once the
+        // grace period has passed with no lead attached. Recovery keeps
+        // agent workers at work, and the agent watch follows them.
         let agent_watch = agent_watch::AgentWatch::default();
-        let handed_back = {
-            let now = phase3::now_ms();
-            let mut handed_back = Vec::new();
-            for worker in &mut workers {
-                if worker.claude_agent.is_none()
-                    || !matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
-                {
-                    continue;
-                }
-                let view = agent_watch::look(&agent_watch, worker, now).map(|looked| looked.view);
-                if agent_watch::hand_back_due(worker, view.as_ref()) {
-                    agent_watch::hand_back(worker);
-                    agent_watch.forget(&worker.id);
-                    handed_back.push(worker.id.clone());
-                }
-            }
-            handed_back
-        };
         let held: Vec<(String, PathBuf)> = workers
             .iter()
             .filter(|worker| !worker.worktree.as_os_str().is_empty())
@@ -638,13 +625,18 @@ impl TeamRuntime {
         // backend). With no own memory store there is nothing to embed with,
         // so the overlay is absent and Laya decides every dispatch.
         let route_knn = options.engine.embedder_handle().map(|initial| {
-            let engine = Arc::clone(&options.engine);
-            let getter: EmbedderGetter =
-                Arc::new(move || engine.embedder_handle().unwrap_or_else(|| initial.clone()));
+            // A back-reference only: the team's own handle owns the engine.
+            let engine = Arc::downgrade(&options.engine);
+            let getter: EmbedderGetter = Arc::new(move || {
+                engine
+                    .upgrade()
+                    .and_then(|engine| engine.embedder_handle())
+                    .unwrap_or_else(|| initial.clone())
+            });
             Arc::new(RouteKnn::new(getter, routing_log_path.clone()))
         });
         let runtime = Self {
-            engine: options.engine,
+            engine: std::sync::RwLock::new(Some(options.engine)),
             workspace_root: options.workspace_root,
             records: Arc::new(Mutex::new(workers)),
             live: Arc::new(Mutex::new(HashMap::new())),
@@ -678,17 +670,15 @@ impl TeamRuntime {
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
-            external: std::sync::Mutex::new(ExternalLead::default()),
+            external: std::sync::Mutex::new(ExternalLead::away_since(unix_ms())),
             external_wake: tokio::sync::Notify::new(),
         };
-        // The in-app lead (or the next external lead) learns of each one.
-        runtime.restore_undelivered_notices(
-            handed_back
-                .iter()
-                .map(|id| agent_watch::handed_back_notice(id))
-                .collect(),
-        );
         runtime.persist().await?;
+        // A grace of 0 hands back at once, as before the grace existed; the
+        // in-app lead (or the next external lead) learns of each one.
+        if let Err(error) = runtime.hand_back_agent_workers().await {
+            eprintln!("team: could not hand back agent workers at start: {error}");
+        }
         // App start: sweep checkouts a previous run renamed into the
         // trash folder but could not remove yet (something held them).
         schedule_trash_sweep(&runtime.workspace_root);
@@ -699,9 +689,9 @@ impl TeamRuntime {
         // pools above the slot count, so a started app converges on the slots
         // (plan 2e15085a).
         runtime.trim_idle_pools().await;
-        // A registered agent that still runs (recovery kept its worker at
-        // work) is watched again: its finish is processed, and a later stall
-        // with no lead attached hands it back.
+        // An agent worker recovery kept at work is watched again: its
+        // finish is processed, and once no lead has been attached for the
+        // grace period an unlaunched or stalled one is handed back.
         runtime.ensure_agent_watch().await;
         Ok(runtime)
     }
@@ -1250,24 +1240,66 @@ impl TeamRuntime {
         Ok(())
     }
 
-    /// Stop every live worker. The shared engine is owned by the lead and is
-    /// not shut down here.
+    /// The shared engine, or an error once the team has shut down.
+    pub(crate) fn engine(&self) -> Result<Arc<Engine>, String> {
+        self.engine
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| "the team has shut down".to_string())
+    }
+
+    /// Stop every live worker and release the team's handles on the shared
+    /// engine and the plan board. The engine is owned by the lead and is not
+    /// shut down here.
     pub async fn shutdown(&self) {
         // Void a pending telemetry flush: the final persist is the last write.
         self.persistence.closed.store(true, Ordering::SeqCst);
-        self.agent_watch.stop();
+        self.agent_watch.stop().await;
         *self.lead_session.lock().await = None;
         let live = {
             let mut map = self.live.lock().await;
             std::mem::take(&mut *map)
         };
-        for worker in live.into_values() {
+        let live: Vec<LiveWorker> = live.into_values().collect();
+        for worker in &live {
             worker.abort();
-            let _ = worker.session.close().await;
+        }
+        // Wait until each worker's agent family has released its loop: a
+        // worktree session holds the checkout's code graph (an open SQLite
+        // file), which must be closed once shutdown returns.
+        for worker in &live {
+            let _ = worker.session.close_and_wait().await;
+        }
+        // An aborted pump holds the engine until the runtime polls it again:
+        // wait until each one is dropped.
+        for worker in live {
+            let _ = worker.pump.await;
+        }
+        // The pumps' detached tasks (a transcript refresh running Git in a
+        // checkout, a turn-end proof trigger, the proof jobs it starts)
+        // outlive the aborted pumps: wait for them, bounded, so no child
+        // process is still working in a checkout once shutdown returns.
+        let detached = self.persistence.tasks.join(PUMP_TASK_GRACE).await;
+        if detached > 0 {
+            eprintln!("team shutdown: {detached} worker task(s) still running; they finish in the background");
         }
         let _ = self.persist().await;
+        // The board holds the engine's memory store and code graph.
+        self.board.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.engine
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
+
+/// How long [`TeamRuntime::shutdown`] waits for the worker pumps' detached
+/// tasks. They are usually short (a `git rev-parse`, a ledger save); a long
+/// proof job finishes detached. With the engine's own waits (5 s for the
+/// agent loops, 3 s for its background tasks) this stays inside the app's
+/// 10 s `SHUTDOWN_DEADLINE`.
+const PUMP_TASK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn now_key() -> u128 {
     phase3::now_ms()

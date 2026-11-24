@@ -407,6 +407,7 @@ async fn spawn_agent_shared_inner(
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         fanin_tx = mgr.fanin_sender();
         let mut task = AgentTask::new(agent_id, name.clone(), agent_loop.clone());
+        task.set_background_tasks(mgr.background_tasks());
         // 3a.6 (G5): the resume seed — applied before the task runs, so
         // the seeded history is the first request's byte prefix.
         if let Some(messages) = initial_messages {
@@ -750,24 +751,46 @@ pub async fn cleanup_inactive_subagents(
 /// registration, loop-map tracking). The parent completion Suggestion IS
 /// sent, by [`LifecycleBookkeeping`], with the same composition for every
 /// frontend.
+///
+/// The spawner only BORROWS the runtime pieces: it holds them as `Weak`
+/// back-references. The factory stores the spawner, and every built loop's
+/// `spawn_agent` tool holds it too, so strong references here would close
+/// two ownership cycles (factory -> spawner -> factory, and loop -> spawner
+/// -> loop map -> loop) that keep the whole runtime, its agent loops and
+/// the project's SQLite stores alive after the host drops it. The
+/// [`HostRuntime`] owns the pieces; once it is gone a spawn reports that the
+/// runtime has shut down.
 pub struct HostSpawner {
-    factory: Arc<AgentLoopFactory>,
-    manager: Arc<tokio::sync::Mutex<AgentManager>>,
-    agent_loops: AgentLoopMap,
+    factory: std::sync::Weak<AgentLoopFactory>,
+    manager: std::sync::Weak<tokio::sync::Mutex<AgentManager>>,
+    agent_loops: std::sync::Weak<
+        tokio::sync::Mutex<std::collections::HashMap<AgentId, Arc<AgentLoop>>>,
+    >,
 }
 
 impl HostSpawner {
-    /// Create a spawner over the shared runtime pieces.
+    /// Create a spawner over the shared runtime pieces (held weakly — the
+    /// caller keeps the strong references for the runtime's lifetime).
     pub fn new(
         factory: Arc<AgentLoopFactory>,
         manager: Arc<tokio::sync::Mutex<AgentManager>>,
         agent_loops: AgentLoopMap,
     ) -> Self {
         Self {
-            factory,
-            manager,
-            agent_loops,
+            factory: Arc::downgrade(&factory),
+            manager: Arc::downgrade(&manager),
+            agent_loops: Arc::downgrade(&agent_loops),
         }
+    }
+
+    /// The live runtime pieces, or `None` once the host runtime that owns
+    /// them has been dropped.
+    fn host(&self) -> Option<SpawnHost> {
+        Some(SpawnHost {
+            factory: self.factory.upgrade()?,
+            manager: self.manager.upgrade()?,
+            agent_loops: self.agent_loops.upgrade()?,
+        })
     }
 }
 
@@ -810,12 +833,11 @@ impl ParentAwareSpawner for HostSpawner {
         // (ApproveViaApi) is what factory-built children carry.
         permission: crate::agent::policy::PermissionPolicy,
     ) -> Result<AgentId, String> {
+        let host = self
+            .host()
+            .ok_or_else(|| "the host runtime has shut down".to_string())?;
         let (id, _) = spawn_agent_shared(
-            SpawnHost {
-                factory: self.factory.clone(),
-                manager: self.manager.clone(),
-                agent_loops: self.agent_loops.clone(),
-            },
+            host,
             name.to_string(),
             Some(task.to_string()),
             parent_id,
@@ -854,7 +876,11 @@ impl DescendantTracker for HostSpawner {
     /// Whether the agent has any running spawned descendants — delegates to
     /// the manager's `parent_id`-chain walk, same as the IPC twin.
     async fn has_running_descendants(&self, agent_id: AgentId) -> bool {
-        let mgr = self.manager.lock().await;
+        let Some(manager) = self.manager.upgrade() else {
+            // The runtime is gone, and with it every agent it ran.
+            return false;
+        };
+        let mgr = manager.lock().await;
         mgr.has_running_descendants(agent_id)
     }
 }
@@ -899,7 +925,10 @@ impl HostRuntime {
     /// setup, loop-map insert, and registration are identical), and set
     /// up the lifecycle bookkeeping.
     pub async fn start(factory: Arc<AgentLoopFactory>) -> Result<Self, String> {
-        let mut mgr = AgentManager::new(256);
+        // The manager shares the factory's background-task register, so a
+        // shutdown joins the brain's re-embed passes with the agents'
+        // consolidations.
+        let mut mgr = AgentManager::with_background_tasks(256, factory.background_tasks());
         // Take the fan-in receiver before wrapping the manager (the
         // runtime owns it, like the GUI's event forwarder does).
         let fanin_rx = mgr.take_fanin_rx().expect("fan-in receiver already taken");

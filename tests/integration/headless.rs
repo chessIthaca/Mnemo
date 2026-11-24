@@ -1399,6 +1399,9 @@ async fn spawn_with_worktree_binds_tools_to_the_worktree_root() {
         !root.path().join("probe.txt").exists(),
         "the lead root stays untouched"
     );
+    // The engine's own teardown closes the project's stores before the
+    // temp folders are removed.
+    engine.shutdown().await.expect("shutdown");
 }
 
 struct PendingLlm {
@@ -1508,6 +1511,11 @@ struct ConsolidationBlockingLlm {
     caps: Capabilities,
     calls: AtomicUsize,
     consolidation_started: tokio::sync::Notify,
+    /// Holds the consolidation's request until the test releases it, so the
+    /// consolidation is still running while the worktree is removed and
+    /// then ends, releasing the memory store before the engine shuts down.
+    release: tokio::sync::Notify,
+    released: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -1541,7 +1549,15 @@ impl LlmClient for ConsolidationBlockingLlm {
             ])))
         } else {
             self.consolidation_started.notify_one();
-            Ok(Box::pin(futures::stream::pending()))
+            let (release, released) = (&self.release, &self.released);
+            Ok(Box::pin(futures::stream::once(async move {
+                if !released.load(Ordering::SeqCst) {
+                    release.notified().await;
+                }
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                }
+            })))
         }
     }
 }
@@ -1561,6 +1577,8 @@ async fn consolidation_does_not_hold_a_worktree_codegraph_open() {
         caps: Capabilities::openai(),
         calls: AtomicUsize::new(0),
         consolidation_started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        released: std::sync::atomic::AtomicBool::new(false),
     });
     let engine = Engine::builder(opts)
         .provider(llm.clone())
@@ -1595,4 +1613,9 @@ async fn consolidation_does_not_hold_a_worktree_codegraph_open() {
     std::fs::remove_dir_all(worktree.path())
         .expect("the released codegraph does not pin the worktree on Windows");
     assert!(!worktree.path().exists());
+    // Let the consolidation end, so the engine's teardown closes the
+    // project's stores before the temp folders are removed.
+    llm.released.store(true, Ordering::SeqCst);
+    llm.release.notify_one();
+    engine.shutdown().await.expect("shutdown");
 }

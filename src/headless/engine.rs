@@ -77,8 +77,11 @@ pub struct Engine {
     /// "hash" sentinel mapped to None) — the memory overview's line
     /// (3b.2 D2).
     configured_embedding_model: Option<String>,
-    /// The event pump task — `shutdown` aborts it.
-    pump: tokio::task::JoinHandle<()>,
+    /// The event pump task — `shutdown` aborts and joins it, and a drop
+    /// aborts it. The pump holds the shared state (and through it every
+    /// agent loop and the project's stores), so it must never outlive the
+    /// engine. Behind a lock so `shutdown(&self)` can take it to join.
+    pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether the builder supplied the model transport. An injected
     /// provider remains the transport for model-pinned sessions instead of
     /// being replaced by a config-resolved client.
@@ -100,6 +103,8 @@ pub struct EngineBuilder {
     /// exclusive with the three seams above (the brain carries its own
     /// transport, store, and shared resources).
     brain: Option<Arc<Brain>>,
+    /// Whether the built brain arms the code-search embedder.
+    code_embedder: crate::headless::CodeEmbedder,
 }
 
 impl EngineBuilder {
@@ -111,6 +116,7 @@ impl EngineBuilder {
             memory_store: None,
             shared: None,
             brain: None,
+            code_embedder: crate::headless::CodeEmbedder::Auto,
         }
     }
 
@@ -163,6 +169,15 @@ impl EngineBuilder {
         self
     }
 
+    /// Whether the engine runs the code-search embedder (default
+    /// [`CodeEmbedder::Auto`](crate::headless::CodeEmbedder::Auto)). `Off`
+    /// never arms the code graph's symbol-embed pass, so no code model is
+    /// built or downloaded. An injected brain keeps its own wiring.
+    pub fn code_embedder(mut self, mode: crate::headless::CodeEmbedder) -> Self {
+        self.code_embedder = mode;
+        self
+    }
+
     /// Build + start (identical to [`Engine::start`] plus the injections).
     pub async fn start(self) -> Result<Engine, EngineError> {
         // Job 6: the whole-brain seam is exclusive with the part seams —
@@ -183,6 +198,7 @@ impl EngineBuilder {
             self.memory_store,
             self.shared,
             self.brain,
+            self.code_embedder,
         )
         .await
     }
@@ -209,6 +225,37 @@ fn worktree_binding(
         codegraph,
         check_commands,
     })
+}
+
+/// How long [`Engine::shutdown`] waits for the cancelled agents' loops to be
+/// released.
+///
+/// [`LOOP_RELEASE_WAIT`] + [`CONSOLIDATION_GRACE`] must stay under the app's
+/// own shutdown deadline (Mnemo2's `SHUTDOWN_DEADLINE`, 10 s), or the app
+/// abandons the teardown before the engine's waits end.
+const LOOP_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long [`Engine::shutdown`] waits for in-flight session-end
+/// consolidations before it returns and lets the rest finish detached. See
+/// [`LOOP_RELEASE_WAIT`] for the budget both must fit in.
+const CONSOLIDATION_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A dropped engine stops its event pump even without a `shutdown`: the
+/// pump task holds the shared state, so a still-running pump would keep the
+/// host runtime, its agent loops and the project's stores alive for as long
+/// as the tokio runtime lives. The agent tasks then end on their next poll,
+/// once the dropped manager has closed their command channels.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(pump) = self
+            .pump
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            pump.abort();
+        }
+    }
 }
 
 impl Engine {
@@ -568,29 +615,72 @@ impl Engine {
         }
     }
 
-    /// Shut the engine down (§5.3 :301): cancel every live session,
-    /// deregister, stop the pump. (The session-end consolidation rides
-    /// the kernel's existing shutdown path when the loops' tasks end.)
+    /// Shut the engine down (§5.3 :301): cancel every live agent (the
+    /// sessions, their subagents and the host's main agent) after stopping
+    /// and joining the pump, deregister, and wait (bounded) until their
+    /// loops are released ([`LOOP_RELEASE_WAIT`]). The session-end
+    /// consolidations those agents start, and the host's other store-holding
+    /// tasks (the startup reconcile and code index, re-embed passes, the
+    /// archive prune), get [`CONSOLIDATION_GRACE`] to finish; any still running then finish
+    /// detached, never cut short. Both waits are sized to fit inside the
+    /// app's shutdown budget (Mnemo2's `SHUTDOWN_DEADLINE`), which the team
+    /// runtime's own `shutdown` shares, so the whole app teardown ends
+    /// before the app gives up on it.
+    ///
+    /// After this returns and the engine is dropped, the project's stores
+    /// close once those tasks (and any loop that outlived the wait, with the
+    /// consolidation it then starts) have finished — immediately in the
+    /// usual case where none is left. Caveat: an engine from
+    /// [`Engine::start_blocking`] owns its tokio runtime, so dropping that
+    /// engine shuts the runtime down and cancels the detached tasks with it.
     pub async fn shutdown(&self) -> Result<(), EngineError> {
-        let agents: Vec<crate::runtime::AgentId> = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .values()
-            .copied()
-            .collect();
-        for agent in agents {
-            let mgr = self.inner.host.manager.lock().await;
-            let _ = mgr.send(agent, crate::runtime::AgentCommand::Cancel);
-        }
         self.inner.sessions.lock().await.clear();
-        self.pump.abort();
+        // Stop the pump first, as before: no session event is published
+        // once shutdown has begun. The pump holds the shared state, so it
+        // is joined, not just aborted.
+        let pump = self.pump.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(pump) = pump {
+            pump.abort();
+            let _ = pump.await;
+        }
+        let loops: Vec<std::sync::Weak<crate::agent::AgentLoop>> = {
+            let manager = self.inner.host.manager.lock().await;
+            let mut agent_loops = self.inner.host.agent_loops.lock().await;
+            for handle in manager.list() {
+                let _ = manager.send(handle.id, crate::runtime::AgentCommand::Cancel);
+            }
+            agent_loops
+                .drain()
+                .map(|(_, agent_loop)| Arc::downgrade(&agent_loop))
+                .collect()
+        };
+        let released = async {
+            while loops.iter().any(|weak| weak.upgrade().is_some()) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(LOOP_RELEASE_WAIT, released).await.is_err() {
+            eprintln!(
+                "engine shutdown: an agent loop was still live after {}s",
+                LOOP_RELEASE_WAIT.as_secs()
+            );
+        }
+        // The session-end consolidations the cancelled agents started, and
+        // the host's reconcile, index, re-embed and prune tasks, hold the
+        // project's stores: give them a bounded grace to finish their
+        // writes; the rest finish detached and release them when they end.
+        let background = self.inner.host.manager.lock().await.background_tasks();
+        let detached = background.join(CONSOLIDATION_GRACE).await;
+        if detached > 0 {
+            eprintln!(
+                "engine shutdown: {detached} background task(s) (consolidation, reconcile, index, re-embed) still running; they finish in the background"
+            );
+        }
         // Drop the engine's bus sender LAST: every subscriber's `recv` then
         // observes `Closed`. `shutdown` borrows `&self` so a shared
         // `Arc<Engine>` can shut down, which means the sender must be
         // takeable rather than left alive with the struct (§7 row 15).
-        let _ = self.bus.lock().expect("session bus lock poisoned").take();
+        let _ = self.bus.lock().unwrap_or_else(|e| e.into_inner()).take();
         Ok(())
     }
 
@@ -778,11 +868,9 @@ impl Engine {
             .enable_all()
             .build()
             .map_err(|e| EngineError::start_failed(format!("runtime build failed: {e}")))?;
-        let engine = runtime.block_on(Self::start(opts))?;
-        Ok(Engine {
-            _owned_runtime: Some(runtime),
-            ..engine
-        })
+        let mut engine = runtime.block_on(Self::start(opts))?;
+        engine._owned_runtime = Some(runtime);
+        Ok(engine)
     }
 }
 
@@ -795,6 +883,7 @@ async fn start_inner(
     injected_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
     shared: Option<Arc<crate::host::brain::SharedResources>>,
     injected_brain: Option<Arc<Brain>>,
+    code_embedder: crate::headless::CodeEmbedder,
 ) -> Result<Engine, EngineError> {
     // The workspace gates — row 9 + the §5.9.3 :664 require_git rule
     // (either the option or the workspace marker demands a repo).
@@ -896,6 +985,7 @@ async fn start_inner(
                     index_codegraph: opts.index_codegraph,
                     injected_store,
                     shared,
+                    code_embedder,
                 },
             )
             .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
@@ -985,8 +1075,13 @@ async fn start_inner(
     // `ARCHIVE_RETENTION_SECS` in the background. Spawned and never awaited —
     // `start` must not wait on a large archive sweep — and it runs for an
     // injected brain too, since the archive belongs to the store either way.
+    // It holds the store, so it is tracked like a re-embed pass and the
+    // shutdown joins it.
     if let Some(store) = brain.factory.memory_handle() {
-        tokio::spawn(maintenance::prune_old_archive_rows(store));
+        brain
+            .factory
+            .background_tasks()
+            .register(tokio::spawn(maintenance::prune_old_archive_rows(store)));
     }
 
     Ok(Engine {
@@ -996,7 +1091,7 @@ async fn start_inner(
         host_events_tx,
         default_permissions: opts.permissions,
         configured_embedding_model,
-        pump,
+        pump: std::sync::Mutex::new(Some(pump)),
         has_injected_provider,
         _owned_runtime: None,
     })
@@ -1106,6 +1201,7 @@ mod tests {
                 index_codegraph: false,
                 injected_store: None,
                 shared: None,
+                code_embedder: crate::headless::CodeEmbedder::Auto,
             },
         )
         .unwrap();
@@ -1134,6 +1230,40 @@ mod tests {
             panic!("the injected brain is memory-disabled — memory() must error");
         };
         assert_eq!(err.code(), "memory_disabled");
+    }
+
+    /// `CodeEmbedder::Off` leaves the code graph's symbol-embed pass unarmed:
+    /// an engine indexing real code never builds (or downloads) the code
+    /// embedder, and a find_code query does not start one either.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn code_embedder_off_never_arms_the_symbol_embed_pass() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        std::fs::write(ws.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::create_dir_all(ws.path().join(".coding")).unwrap();
+        let mut options = opts(ws.path(), cfg.path());
+        options.memory = MemoryBackend::Disabled;
+        options.index_codegraph = true;
+        let engine = EngineBuilder::new(options)
+            .code_embedder(crate::headless::CodeEmbedder::Off)
+            .start()
+            .await
+            .unwrap();
+        let graph = engine.codegraph_handle().expect("the graph opened");
+        assert_eq!(
+            graph.code_embedder_state(),
+            crate::codegraph::CodeEmbedderState::Unarmed,
+            "Off never arms the pass"
+        );
+        assert!(graph.query_embedder().is_none(), "a query starts no build");
+        drop(graph);
+        engine.shutdown().await.unwrap();
+        assert!(
+            !cfg.path().join("models").exists(),
+            "nothing was built into the model cache"
+        );
     }
 
     #[tokio::test]

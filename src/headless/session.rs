@@ -1357,17 +1357,54 @@ mod lifecycle_tests {
             _tools: &[crate::provider::ToolSchema],
             _tool_choice: Option<crate::provider::ToolChoice>,
         ) -> crate::error::Result<futures::stream::BoxStream<'_, crate::provider::LlmEvent>> {
-            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Ok(Box::pin(futures::stream::iter([
-                    crate::provider::LlmEvent::TextDelta { text: "served".into() },
-                    crate::provider::LlmEvent::Finish {
-                        reason: crate::provider::FinishReason::Stop,
-                    },
-                ])))
+            // The first call serves the session's turn; every later one (the
+            // session-end consolidation) gets an empty answer that ends, so
+            // the consolidation finishes and releases the memory store.
+            let text = if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                "served"
             } else {
-                Ok(Box::pin(futures::stream::pending()))
-            }
+                ""
+            };
+            Ok(Box::pin(futures::stream::iter([
+                crate::provider::LlmEvent::TextDelta { text: text.into() },
+                crate::provider::LlmEvent::Finish {
+                    reason: crate::provider::FinishReason::Stop,
+                },
+            ])))
         }
+    }
+
+    #[tokio::test]
+    async fn memory_store_is_released_after_headless_close() {
+        let project = tempfile::tempdir().expect("project");
+        let config = tempfile::tempdir().expect("config");
+        write_test_config(config.path());
+        std::fs::create_dir_all(project.path().join(".coding")).expect("memory state");
+        let mut options = test_engine_options(project.path(), config.path());
+        options.memory = crate::headless::MemoryBackend::Sqlite { path: None };
+        let engine = Engine::start(options).await.expect("start memory engine");
+        let store = std::sync::Arc::downgrade(
+            &engine
+                .memory_store_handle()
+                .expect("the engine opened its own store"),
+        );
+        let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+        session.close_and_wait().await.expect("close the session");
+        drop(session);
+        drop(engine);
+
+        // The agent tasks end on their next poll once their command
+        // channels close, so give the runtime a bounded chance to run them.
+        for _ in 0..200 {
+            if store.upgrade().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            store.upgrade().is_none(),
+            "the memory store outlived the closed session and the dropped engine"
+        );
     }
 
     #[tokio::test]
@@ -1427,6 +1464,9 @@ mod lifecycle_tests {
             .expect("join close")
             .expect("close after the digest completes");
         std::fs::remove_dir_all(worktree.path()).expect("remove the digested worktree");
+        // The engine's own teardown: the memory store must be closed
+        // before the project folder is removed.
+        engine.shutdown().await.expect("shut the engine down");
     }
 
     #[tokio::test]
@@ -1516,6 +1556,9 @@ mod lifecycle_tests {
         }
         assert_eq!(cancellations, 1, "Cancel must be sent only once");
         std::fs::remove_dir_all(worktree.path()).expect("remove the released worktree");
+        // The engine's own teardown: the memory store must be closed
+        // before the project folder is removed.
+        engine.shutdown().await.expect("shut the engine down");
     }
 
     #[tokio::test]

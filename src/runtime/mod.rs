@@ -30,6 +30,9 @@ pub struct AgentManager {
     fanin_tx: mpsc::Sender<(AgentId, AgentEvent)>,
     fanin_rx: mpsc::Receiver<(AgentId, AgentEvent)>,
     next_id: AtomicU64,
+    /// The agents' background tasks (session-end consolidation), joined by
+    /// the host on shutdown.
+    background_tasks: agent::BackgroundTasks,
 }
 
 impl AgentManager {
@@ -41,7 +44,23 @@ impl AgentManager {
             fanin_tx,
             fanin_rx,
             next_id: AtomicU64::new(1),
+            background_tasks: agent::BackgroundTasks::default(),
         }
+    }
+
+    /// Create a manager whose agents register their background tasks in
+    /// `tasks` — the host's shared register (the factory's), so the host's
+    /// other store-holding tasks are joined with them on shutdown.
+    pub fn with_background_tasks(channel_capacity: usize, tasks: agent::BackgroundTasks) -> Self {
+        Self {
+            background_tasks: tasks,
+            ..Self::new(channel_capacity)
+        }
+    }
+
+    /// The register of the agents' background tasks (shared handle).
+    pub fn background_tasks(&self) -> agent::BackgroundTasks {
+        self.background_tasks.clone()
     }
 
     /// Get the sender half of the fan-in channel (cloned to each agent at spawn).

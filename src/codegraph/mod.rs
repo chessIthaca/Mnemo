@@ -1305,7 +1305,8 @@ impl CodeGraph {
         }
         let stop = Arc::clone(&self.symbol_embed.stop);
         let running = Arc::clone(&self.symbol_embed.running);
-        let store = Arc::clone(&self.store);
+        // The pass only borrows the store (see `run_symbol_embed_pass`).
+        let store = Arc::downgrade(&self.store);
         // Semantic code search (step 11): the pass announces stored vectors
         // so an in-memory query snapshot reloads instead of ranking stale.
         let generation = Arc::clone(&self.symbol_search.generation);
@@ -1825,7 +1826,8 @@ impl Drop for RunningFlagGuard {
 }
 
 /// The background pass body (plan d3336a8a step 9): builds the embedder
-/// per the armed source — the real path builds it ONCE per process ON
+/// per the armed source — the real path, only when symbols are pending,
+/// builds it ONCE per process ON
 /// THIS THREAD (attach-or-spawn of the shared host, or an in-process
 /// ONNX load, possibly a first ~600 MB download: never on a tokio
 /// worker, never under the store lock, never on the index path) — then
@@ -1838,13 +1840,35 @@ impl Drop for RunningFlagGuard {
 /// Never stores junk: only the real code model with a non-`Failed`
 /// status runs, and an all-zero batch (the degraded-embedder contract)
 /// is dropped, not persisted.
+///
+/// The pass holds the graph's store weakly and upgrades it only for each
+/// read or write: the embedder acquire and every embed call can take long,
+/// and a strong handle held across them would keep the database files open
+/// after the graph (and its engine) is dropped. A store that is gone ends
+/// the pass, like the stop flag does.
 #[cfg(feature = "embeddings")]
 fn run_symbol_embed_pass(
     armed: ArmedEmbedder,
-    store: Arc<Mutex<Store>>,
+    store: std::sync::Weak<Mutex<Store>>,
     stop: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 ) {
+    // An empty queue needs no embedder: the real build may download the
+    // ~600 MB model, which would then run (and write into the model cache)
+    // for nothing, past the graph's own lifetime. A later index that adds
+    // symbols schedules a new pass, which builds it then.
+    if matches!(armed, ArmedEmbedder::Real { .. }) {
+        let Some(live_store) = store.upgrade() else {
+            return;
+        };
+        let nothing_pending = lock_store(&live_store)
+            .pending_symbols(crate::memory::embedder::CODE_EMBEDDING_MODEL, 1)
+            .is_ok_and(|batch| batch.is_empty());
+        drop(live_store);
+        if nothing_pending {
+            return;
+        }
+    }
     let embedder = match &armed {
         #[cfg(test)]
         ArmedEmbedder::Stub(embedder) => Arc::clone(embedder),
@@ -1898,13 +1922,17 @@ fn run_symbol_embed_pass(
             // Read the batch under one short lock, RELEASE before the
             // embed call — the write connection is never held across an
             // embed.
-            let batch = match lock_store(&store).pending_symbols(&model, SYMBOL_EMBED_BATCH) {
+            let Some(live_store) = store.upgrade() else {
+                break;
+            };
+            let batch = match lock_store(&live_store).pending_symbols(&model, SYMBOL_EMBED_BATCH) {
                 Ok(batch) => batch,
                 Err(e) => {
                     eprintln!("codegraph: symbol-embed batch read failed: {e}");
                     break;
                 }
             };
+            drop(live_store);
             if batch.is_empty() {
                 break;
             }
@@ -1956,7 +1984,13 @@ fn run_symbol_embed_pass(
                     stop = true;
                     break;
                 }
-                match lock_store(&store).store_symbol_vecs(&model, dim, rows, &vectors) {
+                let Some(live_store) = store.upgrade() else {
+                    stop = true;
+                    break;
+                };
+                let written = lock_store(&live_store).store_symbol_vecs(&model, dim, rows, &vectors);
+                drop(live_store);
+                match written {
                     Ok(0) => {
                         // Review finding zeroProgressLoop: nothing stored
                         // for a NON-empty sub-batch (wrong-length vectors,
@@ -3316,7 +3350,7 @@ mod tests {
             .expect("the graph must be armed first");
         run_symbol_embed_pass(
             armed,
-            Arc::clone(&graph.store),
+            Arc::downgrade(&graph.store),
             Arc::clone(&graph.symbol_embed.stop),
             Arc::clone(&graph.symbol_search.generation),
         );
@@ -3483,6 +3517,39 @@ mod tests {
             "a zero window never parks the slot"
         );
         assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+        code_embedder_slot::test::reset();
+    }
+
+    /// A real-armed pass with no pending symbols never builds the code
+    /// embedder: the build may download the model, which would run into the
+    /// model cache for nothing (and outlive the graph that asked for it).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn an_empty_queue_never_builds_the_code_embedder() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        code_embedder_slot::test::install_builder(Box::new(move |_cache_dir, _memory_model| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Notes\n\nNo code here.\n").unwrap();
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        run_armed_pass(&graph);
+        assert_eq!(builds.load(Ordering::Relaxed), 0, "nothing to embed, no build");
+
+        // Code arrives: the next pass builds and embeds it.
+        fixture(dir.path());
+        graph.index(None).unwrap();
+        run_armed_pass(&graph);
+        assert_eq!(builds.load(Ordering::Relaxed), 1, "pending symbols build the embedder");
+        assert!(graph.store().symbol_vec_count().unwrap() > 0);
         code_embedder_slot::test::reset();
     }
 

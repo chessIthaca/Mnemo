@@ -270,7 +270,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_agent_started".to_string(),
-                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent.".to_string(),
+                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent. On a worker Mnemo handed back to its own models while you were away, and no Mnemo model has run on since, it restores the worker as an agent worker with your agent registered.".to_string(),
                 parameters: json!({"type":"object","properties":{
                     "worker_id":{"type":"string","description":"The agent worker the agent runs."},
                     "agent_id":{"type":"string","description":"The id of the Claude Code agent (the Agent tool's agent id)."},
@@ -670,8 +670,16 @@ impl TeamRuntime {
                     .get("reasoning_effort")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                // Only the external lead may let a Mnemo model take over a
+                // handed-back worker's dirty checkout (plan ee73bd2f
+                // decision 3); the in-app lead's tool has no such switch.
+                let keep_changes = sender == MessageSender::ExternalLead
+                    && args
+                        .get("keep_changes")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                 if tier.is_none() && model.is_none() && reasoning_effort.is_none() {
-                    self.resume(worker_id).await
+                    self.resume_keeping(worker_id, keep_changes).await
                 } else {
                     self.resume_on_tier(
                         worker_id,
@@ -679,6 +687,7 @@ impl TeamRuntime {
                         model,
                         reasoning_effort,
                         ChangeSource::Lead,
+                        keep_changes,
                     )
                     .await
                     .map(|resumed| {

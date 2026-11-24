@@ -32,9 +32,10 @@ use mnemo::app::worktrees::is_link_or_junction;
 use crate::mnemo2::phase3;
 use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
 
+use super::dispatch::BoxFuture;
 use super::pump::save_workers;
 use super::record::{
-    append_inbox, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus,
+    append_inbox, HandedBack, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus,
 };
 use super::{BoardSignal, TeamRuntime};
 
@@ -653,45 +654,52 @@ impl TeamRuntime {
         refresh(&self.records, &self.agent_watch, worker).await
     }
 
-    /// Start the watcher when a registered agent worker is Working or
-    /// Fixing and no watcher runs.
-    pub(super) async fn ensure_agent_watch(&self) {
-        let wanted = self
-            .records
-            .lock()
-            .await
-            .iter()
-            .any(watched);
-        if !wanted {
-            return;
-        }
-        let mut inner = self.agent_watch.lock();
-        if inner.task.as_ref().is_some_and(|task| !task.is_finished()) {
-            return;
-        }
-        let records = self.records.clone();
-        let signals = self.signals.clone();
-        let watch = self.agent_watch.clone();
-        // The runtime, to finish a worker whose agent ended; set once the
-        // runtime holds its own Arc (`attach_board`).
-        let limits = self.usage_limits.clone();
-        inner.task = Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(WATCH_INTERVAL).await;
-                let (keep, finished, stalled) = tick(&records, &signals, &watch).await;
-                match limits.team() {
-                    Some(team) => team.after_agent_watch(&finished, stalled).await,
-                    None => {
-                        for run in &finished {
-                            watch.retry_finish(run);
+    /// Start the watcher when an agent worker is Working or Fixing (its
+    /// agent registered or still awaited) and no watcher runs. Each pass
+    /// also runs the hand-back check while no lead is attached.
+    ///
+    /// Boxed: the hand-back check may register a launched agent, which
+    /// starts the watch again, so this future's type must not be inferred
+    /// through the watch task's own.
+    pub(super) fn ensure_agent_watch(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let wanted = self
+                .records
+                .lock()
+                .await
+                .iter()
+                .any(keeps_watch);
+            if !wanted {
+                return;
+            }
+            let mut inner = self.agent_watch.lock();
+            if inner.task.as_ref().is_some_and(|task| !task.is_finished()) {
+                return;
+            }
+            let records = self.records.clone();
+            let signals = self.signals.clone();
+            let watch = self.agent_watch.clone();
+            // The runtime, to finish a worker whose agent ended; set once the
+            // runtime holds its own Arc (`attach_board`).
+            let limits = self.usage_limits.clone();
+            inner.task = Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(WATCH_INTERVAL).await;
+                    let (keep, finished, _stalled) = tick(&records, &signals, &watch).await;
+                    match limits.team() {
+                        Some(team) => team.after_agent_watch(&finished).await,
+                        None => {
+                            for run in &finished {
+                                watch.retry_finish(run);
+                            }
                         }
                     }
+                    if !keep {
+                        return;
+                    }
                 }
-                if !keep {
-                    return;
-                }
-            }
-        }));
+            }));
+        })
     }
 
     /// Arm the run-start probe ([`TeamRuntime::probe_run_start`]). Tests only.
@@ -723,20 +731,22 @@ impl TeamRuntime {
     /// One pass of the watcher. Tests call it instead of waiting a minute.
     #[cfg(test)]
     pub(super) async fn agent_watch_tick(&self) {
-        let (_, finished, stalled) = tick(&self.records, &self.signals, &self.agent_watch).await;
-        self.after_agent_watch(&finished, stalled).await;
+        let (_, finished, _) = tick(&self.records, &self.signals, &self.agent_watch).await;
+        self.after_agent_watch(&finished).await;
     }
 
     /// What a watcher pass leaves to the runtime: finish the runs that
-    /// ended, and, when an agent stalled while no Claude Code lead is
-    /// attached to run it, hand such workers back.
-    async fn after_agent_watch(&self, finished: &[FinishedRun], stalled: bool) {
+    /// ended, and, while no Claude Code lead is attached, run the hand-back
+    /// check ([`TeamRuntime::hand_back_agent_workers`]): it hands back only
+    /// once the lead has been away for the grace period (plan ee73bd2f
+    /// decision 1), so a stall alone hands nothing back.
+    async fn after_agent_watch(&self, finished: &[FinishedRun]) {
         for run in finished {
             self.finish_agent_run(run).await;
         }
-        if stalled && !self.external_lead_attached() {
+        if !self.external_lead_attached() {
             if let Err(error) = self.hand_back_agent_workers().await {
-                eprintln!("team: could not hand back stalled agent workers: {error}");
+                eprintln!("team: could not hand back agent workers: {error}");
             }
         }
     }
@@ -759,6 +769,14 @@ impl TeamRuntime {
 fn watched(worker: &WorkerRecord) -> bool {
     worker.claude_agent.is_some()
         && worker.claude_agent_id.is_some()
+        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+}
+
+/// An agent worker at work, its agent registered or still awaited: the
+/// watcher keeps running for it, so the hand-back check also reaches a
+/// worker whose agent was never launched.
+fn keeps_watch(worker: &WorkerRecord) -> bool {
+    worker.claude_agent.is_some()
         && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
 }
 
@@ -804,9 +822,11 @@ async fn tick(
         .collect();
     if workers.is_empty() {
         // Re-check under the task slot, so a registration racing the exit
-        // either keeps this task or finds the slot free.
+        // either keeps this task or finds the slot free. An agent worker
+        // still awaiting its agent keeps the task too: its hand-back check
+        // runs after each pass.
         let mut inner = watch.lock();
-        let again = records.try_lock().map(|r| r.iter().any(watched)).unwrap_or(true);
+        let again = records.try_lock().map(|r| r.iter().any(keeps_watch)).unwrap_or(true);
         if again {
             return (true, Vec::new(), false);
         }
@@ -930,11 +950,19 @@ pub(super) fn agent_phase(worker: &WorkerRecord, view: Option<&AgentView>) -> Op
 
 /// Why an agent worker was handed back to Mnemo.
 pub(super) const HANDED_BACK_REASON: &str =
-    "Its Claude Code lead left before the agent finished; resume it to continue on a Mnemo model.";
+    "Its Claude Code lead was away longer than the hand-back grace period ([routing] agent_hand_back_minutes) while its agent was not launched or had stalled.";
 
-/// Whether a leaving lead hands `worker` back: its agent was never launched,
-/// or it stalled. A running agent may still write its transcript, so it
-/// stays.
+/// Whether the lead has been away long enough for a hand-back (plan
+/// ee73bd2f decision 1): `away_since_ms` is when the external lead left
+/// (`None` while one is attached), `grace_ms` the grace period. A grace of 0
+/// hands back as soon as the lead is gone.
+pub(super) fn hand_back_grace_passed(away_since_ms: Option<u64>, now_ms: u64, grace_ms: u64) -> bool {
+    away_since_ms.is_some_and(|since| now_ms.saturating_sub(since) >= grace_ms)
+}
+
+/// Whether an absent lead's agent worker is due for a hand-back: its agent
+/// was never launched, or it stalled. A running agent may still write its
+/// transcript, so it stays.
 pub(super) fn hand_back_due(worker: &WorkerRecord, view: Option<&AgentView>) -> bool {
     matches!(
         agent_phase(worker, view),
@@ -943,10 +971,19 @@ pub(super) fn hand_back_due(worker: &WorkerRecord, view: Option<&AgentView>) -> 
 }
 
 /// Make an agent worker an ordinary interrupted Mnemo worker: it no longer
-/// runs as a Claude Code agent, and says why. Record, branch, checkout,
-/// commits, findings and review history stay.
-pub(super) fn hand_back(worker: &mut WorkerRecord) {
-    worker.claude_agent = None;
+/// runs as a Claude Code agent, and says why. What it was is kept in
+/// `handed_back`, so `team_agent_started` can restore it while no Mnemo
+/// model has run on it. Record, branch, checkout, commits, findings and
+/// review history stay.
+pub(super) fn hand_back(worker: &mut WorkerRecord, at_ms: u64) {
+    if let Some(agent) = worker.claude_agent.take() {
+        worker.handed_back = Some(HandedBack {
+            at_ms,
+            claude_agent: agent,
+            claude_agent_effort: worker.claude_agent_effort.clone(),
+            status: worker.status,
+        });
+    }
     worker.claude_agent_effort = None;
     worker.claude_agent_id = None;
     worker.claude_agent_transcript = None;
@@ -955,11 +992,189 @@ pub(super) fn hand_back(worker: &mut WorkerRecord) {
     worker.error = Some(HANDED_BACK_REASON.to_string());
 }
 
-/// The notice the next lead gets for a handed-back worker.
-pub(super) fn handed_back_notice(worker_id: &str) -> String {
+/// Whether a worker's checkout has uncommitted changes: tracked or
+/// untracked, ignored files excluded (the pool check's rule). A checkout
+/// Git cannot read counts as dirty, which only ever refuses a takeover; a
+/// worker without a checkout has nothing to overwrite.
+pub(super) async fn checkout_dirty(worktree: &Path) -> bool {
+    if worktree.as_os_str().is_empty() || !worktree.is_dir() {
+        return false;
+    }
+    match phase3::git_value(worktree, &["status", "--porcelain", "-uall"]).await {
+        Ok(status) => !status.trim().is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// The ways to continue a handed-back worker, as the notices name them.
+fn handed_back_recovery(worker_id: &str) -> String {
     format!(
-        "{TEAM_NOTICE_PREFIX} worker_id={worker_id}\n{worker_id} was handed back from Claude Code: {HANDED_BACK_REASON}"
+        "To continue it:\n- team_agent_started (worker_id={worker_id}, agent_id=<the agent's id>) reclaims it with an agent you launched for it;\n- team_resume (worker_id={worker_id}, tier=<a tier that runs as a Claude Code agent>) starts a fresh agent on it;\n- team_resume onto a Mnemo tier runs it on a Mnemo model, which is refused while its checkout has uncommitted changes unless you pass keep_changes: true."
     )
+}
+
+/// The notice the next lead gets for a handed-back worker: the worker, its
+/// checkout, whether that holds uncommitted changes, and the recovery calls.
+pub(super) fn handed_back_notice(worker: &WorkerRecord, dirty: bool) -> String {
+    let id = &worker.id;
+    let changes = if dirty {
+        "has uncommitted changes"
+    } else {
+        "has no uncommitted changes"
+    };
+    format!(
+        "{TEAM_NOTICE_PREFIX} worker_id={id}\n{id} was handed back from Claude Code: {HANDED_BACK_REASON}\nIts checkout {checkout} {changes}.\n{recovery}",
+        checkout = worker.worktree.display(),
+        recovery = handed_back_recovery(id),
+    )
+}
+
+/// The refusal (and notice) when a Mnemo model would take over a
+/// handed-back worker whose checkout has uncommitted changes (plan ee73bd2f
+/// decision 3): a launched agent may still be writing there.
+pub(super) fn handed_back_dirty_refusal(worker: &WorkerRecord) -> String {
+    let id = &worker.id;
+    format!(
+        "worker_id={id}\n{id} was handed back from Claude Code and its checkout {checkout} has uncommitted changes, which its Claude Code agent may still be writing: Mnemo does not start a Mnemo model there, so {id} stays interrupted.\n{recovery}",
+        checkout = worker.worktree.display(),
+        recovery = handed_back_recovery(id),
+    )
+}
+
+/// A launched agent's transcript found for an agent worker that awaits its
+/// launch ([`find_launched_agent`]).
+pub(super) struct Launched {
+    pub(super) agent_id: String,
+    pub(super) path: PathBuf,
+    /// How many transcripts matched; the newest is the one named.
+    pub(super) matches: usize,
+}
+
+/// The most bytes read from a transcript while looking for its first user
+/// message.
+const FIRST_MESSAGE_BYTES: u64 = 1024 * 1024;
+
+/// Whether `path` exists and is no link or junction.
+fn plain_entry(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| !is_link_or_junction(&meta))
+}
+
+/// The text of a transcript's first user message, read from at most
+/// [`FIRST_MESSAGE_BYTES`].
+fn first_user_text(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file.take(FIRST_MESSAGE_BYTES));
+    for line in reader.split(b'\n') {
+        let Ok(line) = line else {
+            return None;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        let user = message.get("role").and_then(Value::as_str) == Some("user")
+            || value.get("type").and_then(Value::as_str) == Some("user");
+        if !user {
+            continue;
+        }
+        return Some(match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        });
+    }
+    None
+}
+
+/// Look for the agent the lead launched for `worker` (an agent worker that
+/// awaits its launch) before handing it back (plan ee73bd2f decision 2):
+/// `~/.claude/projects/<slug>/<session>/subagents/agent-<id>.jsonl` files,
+/// reached without links and confined to the projects root as
+/// [`find_transcript`] requires, written at or after `since_ms` (the
+/// worker's dispatch or its last reroute), whose agent is not in `taken`
+/// (registered to another worker), and whose first user message names the
+/// worker's checkout or its branch. The newest match wins.
+pub(super) fn find_launched_agent(
+    watch: &AgentWatch,
+    worker: &WorkerRecord,
+    since_ms: u128,
+    taken: &[String],
+) -> Option<Launched> {
+    let root = watch.projects_root()?;
+    let mut needles = Vec::new();
+    if !worker.branch.trim().is_empty() {
+        needles.push(worker.branch.trim().to_lowercase());
+    }
+    if !worker.worktree.as_os_str().is_empty() {
+        let checkout = worker.worktree.to_string_lossy().to_lowercase();
+        needles.push(checkout.replace('\\', "/"));
+        needles.push(checkout.replace('/', "\\"));
+    }
+    if needles.is_empty() {
+        return None;
+    }
+    let mut found: Vec<(u128, String, PathBuf)> = Vec::new();
+    for slug in std::fs::read_dir(&root).ok()?.flatten() {
+        if !plain_entry(&slug.path()) {
+            continue;
+        }
+        let Ok(sessions) = std::fs::read_dir(slug.path()) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            let subagents = session.path().join("subagents");
+            if !plain_entry(&session.path()) || !plain_entry(&subagents) {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&subagents) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let name = file.file_name();
+                let Some(agent_id) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("agent-"))
+                    .and_then(|name| name.strip_suffix(".jsonl"))
+                else {
+                    continue;
+                };
+                if !valid_agent_id(agent_id) || taken.iter().any(|id| id == agent_id) {
+                    continue;
+                }
+                let Some(path) = confined(&root, &file.path(), agent_id) else {
+                    continue;
+                };
+                let modified = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .map_or(0, epoch_ms);
+                if modified < since_ms {
+                    continue;
+                }
+                let Some(text) = first_user_text(&path) else {
+                    continue;
+                };
+                let text = text.to_lowercase();
+                if needles.iter().any(|needle| text.contains(needle.as_str())) {
+                    found.push((modified, agent_id.to_string(), path));
+                }
+            }
+        }
+    }
+    let matches = found.len();
+    let (_, agent_id, path) = found.into_iter().max_by_key(|(modified, _, _)| *modified)?;
+    Some(Launched {
+        agent_id,
+        path,
+        matches,
+    })
 }
 
 /// The longest agent report quoted in a finished notice, in characters.
@@ -1024,11 +1239,19 @@ impl TeamRuntime {
     }
 }
 
+/// A handed-back worker `team_agent_started` may reclaim: Interrupted, with
+/// the hand-back still on record (no Mnemo model has run on it since).
+fn reclaimable(worker: &WorkerRecord) -> bool {
+    worker.claude_agent.is_none()
+        && worker.handed_back.is_some()
+        && worker.status == WorkerStatus::Interrupted
+}
+
 /// The agent workers `team_agent_started` and `team_progress` accept.
 fn agent_worker_in_work(worker: &WorkerRecord, tool: &str) -> Result<(), String> {
     if worker.claude_agent.is_none() {
         return Err(format!(
-            "{} does not run as a Claude Code agent: {tool} only serves agent workers",
+            "{} does not run as a Claude Code agent (it never did, or a Mnemo model has run on it since it was handed back): {tool} only serves agent workers",
             worker.id
         ));
     }
@@ -1059,14 +1282,38 @@ impl TeamRuntime {
             );
         }
         let worker = self.worker(worker_id).await?;
-        agent_worker_in_work(&worker, "team_agent_started")?;
+        // A handed-back worker no Mnemo model has run on since is reclaimed
+        // (plan ee73bd2f decision 4): the lead launched its agent after all.
+        // Under the merge lock, so no resume starts a Mnemo session on it
+        // meanwhile; no other caller of this holds that lock for such a
+        // worker (they register a worker that awaits its agent).
+        let reclaim_guard = if reclaimable(&worker) {
+            Some(self.merge_lock.lock().await)
+        } else {
+            agent_worker_in_work(&worker, "team_agent_started")?;
+            None
+        };
         let search = find_transcript(&self.agent_watch, agent_id, transcript_path);
         let transcript = search.path;
+        let mut restored = false;
         {
             let mut records = self.records.lock().await;
             let Some(record) = records.iter_mut().find(|record| record.id == worker_id) else {
                 return Err(format!("unknown worker '{worker_id}'"));
             };
+            if reclaim_guard.is_some() {
+                // Re-checked under the lock: a Mnemo session may have started.
+                if !reclaimable(record) {
+                    agent_worker_in_work(record, "team_agent_started")?;
+                }
+                if let Some(handed) = record.handed_back.take() {
+                    record.claude_agent = Some(handed.claude_agent);
+                    record.claude_agent_effort = handed.claude_agent_effort;
+                    record.status = handed.status;
+                    record.error = None;
+                    restored = true;
+                }
+            }
             record.claude_agent_id = Some(agent_id.to_string());
             record.claude_agent_transcript = transcript.clone();
             // The launch is activity: an agent whose transcript never shows
@@ -1088,14 +1335,23 @@ impl TeamRuntime {
         } else {
             ""
         };
+        let registered = if restored {
+            format!(
+                "Restored {worker_id} as a Claude Code agent worker and registered agent {agent_id}"
+            )
+        } else {
+            format!("Registered Claude Code agent {agent_id} for {worker_id}")
+        };
         let text = match &transcript {
-            Some(path) => format!(
-                "{ignored}Registered Claude Code agent {agent_id} for {worker_id}; Mnemo follows its transcript {path}."
-            ),
+            Some(path) => format!("{ignored}{registered}; Mnemo follows its transcript {path}."),
             None => format!(
-                "{ignored}Registered Claude Code agent {agent_id} for {worker_id}; its transcript was not found yet, so Mnemo keeps looking for it under ~/.claude/projects."
+                "{ignored}{registered}; its transcript was not found yet, so Mnemo keeps looking for it under ~/.claude/projects."
             ),
         };
+        drop(reclaim_guard);
+        if restored {
+            let _ = self.signals.send(BoardSignal::Changed);
+        }
         let worker = self.worker(worker_id).await?;
         Ok((worker, text))
     }

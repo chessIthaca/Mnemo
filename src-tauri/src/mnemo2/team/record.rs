@@ -399,6 +399,13 @@ pub struct WorkerRecord {
     /// The agent's transcript file (`agent-<id>.jsonl`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_agent_transcript: Option<String>,
+    /// What Mnemo took away when it handed this agent worker back to its own
+    /// models (plan ee73bd2f decision 3): set by the hand-back, cleared once
+    /// a Mnemo session starts on the worker or it runs as an agent again.
+    /// While set, no Mnemo model takes over a dirty checkout, and
+    /// `team_agent_started` may reclaim the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed_back: Option<HandedBack>,
     /// The branches `team_integrate` merged into this worker's branch, in
     /// order (plan ca7f2177 decision 6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -421,6 +428,21 @@ pub struct WorkerRecord {
     /// the log.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reroutes: Vec<DispatchRoutingRow>,
+}
+
+/// An agent worker's hand-back to Mnemo: when it happened and what the
+/// worker was before, so `team_agent_started` can restore it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandedBack {
+    /// When the worker was handed back, in Unix epoch milliseconds.
+    pub at_ms: u64,
+    /// The Claude Code model it ran as.
+    pub claude_agent: String,
+    /// The Claude Code effort its agent ran at, if its tier set one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_agent_effort: Option<String>,
+    /// Its status before the hand-back: Working or Fixing.
+    pub status: WorkerStatus,
 }
 
 /// One branch `team_integrate` merged into a worker's branch: the branch, the

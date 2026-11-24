@@ -253,6 +253,7 @@ impl TeamRuntime {
             claude_agent_effort: None,
             claude_agent_id: None,
             claude_agent_transcript: None,
+            handed_back: None,
             integrations: Vec::new(),
             integration_note: None,
             base_commit: Some(base_tip.clone()),

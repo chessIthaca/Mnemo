@@ -1774,6 +1774,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         claude_agent_effort: None,
         claude_agent_id: None,
         claude_agent_transcript: None,
+        handed_back: None,
         integrations: Vec::new(),
         integration_note: None,
         base_commit: None,
@@ -18064,6 +18065,8 @@ async fn restart_with_agent(
         .duration_since(std::time::UNIX_EPOCH)
         .expect("epoch")
         .as_millis();
+    // These starts hand back at once, as they did before the grace existed.
+    write_hand_back_grace(config.path(), 0);
     let team = open_test_team_with_config(root.path(), state.path(), vec![record], config.path())
         .await;
     RestartFixture {
@@ -18124,7 +18127,7 @@ async fn a_stalled_agent_is_handed_back_at_startup() {
     assert_eq!(worker.status, WorkerStatus::Interrupted);
     assert_eq!(worker.claude_agent, None);
     assert_eq!(worker.claude_agent_id, None);
-    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead was away longer than")));
     let held = team.take_undelivered_notices();
     assert_eq!(
         held.iter().filter(|notice| notice.contains("restartAgent02 was handed back")).count(),
@@ -18146,7 +18149,7 @@ async fn an_agent_without_a_transcript_is_handed_back_at_startup() {
     let worker = team.worker("restartAgent03").await.expect("worker");
     assert_eq!(worker.status, WorkerStatus::Interrupted);
     assert_eq!(worker.claude_agent, None);
-    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead was away longer than")));
     team.shutdown().await;
 }
 
@@ -18231,6 +18234,7 @@ async fn agent_phase_is_not_written_to_team_json() {
 async fn a_detached_lead_hands_back_an_unlaunched_agent_worker() {
     let (fixture, _projects, _transcript) = agent_watch_fixture("handBack01").await;
     let team = &fixture.team;
+    set_hand_back_grace(team, 0);
     let before = team.worker("handBack01").await.expect("worker");
     assert!(before.claude_agent.is_some());
     assert!(team.leave_external_lead().await, "the lead was attached");
@@ -18241,19 +18245,19 @@ async fn a_detached_lead_hands_back_an_unlaunched_agent_worker() {
     assert_eq!(worker.claude_agent_id, None);
     assert_eq!(
         worker.error.as_deref(),
-        Some("Its Claude Code lead left before the agent finished; resume it to continue on a Mnemo model.")
+        Some(super::agent_watch::HANDED_BACK_REASON)
     );
     assert_eq!(worker.branch, before.branch);
     assert_eq!(worker.worktree, before.worktree);
     assert!(worker.worktree.is_dir(), "the checkout stays");
     // Saved, not only in memory.
     let saved = std::fs::read_to_string(&team.persistence.path).expect("team.json");
-    assert!(saved.contains("Its Claude Code lead left"), "{saved}");
+    assert!(saved.contains("Its Claude Code lead was away longer than"), "{saved}");
     // The next lead hears of it once.
     let held = team.take_undelivered_notices();
     let handed: Vec<_> = held
         .iter()
-        .filter(|notice| notice.contains("handBack01 was handed back from Claude Code: Its Claude Code lead left"))
+        .filter(|notice| notice.contains("handBack01 was handed back from Claude Code: Its Claude Code lead was away longer than"))
         .collect();
     assert_eq!(handed.len(), 1, "{held:?}");
     assert!(entry_has_no_phase(&status_entry(team, "handBack01").await));
@@ -18280,6 +18284,7 @@ fn entry_has_no_phase(entry: &serde_json::Value) -> bool {
 async fn a_stalled_agent_is_handed_back_when_the_lead_leaves() {
     let (fixture, _projects, transcript) = agent_watch_fixture("handBack02").await;
     let team = &fixture.team;
+    set_hand_back_grace(team, 0);
     write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
     assert!(start_agent(team, "handBack02", serde_json::json!({})).await.success);
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
@@ -18294,7 +18299,7 @@ async fn a_stalled_agent_is_handed_back_when_the_lead_leaves() {
     assert_eq!(worker.status, WorkerStatus::Interrupted);
     assert_eq!(worker.claude_agent, None);
     assert_eq!(worker.claude_agent_id, None);
-    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead was away longer than")));
     team.shutdown().await;
 }
 
@@ -18336,22 +18341,388 @@ async fn mnemo2_start_hands_back_an_unlaunched_agent_worker() {
     let state = tempfile::tempdir().expect("state");
     let config = tempfile::tempdir().expect("config");
     init_git(root.path());
+    let projects = tempfile::tempdir().expect("projects");
+    let _projects_root = ThreadProjectsRoot::set(projects.path());
     let mut waiting = test_worker_record("handBack05");
     waiting.claude_agent = Some("opus".into());
     waiting.status = WorkerStatus::Working;
     waiting.worktree = root.path().join("checkout");
+    write_hand_back_grace(config.path(), 0);
     let team = open_test_team_with_config(root.path(), state.path(), vec![waiting], config.path())
         .await;
     let worker = team.worker("handBack05").await.expect("worker");
     assert_eq!(worker.status, WorkerStatus::Interrupted);
     assert_eq!(worker.claude_agent, None);
-    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead left")));
+    assert!(worker.error.as_deref().is_some_and(|error| error.starts_with("Its Claude Code lead was away longer than")));
     let held = team.take_undelivered_notices();
     assert_eq!(
         held.iter().filter(|notice| notice.contains("handBack05 was handed back")).count(),
         1,
         "{held:?}"
     );
+    team.shutdown().await;
+}
+
+// --- Agent workers go back to Mnemo only when the lead is really gone
+// (plan ee73bd2f) --------------------------------------------------------
+
+/// Write `[routing] agent_hand_back_minutes` into a config folder before a
+/// team opens there.
+fn write_hand_back_grace(config: &std::path::Path, minutes: u64) {
+    std::fs::write(
+        crate::mnemo2::dispatch_routing::routing_settings_path(config),
+        format!("[routing]\nagent_hand_back_minutes = {minutes}\n"),
+    )
+    .expect("mnemo2.toml");
+}
+
+/// Set an open team's hand-back grace period, in minutes.
+fn set_hand_back_grace(team: &TeamRuntime, minutes: u64) {
+    let mut settings = team.routing_settings_for_test();
+    settings.agent_hand_back_minutes = minutes;
+    *team.routing.write().unwrap_or_else(|e| e.into_inner()) = settings;
+}
+
+/// The handed-back notices waiting for the next lead that name `worker_id`.
+fn handed_back_notices(team: &TeamRuntime, worker_id: &str) -> Vec<String> {
+    team.take_undelivered_notices()
+        .into_iter()
+        .filter(|notice| notice.contains(&format!("{worker_id} was handed back")))
+        .collect()
+}
+
+/// An agent worker the lead left with a grace of 0, so it was handed back
+/// at once.
+async fn handed_back_agent(worker_id: &str) -> (RoutingFixture, tempfile::TempDir, std::path::PathBuf) {
+    let (fixture, projects, transcript) = agent_watch_fixture(worker_id).await;
+    set_hand_back_grace(&fixture.team, 0);
+    assert!(fixture.team.leave_external_lead().await, "the lead was attached");
+    let worker = fixture.team.worker(worker_id).await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert!(worker.handed_back.is_some(), "handed back: {worker:?}");
+    (fixture, projects, transcript)
+}
+
+#[test]
+fn hand_back_grace_passed_decides_from_the_clock() {
+    use super::agent_watch::hand_back_grace_passed;
+    // A lead is attached: never.
+    assert!(!hand_back_grace_passed(None, 10_000_000, 0));
+    // A grace of 0: as soon as the lead is gone.
+    assert!(hand_back_grace_passed(Some(5_000), 5_000, 0));
+    let grace = 30 * 60_000;
+    assert!(!hand_back_grace_passed(Some(1_000), 1_000 + grace - 1, grace));
+    assert!(hand_back_grace_passed(Some(1_000), 1_000 + grace, grace));
+    // A clock that went backwards counts as no time away.
+    assert!(!hand_back_grace_passed(Some(9_000), 1_000, grace));
+}
+
+#[tokio::test]
+async fn agent_worker_is_not_handed_back_before_the_grace_period() {
+    let (fixture, _projects, _transcript) = agent_watch_fixture("graceBack01").await;
+    let team = &fixture.team;
+    assert_eq!(team.routing_settings_for_test().agent_hand_back_minutes, 30);
+    let still_an_agent_worker = || async {
+        let worker = team.worker("graceBack01").await.expect("worker");
+        worker.status == WorkerStatus::Working
+            && worker.claude_agent.as_deref() == Some("opus")
+            && worker.handed_back.is_none()
+    };
+    // The lead leaves while the worker awaits its launch: nothing goes back.
+    assert!(team.leave_external_lead().await, "the lead was attached");
+    assert!(still_an_agent_worker().await, "handed back as the lead left");
+    assert!(team.hand_back_agent_workers().await.expect("no error").is_empty());
+    // 29 minutes later the periodic check still hands nothing back.
+    team.backdate_lead_away_for_test(29 * 60_000);
+    team.agent_watch_tick().await;
+    assert!(still_an_agent_worker().await, "handed back inside the grace");
+    // The lead re-attaches inside the grace: the clock stops, and a later
+    // leave starts it over, so the earlier 29 minutes do not count.
+    assert!(team.attach_external_lead());
+    assert_eq!(team.lead_away_since_for_test(), None);
+    team.agent_watch_tick().await;
+    assert!(team.leave_external_lead().await);
+    assert!(team.lead_away_since_for_test().is_some());
+    team.agent_watch_tick().await;
+    assert!(still_an_agent_worker().await, "the re-attach did not reset the clock");
+    assert!(handed_back_notices(team, "graceBack01").is_empty());
+    // Past the grace the periodic check hands it back.
+    team.backdate_lead_away_for_test(31 * 60_000);
+    team.agent_watch_tick().await;
+    let worker = team.worker("graceBack01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert_eq!(worker.claude_agent, None);
+    let handed = worker.handed_back.expect("what was taken away is kept");
+    assert_eq!(handed.claude_agent, "opus");
+    assert_eq!(handed.status, WorkerStatus::Working);
+    assert_eq!(handed_back_notices(team, "graceBack01").len(), 1);
+    team.shutdown().await;
+}
+
+/// One transcript line: the user message an agent starts with.
+fn first_user_line(text: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": text}})
+    )
+}
+
+#[tokio::test]
+async fn hand_back_registers_a_launched_agent_transcript_instead() {
+    let (fixture, projects, _transcript) = agent_watch_fixture("launchBack01").await;
+    let team = &fixture.team;
+    set_hand_back_grace(team, 0);
+    let worker = team.worker("launchBack01").await.expect("worker");
+    let subagents = std::fs::canonicalize(projects.path())
+        .expect("canonical projects folder")
+        .join("D--proj")
+        .join("session1")
+        .join("subagents");
+    // The agent the lead launched: its prompt names the worker's checkout.
+    let launched = subagents.join("agent-launch42.jsonl");
+    write_agent_transcript(
+        &launched,
+        &first_user_line(&format!(
+            "Your task is below. You work in {}.",
+            worker.worktree.display()
+        )),
+    );
+    // An agent for some other checkout and branch is never taken.
+    write_agent_transcript(
+        &subagents.join("agent-other77.jsonl"),
+        &first_user_line("You run on branch wt/agent-somebody and in C:/elsewhere."),
+    );
+    // One that names the branch but was written before the dispatch is old.
+    let stale = subagents.join("agent-stale11.jsonl");
+    write_agent_transcript(
+        &stale,
+        &first_user_line(&format!("You run on branch {}.", worker.branch)),
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600))
+        .expect("set mtime");
+    assert!(team.leave_external_lead().await, "the lead was attached");
+    let worker = team.worker("launchBack01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Working);
+    assert_eq!(worker.claude_agent.as_deref(), Some("opus"));
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("launch42"));
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(launched.to_string_lossy().as_ref())
+    );
+    assert!(worker.handed_back.is_none());
+    assert!(handed_back_notices(team, "launchBack01").is_empty());
+    // Registered, it is followed like any agent: a running agent stays.
+    team.agent_watch_tick().await;
+    let worker = team.worker("launchBack01").await.expect("worker");
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("launch42"));
+    assert_eq!(worker.status, WorkerStatus::Working);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn handed_back_worker_with_uncommitted_changes_is_not_resumed_on_a_mnemo_model() {
+    let (fixture, _projects, _transcript) = handed_back_agent("dirtyBack01").await;
+    let team = &fixture.team;
+    let worker = team.worker("dirtyBack01").await.expect("worker");
+    let checkout = worker.worktree.clone();
+    // The agent the lead launched was writing here.
+    std::fs::write(checkout.join("agent_edit.txt"), "half done\n").expect("an agent's edit");
+    let mut notices = team.subscribe_board();
+    let refused = |result: &ToolResult| {
+        !result.success
+            && result.output.contains("uncommitted changes")
+            && result.output.contains(&checkout.display().to_string())
+            && result.output.contains("team_agent_started")
+    };
+    let still_handed_back = || async {
+        let worker = team.worker("dirtyBack01").await.expect("worker");
+        worker.status == WorkerStatus::Interrupted
+            && worker.handed_back.is_some()
+            && !team.live.lock().await.contains_key("dirtyBack01")
+    };
+    // team_resume onto a Mnemo tier, and without a tier.
+    let on_tier = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            serde_json::json!({"worker_id": "dirtyBack01", "tier": "routine"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(refused(&on_tier), "{}", on_tier.output);
+    assert!(still_handed_back().await);
+    let plain = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            serde_json::json!({"worker_id": "dirtyBack01"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(refused(&plain), "{}", plain.output);
+    assert!(still_handed_back().await);
+    // The path the usage-limit auto-resume takes.
+    let model = team
+        .lead_model_choice(Some("routine"), None)
+        .expect("the routine tier resolves");
+    let auto = team
+        .resume_on_tier_locked("dirtyBack01", Some("routine"), model, None, ChangeSource::Lead)
+        .await;
+    assert!(
+        auto.as_ref().is_err_and(|error| error.contains("uncommitted changes")),
+        "{auto:?}"
+    );
+    assert!(still_handed_back().await);
+    // The in-app lead's tool has no keep_changes switch.
+    let in_app = team
+        .handle_lead_host_tool(
+            "team_resume",
+            serde_json::json!({"worker_id": "dirtyBack01", "tier": "routine", "keep_changes": true}),
+        )
+        .await;
+    assert!(refused(&in_app), "{}", in_app.output);
+    assert!(still_handed_back().await);
+    // Each refusal told the lead, naming the checkout.
+    let keys = notice_keys(&mut notices, &checkout.display().to_string());
+    assert_eq!(
+        keys.iter().filter(|key| key.starts_with("handed-back-dirty:dirtyBack01:")).count(),
+        4,
+        "{keys:?}"
+    );
+    // A clean checkout resumes on a Mnemo model, which ends the hand-back.
+    std::fs::remove_file(checkout.join("agent_edit.txt")).expect("remove the edit");
+    let clean = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            serde_json::json!({"worker_id": "dirtyBack01", "tier": "routine"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(clean.success, "{}", clean.output);
+    let worker = team.worker("dirtyBack01").await.expect("worker");
+    assert!(worker.handed_back.is_none());
+    assert!(team.live.lock().await.contains_key("dirtyBack01"), "a Mnemo session runs it");
+    team.shutdown().await;
+
+    // keep_changes: true from the external lead lets a Mnemo model take over.
+    let (fixture, _projects, _transcript) = handed_back_agent("dirtyBack02").await;
+    let team = &fixture.team;
+    let checkout = team.worker("dirtyBack02").await.expect("worker").worktree;
+    std::fs::write(checkout.join("agent_edit.txt"), "half done\n").expect("an agent's edit");
+    let kept = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            serde_json::json!({"worker_id": "dirtyBack02", "tier": "routine", "keep_changes": true}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(kept.success, "{}", kept.output);
+    let worker = team.worker("dirtyBack02").await.expect("worker");
+    assert!(worker.handed_back.is_none(), "a Mnemo model ran");
+    assert!(team.live.lock().await.contains_key("dirtyBack02"));
+    assert!(checkout.join("agent_edit.txt").is_file(), "the changes were kept");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn agent_started_reclaims_a_handed_back_worker_no_mnemo_model_ran_on() {
+    let (fixture, _projects, transcript) = handed_back_agent("reclaim01").await;
+    let team = &fixture.team;
+    let handed = team
+        .worker("reclaim01")
+        .await
+        .expect("worker")
+        .handed_back
+        .expect("handed back");
+    // The lead comes back; its agent did launch after all.
+    assert!(team.attach_external_lead());
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let started = start_agent(team, "reclaim01", serde_json::json!({})).await;
+    assert!(started.success, "{}", started.output);
+    assert!(
+        started
+            .output
+            .starts_with("Restored reclaim01 as a Claude Code agent worker and registered agent a1b2c3"),
+        "{}",
+        started.output
+    );
+    let worker = team.worker("reclaim01").await.expect("worker");
+    assert_eq!(worker.status, handed.status);
+    assert_eq!(worker.claude_agent.as_deref(), Some(handed.claude_agent.as_str()));
+    assert_eq!(worker.claude_agent_effort, handed.claude_agent_effort);
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert_eq!(
+        worker.claude_agent_transcript.as_deref(),
+        Some(transcript.to_string_lossy().as_ref())
+    );
+    assert_eq!(worker.error, None);
+    assert!(worker.handed_back.is_none());
+    // Saved, and followed like any registered agent.
+    let saved = std::fs::read_to_string(&team.persistence.path).expect("team.json");
+    assert!(!saved.contains("handed_back"), "{saved}");
+    assert_eq!(status_entry(team, "reclaim01").await["agent_phase"], "running");
+    team.shutdown().await;
+
+    // A worker a Mnemo model ran on since it was handed back is refused.
+    let (fixture, _projects, _transcript) = handed_back_agent("reclaim02").await;
+    let team = &fixture.team;
+    let resumed = team
+        .handle_lead_host_tool(
+            "team_resume",
+            serde_json::json!({"worker_id": "reclaim02", "tier": "routine"}),
+        )
+        .await;
+    assert!(resumed.success, "{}", resumed.output);
+    team.stop("reclaim02").await.expect("stop the Mnemo session");
+    assert!(team.attach_external_lead());
+    let refused = start_agent(team, "reclaim02", serde_json::json!({})).await;
+    assert!(!refused.success);
+    assert!(
+        refused.output.contains("a Mnemo model has run on it since it was handed back"),
+        "{}",
+        refused.output
+    );
+    let worker = team.worker("reclaim02").await.expect("worker");
+    assert_eq!(worker.claude_agent, None);
+    assert_eq!(worker.claude_agent_id, None);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn hand_back_notice_names_the_worker_and_the_recovery_calls() {
+    let mut worker = test_worker_record("noticeBack01");
+    worker.worktree = std::path::PathBuf::from("D:/proj/.worktrees/pool-7");
+    let dirty = super::agent_watch::handed_back_notice(&worker, true);
+    for needed in [
+        "worker_id=noticeBack01",
+        "noticeBack01 was handed back from Claude Code",
+        "away longer than the hand-back grace period",
+        "D:/proj/.worktrees/pool-7 has uncommitted changes",
+        "team_agent_started (worker_id=noticeBack01, agent_id=",
+        "team_resume (worker_id=noticeBack01, tier=",
+        "keep_changes: true",
+    ] {
+        assert!(dirty.contains(needed), "missing {needed:?} in {dirty}");
+    }
+    let clean = super::agent_watch::handed_back_notice(&worker, false);
+    assert!(clean.contains("D:/proj/.worktrees/pool-7 has no uncommitted changes"), "{clean}");
+    // A real hand-back sends that notice, with the checkout's state.
+    let (fixture, _projects, _transcript) = agent_watch_fixture("noticeBack02").await;
+    let team = &fixture.team;
+    set_hand_back_grace(team, 0);
+    let checkout = team.worker("noticeBack02").await.expect("worker").worktree;
+    std::fs::write(checkout.join("agent_edit.txt"), "half done\n").expect("an agent's edit");
+    assert!(team.leave_external_lead().await);
+    let held = handed_back_notices(team, "noticeBack02");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert!(
+        held[0].contains(&format!("{} has uncommitted changes", checkout.display())),
+        "{}",
+        held[0]
+    );
+    assert!(held[0].contains("team_agent_started"), "{}", held[0]);
     team.shutdown().await;
 }
 

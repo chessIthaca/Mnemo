@@ -320,6 +320,10 @@ pub struct RoutingSettings {
     /// Tell the lead when one worker's estimated cost passes this many
     /// dollars, then at each doubling; 0 turns it off (default 2.0).
     pub cost_notice_usd: f64,
+    /// How long, in minutes, the Claude Code lead may be away before Mnemo
+    /// hands its unlaunched or stalled agent workers back to its own models
+    /// (default 30). 0 hands them back as soon as the lead leaves.
+    pub agent_hand_back_minutes: u64,
 }
 
 impl Default for RoutingSettings {
@@ -335,6 +339,7 @@ impl Default for RoutingSettings {
             nudges: true,
             min_words: MIN_WORDS,
             cost_notice_usd: 2.0,
+            agent_hand_back_minutes: 30,
         }
     }
 }
@@ -1074,6 +1079,36 @@ high = "high"
             0.0,
             "0 turns the alert off and round-trips"
         );
+    }
+
+    /// The agent hand-back grace (plan ee73bd2f decision 1) defaults to 30
+    /// minutes, so a `mnemo2.toml` written before the key existed loads it;
+    /// a set value and 0 (hand back at once) load as written.
+    #[test]
+    fn agent_hand_back_minutes_defaults_to_thirty_and_loads_set_values() {
+        let config = tempfile::tempdir().expect("config dir");
+        std::fs::write(
+            routing_settings_path(config.path()),
+            "[routing]\nmode = \"shadow\"\ncost_notice_usd = 1.5\n",
+        )
+        .expect("an old settings file");
+        assert_eq!(load_routing_settings(config.path()).agent_hand_back_minutes, 30);
+        assert_eq!(RoutingSettings::default().agent_hand_back_minutes, 30);
+        std::fs::write(
+            routing_settings_path(config.path()),
+            "[routing]\nagent_hand_back_minutes = 45\n",
+        )
+        .expect("a set value");
+        assert_eq!(load_routing_settings(config.path()).agent_hand_back_minutes, 45);
+        std::fs::write(
+            routing_settings_path(config.path()),
+            "[routing]\nagent_hand_back_minutes = 0\n",
+        )
+        .expect("zero");
+        let loaded = load_routing_settings(config.path());
+        assert_eq!(loaded.agent_hand_back_minutes, 0, "0 hands back at once");
+        save_routing_settings(config.path(), &loaded).expect("save routing settings");
+        assert_eq!(load_routing_settings(config.path()).agent_hand_back_minutes, 0);
     }
 
     #[test]

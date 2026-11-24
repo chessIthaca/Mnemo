@@ -1727,9 +1727,16 @@ fn prompt_names_branch(prompt: &str, branch: &str) -> bool {
     }
     let prompt = prompt.to_lowercase();
     let branch = branch.to_lowercase();
+    // A further branch-name character ('.' included, as in the checkout
+    // matcher) means a longer branch; a lone '.' ending a sentence does not.
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.');
     prompt.match_indices(&branch).any(|(index, _)| {
-        let after = prompt[index + branch.len()..].chars().next();
-        !after.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'))
+        let mut after = prompt[index + branch.len()..].chars();
+        match after.next() {
+            Some('.') => !after.next().is_some_and(name_char),
+            Some(c) => !name_char(c),
+            None => true,
+        }
     })
 }
 

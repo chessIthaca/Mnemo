@@ -1559,7 +1559,10 @@ fn tool_list(target: &Target) -> Vec<Value> {
         .team
         .lead_host_tools()
         .into_iter()
-        .map(|spec| {
+        .map(|mut spec| {
+            if spec.name == "team_resume" {
+                external_team_resume(&mut spec.description, &mut spec.parameters);
+            }
             json!({
                 "name": spec.name,
                 "description": spec.description,
@@ -1592,6 +1595,26 @@ fn tool_list(target: &Target) -> Vec<Value> {
         "inputSchema": { "type": "object", "properties": {} },
     }));
     tools
+}
+
+/// `team_resume` as the external lead sees it: with `keep_changes`, the one
+/// way to let a Mnemo model take over a handed-back agent worker's checkout
+/// while it has uncommitted changes (plan ee73bd2f decision 3). The in-app
+/// lead's tool has no such switch.
+fn external_team_resume(description: &mut String, parameters: &mut Value) {
+    description.push_str(" A worker Mnemo handed back from Claude Code is not resumed on a Mnemo model while its checkout has uncommitted changes (its agent may still be writing there): reclaim it with team_agent_started, resume it onto a tier that runs as a Claude Code agent, or pass keep_changes: true to let the Mnemo model take over the checkout as it is.");
+    if let Some(properties) = parameters
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        properties.insert(
+            "keep_changes".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Only for a worker handed back from Claude Code whose checkout has uncommitted changes: true lets a Mnemo model take over that checkout as it is. Default false. Pass it only when you know no Claude Code agent still writes there."
+            }),
+        );
+    }
 }
 
 /// The agent types allowed without a prompt: `[claude_lead]

@@ -1067,8 +1067,9 @@ impl LeadRuntime {
         let Ok(team) = self.team_handle().await else {
             return false;
         };
-        // Agent workers the leaving lead can no longer run go back to Mnemo
-        // first, so their notices travel with the held ones.
+        // Leaving starts the agent hand-back clock; with a grace of 0 the
+        // agent workers go back to Mnemo right away, so their notices travel
+        // with the held ones.
         let was_attached = team.leave_external_lead().await;
         let held = team.current_notices(team.take_undelivered_notices()).await;
         if held.is_empty() {

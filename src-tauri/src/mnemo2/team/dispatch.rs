@@ -686,6 +686,10 @@ impl TeamRuntime {
                     if !existing.worktree.is_dir() {
                         return Err(format!("worker '{id}' has no recoverable worktree"));
                     }
+                    // A handed-back worker's agent may still be writing in
+                    // a dirty checkout: no Mnemo model starts there (plan
+                    // ee73bd2f decision 3; a re-dispatch never keeps changes).
+                    self.handed_back_takeover_refusal(&existing, false).await?;
                     let existing = self.refresh_before_redispatch(existing).await;
                     return Box::pin(self.start_worker(existing))
                         .await

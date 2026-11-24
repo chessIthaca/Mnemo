@@ -85,8 +85,8 @@ pub use external_lead::{
     ExternalWait, ExternalWaitStatus, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 pub use record::{
-    ChangeSource, InboxEntry, InboxKind, MessageSender, ToolErrorNote, WorkerCheck, WorkerRecord,
-    WorkerRouting, WorkerStatus,
+    ChangeSource, HandedBack, InboxEntry, InboxKind, MessageSender, ToolErrorNote, WorkerCheck,
+    WorkerRecord, WorkerRouting, WorkerStatus,
 };
 
 /// The Tauri event channel emitted by the team runtime.
@@ -585,30 +585,12 @@ impl TeamRuntime {
             .map(|team| team.usage.clone())
             .unwrap_or_default();
         let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
-        // Mnemo2 starts with no external lead: an agent worker whose agent
-        // was never launched, or has stalled (judged by the record's last
-        // activity when its transcript is gone), goes back to Mnemo (plan
-        // a2b8ee89 decision 3). A running agent stays an agent worker at
-        // work; recovery leaves it so and the agent watch follows it.
+        // Mnemo2 starts with no external lead, so the hand-back clock starts
+        // now (plan ee73bd2f decision 1): an agent worker whose agent was
+        // never launched, or has stalled, goes back to Mnemo only once the
+        // grace period has passed with no lead attached. Recovery keeps
+        // agent workers at work, and the agent watch follows them.
         let agent_watch = agent_watch::AgentWatch::default();
-        let handed_back = {
-            let now = phase3::now_ms();
-            let mut handed_back = Vec::new();
-            for worker in &mut workers {
-                if worker.claude_agent.is_none()
-                    || !matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
-                {
-                    continue;
-                }
-                let view = agent_watch::look(&agent_watch, worker, now).map(|looked| looked.view);
-                if agent_watch::hand_back_due(worker, view.as_ref()) {
-                    agent_watch::hand_back(worker);
-                    agent_watch.forget(&worker.id);
-                    handed_back.push(worker.id.clone());
-                }
-            }
-            handed_back
-        };
         let held: Vec<(String, PathBuf)> = workers
             .iter()
             .filter(|worker| !worker.worktree.as_os_str().is_empty())
@@ -687,17 +669,15 @@ impl TeamRuntime {
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
-            external: std::sync::Mutex::new(ExternalLead::default()),
+            external: std::sync::Mutex::new(ExternalLead::away_since(unix_ms())),
             external_wake: tokio::sync::Notify::new(),
         };
-        // The in-app lead (or the next external lead) learns of each one.
-        runtime.restore_undelivered_notices(
-            handed_back
-                .iter()
-                .map(|id| agent_watch::handed_back_notice(id))
-                .collect(),
-        );
         runtime.persist().await?;
+        // A grace of 0 hands back at once, as before the grace existed; the
+        // in-app lead (or the next external lead) learns of each one.
+        if let Err(error) = runtime.hand_back_agent_workers().await {
+            eprintln!("team: could not hand back agent workers at start: {error}");
+        }
         // App start: sweep checkouts a previous run renamed into the
         // trash folder but could not remove yet (something held them).
         schedule_trash_sweep(&runtime.workspace_root);
@@ -708,9 +688,9 @@ impl TeamRuntime {
         // pools above the slot count, so a started app converges on the slots
         // (plan 2e15085a).
         runtime.trim_idle_pools().await;
-        // A registered agent that still runs (recovery kept its worker at
-        // work) is watched again: its finish is processed, and a later stall
-        // with no lead attached hands it back.
+        // An agent worker recovery kept at work is watched again: its
+        // finish is processed, and once no lead has been attached for the
+        // grace period an unlaunched or stalled one is handed back.
         runtime.ensure_agent_watch().await;
         Ok(runtime)
     }

@@ -1263,6 +1263,13 @@ impl MemoryStore {
         schema::apply_schema(&conn)?;
         let read_conn = Connection::open(&uri)?;
         schema::apply_schema(&read_conn)?;
+        // In shared-cache mode a reader takes table-level read locks, and a
+        // write that meets one fails at once with SQLITE_LOCKED ("database
+        // table is locked"; busy_timeout does not cover it), so a test polling
+        // the reader could make a background write fail and be lost. With
+        // read_uncommitted the reader takes no table locks. Only in-memory
+        // stores use shared cache; file-backed stores are unaffected.
+        read_conn.pragma_update(None, "read_uncommitted", true)?;
         let now: Arc<dyn Fn() -> i64 + Send + Sync> = match clock {
             Some(c) => Arc::new(c),
             None => Arc::new(|| {

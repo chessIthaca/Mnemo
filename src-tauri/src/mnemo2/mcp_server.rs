@@ -63,7 +63,7 @@ use crate::mnemo2::project;
 use crate::mnemo2::runtime::LeadRuntime;
 use crate::mnemo2::run_file;
 use crate::mnemo2::team::{
-    MessageSender, TeamRuntime, WorkerRecord, WorkerStatus, EXTERNAL_LEAD_IDLE_MS,
+    AgentGateWorker, MessageSender, TeamRuntime, EXTERNAL_LEAD_IDLE_MS,
     EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 
@@ -1125,75 +1125,72 @@ impl Shared {
         // Mnemo auto-approves only its own agent-worker launches, so the hook
         // runs them without a permission prompt; any other Agent call keeps
         // Claude Code's own permission rules (plan 1b038bb3 decisions 1 and 4,
-        // narrowed by the 2026-11-24 review).
-        if let Some(target) = target.as_ref() {
+        // narrowed by the 2026-11-24 review). Agent workers launch as the
+        // general-purpose agent, so only that type (or no type) is ever one
+        // of those launches; any other type, and a Workflow call, keeps the
+        // allow list or the ask below (2026-11-24 step 1 audit).
+        let worker_type =
+            subagent_type.is_empty() || subagent_type.eq_ignore_ascii_case("general-purpose");
+        if let Some(target) = target.as_ref().filter(|_| worker_type) {
             let isolated = body.get("isolation").and_then(Value::as_str) == Some("worktree");
             let prompt = body
                 .get("prompt")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if let Some(worker_id) = target.team.agent_worker_waiting().await {
-                let record = target.team.worker(&worker_id).await.ok();
-                let checkout = record
-                    .as_ref()
-                    .map(|worker| worker.worktree.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+            // Worker records only, under one lock: no snapshot, no
+            // transcripts, so the hook gets its answer inside its timeout.
+            let view = target.team.agent_gate_view().await;
+            if let Some(waiting) = view.waiting {
                 // The launch for a worker that waits for its agent must use
                 // worktree isolation, or the agent would miss its warm
                 // checkout (plan 4d920eec decision 7): the isolated launch is
                 // Mnemo's own.
                 if isolated {
-                    let tier = record
-                        .as_ref()
-                        .and_then(|worker| worker.tier.clone())
-                        .unwrap_or_default();
                     return json!({
                         "decision": "allow",
                         "auto_approve": true,
-                        "reason": agent_worker_allow_reason(&worker_id, &tier),
+                        "reason": agent_worker_allow_reason(&waiting.id, &waiting.tier),
                     });
                 }
                 // Without isolation, a prompt that names the checkout is a
                 // deliberate manual launch into it; otherwise the lead model
                 // gets a deny it can act on at once instead of a human
                 // answering a prompt (plan 1b038bb3 decision 3).
-                if prompt_names_checkout(prompt, &checkout) {
+                if prompt_names_checkout(prompt, &waiting.worktree) {
                     return json!({
                         "decision": "allow",
                         "auto_approve": true,
                         "reason": format!(
-                            "runs Mnemo worker {worker_id} in its checkout {checkout}"
+                            "runs Mnemo worker {} in its checkout {}",
+                            waiting.id, waiting.worktree
                         ),
                     });
                 }
                 return json!({
                     "decision": "deny",
-                    "reason": waiting_launch_refusal(&worker_id, &checkout),
+                    "reason": waiting_launch_refusal(&waiting.id, &waiting.worktree),
                 });
             }
             // A launch that names a Working/Fixing agent worker's checkout or
             // its `wt/agent-*` branch is that worker's own launch.
-            let workers = target.team.snapshot().await.workers;
-            if let Some(worker) = workers
+            if let Some(worker) = view
+                .running
                 .iter()
-                .filter(|worker| runs_as_agent_worker(worker))
                 .find(|worker| launch_names_worker(prompt, worker))
             {
-                let tier = worker.tier.clone().unwrap_or_default();
                 return json!({
                     "decision": "allow",
                     "auto_approve": true,
-                    "reason": agent_worker_allow_reason(&worker.id, &tier),
+                    "reason": agent_worker_allow_reason(&worker.id, &worker.tier),
                 });
             }
             // Any other agent the lead starts while workers run is allowed
             // without `auto_approve`: Claude Code's own rules decide whether to
             // ask.
-            if let Some(worker) = workers.iter().find(|worker| runs_as_agent_worker(worker)) {
-                let tier = worker.tier.clone().unwrap_or_default();
+            if let Some(worker) = view.running.first() {
                 return json!({
                     "decision": "allow",
-                    "reason": agent_worker_allow_reason(&worker.id, &tier),
+                    "reason": agent_worker_allow_reason(&worker.id, &worker.tier),
                 });
             }
         }
@@ -1696,21 +1693,30 @@ fn agent_worker_allow_reason(worker: &str, tier: &str) -> String {
     format!("runs Mnemo worker {worker} ({tier} tier) as a Claude Code agent")
 }
 
-/// Whether `worker` runs as a Claude Code agent right now: the agent gate's
-/// own launches are the ones for a worker in Working or Fixing.
-fn runs_as_agent_worker(worker: &WorkerRecord) -> bool {
-    worker.claude_agent.is_some()
-        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
-}
-
 /// Whether an Agent prompt names the checkout at `worktree`: a deliberate
 /// manual launch into that checkout, which the gate allows without worktree
-/// isolation (plan 1b038bb3 decision 3). Either slash style, case-insensitive.
+/// isolation (plan 1b038bb3 decision 3). Either slash style, case-insensitive,
+/// and not merely a longer path that starts with it (`pool-1` is not named by
+/// `pool-12` or `pool-1.bak`): no further path-name character may follow the
+/// match. A lone '.' that ends a sentence ("Work in <checkout>.") is
+/// punctuation, not part of the name.
 fn prompt_names_checkout(prompt: &str, worktree: &str) -> bool {
     let plain = |text: &str| text.replace('\\', "/").to_lowercase();
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
     let checkout = plain(worktree);
     let checkout = checkout.trim_end_matches('/');
-    !checkout.is_empty() && plain(prompt).contains(checkout)
+    if checkout.is_empty() {
+        return false;
+    }
+    let prompt = plain(prompt);
+    prompt.match_indices(checkout).any(|(index, _)| {
+        let mut after = prompt[index + checkout.len()..].chars();
+        match after.next() {
+            Some('.') => !after.next().is_some_and(name_char),
+            Some(c) => !name_char(c),
+            None => true,
+        }
+    })
 }
 
 /// Whether an Agent prompt names `branch` (case-insensitive), and not merely a
@@ -1730,9 +1736,8 @@ fn prompt_names_branch(prompt: &str, branch: &str) -> bool {
 /// Whether an Agent prompt is `worker`'s own launch: it names the worker's
 /// checkout or its `wt/agent-*` branch (lead review of plan 1b038bb3 decision
 /// 1, 2026-11-24).
-fn launch_names_worker(prompt: &str, worker: &WorkerRecord) -> bool {
-    prompt_names_checkout(prompt, &worker.worktree.to_string_lossy())
-        || prompt_names_branch(prompt, &worker.branch)
+fn launch_names_worker(prompt: &str, worker: &AgentGateWorker) -> bool {
+    prompt_names_checkout(prompt, &worker.worktree) || prompt_names_branch(prompt, &worker.branch)
 }
 
 // ── Tauri glue ────────────────────────────────────────────────────────────
@@ -4685,6 +4690,82 @@ mod tests {
             "This bypasses Mnemo's workers and runs on your Claude subscription. Allow?"
         );
         fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gate_leaves_other_agent_types_alone_while_a_worker_waits() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let root = fixture.root.to_string_lossy().into_owned();
+        fixture.attach().await;
+        let checkout = waiting_agent_worker(&fixture, "extagnt0016").await;
+        assert!(!checkout.is_empty(), "the waiting worker has a checkout");
+        let gate = |body: Value| fixture.lead_post("/lead/gate-agent", body);
+
+        // An isolated Explore is no agent-worker launch: no auto-approval.
+        let reply = gate(json!({
+            "root": root,
+            "subagent_type": "Explore",
+            "isolation": "worktree",
+            "prompt": format!("Look around {checkout}."),
+        }))
+        .await;
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+        assert_eq!(reply["reason"], "Explore may run without asking", "{reply}");
+
+        // A non-isolated Explore keeps the allow list's allow, never a deny.
+        let reply = gate(json!({
+            "root": root,
+            "subagent_type": "Explore",
+            "prompt": "Find where the gate lives.",
+        }))
+        .await;
+        assert_eq!(reply["decision"], "allow", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+        assert_eq!(reply["reason"], "Explore may run without asking", "{reply}");
+
+        // A Workflow call asks as it did before Mnemo auto-approved anything.
+        let reply = gate(json!({
+            "root": root,
+            "subagent_type": "Workflow",
+            "prompt": format!("Run the checks in {checkout}."),
+        }))
+        .await;
+        assert_eq!(reply["decision"], "ask", "{reply}");
+        assert!(reply.get("auto_approve").is_none(), "{reply}");
+        assert_eq!(reply["reason"], GATE_REASON, "{reply}");
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn checkout_matcher_does_not_match_a_longer_path() {
+        let checkout = r"D:\Repo\.worktrees\pool-1";
+        assert!(!prompt_names_checkout(r"Work in D:\Repo\.worktrees\pool-12 now.", checkout));
+        assert!(!prompt_names_checkout("Work in d:/repo/.worktrees/pool-1.bak", checkout));
+        assert!(!prompt_names_checkout("Work in d:/repo/.worktrees/pool-1_old", checkout));
+        assert!(!prompt_names_checkout("Work in d:/repo/.worktrees/pool-1-b", checkout));
+        // A separator, space, quote, sentence-ending period or the end of the
+        // text ends the name.
+        for prompt in [
+            r"Work in D:\Repo\.worktrees\pool-1\src now.",
+            "Work in d:/repo/.worktrees/pool-1/src now.",
+            "Work in D:/Repo/.worktrees/pool-1 now.",
+            "Work in \"D:/Repo/.worktrees/pool-1\".",
+            "Work in D:/Repo/.worktrees/pool-1. Then commit.",
+            "Work in D:/Repo/.worktrees/pool-1.",
+            "Work in D:/Repo/.worktrees/pool-1",
+            "Not pool-12: d:/repo/.worktrees/pool-12, but D:/Repo/.worktrees/pool-1 here.",
+        ] {
+            assert!(prompt_names_checkout(prompt, checkout), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn branch_matcher_does_not_match_a_longer_branch() {
+        assert!(!prompt_names_branch("Commit on wt/agent-foobar.", "wt/agent-foo"));
+        assert!(!prompt_names_branch("Commit on wt/agent-foo-2 now", "wt/agent-foo"));
+        assert!(prompt_names_branch("Commit on wt/agent-foo now.", "wt/agent-foo"));
+        assert!(prompt_names_branch("Commit on WT/AGENT-FOO", "wt/agent-foo"));
+        assert!(!prompt_names_branch("Commit on wt/agent-foo", ""));
     }
 
     #[tokio::test]

@@ -523,7 +523,34 @@ fn gate_passes_the_prompt_capped() {
     assert!(wide.chars().all(|c| c == 'é'), "cut on a character boundary");
 }
 
-// ---- hint --pre-search -----------------------------------------------------
+#[test]
+fn gate_denies_when_the_checkout_is_past_the_prompt_cap() {
+    let sandbox = Sandbox::new();
+    let checkout = r"C:\Mnemo\.worktrees\agent-x";
+    let reason = format!("Mnemo worker extagnt0001 waits for its agent: names {checkout}");
+    // The server sees no checkout in the prompt it gets, so it denies.
+    let server = server_with(
+        &sandbox,
+        "/lead/gate-agent",
+        json!({ "decision": "deny", "reason": reason }),
+    );
+    let prompt = format!("{} Work in {checkout}.", "x".repeat(GATE_PROMPT_BYTES));
+    let output = gate_agent(
+        &sandbox.env(),
+        &gate_input(
+            &sandbox,
+            "Agent",
+            json!({ "subagent_type": "general-purpose", "prompt": prompt }),
+        ),
+    );
+    let sent = server.requests_to("/lead/gate-agent");
+    let sent_prompt = sent[0].json()["prompt"].as_str().expect("capped prompt").to_string();
+    assert_eq!(sent_prompt.len(), GATE_PROMPT_BYTES);
+    assert!(!sent_prompt.contains(checkout), "the checkout lies past the cap");
+    let decision = parsed(output);
+    assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny", "{decision}");
+    assert_eq!(decision["hookSpecificOutput"]["permissionDecisionReason"], reason.as_str());
+}
 
 // ---- hint --pre-search -----------------------------------------------------
 

@@ -1399,6 +1399,9 @@ async fn spawn_with_worktree_binds_tools_to_the_worktree_root() {
         !root.path().join("probe.txt").exists(),
         "the lead root stays untouched"
     );
+    // The engine's own teardown closes the project's stores before the
+    // temp folders are removed.
+    engine.shutdown().await.expect("shutdown");
 }
 
 struct PendingLlm {
@@ -1595,4 +1598,7 @@ async fn consolidation_does_not_hold_a_worktree_codegraph_open() {
     std::fs::remove_dir_all(worktree.path())
         .expect("the released codegraph does not pin the worktree on Windows");
     assert!(!worktree.path().exists());
+    // The engine's own teardown closes the project's stores before the
+    // temp folders are removed.
+    engine.shutdown().await.expect("shutdown");
 }

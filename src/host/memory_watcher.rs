@@ -216,6 +216,11 @@ impl MemoryWatcher {
 
         let task_state_dir = state_dir.clone();
         let task_machine_dir = machine_dir.clone();
+        // The debounce task only borrows the store: it holds a `Weak` and
+        // upgrades it for one pass at a time, so the store (and its open
+        // SQLite files) closes as soon as its owner drops it, without
+        // waiting for this task to notice the closed channel.
+        let store = Arc::downgrade(&store);
         // Run the debounce loop on a Tokio runtime. Most callers are already
         // inside one, but a host may build its brain from a context with NO
         // reactor (e.g. an app's setup hook on the main thread) — a bare
@@ -271,7 +276,7 @@ impl MemoryWatcher {
     /// The debounce loop: consume watcher events, coalesce a burst, then run
     /// one silent reconcile pass.
     async fn debounce_loop(
-        store: Arc<dyn MemoryStoreTrait>,
+        store: std::sync::Weak<dyn MemoryStoreTrait>,
         state_dir: PathBuf,
         machine_dir: Option<PathBuf>,
         mut rx: tokio_mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
@@ -327,6 +332,11 @@ impl MemoryWatcher {
                         tokio::time::sleep(debounce).await;
                     }
                 }
+            };
+
+            // The store's owner is gone: nothing is left to refresh.
+            let Some(store) = store.upgrade() else {
+                return;
             };
 
             // The staleness pre-check decides whether the reconcile runs at

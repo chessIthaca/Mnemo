@@ -1305,7 +1305,8 @@ impl CodeGraph {
         }
         let stop = Arc::clone(&self.symbol_embed.stop);
         let running = Arc::clone(&self.symbol_embed.running);
-        let store = Arc::clone(&self.store);
+        // The pass only borrows the store (see `run_symbol_embed_pass`).
+        let store = Arc::downgrade(&self.store);
         // Semantic code search (step 11): the pass announces stored vectors
         // so an in-memory query snapshot reloads instead of ranking stale.
         let generation = Arc::clone(&self.symbol_search.generation);
@@ -1838,10 +1839,16 @@ impl Drop for RunningFlagGuard {
 /// Never stores junk: only the real code model with a non-`Failed`
 /// status runs, and an all-zero batch (the degraded-embedder contract)
 /// is dropped, not persisted.
+///
+/// The pass holds the graph's store weakly and upgrades it only for each
+/// read or write: the embedder acquire and every embed call can take long,
+/// and a strong handle held across them would keep the database files open
+/// after the graph (and its engine) is dropped. A store that is gone ends
+/// the pass, like the stop flag does.
 #[cfg(feature = "embeddings")]
 fn run_symbol_embed_pass(
     armed: ArmedEmbedder,
-    store: Arc<Mutex<Store>>,
+    store: std::sync::Weak<Mutex<Store>>,
     stop: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 ) {
@@ -1898,13 +1905,17 @@ fn run_symbol_embed_pass(
             // Read the batch under one short lock, RELEASE before the
             // embed call — the write connection is never held across an
             // embed.
-            let batch = match lock_store(&store).pending_symbols(&model, SYMBOL_EMBED_BATCH) {
+            let Some(live_store) = store.upgrade() else {
+                break;
+            };
+            let batch = match lock_store(&live_store).pending_symbols(&model, SYMBOL_EMBED_BATCH) {
                 Ok(batch) => batch,
                 Err(e) => {
                     eprintln!("codegraph: symbol-embed batch read failed: {e}");
                     break;
                 }
             };
+            drop(live_store);
             if batch.is_empty() {
                 break;
             }
@@ -1956,7 +1967,13 @@ fn run_symbol_embed_pass(
                     stop = true;
                     break;
                 }
-                match lock_store(&store).store_symbol_vecs(&model, dim, rows, &vectors) {
+                let Some(live_store) = store.upgrade() else {
+                    stop = true;
+                    break;
+                };
+                let written = lock_store(&live_store).store_symbol_vecs(&model, dim, rows, &vectors);
+                drop(live_store);
+                match written {
                     Ok(0) => {
                         // Review finding zeroProgressLoop: nothing stored
                         // for a NON-empty sub-batch (wrong-length vectors,
@@ -3316,7 +3333,7 @@ mod tests {
             .expect("the graph must be armed first");
         run_symbol_embed_pass(
             armed,
-            Arc::clone(&graph.store),
+            Arc::downgrade(&graph.store),
             Arc::clone(&graph.symbol_embed.stop),
             Arc::clone(&graph.symbol_search.generation),
         );

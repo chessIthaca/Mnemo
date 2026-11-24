@@ -1356,6 +1356,9 @@ async fn host_tool_round_trip_and_timeout_row_31() {
         tool_msg.contains("timed out after 150 ms"),
         "the model sees the abandoned-call error: {tool_msg}"
     );
+    // The engine's own teardown closes the project's stores before the
+    // temp folders are removed.
+    engine.shutdown().await.expect("shutdown");
 }
 
 /// A provider that holds the request open until released — the window
@@ -1862,7 +1865,11 @@ async fn external_policy_gate_and_turn_end_row_32() {
         tool_msg.contains("timed out after 150 ms"),
         "the call proceeded to the host-tool branch (R4 timeout): {tool_msg}"
     );
-}/// Row 32's declarative half (G6 tiers 2 + 1, D4, §5.9.6): the
+    // The engine's own teardown closes the project's stores before the
+    // temp folders are removed.
+    engine.shutdown().await.expect("shutdown");
+}
+/// Row 32's declarative half (G6 tiers 2 + 1, D4, §5.9.6): the
 /// guardrails and the policy registry through a real engine. (a1) A
 /// tool selection of `include: [Read]` drops `file_edit` — the
 /// per-spawn factory clone's registration table narrows the registry
@@ -2040,6 +2047,9 @@ async fn guardrails_selection_gate_rules_and_policy_registry() {
         .await
         .expect("leg c runs");
     assert_eq!(outcome.final_text, "default guardrails are a no-op");
+    // The engine's own teardown closes the project's stores before the
+    // temp folders are removed.
+    engine.shutdown().await.expect("shutdown");
 }
 
 // --- 3c.6 (D6): review F1's regression — the tier-1 snapshot-clone slot ---
@@ -2196,4 +2206,7 @@ async fn tier1_named_factory_isolated_to_its_spawn() {
         !head.contains("SENTINEL-A") && !head.contains("SENTINEL-B"),
         "the plain session never carries a named factory's head: {head}"
     );
+    // The engine's own teardown closes the project's stores before the
+    // temp folders are removed.
+    engine.shutdown().await.expect("shutdown");
 }

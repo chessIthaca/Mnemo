@@ -349,7 +349,11 @@ fn status_name(status: WorkerStatus) -> String {
 
 /// The shared team runtime: one engine, many real worker sessions.
 pub struct TeamRuntime {
-    engine: Arc<Engine>,
+    /// The lead's shared engine, borrowed until [`TeamRuntime::shutdown`]
+    /// releases it: a shut-down team may still be referenced (by the MCP
+    /// host, a pending tool call) and must not keep the engine — and with it
+    /// the project's SQLite stores — alive.
+    engine: std::sync::RwLock<Option<Arc<Engine>>>,
     workspace_root: PathBuf,
     records: Arc<Mutex<Vec<WorkerRecord>>>,
     live: Arc<Mutex<HashMap<String, LiveWorker>>>,
@@ -638,13 +642,18 @@ impl TeamRuntime {
         // backend). With no own memory store there is nothing to embed with,
         // so the overlay is absent and Laya decides every dispatch.
         let route_knn = options.engine.embedder_handle().map(|initial| {
-            let engine = Arc::clone(&options.engine);
-            let getter: EmbedderGetter =
-                Arc::new(move || engine.embedder_handle().unwrap_or_else(|| initial.clone()));
+            // A back-reference only: the team's own handle owns the engine.
+            let engine = Arc::downgrade(&options.engine);
+            let getter: EmbedderGetter = Arc::new(move || {
+                engine
+                    .upgrade()
+                    .and_then(|engine| engine.embedder_handle())
+                    .unwrap_or_else(|| initial.clone())
+            });
             Arc::new(RouteKnn::new(getter, routing_log_path.clone()))
         });
         let runtime = Self {
-            engine: options.engine,
+            engine: std::sync::RwLock::new(Some(options.engine)),
             workspace_root: options.workspace_root,
             records: Arc::new(Mutex::new(workers)),
             live: Arc::new(Mutex::new(HashMap::new())),
@@ -1250,8 +1259,18 @@ impl TeamRuntime {
         Ok(())
     }
 
-    /// Stop every live worker. The shared engine is owned by the lead and is
-    /// not shut down here.
+    /// The shared engine, or an error once the team has shut down.
+    pub(crate) fn engine(&self) -> Result<Arc<Engine>, String> {
+        self.engine
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| "the team has shut down".to_string())
+    }
+
+    /// Stop every live worker and release the team's handles on the shared
+    /// engine and the plan board. The engine is owned by the lead and is not
+    /// shut down here.
     pub async fn shutdown(&self) {
         // Void a pending telemetry flush: the final persist is the last write.
         self.persistence.closed.store(true, Ordering::SeqCst);
@@ -1261,11 +1280,23 @@ impl TeamRuntime {
             let mut map = self.live.lock().await;
             std::mem::take(&mut *map)
         };
-        for worker in live.into_values() {
+        let live: Vec<LiveWorker> = live.into_values().collect();
+        for worker in &live {
             worker.abort();
-            let _ = worker.session.close().await;
+        }
+        // Wait until each worker's agent family has released its loop: a
+        // worktree session holds the checkout's code graph (an open SQLite
+        // file), which must be closed once shutdown returns.
+        for worker in &live {
+            let _ = worker.session.close_and_wait().await;
         }
         let _ = self.persist().await;
+        // The board holds the engine's memory store and code graph.
+        self.board.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.engine
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 

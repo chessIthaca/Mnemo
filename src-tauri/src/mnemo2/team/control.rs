@@ -815,7 +815,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             worker_id.to_string(),
             generation,
-            self.engine.clone(),
+            self.engine()?,
             session_id,
             receiver,
             self.events.clone(),

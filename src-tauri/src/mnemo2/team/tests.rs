@@ -18467,48 +18467,86 @@ fn first_user_line(text: &str) -> String {
     )
 }
 
+/// The user entries Claude Code writes before a prompt: a meta entry and a
+/// command caveat, both naming the branch, which must not be read as it.
+fn meta_lines(branch: &str) -> String {
+    format!(
+        "{}\n{}\n",
+        serde_json::json!({"type": "user", "isMeta": true, "message": {"role": "user", "content": format!("You run on branch {branch}.")}}),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": format!("<local-command-caveat>Caveat: on branch {branch}</local-command-caveat>")}}),
+    )
+}
+
+/// Write a transcript and set its last write time.
+fn write_transcript_at(path: &std::path::Path, text: &str, modified: std::time::SystemTime) {
+    write_agent_transcript(path, text);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open")
+        .set_modified(modified)
+        .expect("set mtime");
+}
+
+/// The folder a fixture's agent transcripts live in.
+fn subagents_folder(projects: &tempfile::TempDir) -> std::path::PathBuf {
+    std::fs::canonicalize(projects.path())
+        .expect("canonical projects folder")
+        .join("D--proj")
+        .join("session1")
+        .join("subagents")
+}
+
 #[tokio::test]
 async fn hand_back_registers_a_launched_agent_transcript_instead() {
     let (fixture, projects, _transcript) = agent_watch_fixture("launchBack01").await;
     let team = &fixture.team;
     set_hand_back_grace(team, 0);
     let worker = team.worker("launchBack01").await.expect("worker");
-    let subagents = std::fs::canonicalize(projects.path())
-        .expect("canonical projects folder")
-        .join("D--proj")
-        .join("session1")
-        .join("subagents");
-    // The agent the lead launched: its prompt names the worker's checkout.
-    let launched = subagents.join("agent-launch42.jsonl");
-    write_agent_transcript(
-        &launched,
-        &first_user_line(&format!(
-            "Your task is below. You work in {}.",
-            worker.worktree.display()
-        )),
+    let subagents = subagents_folder(&projects);
+    let now = std::time::SystemTime::now();
+    let prompt = |branch: &str| format!("Your task is below.\nYou run in your own checkout of this project on branch {branch}; commit your work there.");
+    // Two agents the lead launched for this worker, each after a meta entry
+    // and a caveat: the newer one wins.
+    let older = subagents.join("agent-launch41.jsonl");
+    write_transcript_at(
+        &older,
+        &format!("{}{}", meta_lines(&worker.branch), first_user_line(&prompt(&worker.branch))),
+        now,
     );
-    // An agent for some other checkout and branch is never taken.
+    let launched = subagents.join("agent-launch42.jsonl");
+    write_transcript_at(
+        &launched,
+        &format!("{}{}", meta_lines(&worker.branch), first_user_line(&prompt(&worker.branch))),
+        now + std::time::Duration::from_secs(60),
+    );
+    // Newest of all, but its agent is registered to another worker.
+    write_transcript_at(
+        &subagents.join("agent-taken33.jsonl"),
+        &first_user_line(&prompt(&worker.branch)),
+        now + std::time::Duration::from_secs(120),
+    );
+    let mut other = test_worker_record("otherWorker1");
+    other.claude_agent = Some("opus".into());
+    other.claude_agent_id = Some("taken33".into());
+    other.status = WorkerStatus::Completed;
+    team.records.lock().await.push(other);
+    // An agent for some other branch is never taken.
     write_agent_transcript(
         &subagents.join("agent-other77.jsonl"),
-        &first_user_line("You run on branch wt/agent-somebody and in C:/elsewhere."),
+        &first_user_line(&prompt("wt/agent-somebody")),
     );
-    // One that names the branch but was written before the dispatch is old.
-    let stale = subagents.join("agent-stale11.jsonl");
-    write_agent_transcript(
-        &stale,
-        &first_user_line(&format!("You run on branch {}.", worker.branch)),
+    // One that names this branch but was written before the dispatch is old.
+    write_transcript_at(
+        &subagents.join("agent-stale11.jsonl"),
+        &first_user_line(&prompt(&worker.branch)),
+        now - std::time::Duration::from_secs(24 * 3600),
     );
-    std::fs::File::options()
-        .write(true)
-        .open(&stale)
-        .expect("open")
-        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600))
-        .expect("set mtime");
     assert!(team.leave_external_lead().await, "the lead was attached");
     let worker = team.worker("launchBack01").await.expect("worker");
     assert_eq!(worker.status, WorkerStatus::Working);
     assert_eq!(worker.claude_agent.as_deref(), Some("opus"));
-    assert_eq!(worker.claude_agent_id.as_deref(), Some("launch42"));
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("launch42"), "the newest free match");
     assert_eq!(
         worker.claude_agent_transcript.as_deref(),
         Some(launched.to_string_lossy().as_ref())
@@ -18520,6 +18558,47 @@ async fn hand_back_registers_a_launched_agent_transcript_instead() {
     let worker = team.worker("launchBack01").await.expect("worker");
     assert_eq!(worker.claude_agent_id.as_deref(), Some("launch42"));
     assert_eq!(worker.status, WorkerStatus::Working);
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn rediscovery_ignores_a_prompt_that_only_mentions_the_checkout() {
+    let (fixture, projects, _transcript) = agent_watch_fixture("launchBack02").await;
+    let team = &fixture.team;
+    let worker = team.worker("launchBack02").await.expect("worker");
+    let subagents = subagents_folder(&projects);
+    // A sibling's agent: its brief names this worker's checkout and branch
+    // only to keep away from them, and it runs on another branch.
+    write_agent_transcript(
+        &subagents.join("agent-sibling5.jsonl"),
+        &first_user_line(&format!(
+            "Never touch {} or the branch {}.\nYou run in your own checkout of this project on branch {}-other; commit your work there.",
+            worker.worktree.display(),
+            worker.branch,
+            worker.branch
+        )),
+    );
+    let since = worker.created_at_ms;
+    assert!(
+        super::agent_watch::find_launched_agent(&team.agent_watch, &worker, since, &[]).is_none(),
+        "a prompt that only mentions the checkout was taken"
+    );
+    // A prompt that says the agent runs on this branch is this worker's.
+    write_agent_transcript(
+        &subagents.join("agent-mine9.jsonl"),
+        &format!(
+            "{}{}",
+            meta_lines(&worker.branch),
+            first_user_line(&format!(
+                "Your task.\nYou run in your own checkout of this project ON BRANCH {}; commit your work there.",
+                worker.branch
+            ))
+        ),
+    );
+    let found = super::agent_watch::find_launched_agent(&team.agent_watch, &worker, since, &[])
+        .expect("this worker's agent");
+    assert_eq!(found.agent_id, "mine9");
+    assert_eq!(found.matches, 1);
     team.shutdown().await;
 }
 
@@ -18724,6 +18803,117 @@ async fn hand_back_notice_names_the_worker_and_the_recovery_calls() {
     );
     assert!(held[0].contains("team_agent_started"), "{}", held[0]);
     team.shutdown().await;
+}
+
+#[tokio::test]
+async fn redispatch_of_a_handed_back_worker_respects_the_dirty_guard() {
+    let (fixture, _projects, _transcript) = handed_back_agent("redisp01").await;
+    let team = &fixture.team;
+    // A worker whose brief never reached a Mnemo session (it went straight
+    // to an agent): a re-dispatch with its identity starts it.
+    team.update_worker("redisp01", |worker| worker.brief_sent = false)
+        .await;
+    let before = team.worker("redisp01").await.expect("worker");
+    let checkout = before.worktree.clone();
+    std::fs::write(checkout.join("agent_edit.txt"), "half done\n").expect("an agent's edit");
+    let mut notices = team.subscribe_board();
+    let redispatch = || {
+        let mut request = agent_dispatch_request(
+            &fixture.plan_id,
+            "implement the agent-tier handling",
+            "redisp01",
+        );
+        // The same identity: no tier, so the record's own model is kept.
+        request.tier = None;
+        request
+    };
+    let refused = team.dispatch_request(redispatch()).await;
+    assert!(
+        refused.as_ref().is_err_and(|error| error.contains("uncommitted changes")
+            && error.contains(&checkout.display().to_string())),
+        "{refused:?}"
+    );
+    let worker = team.worker("redisp01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert!(worker.handed_back.is_some());
+    assert!(!team.live.lock().await.contains_key("redisp01"));
+    assert_eq!(
+        notice_keys(&mut notices, &checkout.display().to_string())
+            .iter()
+            .filter(|key| key.starts_with("handed-back-dirty:redisp01:"))
+            .count(),
+        1
+    );
+    // Clean, the re-dispatch starts a Mnemo session, which ends the
+    // hand-back: the worker is no longer reclaimable.
+    std::fs::remove_file(checkout.join("agent_edit.txt")).expect("remove the edit");
+    team.dispatch_request(redispatch())
+        .await
+        .expect("a clean checkout re-dispatches");
+    let worker = team.worker("redisp01").await.expect("worker");
+    assert!(worker.handed_back.is_none(), "a Mnemo model ran: {worker:?}");
+    assert!(team.live.lock().await.contains_key("redisp01"), "a Mnemo session runs it");
+    team.stop("redisp01").await.expect("stop the Mnemo session");
+    assert!(team.attach_external_lead());
+    let reclaim = start_agent(team, "redisp01", serde_json::json!({})).await;
+    assert!(!reclaim.success, "{}", reclaim.output);
+    assert!(
+        reclaim.output.contains("a Mnemo model has run on it since it was handed back"),
+        "{}",
+        reclaim.output
+    );
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn handed_back_survives_a_restart_and_stays_reclaimable() {
+    let (fixture, projects, transcript) = handed_back_agent("restartBack01").await;
+    let team = &fixture.team;
+    let handed = team
+        .worker("restartBack01")
+        .await
+        .expect("worker")
+        .handed_back
+        .expect("handed back");
+    let state_dir = team.state_dir().to_path_buf();
+    let root = team.workspace_root.clone();
+    team.shutdown().await;
+    // Reopen the team from its saved team.json.
+    let saved = std::fs::read_to_string(state_dir.join("team.json")).expect("team.json");
+    assert!(saved.contains("\"handed_back\""), "{saved}");
+    let persisted = TeamPersistence::new(&state_dir)
+        .load()
+        .expect("load the ledger")
+        .expect("a saved ledger");
+    let record = persisted
+        .workers
+        .into_iter()
+        .find(|worker| worker.id == "restartBack01")
+        .expect("the saved worker");
+    assert_eq!(record.handed_back.as_ref(), Some(&handed));
+    let state = tempfile::tempdir().expect("state");
+    let config = tempfile::tempdir().expect("config");
+    let _projects_root = ThreadProjectsRoot::set(projects.path());
+    let reopened = open_test_team_with_config(&root, state.path(), vec![record], config.path()).await;
+    let worker = reopened.worker("restartBack01").await.expect("worker");
+    assert_eq!(worker.status, WorkerStatus::Interrupted);
+    assert_eq!(worker.handed_back.as_ref(), Some(&handed));
+    // The lead's agent did launch: team_agent_started reclaims the worker.
+    assert!(reopened.attach_external_lead());
+    write_agent_transcript(&transcript, AGENT_TRANSCRIPT);
+    let started = start_agent(&reopened, "restartBack01", serde_json::json!({})).await;
+    assert!(started.success, "{}", started.output);
+    assert!(
+        started.output.starts_with("Restored restartBack01 as a Claude Code agent worker"),
+        "{}",
+        started.output
+    );
+    let worker = reopened.worker("restartBack01").await.expect("worker");
+    assert_eq!(worker.status, handed.status);
+    assert_eq!(worker.claude_agent.as_deref(), Some(handed.claude_agent.as_str()));
+    assert_eq!(worker.claude_agent_id.as_deref(), Some("a1b2c3"));
+    assert!(worker.handed_back.is_none());
+    reopened.shutdown().await;
 }
 
 #[tokio::test]

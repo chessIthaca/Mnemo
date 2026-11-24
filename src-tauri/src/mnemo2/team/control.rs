@@ -569,7 +569,7 @@ impl TeamRuntime {
     /// (Interrupted) and the lead gets a notice naming the checkout and the
     /// recovery calls. `keep_changes` (the external lead's explicit choice)
     /// allows the takeover.
-    async fn handed_back_takeover_refusal(
+    pub(super) async fn handed_back_takeover_refusal(
         &self,
         record: &WorkerRecord,
         keep_changes: bool,
@@ -588,19 +588,6 @@ impl TeamRuntime {
         Err(refusal)
     }
 
-    /// A Mnemo session started on a worker: a hand-back on record is over,
-    /// so `team_agent_started` no longer reclaims it.
-    async fn clear_handed_back(&self, worker_id: &str) -> Result<(), String> {
-        let mut cleared = false;
-        self.update_worker(worker_id, |worker| {
-            cleared = worker.handed_back.take().is_some();
-        })
-        .await;
-        if cleared {
-            self.persist().await?;
-        }
-        Ok(())
-    }
 
     /// Move a worker onto the lead's `tier`/`model`/`reasoning_effort` choice
     /// and resume it there with its transcript: the path `team_resume` with a
@@ -1155,11 +1142,8 @@ impl TeamRuntime {
             if !record.worktree.is_dir() {
                 return Err(format!("worker '{worker_id}' has no recoverable worktree"));
             }
-            let mut started = self.start_worker(record).await?;
-            if started.handed_back.take().is_some() {
-                self.clear_handed_back(worker_id).await?;
-            }
-            return Ok(started);
+            // A session that starts clears the hand-back on record.
+            return self.start_worker(record).await;
         }
         // The takeover was decided above.
         self.resume_session(worker_id, true).await

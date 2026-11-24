@@ -434,6 +434,9 @@ impl TeamRuntime {
             worker.generation = generation;
             worker.brief_sent = true;
             worker.error = None;
+            // A Mnemo model runs it now: a hand-back on record is over, so
+            // team_agent_started no longer reclaims it (plan ee73bd2f).
+            worker.handed_back = None;
         })
         .await;
         if let Err(err) = self.persist().await {

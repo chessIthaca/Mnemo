@@ -4773,6 +4773,9 @@ mod tests {
         assert!(prompt_names_branch("Commit on wt/agent-foo now.", "wt/agent-foo"));
         assert!(prompt_names_branch("Commit on WT/AGENT-FOO", "wt/agent-foo"));
         assert!(!prompt_names_branch("Commit on wt/agent-foo", ""));
+        // A longer dotted ref is another branch; a sentence-ending dot is not.
+        assert!(!prompt_names_branch("Commit on wt/agent-foo.2 now", "wt/agent-foo"));
+        assert!(prompt_names_branch("Commit on wt/agent-foo.", "wt/agent-foo"));
     }
 
     #[tokio::test]

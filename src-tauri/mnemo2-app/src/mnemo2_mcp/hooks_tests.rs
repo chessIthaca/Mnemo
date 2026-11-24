@@ -370,7 +370,11 @@ fn gate_agent_asks_when_the_server_says_ask() {
     let sent = server.requests_to("/lead/gate-agent");
     assert_eq!(
         sent[0].json(),
-        json!({ "root": sandbox.project_str(), "subagent_type": "general-purpose" })
+        json!({
+            "root": sandbox.project_str(),
+            "subagent_type": "general-purpose",
+            "prompt": "x",
+        })
     );
 }
 
@@ -406,6 +410,120 @@ fn gate_agent_gives_ask_a_default_reason() {
     let reason = parsed(output)["hookSpecificOutput"]["permissionDecisionReason"].clone();
     assert!(reason.as_str().is_some_and(|text| !text.is_empty()));
 }
+
+#[test]
+fn gate_emits_allow_only_for_auto_approve() {
+    let sandbox = Sandbox::new();
+    let reason = "runs Mnemo worker extagnt0001 (high tier) as a Claude Code agent";
+    let _server = server_with(
+        &sandbox,
+        "/lead/gate-agent",
+        json!({ "decision": "allow", "auto_approve": true, "reason": reason }),
+    );
+    let env = sandbox.env();
+    let decided = gate_agent(
+        &env,
+        &gate_input(
+            &sandbox,
+            "Agent",
+            json!({ "subagent_type": "general-purpose", "isolation": "worktree" }),
+        ),
+    );
+    assert_eq!(
+        parsed(decided),
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": reason,
+            }
+        })
+    );
+
+    // An allow Mnemo did not mark stays with Claude Code's own rules.
+    let other = Sandbox::new();
+    let _server = server_with(
+        &other,
+        "/lead/gate-agent",
+        json!({ "decision": "allow", "auto_approve": false, "reason": reason }),
+    );
+    assert!(gate_agent(&other.env(), &gate_input(&other, "Agent", json!({}))).is_none());
+}
+
+#[test]
+fn gate_emits_deny_with_the_server_reason() {
+    let sandbox = Sandbox::new();
+    let reason = "Mnemo worker extagnt0001 waits for its agent: relaunch with isolation \
+                  \"worktree\" (the hook then hands the agent its warm checkout), or, if the \
+                  worktree hook cannot place it, launch without isolation with a prompt that \
+                  names its checkout C:\\Mnemo\\.worktrees\\agent-x.";
+    let _server = server_with(
+        &sandbox,
+        "/lead/gate-agent",
+        json!({ "decision": "deny", "reason": reason }),
+    );
+    let output = gate_agent(
+        &sandbox.env(),
+        &gate_input(&sandbox, "Agent", json!({ "subagent_type": "general-purpose" })),
+    );
+    assert_eq!(
+        parsed(output),
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+    );
+}
+
+#[test]
+fn gate_passes_the_prompt_capped() {
+    let sandbox = Sandbox::new();
+    let server = server_with(&sandbox, "/lead/gate-agent", json!({ "decision": "ask" }));
+    let env = sandbox.env();
+    // A short prompt travels unchanged.
+    gate_agent(
+        &env,
+        &gate_input(
+            &sandbox,
+            "Agent",
+            json!({ "subagent_type": "general-purpose", "prompt": "name the checkout" }),
+        ),
+    );
+    // A huge one is cut to the cap: the gate only looks for the checkout path.
+    let huge = format!("{}checkout", "x".repeat(GATE_PROMPT_BYTES));
+    gate_agent(
+        &env,
+        &gate_input(
+            &sandbox,
+            "Agent",
+            json!({ "subagent_type": "general-purpose", "prompt": huge }),
+        ),
+    );
+    // The cut lands on a character boundary even mid-character.
+    let wide = "é".repeat(GATE_PROMPT_BYTES);
+    gate_agent(
+        &env,
+        &gate_input(
+            &sandbox,
+            "Agent",
+            json!({ "subagent_type": "general-purpose", "prompt": wide }),
+        ),
+    );
+    let sent = server.requests_to("/lead/gate-agent");
+    assert_eq!(sent[0].json()["prompt"], "name the checkout");
+    let plain = sent[1].json()["prompt"].as_str().expect("capped prompt").to_string();
+    assert_eq!(plain.len(), GATE_PROMPT_BYTES);
+    assert!(plain.chars().all(|c| c == 'x'), "cut on the cap");
+    let wide = sent[2].json()["prompt"].as_str().expect("capped prompt").to_string();
+    assert!(wide.len() <= GATE_PROMPT_BYTES, "{}", wide.len());
+    assert!(wide.len() > GATE_PROMPT_BYTES - 4, "{}", wide.len());
+    assert!(wide.chars().all(|c| c == 'é'), "cut on a character boundary");
+}
+
+// ---- hint --pre-search -----------------------------------------------------
 
 // ---- hint --pre-search -----------------------------------------------------
 

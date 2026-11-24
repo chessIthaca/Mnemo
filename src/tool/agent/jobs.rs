@@ -1377,6 +1377,7 @@ impl Tool for JobKillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::agent::shell::wait_for_temp_dir_release;
     use serde_json::Value;
     use tempfile::TempDir;
 
@@ -1494,6 +1495,9 @@ mod tests {
             "job_kill did not return promptly: {:?}",
             killing.elapsed()
         );
+        // The killed tree holds the folder as its cwd until it is gone; wait
+        // for that instead of racing the TempDir drop.
+        wait_for_temp_dir_release(dir.path()).await;
     }
 
     #[tokio::test]
@@ -1517,6 +1521,13 @@ mod tests {
             "the wait did not honor timeout_s: {:?}",
             began.elapsed()
         );
+        // The job's 10 s sleep is still running: kill it before the test ends,
+        // or its shell would keep the folder as its cwd past the TempDir drop.
+        let kill = JobKillTool::new(Arc::clone(&jobs))
+            .execute(json!({ "job_id": id }))
+            .await;
+        assert!(kill.success, "job_kill failed: {}", kill.output);
+        wait_for_temp_dir_release(dir.path()).await;
     }
 
     #[tokio::test]
@@ -1675,9 +1686,13 @@ mod tests {
         assert_eq!(data.get("waited_s"), Some(&json!(0)));
         assert_eq!(data.get("purpose"), Some(&json!("dev server")));
         let id = job_id(&result);
-        JobKillTool::new(Arc::clone(&jobs))
+        let kill = JobKillTool::new(Arc::clone(&jobs))
             .execute(json!({ "job_id": id }))
             .await;
+        assert!(kill.success, "job_kill failed: {}", kill.output);
+        // The killed tree holds the folder as its cwd until it is gone; wait
+        // for that instead of racing the TempDir drop.
+        wait_for_temp_dir_release(dir.path()).await;
     }
 
     #[tokio::test]
@@ -1749,9 +1764,13 @@ mod tests {
             began.elapsed()
         );
         let id = job_id(&result);
-        JobKillTool::new(Arc::clone(&jobs))
+        let kill = JobKillTool::new(Arc::clone(&jobs))
             .execute(json!({ "job_id": id }))
             .await;
+        assert!(kill.success, "job_kill failed: {}", kill.output);
+        // The killed tree holds the folder as its cwd until it is gone; wait
+        // for that instead of racing the TempDir drop.
+        wait_for_temp_dir_release(dir.path()).await;
     }
 
     /// Plan 5b498359's data contract: EVERY job tool reports the id, the label,

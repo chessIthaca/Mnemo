@@ -9,3 +9,5 @@ Recovery: run `git worktree list` to confirm the pool is on the worker's branch 
 - use absolute paths, `git -C <pool>`, and cargo with the pool as the working directory;
 - never touch the main checkout, push, stash, merge or switch branches.
 Then call team_agent_started with the agent's id so Mnemo follows its transcript. Until that call, team_status shows agent_phase "awaiting_launch".
+
+Amended 2026-11-24: Risk of this workaround: without isolation, the agent's tools can reach the main checkout, and one did. On 2026-11-24 a worker launched this way edited two lines of a source file in D:\Mnemo itself, besides committing the same change in its pool. That uncommitted stray then blocked every team_merge ("the lead working tree must be clean") until it was discarded, which needed the user's OK because discarding it is destructive. Before merging, run `git status --short` in the main checkout. If a stray source edit appears, compare it with the worker's pool commit; if it is an exact duplicate, ask the user before discarding it.

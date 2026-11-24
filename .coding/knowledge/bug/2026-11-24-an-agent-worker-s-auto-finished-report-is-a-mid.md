@@ -1,0 +1,7 @@
++++
+title = "an agent worker's auto-finished report is a mid-run sentence, not the agent's final report"
+created = "2026-11-24"
+evidence = "The finished notices for storeRelease01 (twice) and handBackGrace01 on 2026-11-24 quoted mid-run sentences, while the subagent hand-backs carried full reports. Code: team/agent_watch.rs FinishedRun / finish_agent_run (auto_finish_agent)."
++++
+
+Symptom (2026-11-24, three runs): when a Claude Code agent worker's agent ends, Mnemo finishes the worker with "its last message" as the report. The text it picks is a short sentence from the middle of the run, e.g. "Now the final full workspace run from an empty target." or "Rewrite this test with the extended cases and add the new rediscovery test.". The agent's actual final report, which the lead receives as the subagent hand-back, is missing. The lead must replace it with team_agent_done each time. Likely cause (unconfirmed): the agent watch takes the last assistant text block from the subagent transcript (agent-<id>.jsonl), but the final report is not an ordinary trailing assistant text entry there. It may be delivered through the hand-back tool call, or it may be followed by tool-only or progress entries. Fix direction: read the agent's final result the way Claude Code delivers it (the last assistant message of the final turn, including a hand-back tool's report argument when present), and add a test with a recorded transcript whose final report follows tool calls.

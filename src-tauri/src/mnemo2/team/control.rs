@@ -39,7 +39,7 @@ use super::spawn::load_check_commands;
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
     agent_continue_prompt, agent_resume_refusal, agent_worker_refusal, audit_finished, audit_finished_error,
-    kickoff_message, note_model, session_model_spec,
+    fresh_launch_token, kickoff_message, note_model, session_model_spec, with_launch_token,
 };
 use super::routing::{
     NUDGE_LADDER, final_tier, logs_label, logs_routing, next_tier_above, outcome_row,
@@ -701,6 +701,8 @@ impl TeamRuntime {
             worker.error = None;
             // An agent runs it again: a hand-back on record is over.
             worker.handed_back = None;
+            // The new launch prompt carries a fresh one-time token.
+            worker.launch_token = Some(fresh_launch_token());
             worker.reroutes.push(row.clone());
             if let Some(routing) = worker.routing.as_mut() {
                 routing.nudged = None;
@@ -712,7 +714,10 @@ impl TeamRuntime {
         let worker = self.worker(worker_id).await?;
         let mut block = claude_agent_block(&worker)
             .ok_or_else(|| format!("worker '{worker_id}' has no Claude Code agent"))?;
-        block["prompt"] = json!(agent_continue_prompt(&worker, &previous));
+        block["prompt"] = json!(with_launch_token(
+            agent_continue_prompt(&worker, &previous),
+            worker.launch_token.as_deref(),
+        ));
         Ok(Some(TierResume {
             worker,
             claude_agent: Some(block),

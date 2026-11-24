@@ -406,6 +406,13 @@ pub struct WorkerRecord {
     /// `team_agent_started` may reclaim the worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handed_back: Option<HandedBack>,
+    /// The one-time token Mnemo put on the first line of the launch prompt
+    /// it last handed the lead for this agent worker. The agent gate
+    /// auto-approves only a launch whose prompt carries it, and clears it
+    /// when it does, so each handed-out prompt runs without a permission
+    /// prompt exactly once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_token: Option<String>,
     /// The branches `team_integrate` merged into this worker's branch, in
     /// order (plan ca7f2177 decision 6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -505,6 +512,24 @@ pub(super) fn agent_prompt(record: &WorkerRecord) -> String {
         pinned = pinned,
         branch = record.branch,
     )
+}
+
+/// A fresh one-time launch token for an agent worker's next launch prompt:
+/// random, so only a prompt Mnemo handed out can carry it.
+pub(super) fn fresh_launch_token() -> String {
+    format!("mnemo-launch-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// `prompt` with the worker's launch token on its first line, where the
+/// agent gate (which reads only the first 64 KiB of a prompt) always sees it.
+/// A worker with no token gets the prompt unchanged.
+pub(super) fn with_launch_token(prompt: String, token: Option<&str>) -> String {
+    match token {
+        Some(token) => format!(
+            "Mnemo launch token: {token} (Mnemo's gate starts this agent without a permission prompt once)\n\n{prompt}"
+        ),
+        None => prompt,
+    }
 }
 
 /// [`agent_prompt`] for a step a Mnemo worker on `previous_model` already

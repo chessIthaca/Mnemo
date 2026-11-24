@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use super::lead_tools::{team_tool_error, worker_status_view};
 use super::record::{
-    agent_prompt, validate_worker_id, InboxKind, MessageSender, WorkerRecord, WorkerRouting,
+    agent_prompt, validate_worker_id, with_launch_token, InboxKind, MessageSender, WorkerRecord, WorkerRouting,
     WorkerStatus,
 };
 use super::routing::RoutedDispatch;
@@ -182,7 +182,7 @@ pub(super) fn claude_agent_block(worker: &WorkerRecord) -> Option<Value> {
         "model": worker.claude_agent,
         "worktree": worker.worktree,
         "branch": worker.branch,
-        "prompt": agent_prompt(worker),
+        "prompt": with_launch_token(agent_prompt(worker), worker.launch_token.as_deref()),
         "effort": worker.claude_agent_effort,
     }))
 }

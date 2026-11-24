@@ -35,7 +35,8 @@ use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
 use super::dispatch::BoxFuture;
 use super::pump::save_workers;
 use super::record::{
-    append_inbox, HandedBack, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus,
+    append_inbox, fresh_launch_token, HandedBack, InboxEntry, InboxKind, MessageSender,
+    WorkerRecord, WorkerStatus,
 };
 use super::{BoardSignal, TeamRuntime};
 
@@ -1295,6 +1296,53 @@ impl TeamRuntime {
                 .map(gate_worker)
                 .collect(),
         }
+    }
+
+    /// The agent gate's one-time launch approval: the running agent worker
+    /// (Working or Fixing) whose launch token `prompt` carries, with that
+    /// token cleared under the same records lock, so a handed-out prompt
+    /// runs without a permission prompt exactly once. Returns the worker's id
+    /// and settled tier, or `None` when the prompt carries no live token.
+    pub async fn take_launch_token(&self, prompt: &str) -> Option<(String, String)> {
+        let taken = {
+            let mut records = self.records.lock().await;
+            records
+                .iter_mut()
+                .filter(|worker| runs_as_agent(worker))
+                .find(|worker| {
+                    worker
+                        .launch_token
+                        .as_deref()
+                        .is_some_and(|token| !token.is_empty() && prompt.contains(token))
+                })
+                .map(|worker| {
+                    worker.launch_token = None;
+                    (worker.id.clone(), worker.tier.clone().unwrap_or_default())
+                })
+        };
+        if taken.is_some() {
+            // A failed save is retried by the next save; the token is spent
+            // in memory either way.
+            if let Err(error) =
+                save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await
+            {
+                eprintln!("team: could not save a spent launch token: {error}");
+            }
+        }
+        taken
+    }
+
+    /// Give `worker_id` a fresh launch token for the next launch prompt Mnemo
+    /// hands the lead (a continuation with no registered agent), replacing
+    /// any earlier one, and return it.
+    pub(super) async fn issue_launch_token(&self, worker_id: &str) -> Result<String, String> {
+        let token = fresh_launch_token();
+        self.update_worker(worker_id, |worker| {
+            worker.launch_token = Some(token.clone());
+        })
+        .await;
+        self.persist().await?;
+        Ok(token)
     }
 
     /// Why another agent worker may not start now, if it may not (plan

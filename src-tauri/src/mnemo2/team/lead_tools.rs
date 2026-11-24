@@ -21,7 +21,7 @@ use crate::mnemo2::phase3::{self, ReviewEvidence};
 
 use super::agent_watch;
 use super::findings_ledger;
-use super::record::{ChangeSource, MessageSender, WorkerRecord};
+use super::record::{with_launch_token, ChangeSource, MessageSender, WorkerRecord};
 use super::routing::tier_ids;
 use super::dispatch::{
     BoxFuture, DispatchRequest, DispatchSource, PlanRef, dispatch_result, stale_base_line,
@@ -784,7 +784,14 @@ impl TeamRuntime {
                 if worker.claude_agent.is_some()
                     && matches!(name, "team_message" | "team_route_fix") =>
             {
-                continue_agent_answer(&worker, name)
+                // No registered agent: the lead launches a new one with this
+                // message, which carries a fresh one-time launch token.
+                let token = if worker.claude_agent_id.is_none() {
+                    self.issue_launch_token(&worker.id).await.ok()
+                } else {
+                    None
+                };
+                continue_agent_answer(&worker, name, token.as_deref())
             }
             (result, _) => worker_result(result, name),
         };
@@ -1208,12 +1215,14 @@ fn agent_handoff_answer(worker: &WorkerRecord, block: Value) -> ToolResult {
 /// or the fix round, and the lead passes the text on to its agent. The
 /// `continue_agent` block `{agent_id, worktree, message}` is in the result
 /// and in `data`; the text says how to continue, with the message below it.
-fn continue_agent_answer(worker: &WorkerRecord, action: &str) -> ToolResult {
+fn continue_agent_answer(worker: &WorkerRecord, action: &str, token: Option<&str>) -> ToolResult {
     let message = worker
         .inbox
         .last()
         .map(|entry| entry.text.clone())
         .unwrap_or_default();
+    // A message for a new agent carries the launch token on its first line.
+    let message = with_launch_token(message, token);
     let block = json!({
         "agent_id": worker.claude_agent_id,
         "worktree": worker.worktree,

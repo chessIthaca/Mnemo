@@ -4243,6 +4243,17 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Release housekeeping: dependency and version bumps plus CHANGELOG; no specified behavior changes."
+    },
+    {
+      "id": "599eb162",
+      "status": "closed",
+      "created_at_ms": 1795476994223,
+      "closed_at_ms": 1795479939249,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-599eb162-20261124-002539.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Dependency manifest and lockfile alignment only."
     }
   ]
 }

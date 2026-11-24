@@ -1,6 +1,13 @@
 import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
+import { testTmpRoot } from "../scripts/test-tmp.mjs";
+
+// The suite's temp folders stay in this checkout's target/tmp (and on its drive),
+// not the user's system temp folder: this config runs in the main process before
+// the worker pool starts, so every worker and child inherits the redirect.
+testTmpRoot();
+
 export default defineConfig({
   plugins: [svelte()],
   resolve: {

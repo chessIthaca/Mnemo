@@ -230,6 +230,7 @@ async fn team_snapshots_leave_out_transcripts_the_caller_holds() {
     let full = team.snapshot().await;
     assert_eq!(full.workers[0].transcript.messages.len(), 2);
     assert!(full.omitted_transcripts.is_empty());
+    team.shutdown().await;
 }
 
 /// Workers do the bulk of the work and run without any session limit.
@@ -2702,6 +2703,7 @@ async fn a_leftover_checkout_does_not_block_deleting_its_worker() {
     assert!(team.live.lock().await.is_empty());
     assert!(!dangling.worktree.exists());
     assert!(!fragment.worktree.exists());
+    team.shutdown().await;
 }
 
 /// One worker whose checkout refuses to delete must not keep the other
@@ -2760,6 +2762,7 @@ async fn delete_workers_continues_past_a_failed_worker() {
     assert!(!branch_exists(root.path(), &third.branch).await);
     assert!(stuck.worktree.exists());
     assert!(branch_exists(root.path(), &stuck.branch).await);
+    team.shutdown().await;
 }
 
 /// A deleted worker's checkout is renamed away with one move and its
@@ -2802,6 +2805,7 @@ async fn a_deleted_checkout_is_renamed_to_trash_and_deregistered() {
     // The renamed folder leaves the trash with the sweep.
     sweep_trash(root.path()).await;
     assert!(trash_entries(root.path()).is_empty());
+    team.shutdown().await;
 }
 
 /// The trash sweep removes every renamed-away checkout folder, one
@@ -2863,6 +2867,7 @@ async fn deletion_preview_streams_each_worker_as_it_checks() {
     assert_eq!(seen, ids, "every worker streamed exactly once");
     let returned: Vec<String> = previews.iter().map(|preview| preview.worker_id.clone()).collect();
     assert_eq!(returned, ids, "previews return in request order");
+    team.shutdown().await;
 }
 
 /// On Windows, a held checkout refuses the rename into trash: the
@@ -2922,6 +2927,7 @@ async fn a_held_checkout_falls_back_to_the_foreground_removal_and_reports_it() {
     assert!(team.worker(&other.id).await.is_err());
     assert!(!other.worktree.exists());
     drop(hold);
+    team.shutdown().await;
 }
 
 #[tokio::test]
@@ -3072,6 +3078,7 @@ async fn stop_close_error_is_persisted_and_retryable() {
     let stopped = team.stop_inner(&worker.id).await.expect("stop retry");
     assert_eq!(stopped.status, WorkerStatus::Stopped);
     assert!(!team.live.lock().await.contains_key(&worker.id));
+    team.shutdown().await;
 }
 
 #[tokio::test]
@@ -3136,6 +3143,7 @@ async fn merge_close_error_returns_to_review_and_retries_cleanup() {
     assert!(!worker.worktree.exists());
     assert!(!team.live.lock().await.contains_key(&worker.id));
     assert!(!branch_exists(root.path(), &worker.branch).await);
+    team.shutdown().await;
 }
 
 #[tokio::test]
@@ -3214,6 +3222,7 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
         .expect("load persisted team")
         .expect("saved team");
     assert_eq!(persisted.workers[0].error, None);
+    team.shutdown().await;
 }
 
 /// A clean merge deletes the worker's branch with Git's safe delete, and
@@ -3277,6 +3286,7 @@ async fn merge_deletes_the_merged_branch_and_keeps_the_work() {
         "the merge commit keeps the reviewed tip as its second parent"
     );
     run_git(root.path(), &["merge-base", "--is-ancestor", &tip, "HEAD"]);
+    team.shutdown().await;
 }
 
 #[tokio::test]
@@ -3376,6 +3386,7 @@ async fn a_later_merge_sweeps_an_earlier_merged_workers_leftover_branch() {
         "the sweep deletes the earlier merged worker's leftover branch"
     );
     assert_eq!(team.worker(&early.id).await.expect("early worker").error, None);
+    team.shutdown().await;
 }
 
 /// The sweep keeps every branch it must not touch: a reverted merge, an
@@ -3452,6 +3463,7 @@ async fn the_sweep_keeps_reverted_held_and_unmerged_branches() {
         branch_exists(root.path(), &unmerged.branch).await,
         "commits outside the lead branch keep the branch"
     );
+    team.shutdown().await;
 }
 
 /// A worker parked in review at one exact, reviewed tip, ready to merge.
@@ -3546,6 +3558,7 @@ async fn a_later_merge_retries_an_earlier_merged_workers_stuck_checkout() {
         .find(|worker| worker.id == early.id)
         .expect("the early worker is persisted");
     assert_eq!(early_persisted.error, None);
+    team.shutdown().await;
 }
 
 /// A stuck checkout that still cannot be removed (a link outside
@@ -3587,6 +3600,7 @@ async fn a_stuck_checkout_that_still_cannot_be_removed_keeps_its_note_and_branch
         branch_exists(root.path(), &early.branch).await,
         "the stuck checkout keeps its branch"
     );
+    team.shutdown().await;
 }
 
 /// The retry only touches merged workers whose error is one of the
@@ -3618,6 +3632,7 @@ async fn the_retry_ignores_a_merged_worker_whose_error_is_not_a_checkout_note() 
         team.worker(&early.id).await.expect("early worker").error,
         Some("something else needs attention".to_string())
     );
+    team.shutdown().await;
 }
 
 /// App start retries a checkout a previous run could not remove, clears the
@@ -3653,6 +3668,7 @@ async fn open_retries_a_stuck_checkout_left_by_an_earlier_run() {
         .expect("load team")
         .expect("saved team");
     assert_eq!(persisted.workers[0].error, None);
+    team.shutdown().await;
 }
 
 /// An audit worker is never mergeable — in particular, a still-running
@@ -3697,6 +3713,7 @@ async fn audit_merge_is_refused_even_while_the_audit_is_busy() {
         before
     );
     assert!(team.live.lock().await.contains_key(&audit.id));
+    team.shutdown().await;
 }
 
 #[test]
@@ -6734,6 +6751,7 @@ async fn a_worker_past_the_threshold_notifies_the_lead_once() {
         "the alert never stopped or changed the worker: {settled:?}"
     );
     assert!(settled.error.is_none(), "{settled:?}");
+    fixture.team.shutdown().await;
 }
 
 /// A lead message long enough for drift classification (≥ 20 words).
@@ -9476,6 +9494,7 @@ async fn schema_offers_auto_only_in_suggest_and_auto() {
             .as_array()
             .expect("tier enum");
         assert_eq!(tiers.contains(&json!("auto")), offers_auto, "{mode:?}");
+        team.shutdown().await;
     }
 }
 
@@ -9511,6 +9530,7 @@ async fn tier_is_optional_only_in_auto_mode() {
             .as_array()
             .expect("required fields");
         assert_eq!(required_fields.contains(&json!("tier")), required, "{mode:?}");
+        team.shutdown().await;
     }
 }
 
@@ -10032,6 +10052,7 @@ async fn off_mode_schema_uses_the_ladder_without_auto() {
     assert!(dispatch.parameters["required"]
         .as_array()
         .is_some_and(|required| required.contains(&json!("tier"))));
+    team.shutdown().await;
 }
 
 
@@ -15317,6 +15338,7 @@ async fn agent_tier_dispatch_prepares_the_checkout_without_a_session() {
         block["prompt"].as_str(),
         "the reuse returns the same prompt"
     );
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15344,6 +15366,7 @@ async fn agent_tier_without_models_is_still_an_agent_tier() {
         worker_status_view(&record, false)["model"].as_str(),
         Some("claude-code/sonnet")
     );
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15371,6 +15394,7 @@ async fn agent_tier_with_an_explicit_model_still_starts_a_mnemo_worker() {
     assert!(record.claude_agent.is_none());
     assert_eq!(record.model.as_deref(), Some("test/scripted-difficult"));
     assert!(fixture.team.live.lock().await.get("agenttier11").is_some());
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15404,6 +15428,7 @@ async fn agent_tier_is_ignored_without_an_external_lead() {
 
     // An attached external lead does not claim the in-app lead's dispatch:
     // the sender, not the attach state alone, decides.
+    fixture.team.shutdown().await;
     let fixture = agent_fixture(
         RoutingMode::Off,
         None,
@@ -15426,6 +15451,7 @@ async fn agent_tier_is_ignored_without_an_external_lead() {
 
     // IPC dispatches (the Control Room form) never take the agent path,
     // even when Laya clears the agent tier while a lead is attached.
+    fixture.team.shutdown().await;
     let fixture = agent_fixture(
         RoutingMode::Auto,
         routing_answer(mnemo::agent::route_question::LABEL_HARD, 0.93),
@@ -15459,6 +15485,7 @@ async fn agent_tier_is_ignored_without_an_external_lead() {
         "Laya cleared high and the worker runs on its model"
     );
     assert!(fixture.team.live.lock().await.get("agenttier05").is_some());
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15500,6 +15527,7 @@ async fn laya_auto_into_an_agent_tier_hands_it_to_the_lead() {
     );
     assert_eq!(record.tier.as_deref(), Some("high"));
     assert!(fixture.team.live.lock().await.get("layaagnt01").is_none());
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15531,6 +15559,7 @@ async fn auto_fallback_into_an_agent_tier_hands_it_to_the_lead() {
     assert_eq!(record.claude_agent.as_deref(), Some("fable"));
     assert_eq!(record.tier.as_deref(), Some("high"));
     assert!(fixture.team.live.lock().await.get("agenttier12").is_none());
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15648,6 +15677,7 @@ async fn team_agent_done_finishes_the_worker_and_notifies_the_lead() {
         .await
         .expect("merge the agent worker");
     assert_eq!(merged.status, WorkerStatus::Merged);
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15701,6 +15731,7 @@ async fn team_agent_done_failed_marks_failed() {
     assert!(notice.contains("could not finish its turn"), "{notice}");
     assert!(notice.contains(report), "{notice}");
     assert!(!notice.contains("Review it now"), "{notice}");
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15732,6 +15763,7 @@ async fn team_agent_done_refuses_a_mnemo_worker() {
     );
 
     // And an agent worker outside Working/Interrupted is refused with its state.
+    fixture.team.shutdown().await;
     let fixture = agent_fixture(
         RoutingMode::Off,
         None,
@@ -15761,6 +15793,7 @@ async fn team_agent_done_refuses_a_mnemo_worker() {
         .await
         .expect_err("an already-completed worker is refused");
     assert!(error.contains("completed"), "{error}");
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15864,6 +15897,7 @@ async fn session_tools_refuse_an_agent_worker() {
         refusal,
         "agenttier10 runs as a Claude Code agent and has ended: dispatch the step again with a new worker_id."
     );
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15888,6 +15922,7 @@ async fn tier_guidance_names_the_claude_agent() {
 
     // An agent tier with no models still appears, naming the fold target as
     // today, followed by the same suffix.
+    fixture.team.shutdown().await;
     let fixture = agent_fixture(RoutingMode::Off, None, false, "haiku", vec![]).await;
     let guidance = fixture.team.tier_guidance().expect("tier guidance");
     let line = guidance
@@ -15899,6 +15934,7 @@ async fn tier_guidance_names_the_claude_agent() {
         line.ends_with("; runs as a Claude Code agent (haiku) when Claude Code leads"),
         "{line}"
     );
+    fixture.team.shutdown().await;
 }
 
 /// The agent fixture with the high tier's Claude Code effort set too.
@@ -15947,6 +15983,7 @@ async fn agent_dispatch_carries_the_tier_effort() {
     assert_eq!(block, claude_agent_block(&retry).expect("the retry block"));
 
     // A tier without an effort carries null.
+    fixture.team.shutdown().await;
     let fixture = agent_fixture(
         RoutingMode::Off,
         None,
@@ -15968,6 +16005,7 @@ async fn agent_dispatch_carries_the_tier_effort() {
         .expect("the agent dispatch");
     let block = claude_agent_block(&record).expect("the agent block");
     assert!(block["effort"].is_null(), "{block}");
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -15985,6 +16023,7 @@ async fn tier_guidance_names_the_agent_effort() {
     );
 
     // Without an effort the suffix stays exactly as it was.
+    fixture.team.shutdown().await;
     let fixture = agent_fixture(
         RoutingMode::Off,
         None,
@@ -16002,6 +16041,7 @@ async fn tier_guidance_names_the_agent_effort() {
         line.ends_with("; runs as a Claude Code agent (opus) when Claude Code leads"),
         "{line}"
     );
+    fixture.team.shutdown().await;
 }
 
 
@@ -16062,6 +16102,7 @@ async fn agent_dispatch_read_back_uses_the_updated_record_and_reuses_the_same_bl
     let data = answer.data.expect("dispatch data");
     assert_eq!(data["worker"]["read_back"], true);
     assert!(data["worker"]["routing"].is_object());
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -16112,6 +16153,7 @@ async fn agent_workers_count_against_dispatch_slots() {
         .await
         .expect("the slot is available after team_agent_done");
     assert_eq!(second.status, WorkerStatus::Working);
+    fixture.team.shutdown().await;
 }
 
 
@@ -16158,6 +16200,7 @@ async fn agent_workers_count_when_reducing_slots() {
         .set_slots(1)
         .await
         .expect("one active agent fits the reduced cap");
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -16227,6 +16270,7 @@ async fn agent_merge_and_outcome_use_the_claude_code_model() {
         refusal,
         "agenttier14 ran as a Claude Code agent and is merged: there is nothing left to continue."
     );
+    fixture.team.shutdown().await;
 }
 
 
@@ -16330,6 +16374,7 @@ async fn dispatch_after_a_lead_commit_gets_the_new_tip() {
     );
     let first_again = fixture.team.worker("alphabase1").await.expect("first record");
     assert_eq!(first_again.base_commit.as_deref(), Some(first_tip.as_str()));
+    fixture.team.shutdown().await;
 }
 
 #[tokio::test]
@@ -16597,6 +16642,7 @@ async fn agent_done_persist_failure_rolls_back_and_can_retry() {
         .expect("the persisted completed agent");
     assert_eq!(saved_worker.status, WorkerStatus::Completed);
     assert_eq!(saved_worker.report.as_deref(), Some("the clean retry completes"));
+    fixture.team.shutdown().await;
 }
 
 
@@ -16650,6 +16696,7 @@ async fn agent_workers_count_against_resume_slots() {
         .resume("resumeB01")
         .await
         .expect("resume succeeds once the agent is done");
+    fixture.team.shutdown().await;
 }
 
 
@@ -16704,6 +16751,7 @@ async fn agent_workers_count_against_audit_slots() {
         .await
         .expect("audit dispatch succeeds once the agent is done");
     assert!(!reused);
+    fixture.team.shutdown().await;
 }
 
 
@@ -16760,6 +16808,7 @@ async fn agent_prompt_names_only_tools_a_claude_agent_has() {
     assert!(prompt.contains("No questions."), "{prompt}");
     assert!(!prompt.contains("message_parent"), "{prompt}");
     assert!(!prompt.contains("plan_read"), "{prompt}");
+    fixture.team.shutdown().await;
 }
 
 
@@ -16841,6 +16890,7 @@ async fn team_agent_done_rollback_keeps_a_concurrent_routing_update() {
     assert_eq!(current.turns, 0);
     assert!(current.report.is_none());
     assert_eq!(current.routing.as_ref(), Some(&routing));
+    fixture.team.shutdown().await;
 }
 
 /// A team whose `.coding/checks.toml` lists `commands` and whose one pool

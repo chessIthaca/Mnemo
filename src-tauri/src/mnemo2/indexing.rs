@@ -390,15 +390,21 @@ impl IndexingTracker {
         })
     }
 
-    /// Stop following the engine.
-    pub fn stop(&self) {
-        for task in self
+    /// Stop following the engine. An aborted task is only dropped when the
+    /// runtime next polls it, so each one is awaited: once this returns, no
+    /// task still holds the engine (and its stores).
+    pub async fn stop(&self) {
+        let tasks: Vec<JoinHandle<()>> = self
             .tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain(..)
-        {
+            .collect();
+        for task in &tasks {
             task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
         }
     }
 }

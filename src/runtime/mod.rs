@@ -48,6 +48,16 @@ impl AgentManager {
         }
     }
 
+    /// Create a manager whose agents register their background tasks in
+    /// `tasks` — the host's shared register (the factory's), so the host's
+    /// other store-holding tasks are joined with them on shutdown.
+    pub fn with_background_tasks(channel_capacity: usize, tasks: agent::BackgroundTasks) -> Self {
+        Self {
+            background_tasks: tasks,
+            ..Self::new(channel_capacity)
+        }
+    }
+
     /// The register of the agents' background tasks (shared handle).
     pub fn background_tasks(&self) -> agent::BackgroundTasks {
         self.background_tasks.clone()

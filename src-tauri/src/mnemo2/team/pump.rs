@@ -471,12 +471,18 @@ const FOLLOW_UP_GRACE: std::time::Duration = if cfg!(test) {
 /// events while the proof runs. Every path that settles a turn as Completed
 /// calls this — the natural finished turn, a parked steered turn end, and the
 /// follow-up deadline below (F4/F5).
-async fn fire_turn_end_proofs(proof: &super::proving::ProofCtx, worker_id: &str) {
+/// The trigger is tracked in the team's task register, so a shutdown waits
+/// for it instead of leaving it running in the worker's checkout.
+async fn fire_turn_end_proofs(
+    proof: &super::proving::ProofCtx,
+    worker_id: &str,
+    tasks: &mnemo::headless::BackgroundTasks,
+) {
     let proof = proof.clone();
     let proved_worker = worker_id.to_string();
-    tokio::spawn(async move {
+    tasks.register(tokio::spawn(async move {
         super::proving::spawn_turn_proofs(&proof, proved_worker).await;
-    });
+    }));
 }
 
 // Each parameter is one shared worker handle — the pump's wiring stays flat.
@@ -627,7 +633,7 @@ pub(super) async fn pump_worker(
                         // it owes its proofs like any other turn end — this
                         // branch continues and never reaches the trigger
                         // below.
-                        fire_turn_end_proofs(&proof, &worker_id).await;
+                        fire_turn_end_proofs(&proof, &worker_id, &persistence.tasks).await;
                     }
                     continue;
                 }
@@ -1344,7 +1350,7 @@ pub(super) async fn pump_worker(
             // not finished the work, and its resume would run under the
             // proof's checkout.
             if completed_turn_end {
-                fire_turn_end_proofs(&proof, &worker_id).await;
+                fire_turn_end_proofs(&proof, &worker_id, &persistence.tasks).await;
             }
         }
         // A suppressed repeated report is not forwarded (plan 9a6cffc1):
@@ -1399,10 +1405,10 @@ pub(super) async fn pump_worker(
                 // this pump.
                 if let Some(team) = usage_limits.team() {
                     let worker_id = worker_id.clone();
-                    tokio::spawn(async move {
+                    persistence.tasks.register(tokio::spawn(async move {
                         team.resume_usage_limited(&worker_id, generation, &spec)
                             .await;
-                    });
+                    }));
                 }
             }
         }
@@ -1448,9 +1454,9 @@ pub(super) async fn pump_worker(
         };
         if let Some(team) = to_agent {
             let worker_id = worker_id.clone();
-            tokio::spawn(async move {
+            persistence.tasks.register(tokio::spawn(async move {
                 let _ = team.escalate_to_agent(&worker_id).await;
-            });
+            }));
         } else if settings.nudges && settings.mode == RoutingMode::Auto {
             // A strike fires during a busy turn. Trying on every event makes
             // the first idle event apply the pending nudge without a restart.
@@ -1477,7 +1483,10 @@ pub(super) async fn pump_worker(
             let save_lock = save_lock.clone();
             let persistence = persistence.clone();
             let worker_id = worker_id.clone();
-            tokio::spawn(async move {
+            // Tracked: the refresh runs `git rev-parse HEAD` in the checkout
+            // and holds the engine, so the team's shutdown waits for it.
+            let tasks = persistence.tasks.clone();
+            tasks.register(tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 let handle = engine.session(&session_id).await;
                 let Some(handle) = handle else {
@@ -1518,7 +1527,7 @@ pub(super) async fn pump_worker(
                     }
                 }
                 let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
-            });
+            }));
         }
     }
 }

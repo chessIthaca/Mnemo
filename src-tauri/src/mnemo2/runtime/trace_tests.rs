@@ -119,6 +119,8 @@ async fn lead_calls_carry_the_lead_identity() {
         !attribution.session_id.is_empty(),
         "the spawn path filled the session id"
     );
+    drop(engine);
+    lead.shutdown().await;
 }
 
 #[tokio::test]
@@ -186,4 +188,7 @@ async fn worker_calls_carry_worker_plan_and_step() {
     assert_eq!(attribution.plan_id.as_deref(), Some("plan-trace"));
     assert_eq!(attribution.plan_step, Some(1));
     assert!(!attribution.session_id.is_empty(), "ids filled at spawn");
+    let _ = session.close_and_wait().await;
+    team.shutdown().await;
+    engine.shutdown().await.expect("shut the engine down");
 }

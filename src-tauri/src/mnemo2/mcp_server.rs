@@ -2830,6 +2830,9 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate tool names");
+        // The engine's tools hold its memory store and code graph: release
+        // them before the shutdown removes the project folder.
+        drop(engine_tools);
         fixture.shutdown().await;
     }
 

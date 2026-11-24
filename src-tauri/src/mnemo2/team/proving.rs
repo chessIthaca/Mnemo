@@ -450,7 +450,10 @@ impl ProofCtx {
         let ctx = self.clone();
         let id = worker_id.to_string();
         let jobs = jobs.to_vec();
-        tokio::spawn(async move {
+        // Tracked in the team's task register: the jobs run Git and check
+        // commands in the worker's checkout, so a shutdown waits for them.
+        let tasks = self.persistence.tasks.clone();
+        tasks.register(tokio::spawn(async move {
             // One claim runs every owed job in sequence: the claim is held
             // for both, and the busy guard keeps the checkout still.
             let _guard = guard;
@@ -466,7 +469,7 @@ impl ProofCtx {
                     ctx.notice(format!("proof:{id}:{}", now_key()), text);
                 }
             }
-        });
+        }));
         Ok(())
     }
 

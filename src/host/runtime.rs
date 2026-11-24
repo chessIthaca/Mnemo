@@ -925,7 +925,10 @@ impl HostRuntime {
     /// setup, loop-map insert, and registration are identical), and set
     /// up the lifecycle bookkeeping.
     pub async fn start(factory: Arc<AgentLoopFactory>) -> Result<Self, String> {
-        let mut mgr = AgentManager::new(256);
+        // The manager shares the factory's background-task register, so a
+        // shutdown joins the brain's re-embed passes with the agents'
+        // consolidations.
+        let mut mgr = AgentManager::with_background_tasks(256, factory.background_tasks());
         // Take the fan-in receiver before wrapping the manager (the
         // runtime owns it, like the GUI's event forwarder does).
         let fanin_rx = mgr.take_fanin_rx().expect("fan-in receiver already taken");

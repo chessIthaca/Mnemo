@@ -1826,7 +1826,8 @@ impl Drop for RunningFlagGuard {
 }
 
 /// The background pass body (plan d3336a8a step 9): builds the embedder
-/// per the armed source — the real path builds it ONCE per process ON
+/// per the armed source — the real path, only when symbols are pending,
+/// builds it ONCE per process ON
 /// THIS THREAD (attach-or-spawn of the shared host, or an in-process
 /// ONNX load, possibly a first ~600 MB download: never on a tokio
 /// worker, never under the store lock, never on the index path) — then
@@ -1852,6 +1853,22 @@ fn run_symbol_embed_pass(
     stop: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
 ) {
+    // An empty queue needs no embedder: the real build may download the
+    // ~600 MB model, which would then run (and write into the model cache)
+    // for nothing, past the graph's own lifetime. A later index that adds
+    // symbols schedules a new pass, which builds it then.
+    if matches!(armed, ArmedEmbedder::Real { .. }) {
+        let Some(live_store) = store.upgrade() else {
+            return;
+        };
+        let nothing_pending = lock_store(&live_store)
+            .pending_symbols(crate::memory::embedder::CODE_EMBEDDING_MODEL, 1)
+            .is_ok_and(|batch| batch.is_empty());
+        drop(live_store);
+        if nothing_pending {
+            return;
+        }
+    }
     let embedder = match &armed {
         #[cfg(test)]
         ArmedEmbedder::Stub(embedder) => Arc::clone(embedder),
@@ -3500,6 +3517,39 @@ mod tests {
             "a zero window never parks the slot"
         );
         assert_eq!(graph.store().symbol_vec_count().unwrap(), 0);
+        code_embedder_slot::test::reset();
+    }
+
+    /// A real-armed pass with no pending symbols never builds the code
+    /// embedder: the build may download the model, which would run into the
+    /// model cache for nothing (and outlive the graph that asked for it).
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn an_empty_queue_never_builds_the_code_embedder() {
+        let _guard = SLOT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        code_embedder_slot::test::reset();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        code_embedder_slot::test::install_builder(Box::new(move |_cache_dir, _memory_model| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            StubEmbedder::new(crate::memory::embedder::CODE_EMBEDDING_MODEL, 8, None)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Notes\n\nNo code here.\n").unwrap();
+        let mut graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+        graph.arm_symbol_embeddings(Path::new("does-not-matter"), None);
+        run_armed_pass(&graph);
+        assert_eq!(builds.load(Ordering::Relaxed), 0, "nothing to embed, no build");
+
+        // Code arrives: the next pass builds and embeds it.
+        fixture(dir.path());
+        graph.index(None).unwrap();
+        run_armed_pass(&graph);
+        assert_eq!(builds.load(Ordering::Relaxed), 1, "pending symbols build the embedder");
+        assert!(graph.store().symbol_vec_count().unwrap() > 0);
         code_embedder_slot::test::reset();
     }
 

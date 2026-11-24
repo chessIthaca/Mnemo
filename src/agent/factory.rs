@@ -468,6 +468,12 @@ pub struct AgentLoopFactory {
     /// [`with_staleness_log`](Self::with_staleness_log) so no test writes the
     /// real one.
     staleness_log: crate::index_staleness::StalenessLog,
+    /// The host's register of background tasks that hold the project's
+    /// stores past their caller (session-end consolidations, the startup
+    /// reconcile, code index and re-embed passes, the archive prune). Shared
+    /// by every clone of this factory and adopted by the host's
+    /// `AgentManager`, so the engine's shutdown joins all of them.
+    background_tasks: crate::runtime::agent::BackgroundTasks,
 }
 
 /// The shared, stateless deps every built agent clones — the argument to
@@ -501,6 +507,23 @@ impl AgentLoopFactory {
     /// host hands the same dir to the derived-index runs).
     pub fn machine_knowledge(&self) -> Option<&Arc<KnowledgeStore>> {
         self.machine_knowledge.as_ref()
+    }
+
+    /// Adopt an existing background-task register (the brain creates it
+    /// before the factory, so its startup tasks are tracked too).
+    pub fn with_background_tasks(
+        mut self,
+        tasks: crate::runtime::agent::BackgroundTasks,
+    ) -> Self {
+        self.background_tasks = tasks;
+        self
+    }
+
+    /// The host's register of background tasks that hold the project's
+    /// stores (shared handle). The host's `AgentManager` adopts it, so
+    /// `Engine::shutdown` joins every task registered here.
+    pub fn background_tasks(&self) -> crate::runtime::agent::BackgroundTasks {
+        self.background_tasks.clone()
     }
 
     /// The factory's steering counters (2c.4/G4) — the instance-scoped
@@ -639,6 +662,7 @@ impl AgentLoopFactory {
             // The global index-staleness log (backlog fc1d57fe) unless a test
             // overrides it.
             staleness_log: crate::index_staleness::StalenessLog::global(),
+            background_tasks: crate::runtime::agent::BackgroundTasks::default(),
             mcp: None,
             // No auto-typing gate at construction — the IPC layer wires it
             // via `with_auto_typing` once the app runtime's classifier slot

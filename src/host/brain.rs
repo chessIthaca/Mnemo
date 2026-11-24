@@ -156,6 +156,10 @@ pub(crate) struct BrainMemoryOptions {
     /// G8 (§5.9.8 :729-731): process-shared resources (the embedder) —
     /// N engines over one handle hold ONE instance.
     pub shared: Option<Arc<SharedResources>>,
+    /// Whether the code graph arms its symbol-embed pass
+    /// ([`crate::headless::CodeEmbedder`]; the headless Engine passes its
+    /// builder's choice).
+    pub code_embedder: crate::headless::CodeEmbedder,
 }
 
 /// Process-shared resources (G8, §5.9.8 :729-731) — Rust-only, injected
@@ -213,6 +217,7 @@ pub(crate) fn wire_brain(
         index_codegraph,
         injected_store,
         shared,
+        code_embedder,
     } = memory;
     // The shared request/response trace log — created first so every provider
     // built below (default, dummy fallback, resolver) records into the same
@@ -567,6 +572,12 @@ pub(crate) fn wire_brain(
     // "already running" instead of corrupting the state table).
     // 3b.1 (D1): no store (MemoryBackend::Disabled) → no derived-index
     // reconcile — nothing to index into, no derived artifacts on disk.
+    //
+    // The host's background-task register (handed to the factory below):
+    // the reconcile, the startup re-embed and the startup code index hold
+    // the project's stores and write its files, so the engine's shutdown
+    // joins them like a session-end consolidation.
+    let background_tasks = crate::runtime::agent::BackgroundTasks::default();
     if let Some(store_for_index) = store.clone() {
         let notifier = notifier.clone();
         let plans_dir = workspace.state_dir.join("plans");
@@ -576,7 +587,7 @@ pub(crate) fn wire_brain(
         // the machine, indexed READ-ONLY into this project's store in the same
         // pass as the project corpus.
         let machine_knowledge_dir = crate::memory::knowledge::machine_knowledge_dir(&config_dir);
-        rt.spawn(async move {
+        background_tasks.register(rt.spawn(async move {
             // Console mode (no app handle) has no frontend to notify — the
             // reconcile still runs, but silently (the events are dropped).
             let Some(notifier) = notifier else {
@@ -775,7 +786,7 @@ pub(crate) fn wire_brain(
                 }
             }
             drop(guard);
-        });
+        }));
     }
 
     // Startup re-embed check: the memory DB is a gitignored per-machine cache
@@ -798,6 +809,9 @@ pub(crate) fn wire_brain(
     // running it here with the interim hash embedder would destroy vectors).
     // Also skipped when a local model load is pending (the background load
     // task owns the re-embed the same way).
+    //
+    // The pass holds the store until it ends, so it is tracked in the host's
+    // background-task register: the engine's shutdown joins it.
     let configured_bundled = config.general.general.bundled_embedding_model.as_deref();
     let status_snapshot = embedder_status
         .read()
@@ -812,9 +826,9 @@ pub(crate) fn wire_brain(
         // 3b.1 (D1): no store → nothing to re-embed.
         if let Some(store_for_reembed) = store.clone() {
             let embedder_for_reembed = store_for_reembed.embedder_handle();
-            rt.spawn(async move {
+            background_tasks.register(rt.spawn(async move {
                 crate::memory::reembed_if_needed(&store_for_reembed, &embedder_for_reembed).await;
-            });
+            }));
         }
     }
 
@@ -958,13 +972,19 @@ pub(crate) fn wire_brain(
                 // lazily — never on the startup path. The cfg'd shadow
                 // binding keeps the light build free of the unused
                 // `mut` (there is no arm method to call there).
+                // `CodeEmbedder::Off` leaves the pass unarmed: nothing is
+                // built or downloaded.
                 #[cfg(feature = "embeddings")]
                 let mut graph = graph;
                 #[cfg(feature = "embeddings")]
-                graph.arm_symbol_embeddings(
-                    &embedder_cache_dir,
-                    config.general.general.bundled_embedding_model.as_deref(),
-                );
+                if code_embedder == crate::headless::CodeEmbedder::Auto {
+                    graph.arm_symbol_embeddings(
+                        &embedder_cache_dir,
+                        config.general.general.bundled_embedding_model.as_deref(),
+                    );
+                }
+                #[cfg(not(feature = "embeddings"))]
+                let _ = code_embedder;
                 let graph = Arc::new(graph);
                 let g = graph.clone();
                 // The open-project overlay (IndexingOverlay.tsx) renders
@@ -972,7 +992,10 @@ pub(crate) fn wire_brain(
                 // counter. Console mode (no app handle) has no frontend
                 // to notify — the pass runs silently there.
                 let notifier = notifier.clone();
-                rt.spawn(async move {
+                // The pass holds the graph (its open database) and walks
+                // the tree on the blocking pool: tracked like the re-embed
+                // pass, so the engine's shutdown waits for it.
+                background_tasks.register(rt.spawn(async move {
                     // index() owns the indexing flag: set on entry,
                     // cleared by a drop guard on every exit path (Ok,
                     // Err, panic unwind) — review M1.
@@ -1098,7 +1121,7 @@ pub(crate) fn wire_brain(
                             Ok(Err(e)) => eprintln!("codegraph: index failed: {e}"),
                             Err(e) => eprintln!("codegraph: index task panicked: {e}"),
                         }
-                });
+                }));
                 Some(graph)
             }
             Err(e) => {
@@ -1127,6 +1150,9 @@ pub(crate) fn wire_brain(
         plans_dir: workspace.state_dir.join("plans"),
         vision,
     })
+    // The register that already tracks the startup re-embed above: the
+    // engine's shutdown joins it with the agents' consolidations.
+    .with_background_tasks(background_tasks)
     // Wire the per-context model resolver so `[models]` overrides take effect
     // at turn time (skill > subagent > state > default).
     .with_model_resolver(model_resolver.clone())
@@ -1344,7 +1370,10 @@ impl Brain {
         };
         let status = self.embedder_status.clone();
         let cache_dir = cache_dir.to_path_buf();
-        tokio::spawn(async move {
+        // The load ends in a re-embed pass that holds the store: tracked in
+        // the host's register so the engine's shutdown joins it.
+        let background_tasks = self.factory.background_tasks();
+        background_tasks.register(tokio::spawn(async move {
             // d3336a8a step 2: try the shared models host first. One
             // process per machine holds the models; when a host serves
             // this model, the instance embeds over loopback and never
@@ -1414,7 +1443,7 @@ impl Brain {
                     emit(s);
                 }
             }
-        });
+        }));
     }
 
     /// Without the `embeddings` feature there is no bundled model to

@@ -81,6 +81,13 @@ pub(super) struct TeamPersistence {
     /// worker's file. Holding the `Arc` is what makes `Arc::ptr_eq` a sound
     /// "unchanged" test: the comparing code always holds it too.
     written: Arc<Mutex<HashMap<String, Arc<Transcript>>>>,
+    /// The worker pumps' detached tasks that outlive one pump iteration (the
+    /// turn-end transcript refresh with its `git rev-parse` in the checkout,
+    /// the turn-end proof trigger and the proof jobs it starts, the automatic
+    /// usage-limit resume and agent hand-off). The
+    /// runtime's shutdown joins them, so no Git child or ledger write is
+    /// still busy in a checkout or the state dir once it returns.
+    pub(super) tasks: mnemo::headless::BackgroundTasks,
 }
 
 impl TeamPersistence {
@@ -91,6 +98,7 @@ impl TeamPersistence {
             flush_scheduled: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             written: Arc::new(Mutex::new(HashMap::new())),
+            tasks: mnemo::headless::BackgroundTasks::default(),
         }
     }
 

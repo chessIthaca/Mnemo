@@ -70,7 +70,7 @@ pub use setup::{
 };
 pub use stats::{EngineStats, SessionStats, TraceApi, UsageRates};
 pub use types::{
-    AgentPlan, EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,
+    AgentPlan, CodeEmbedder, EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,
     SessionCommand, SessionEvent, SessionId, SessionLimits, SessionSnapshot, SpawnOptions,
     Transcript, TurnOutcome,
 };

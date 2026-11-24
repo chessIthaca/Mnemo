@@ -102,6 +102,22 @@ pub struct EngineOptions {
     pub auto_install_embedder: bool,
 }
 
+/// Whether an engine runs the code-search embedder (the background
+/// symbol-embed pass behind `find_code`'s semantic ranking). Set through
+/// [`crate::headless::EngineBuilder::code_embedder`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeEmbedder {
+    /// The code graph arms its symbol-embed pass, which builds the code
+    /// embedder (the shared models host, or an in-process load that may
+    /// first download the model) once symbols are pending.
+    #[default]
+    Auto,
+    /// The pass is never armed: no code embedder is built or downloaded,
+    /// and `find_code` answers from its text fallback.
+    Off,
+}
+
 /// Session spawn options (§5.3 :303-314; 3a's core + 3c's `host_tools` —
 /// the `guardrails` / `external_policy` fields are the remaining 3c land).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

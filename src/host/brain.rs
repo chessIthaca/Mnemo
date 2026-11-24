@@ -156,6 +156,10 @@ pub(crate) struct BrainMemoryOptions {
     /// G8 (§5.9.8 :729-731): process-shared resources (the embedder) —
     /// N engines over one handle hold ONE instance.
     pub shared: Option<Arc<SharedResources>>,
+    /// Whether the code graph arms its symbol-embed pass
+    /// ([`crate::headless::CodeEmbedder`]; the headless Engine passes its
+    /// builder's choice).
+    pub code_embedder: crate::headless::CodeEmbedder,
 }
 
 /// Process-shared resources (G8, §5.9.8 :729-731) — Rust-only, injected
@@ -213,6 +217,7 @@ pub(crate) fn wire_brain(
         index_codegraph,
         injected_store,
         shared,
+        code_embedder,
     } = memory;
     // The shared request/response trace log — created first so every provider
     // built below (default, dummy fallback, resolver) records into the same
@@ -967,13 +972,19 @@ pub(crate) fn wire_brain(
                 // lazily — never on the startup path. The cfg'd shadow
                 // binding keeps the light build free of the unused
                 // `mut` (there is no arm method to call there).
+                // `CodeEmbedder::Off` leaves the pass unarmed: nothing is
+                // built or downloaded.
                 #[cfg(feature = "embeddings")]
                 let mut graph = graph;
                 #[cfg(feature = "embeddings")]
-                graph.arm_symbol_embeddings(
-                    &embedder_cache_dir,
-                    config.general.general.bundled_embedding_model.as_deref(),
-                );
+                if code_embedder == crate::headless::CodeEmbedder::Auto {
+                    graph.arm_symbol_embeddings(
+                        &embedder_cache_dir,
+                        config.general.general.bundled_embedding_model.as_deref(),
+                    );
+                }
+                #[cfg(not(feature = "embeddings"))]
+                let _ = code_embedder;
                 let graph = Arc::new(graph);
                 let g = graph.clone();
                 // The open-project overlay (IndexingOverlay.tsx) renders

@@ -802,7 +802,10 @@ async fn engine_start_emits_index_host_events() {
     // startup pass + its events are the contract under test.
     let mut options = opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
     options.index_codegraph = true;
+    // The index events are under test, not code search: keep the code
+    // embedder off so no code model is built or downloaded.
     let engine = Engine::builder(options)
+        .code_embedder(mnemo::headless::CodeEmbedder::Off)
         .provider(llm)
         .start()
         .await

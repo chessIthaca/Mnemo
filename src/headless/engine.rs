@@ -103,6 +103,8 @@ pub struct EngineBuilder {
     /// exclusive with the three seams above (the brain carries its own
     /// transport, store, and shared resources).
     brain: Option<Arc<Brain>>,
+    /// Whether the built brain arms the code-search embedder.
+    code_embedder: crate::headless::CodeEmbedder,
 }
 
 impl EngineBuilder {
@@ -114,6 +116,7 @@ impl EngineBuilder {
             memory_store: None,
             shared: None,
             brain: None,
+            code_embedder: crate::headless::CodeEmbedder::Auto,
         }
     }
 
@@ -166,6 +169,15 @@ impl EngineBuilder {
         self
     }
 
+    /// Whether the engine runs the code-search embedder (default
+    /// [`CodeEmbedder::Auto`](crate::headless::CodeEmbedder::Auto)). `Off`
+    /// never arms the code graph's symbol-embed pass, so no code model is
+    /// built or downloaded. An injected brain keeps its own wiring.
+    pub fn code_embedder(mut self, mode: crate::headless::CodeEmbedder) -> Self {
+        self.code_embedder = mode;
+        self
+    }
+
     /// Build + start (identical to [`Engine::start`] plus the injections).
     pub async fn start(self) -> Result<Engine, EngineError> {
         // Job 6: the whole-brain seam is exclusive with the part seams —
@@ -186,6 +198,7 @@ impl EngineBuilder {
             self.memory_store,
             self.shared,
             self.brain,
+            self.code_embedder,
         )
         .await
     }
@@ -870,6 +883,7 @@ async fn start_inner(
     injected_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
     shared: Option<Arc<crate::host::brain::SharedResources>>,
     injected_brain: Option<Arc<Brain>>,
+    code_embedder: crate::headless::CodeEmbedder,
 ) -> Result<Engine, EngineError> {
     // The workspace gates — row 9 + the §5.9.3 :664 require_git rule
     // (either the option or the workspace marker demands a repo).
@@ -971,6 +985,7 @@ async fn start_inner(
                     index_codegraph: opts.index_codegraph,
                     injected_store,
                     shared,
+                    code_embedder,
                 },
             )
             .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
@@ -1186,6 +1201,7 @@ mod tests {
                 index_codegraph: false,
                 injected_store: None,
                 shared: None,
+                code_embedder: crate::headless::CodeEmbedder::Auto,
             },
         )
         .unwrap();
@@ -1214,6 +1230,40 @@ mod tests {
             panic!("the injected brain is memory-disabled — memory() must error");
         };
         assert_eq!(err.code(), "memory_disabled");
+    }
+
+    /// `CodeEmbedder::Off` leaves the code graph's symbol-embed pass unarmed:
+    /// an engine indexing real code never builds (or downloads) the code
+    /// embedder, and a find_code query does not start one either.
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn code_embedder_off_never_arms_the_symbol_embed_pass() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        std::fs::write(ws.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::create_dir_all(ws.path().join(".coding")).unwrap();
+        let mut options = opts(ws.path(), cfg.path());
+        options.memory = MemoryBackend::Disabled;
+        options.index_codegraph = true;
+        let engine = EngineBuilder::new(options)
+            .code_embedder(crate::headless::CodeEmbedder::Off)
+            .start()
+            .await
+            .unwrap();
+        let graph = engine.codegraph_handle().expect("the graph opened");
+        assert_eq!(
+            graph.code_embedder_state(),
+            crate::codegraph::CodeEmbedderState::Unarmed,
+            "Off never arms the pass"
+        );
+        assert!(graph.query_embedder().is_none(), "a query starts no build");
+        drop(graph);
+        engine.shutdown().await.unwrap();
+        assert!(
+            !cfg.path().join("models").exists(),
+            "nothing was built into the model cache"
+        );
     }
 
     #[tokio::test]

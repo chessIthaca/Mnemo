@@ -291,6 +291,11 @@ pub struct LeadRuntime {
     /// `.coding/logs/`, and its background writer. `None` before the first
     /// engine start and after [`LeadRuntime::shutdown`].
     trace_support: std::sync::Mutex<Option<Arc<TraceSupport>>>,
+    /// Whether the engine runs the code-search embedder: always `Auto` in
+    /// the app; only the tests that index real code turn it off
+    /// (`open_inner_without_code_embedder`), so no test downloads the
+    /// code model.
+    code_embedder: mnemo::headless::CodeEmbedder,
 }
 
 /// The project stores the engine wired into its own agent registries. The
@@ -356,6 +361,31 @@ impl LeadRuntime {
         provider: Option<Arc<dyn LlmClient>>,
         policy: Option<String>,
     ) -> Result<Self, String> {
+        Self::open_with(options, provider, policy, mnemo::headless::CodeEmbedder::Auto).await
+    }
+
+    /// [`Self::open_inner`] with the code-search embedder off: for the tests
+    /// that index real code, which would otherwise download the code model.
+    #[cfg(test)]
+    pub(crate) async fn open_inner_without_code_embedder(
+        options: LeadRuntimeOptions,
+        provider: Option<Arc<dyn LlmClient>>,
+    ) -> Result<Self, String> {
+        Self::open_with(
+            options,
+            provider,
+            Some("mnemo.workflow".to_string()),
+            mnemo::headless::CodeEmbedder::Off,
+        )
+        .await
+    }
+
+    async fn open_with(
+        options: LeadRuntimeOptions,
+        provider: Option<Arc<dyn LlmClient>>,
+        policy: Option<String>,
+        code_embedder: mnemo::headless::CodeEmbedder,
+    ) -> Result<Self, String> {
         if !options.workspace_root.is_dir() {
             return Err(format!(
                 "the selected project root does not exist: {}",
@@ -416,6 +446,7 @@ impl LeadRuntime {
             indexing: crate::mnemo2::indexing::IndexingTracker::new(),
             laya: std::sync::Mutex::new(None),
             trace_support: std::sync::Mutex::new(None),
+            code_embedder,
         };
         runtime.start_engine(provider).await?;
         let engine = runtime.engine_handle().await?;
@@ -1165,7 +1196,7 @@ impl LeadRuntime {
             require_git: false,
             auto_install_embedder: false,
         };
-        let mut builder = Engine::builder(options);
+        let mut builder = Engine::builder(options).code_embedder(self.code_embedder);
         if let Some(provider) = provider {
             builder = builder.provider(provider);
         }

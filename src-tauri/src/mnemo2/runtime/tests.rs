@@ -1286,7 +1286,7 @@ async fn a_new_project_holds_until_its_first_code_index_ends() {
     std::fs::create_dir_all(root.path().join("src")).expect("src");
     std::fs::write(root.path().join("src/lib.rs"), "pub fn indexed() {}\n").expect("source");
     write_config(config.path(), &["scripted-a"]);
-    let runtime = LeadRuntime::open_inner(
+    let runtime = LeadRuntime::open_inner_without_code_embedder(
         options(&root, &config, &state),
         Some(Arc::new(ScriptedLlm::new(Vec::new()))),
     )
@@ -1307,7 +1307,7 @@ async fn a_new_project_holds_until_its_first_code_index_ends() {
     runtime.shutdown().await;
 
     // The index now exists: reopening never holds the project.
-    let reopened = LeadRuntime::open_inner(
+    let reopened = LeadRuntime::open_inner_without_code_embedder(
         options(&root, &config, &state),
         Some(Arc::new(ScriptedLlm::new(Vec::new()))),
     )

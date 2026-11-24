@@ -32,7 +32,16 @@ linker = "rust-lld"
 # always set in the environment, and a non-forced entry is then ignored.
 # `[env]` only reaches processes cargo launches, so installed/release builds
 # are unaffected.
+#
+# `GIT_CEILING_DIRECTORIES` keeps that move invisible to Git's repository
+# discovery: a temp folder directly under `target` would otherwise sit inside
+# this checkout's worktree, so `git` run in such a folder would find the
+# checkout's own `.git` and tests that need "not a repository" (or park a
+# fixture's `.git` away) would see a repository anyway. The ceiling is the
+# `target` folder, so the walk stops before the checkout while a real
+# repository created inside a temp folder is still found.
 [env]
 TMP = { value = "target", relative = true, force = true }
 TEMP = { value = "target", relative = true, force = true }
 TMPDIR = { value = "target", relative = true, force = true }
+GIT_CEILING_DIRECTORIES = { value = "target", relative = true, force = true }

@@ -952,6 +952,74 @@ fn cargo_lock_keeps_the_vendored_patches() {
     );
 }
 
+/// The root `overrides.jsdom` pin and mnemo2's `devDependencies.jsdom` must
+/// name the same exact version, and package-lock.json must lock that version
+/// as the single hoisted copy. `npm ci` on CI's npm 10 rejects the whole
+/// lockfile when the override disagrees with a workspace requirement
+/// ("Invalid: lock file's jsdom@31.0.0 does not satisfy jsdom@31.0.1"), so
+/// build.yml's "Install npm deps" step dies before anything installs. The
+/// override itself must stay: it forces one hoisted jsdom so vitest resolves
+/// it on a clean `npm ci` (c4e34d80).
+///
+/// Regression: Dependabot folded jsdom 31.0.1 into mnemo2/package.json while
+/// the root override stayed at 31.0.0, and build.yml run 45289698182 failed
+/// at "Install npm deps" on both runners.
+#[test]
+fn jsdom_override_matches_the_mnemo2_dev_dependency() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let read_json = |rel: &str| -> serde_json::Value {
+        let text = std::fs::read_to_string(format!("{root}/{rel}"))
+            .unwrap_or_else(|e| panic!("{rel} readable: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{rel} is valid JSON: {e}"))
+    };
+    let root_manifest = read_json("package.json");
+    let mnemo2_manifest = read_json("mnemo2/package.json");
+    let lock = read_json("package-lock.json");
+
+    let override_pin = root_manifest["overrides"]["jsdom"].as_str();
+    let dev_pin = mnemo2_manifest["devDependencies"]["jsdom"].as_str();
+    if let (Some(override_pin), Some(dev_pin)) = (override_pin, dev_pin) {
+        assert_eq!(
+            override_pin, dev_pin,
+            "root package.json overrides.jsdom pins jsdom {override_pin} but \
+             mnemo2/package.json devDependencies.jsdom requires jsdom {dev_pin}: \
+             `npm ci` on CI's npm 10 rejects the lockfile when they differ \
+             (\"Invalid: lock file's jsdom@{override_pin} does not satisfy \
+             jsdom@{dev_pin}\"), failing build.yml's Install npm deps step"
+        );
+    }
+
+    // Only an exact override pin can be compared with the resolved entry; a
+    // floating range (^ ~ > < * x) is not a lockfile version.
+    let Some(override_pin) = override_pin else {
+        return;
+    };
+    if override_pin
+        .chars()
+        .any(|c| matches!(c, '^' | '~' | '>' | '<' | '*' | 'x' | 'X' | '='))
+    {
+        return;
+    }
+    let locked = lock["packages"]["node_modules/jsdom"]["version"].as_str();
+    assert_eq!(
+        locked,
+        Some(override_pin),
+        "package-lock.json locks node_modules/jsdom at {locked:?} but the root \
+         override pins jsdom {override_pin}: `npm ci` installs exactly the \
+         lockfile and rejects it as \"Invalid: lock file's jsdom@{} does not \
+         satisfy jsdom@{override_pin}\" — regenerate it with `npm install \
+         --package-lock-only`",
+        locked.unwrap_or("<missing>")
+    );
+    assert!(
+        lock["packages"].get("mnemo2/node_modules/jsdom").is_none(),
+        "package-lock.json nests a second jsdom under mnemo2/node_modules, but \
+         the root override must leave exactly one hoisted copy for vitest to \
+         resolve on a clean `npm ci` (c4e34d80) — regenerate the lockfile with \
+         `npm install --package-lock-only`"
+    );
+}
+
 /// The PR gate (`.github/workflows/ci.yml`) must keep building, linting and
 /// testing every pull request to main. Before it existed only CodeQL ran on
 /// pull requests, so v2.2.0 shipped with clippy red and Dependabot PRs looked

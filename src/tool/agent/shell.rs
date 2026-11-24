@@ -1230,6 +1230,13 @@ pub(crate) async fn run_command(
         let grace = tokio::time::Instant::now() + READER_JOIN_GRACE;
         let stdout = join_reader_at(&mut readers.out, grace).await;
         let stderr = join_reader_at(&mut readers.err, grace).await;
+        // Kill and REAP the shell before returning. Closing the tree guard
+        // below only STARTS the termination, and a still-terminating process
+        // keeps its working directory open on Windows — a caller that removes
+        // the folder right after the call (a test's TempDir, a worker checkout
+        // cleanup) would fail until the process is gone. Grandchildren are the
+        // guard's job; the caller waits for those it cares about.
+        let _ = child.kill().await;
         return match kind {
             DeadlineKind::Silence => (
                 RunOutcome::SilenceTimeout {
@@ -1781,6 +1788,34 @@ pub(crate) fn test_heartbeat(path: &str) -> String {
     }
 }
 
+/// Remove a test's temp folder once the processes the shell call started have
+/// released it.
+///
+/// A killed process tree terminates asynchronously, and Windows refuses to
+/// delete a folder that a live process still uses as its working directory — so
+/// the `TempDir`'s own drop right after the call can race the termination and
+/// leak the folder. Waiting here keeps it out of the leak and FAILS the test
+/// when the folder never frees, instead of silently leaving it behind.
+#[cfg(test)]
+pub(crate) async fn wait_for_temp_dir_release(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            // Already gone (the fixture removed it): nothing left to clean.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "temp folder {} is still in use: {err}",
+                    path.display()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2022,7 +2057,10 @@ mod tests {
         // instead of waiting out its 60 s, and leave no process behind.
         holder.abort();
         let _ = holder.await;
-
+        // The aborted holder's shell holds the folder as its cwd until the
+        // kill lands; wait for it instead of racing the TempDir drop.
+        wait_for_temp_dir_release(dir.path()).await;
+        wait_for_temp_dir_release(slots.path()).await;
     }
 
     #[test]
@@ -2676,6 +2714,38 @@ mod tests {
         assert_eq!(data["killed"].as_str(), Some("silence"), "{data}");
     }
 
+    /// Regression (plan 35105099): a timed-out call used to return while the
+    /// shell it killed was still terminating. Windows cannot delete a folder
+    /// that a live process uses as its working directory, so a caller removing
+    /// the folder right after the call leaked it — the temp-folder leak this
+    /// plan fixes. The call must reap its own shell before it returns.
+    #[tokio::test]
+    async fn timed_out_call_reaps_its_shell_before_returning() {
+        let dir = tempdir().unwrap();
+        // A window sized from this host's measured boot: the pid write must
+        // land before the deadline fires even under a concurrent build load.
+        let boot = measured_shell_boot(dir.path()).await;
+        let tool = tool_in(dir.path()).with_timeout(boot + Duration::from_secs(2));
+        let cmd = if cfg!(target_os = "windows") {
+            "Set-Content shell.pid $PID; Start-Sleep -Seconds 300"
+        } else {
+            "echo $$ > shell.pid; sleep 300"
+        };
+        let result = tool
+            .execute(json!({"command": cmd, "purpose": "shell reap regression"}))
+            .await;
+        assert!(!result.success, "timed-out command must be a tool error");
+        let pid_text = std::fs::read_to_string(dir.path().join("shell.pid"))
+            .expect("the shell wrote its pid before the deadline fired");
+        let pid: u32 = pid_text.trim().parse().expect("the pid file holds a pid");
+        assert!(
+            !pid_alive(pid),
+            "the call returned before its shell ({pid}) was reaped"
+        );
+        // The caller can remove the folder at once — the leak that was fixed.
+        std::fs::remove_dir_all(dir.path()).expect("the timed-out call left a live cwd behind");
+    }
+
     /// Time a trivial command to learn how long a shell on THIS host can take
     /// to print its first line right now (a PowerShell boot plus its output),
     /// so the limit tests can size their silence window from it. The suite
@@ -2969,6 +3039,9 @@ mod tests {
             .parse()
             .expect("the pid file holds the grandchild's pid");
         assert_eventually_dead(pid).await;
+        // The grandchild reports dead a few ms before the kernel releases its
+        // working directory; wait for that before the TempDir drop races it.
+        wait_for_temp_dir_release(dir.path()).await;
     }
 
     #[tokio::test]
@@ -3469,6 +3542,9 @@ mod tests {
             .find_map(|line| line.trim().parse::<u32>().ok())
             .expect("the command printed the grandchild's pid");
         assert_eventually_dead(pid).await;
+        // The grandchild reports dead a few ms before the kernel releases its
+        // working directory; wait for that before the TempDir drop races it.
+        wait_for_temp_dir_release(dir.path()).await;
     }
 
     /// Regression (plan bfe2b09f), timeout path: `kill_on_drop` killed
@@ -3522,6 +3598,9 @@ mod tests {
             .parse()
             .expect("the pid file holds the grandchild's pid");
         assert_eventually_dead(pid).await;
+        // The grandchild reports dead a few ms before the kernel releases its
+        // working directory; wait for that before the TempDir drop races it.
+        wait_for_temp_dir_release(dir.path()).await;
     }
 
     /// Seed a real git repository, so `content_tree` has an index to copy.

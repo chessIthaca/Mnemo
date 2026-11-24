@@ -172,10 +172,22 @@ mod tests {
 
     #[test]
     fn ancestor_walk_finds_coding_dir() {
+        // The `.cargo/config.toml` [env] redirect keeps the suite's temp folders
+        // inside this checkout's `target`, so a tempdir's ancestors include the
+        // checkout's own `.coding/` — the "no project anywhere" case is proven
+        // above the filesystem root's non-existent child instead.
+        let outside = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("the temp folder has a filesystem root")
+            .join("mnemo-test-no-project-ancestor-walk");
+        assert!(
+            find_coding_dir_ancestor(&outside).is_none(),
+            "no `.coding/` on the ancestor chain of {outside:?}"
+        );
         let dir = tempfile::tempdir().unwrap();
         let deep = dir.path().join("a").join("b").join("c");
         std::fs::create_dir_all(&deep).unwrap();
-        assert!(find_coding_dir_ancestor(&deep).is_none());
         std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
         assert_eq!(
             find_coding_dir_ancestor(&deep).as_deref(),

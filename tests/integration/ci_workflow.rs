@@ -1226,7 +1226,7 @@ fn rust_toolchain_is_pinned_for_local_and_ci() {
 }
 
 /// Temp folders stay inside the checkout: `.cargo/config.toml` `[env]` points
-/// TMP, TEMP and TMPDIR at this checkout's `target/tmp`.
+/// TMP, TEMP and TMPDIR at this checkout's `target` folder.
 ///
 /// The test suite creates thousands of temp folders through `TempDir::new()` /
 /// `tempdir()`, and each one asks `std::env::temp_dir()` where to live. Without
@@ -1235,24 +1235,27 @@ fn rust_toolchain_is_pinned_for_local_and_ci() {
 /// `.tmpXXXXXX` folders behind (31,000 in two days): tempfile ignores a failing
 /// delete, and on Windows a live SQLite handle keeps the folder open. The
 /// `[env]` entries make every cargo-launched process — the tests, the build
-/// scripts and the children they spawn — use this checkout's `target/tmp`.
+/// scripts and the children they spawn — use this checkout's `target` folder.
+///
+/// The value is `target`, not `target/tmp`: cargo creates `target/tmp`
+/// (CARGO_TARGET_TMPDIR) only while it builds or runs an integration-test or
+/// bench target, so a unit-test binary would get a temp folder that does not
+/// exist yet and every `tempdir()` would fail with NotFound.
 ///
 /// Regression: without the `[env]` table in `.cargo/config.toml`,
 /// `temp_dir()` is the system temp folder and this test fails.
 #[test]
 fn temp_dir_is_inside_the_checkouts_target_dir() {
-    let expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("tmp");
+    let expected = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
     let temp = std::env::temp_dir();
     let canonical = |path: &std::path::Path| {
         std::fs::canonicalize(path).unwrap_or_else(|error| {
             panic!(
                 "{path:?} does not resolve ({error}): `.cargo/config.toml` must \
                  carry an `[env]` table with TMP, TEMP and TMPDIR = \
-                 {{ value = \"target/tmp\", relative = true, force = true }}, so \
+                 {{ value = \"target\", relative = true, force = true }}, so \
                  every cargo-run process keeps its temp folders inside this \
-                 checkout's target/tmp"
+                 checkout's target folder"
             )
         })
     };
@@ -1268,7 +1271,7 @@ fn temp_dir_is_inside_the_checkouts_target_dir() {
         "std::env::temp_dir() is {temp:?} (canonical {actual:?}), but a \
          cargo-run process must write its temp folders to this checkout's \
          {wanted:?}. Add the `[env]` table with TMP, TEMP and TMPDIR = \
-         {{ value = \"target/tmp\", relative = true, force = true }} to \
+         {{ value = \"target\", relative = true, force = true }} to \
          .cargo/config.toml: without it every test temp folder lands in the \
          user's system temp folder and leaks there (tempfile ignores the delete \
          error when a handle is still open on Windows)"

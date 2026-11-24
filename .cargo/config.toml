@@ -12,17 +12,27 @@ linker = "rust-lld"
 
 # Temp folders: every temp folder a cargo-launched process (tests, build
 # scripts, the children they spawn) creates stays inside this checkout's own
-# target/tmp instead of the user's system temp folder. `tempfile`'s TempDir and
-# every `std::env::temp_dir()` caller read TMP (Windows) or TMPDIR (Unix), so
-# the ~2,600 `TempDir::new()`/`tempdir()` call sites follow without edits.
+# target folder instead of the user's system temp folder. `tempfile`'s TempDir
+# and every `std::env::temp_dir()` caller read TMP (Windows) or TMPDIR (Unix),
+# so the ~2,600 `TempDir::new()`/`tempdir()` call sites follow without edits.
+#
+# The value is `target`, not `target/tmp`: cargo creates `target/tmp`
+# (CARGO_TARGET_TMPDIR) only while it builds or runs an integration-test or
+# bench target, so a unit-test binary — `cargo test --lib`, and a warm
+# `cargo test --workspace`, which runs the unit tests first — would see TMP
+# pointing at a folder that does not exist yet and every `tempdir()` would fail
+# with NotFound. Cargo always has `target` in place before it starts a test or
+# `cargo run` process, and `cargo clean` and the Mnemo2 pool trim remove it with
+# the checkout; the temporary `.tmpXXXXXX` folders sit beside `debug/` and
+# `release/`.
 #
 # `relative = true` resolves the value against the folder holding this
 # `.cargo` directory, so each worker/pool checkout uses its own
-# <checkout>/target/tmp (`cargo clean` and the Mnemo2 pool trim remove it).
-# `force = true` is required on Windows: TMP and TEMP are always set in the
-# environment, and a non-forced entry is then ignored. `[env]` only reaches
-# processes cargo launches, so installed/release builds are unaffected.
+# <checkout>/target. `force = true` is required on Windows: TMP and TEMP are
+# always set in the environment, and a non-forced entry is then ignored.
+# `[env]` only reaches processes cargo launches, so installed/release builds
+# are unaffected.
 [env]
-TMP = { value = "target/tmp", relative = true, force = true }
-TEMP = { value = "target/tmp", relative = true, force = true }
-TMPDIR = { value = "target/tmp", relative = true, force = true }
+TMP = { value = "target", relative = true, force = true }
+TEMP = { value = "target", relative = true, force = true }
+TMPDIR = { value = "target", relative = true, force = true }

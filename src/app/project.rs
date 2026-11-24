@@ -260,6 +260,19 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// A path with no project (`.coding/`) on its ancestor chain: the filesystem
+    /// root above this checkout plus a component that does not exist. The
+    /// `.cargo/config.toml` [env] redirect keeps the suite's temp folders inside
+    /// this checkout's `target`, so no real tempdir can stand in for "outside
+    /// any project" — its ancestors include the checkout's own `.coding/`.
+    fn path_outside_any_project(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("the temp folder has a filesystem root")
+            .join(format!("mnemo-test-no-project-{name}"))
+    }
+
     #[test]
     fn from_root_computes_paths() {
         let p = Project::from_root("/proj");
@@ -509,29 +522,32 @@ prompt = "Custom project-specific merge flow."
         let dir = tempdir().unwrap();
         let mut registry = ProjectRegistry::default();
         registry.add("test", dir.path().to_str().unwrap());
-        // Launch from an unrelated temp dir.
-        let other = tempdir().unwrap();
-        let resolved = Project::resolve(other.path(), &registry).unwrap();
+        // Launch from a path with no project above it (a tempdir no longer
+        // qualifies: its ancestors include this checkout's `.coding/`).
+        let launch = path_outside_any_project("single-registry-entry");
+        let resolved = Project::resolve(&launch, &registry).unwrap();
         assert_eq!(resolved.root, dir.path());
     }
 
     #[test]
     fn resolve_fails_when_nothing_found() {
-        let dir = tempdir().unwrap();
         let registry = ProjectRegistry::default();
-        let result = Project::resolve(dir.path(), &registry);
+        let launch = path_outside_any_project("nothing-found");
+        let result = Project::resolve(&launch, &registry);
         assert!(result.is_err());
     }
 
     #[test]
     fn resolve_prefers_exact_registry_match() {
-        let dir = tempdir().unwrap();
-        let other = tempdir().unwrap();
+        // No ancestor project above either entry, so only the exact-match rule
+        // can resolve the launch path.
+        let dir = path_outside_any_project("exact-match-a");
+        let other = path_outside_any_project("exact-match-b");
         let mut registry = ProjectRegistry::default();
-        registry.add("a", dir.path().to_str().unwrap());
-        registry.add("b", other.path().to_str().unwrap());
+        registry.add("a", dir.to_str().unwrap());
+        registry.add("b", other.to_str().unwrap());
         // Launch dir matches "a" exactly.
-        let resolved = Project::resolve(dir.path(), &registry).unwrap();
-        assert_eq!(resolved.root, dir.path());
+        let resolved = Project::resolve(&dir, &registry).unwrap();
+        assert_eq!(resolved.root, dir);
     }
 }

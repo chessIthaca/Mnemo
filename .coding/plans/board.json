@@ -4254,6 +4254,39 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Dependency manifest and lockfile alignment only."
+    },
+    {
+      "id": "35105099",
+      "status": "open",
+      "created_at_ms": 1795498645987,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test and dev-tooling hygiene only: cargo [env] for processes cargo launches and test teardown fixes; no product behavior changes."
+    },
+    {
+      "id": "ee73bd2f",
+      "status": "open",
+      "created_at_ms": 1795524782173,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Changes agent-worker hand-back timing and recovery inside the team runtime and the lead skill text; no OpenSpec capability requirement changes. The external-lead behaviour is described in the skill, which step 2 updates."
+    },
+    {
+      "id": "1b038bb3",
+      "status": "open",
+      "created_at_ms": 1795524975051,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Gate decision plumbing between the plugin hook and the external-lead server plus skill wording; the external-lead capability's requirements are unchanged (the gate already allowed agent-worker launches; this makes the allow effective)."
     }
   ]
 }

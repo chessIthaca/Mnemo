@@ -243,10 +243,13 @@ impl AgentWatch {
         observed.stall_noticed = false;
     }
 
-    /// Stop the watcher task.
-    pub(super) fn stop(&self) {
-        if let Some(task) = self.lock().task.take() {
+    /// Stop the watcher task, and wait until the aborted task is dropped (it
+    /// lets go of what it holds only when the runtime polls it again).
+    pub(super) async fn stop(&self) {
+        let task = self.lock().task.take();
+        if let Some(task) = task {
             task.abort();
+            let _ = task.await;
         }
     }
 

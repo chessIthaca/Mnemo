@@ -1274,7 +1274,7 @@ impl TeamRuntime {
     pub async fn shutdown(&self) {
         // Void a pending telemetry flush: the final persist is the last write.
         self.persistence.closed.store(true, Ordering::SeqCst);
-        self.agent_watch.stop();
+        self.agent_watch.stop().await;
         *self.lead_session.lock().await = None;
         let live = {
             let mut map = self.live.lock().await;
@@ -1289,6 +1289,11 @@ impl TeamRuntime {
         // file), which must be closed once shutdown returns.
         for worker in &live {
             let _ = worker.session.close_and_wait().await;
+        }
+        // An aborted pump holds the engine until the runtime polls it again:
+        // wait until each one is dropped.
+        for worker in live {
+            let _ = worker.pump.await;
         }
         // The pumps' detached tasks (a transcript refresh running Git in a
         // checkout, a turn-end proof trigger, the proof jobs it starts)

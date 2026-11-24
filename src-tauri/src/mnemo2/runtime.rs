@@ -226,6 +226,12 @@ impl LeadPersistence {
     }
 }
 
+/// How long [`LeadRuntime::shutdown`] waits, after the engine's own shutdown,
+/// for the last task still holding the engine to let go. Such a task ends on
+/// its next poll, so this is normally a few milliseconds; the bound keeps the
+/// whole teardown inside the app's `SHUTDOWN_DEADLINE`.
+const ENGINE_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 struct LiveLead {
     generation: u64,
     session: AgentSession,
@@ -243,6 +249,16 @@ impl LiveLead {
         self.pump.abort();
         if let Some(notifications) = &self.notifications {
             notifications.abort();
+        }
+    }
+
+    /// Wait until the aborted pump and notification tasks are dropped: an
+    /// aborted task lets go of what it holds only when the runtime polls it
+    /// again, and a shutdown must not return before that.
+    async fn join_aborted(self) {
+        let _ = self.pump.await;
+        if let Some(notifications) = self.notifications {
+            let _ = notifications.await;
         }
     }
 }
@@ -1131,7 +1147,7 @@ impl LeadRuntime {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        self.indexing.stop();
+        self.indexing.stop().await;
         if let Some(team) = self.team.lock().await.take() {
             team.shutdown().await;
         }
@@ -1150,9 +1166,27 @@ impl LeadRuntime {
         if let Some(live) = live {
             live.abort();
             let _ = live.session.send(SessionCommand::Interrupt).await;
+            live.join_aborted().await;
         }
         if let Some(engine) = self.engine.lock().await.take() {
             let _ = engine.shutdown().await;
+            // A task the shutdown just woke (an aborted one, or one whose
+            // event stream closed) still holds its engine handle until the
+            // runtime polls it again: wait, bounded, until the last handle
+            // is gone, so the engine's stores are closed once this returns.
+            let weak = Arc::downgrade(&engine);
+            drop(engine);
+            let released = async {
+                while weak.strong_count() > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            if tokio::time::timeout(ENGINE_RELEASE_WAIT, released).await.is_err() {
+                eprintln!(
+                    "lead shutdown: the engine was still held {}s after its shutdown",
+                    ENGINE_RELEASE_WAIT.as_secs()
+                );
+            }
         }
         // The board and the external lead's knowledge stores hold the
         // engine's memory store and code graph: release them with the

@@ -72,9 +72,11 @@ enum IdleRace {
 }
 
 /// The host's register of agent background tasks that outlive their agent
-/// loop (the session-end memory consolidation). Each holds the memory store,
-/// so a host that shuts down joins them before it drops the store's owner —
-/// a detached task would keep the project's SQLite files open.
+/// loop (the session-end memory consolidation). Each holds the memory store
+/// until it ends, so a host that shuts down gives them a grace period to
+/// finish before it drops the store's owner. A consolidation is never cut
+/// short: one still running after the grace finishes detached, as before,
+/// and releases the store when it ends.
 #[derive(Clone, Default)]
 pub struct BackgroundTasks(Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>);
 
@@ -86,17 +88,24 @@ impl BackgroundTasks {
         tasks.push(task);
     }
 
-    /// Wait up to `grace` for every tracked task, then abort the rest and
-    /// wait for them to drop what they hold.
-    pub async fn join(&self, grace: std::time::Duration) {
-        let tasks = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+    /// Wait up to `grace` for every tracked task, all of them concurrently
+    /// under one deadline. Tasks still running after it are NOT aborted —
+    /// an aborted consolidation would never write its episodic summary —
+    /// they stay registered and finish detached. Returns how many did.
+    pub async fn join(&self, grace: std::time::Duration) -> usize {
+        let mut tasks =
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
         let deadline = tokio::time::Instant::now() + grace;
-        for mut task in tasks {
-            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-                task.abort();
-                let _ = task.await;
-            }
-        }
+        let _ =
+            tokio::time::timeout_at(deadline, futures::future::join_all(tasks.iter_mut())).await;
+        tasks.retain(|task| !task.is_finished());
+        let still_running = tasks.len();
+        // Keep the stragglers registered (pruned once they finish).
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(tasks);
+        still_running
     }
 }
 
@@ -1967,6 +1976,43 @@ mod tests {
     use crate::config::SafetyMode;
     use crate::error::Result;
     use crate::memory::embedder::HashEmbedder;
+
+    /// The shutdown join waits for every task concurrently under ONE
+    /// deadline and never aborts a straggler: it finishes detached.
+    #[tokio::test]
+    async fn background_join_is_concurrent_and_never_aborts_a_straggler() {
+        let tasks = BackgroundTasks::default();
+        let quick_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..3 {
+            let done = quick_done.clone();
+            tasks.register(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        let straggler_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = straggler_done.clone();
+        tasks.register(tokio::spawn(async move {
+            let _ = finish_rx.await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        // Three 150 ms tasks fit a 300 ms grace only when awaited together.
+        let detached = tasks.join(std::time::Duration::from_millis(300)).await;
+        assert_eq!(quick_done.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(detached, 1, "only the straggler is left running");
+
+        // The straggler was not aborted: it still completes its work.
+        finish_tx.send(()).expect("the straggler is still alive");
+        for _ in 0..100 {
+            if straggler_done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(straggler_done.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     /// The concrete app workflow behind a loop's neutral handle (2b.3): the
     /// arm tests attach policies through the same app→app downcast the

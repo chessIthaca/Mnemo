@@ -214,9 +214,18 @@ fn worktree_binding(
     })
 }
 
-/// How long [`Engine::shutdown`] lets in-flight session-end consolidations
-/// finish before it stops them.
-const CONSOLIDATION_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long [`Engine::shutdown`] waits for the cancelled agents' loops to be
+/// released.
+///
+/// [`LOOP_RELEASE_WAIT`] + [`CONSOLIDATION_GRACE`] must stay under the app's
+/// own shutdown deadline (Mnemo2's `SHUTDOWN_DEADLINE`, 10 s), or the app
+/// abandons the teardown before the engine's waits end.
+const LOOP_RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long [`Engine::shutdown`] waits for in-flight session-end
+/// consolidations before it returns and lets the rest finish detached. See
+/// [`LOOP_RELEASE_WAIT`] for the budget both must fit in.
+const CONSOLIDATION_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// A dropped engine stops its event pump even without a `shutdown`: the
 /// pump task holds the shared state, so a still-running pump would keep the
@@ -596,16 +605,19 @@ impl Engine {
     /// Shut the engine down (§5.3 :301): cancel every live agent (the
     /// sessions, their subagents and the host's main agent) after stopping
     /// and joining the pump, deregister, and wait (bounded) until their
-    /// loops are released. The session-end consolidations those agents
-    /// start get [`CONSOLIDATION_GRACE`] to finish and are stopped after
-    /// it. Once this returns, nothing the agents left behind holds the
-    /// project's stores: dropping the engine then closes them.
+    /// loops are released ([`LOOP_RELEASE_WAIT`]). The session-end
+    /// consolidations those agents start get [`CONSOLIDATION_GRACE`] to
+    /// finish; any still running then finish detached, never cut short.
+    /// After this returns and the engine is dropped, the project's stores
+    /// close once those consolidations (and any loop that outlived the wait,
+    /// with the consolidation it then starts) have finished — immediately in
+    /// the usual case where none is left.
     pub async fn shutdown(&self) -> Result<(), EngineError> {
         self.inner.sessions.lock().await.clear();
         // Stop the pump first, as before: no session event is published
         // once shutdown has begun. The pump holds the shared state, so it
         // is joined, not just aborted.
-        let pump = self.pump.lock().expect("pump lock poisoned").take();
+        let pump = self.pump.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(pump) = pump {
             pump.abort();
             let _ = pump.await;
@@ -626,22 +638,27 @@ impl Engine {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         };
-        if tokio::time::timeout(std::time::Duration::from_secs(10), released)
-            .await
-            .is_err()
-        {
-            eprintln!("engine shutdown: an agent loop was still live after 10s");
+        if tokio::time::timeout(LOOP_RELEASE_WAIT, released).await.is_err() {
+            eprintln!(
+                "engine shutdown: an agent loop was still live after {}s",
+                LOOP_RELEASE_WAIT.as_secs()
+            );
         }
         // The session-end consolidations the cancelled agents started hold
         // the memory store: give them a bounded grace to finish their
-        // writes, then stop the rest.
+        // writes; the rest finish detached and release it when they end.
         let background = self.inner.host.manager.lock().await.background_tasks();
-        background.join(CONSOLIDATION_GRACE).await;
+        let detached = background.join(CONSOLIDATION_GRACE).await;
+        if detached > 0 {
+            eprintln!(
+                "engine shutdown: {detached} memory consolidation(s) still running;                  they finish in the background"
+            );
+        }
         // Drop the engine's bus sender LAST: every subscriber's `recv` then
         // observes `Closed`. `shutdown` borrows `&self` so a shared
         // `Arc<Engine>` can shut down, which means the sender must be
         // takeable rather than left alive with the struct (§7 row 15).
-        let _ = self.bus.lock().expect("session bus lock poisoned").take();
+        let _ = self.bus.lock().unwrap_or_else(|e| e.into_inner()).take();
         Ok(())
     }
 

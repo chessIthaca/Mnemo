@@ -1868,7 +1868,8 @@ async fn external_policy_gate_and_turn_end_row_32() {
     // The engine's own teardown closes the project's stores before the
     // temp folders are removed.
     engine.shutdown().await.expect("shutdown");
-}/// Row 32's declarative half (G6 tiers 2 + 1, D4, §5.9.6): the
+}
+/// Row 32's declarative half (G6 tiers 2 + 1, D4, §5.9.6): the
 /// guardrails and the policy registry through a real engine. (a1) A
 /// tool selection of `include: [Read]` drops `file_edit` — the
 /// per-spawn factory clone's registration table narrows the registry

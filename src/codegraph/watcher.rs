@@ -151,6 +151,11 @@ impl GraphWatcher {
         watcher.watch(&root, RecursiveMode::Recursive)?;
 
         let task_root = root.clone();
+        // The debounce task only borrows the graph: it holds a `Weak` and
+        // upgrades it for one pass at a time, so the graph (and its open
+        // SQLite files) closes as soon as its owner drops it, without
+        // waiting for this task to notice the closed channel.
+        let graph = Arc::downgrade(&graph);
         // Run the debounce loop on a Tokio runtime. Most callers are already
         // inside one (the headless engine, tests), but a host may build its
         // brain from a context with NO reactor (e.g. an app's setup hook on
@@ -199,7 +204,7 @@ impl GraphWatcher {
 
     /// The debounce loop: consume watcher events, coalesce a burst, then index.
     async fn debounce_loop(
-        graph: Arc<CodeGraph>,
+        graph: std::sync::Weak<CodeGraph>,
         root: PathBuf,
         mut rx: tokio_mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
         debounce: Duration,
@@ -232,6 +237,10 @@ impl GraphWatcher {
             if !dirty {
                 continue; // only non-source/ignored paths changed
             }
+            // The graph's owner is gone: nothing is left to index.
+            let Some(graph) = graph.upgrade() else {
+                return;
+            };
             // Wait for any in-progress pass (startup or manual refresh) to
             // finish before starting ours — `index()` owns the indexing flag
             // and clears it via a drop guard on EVERY exit path (Ok, Err,

@@ -14037,8 +14037,8 @@ async fn manual_pump_worker(
     })
     .await;
     let session = team
-        .engine
-        .clone()
+        .engine()
+        .expect("the team's engine")
         .spawn(mnemo::headless::SpawnOptions {
             name: Some(worker.name.clone()),
             model: None,
@@ -14066,7 +14066,7 @@ async fn manual_pump_worker(
     let pump = tokio::spawn(pump_worker(
         worker.id.clone(),
         generation,
-        team.engine.clone(),
+        team.engine().expect("the team's engine"),
         session_id,
         receiver,
         team.events.clone(),

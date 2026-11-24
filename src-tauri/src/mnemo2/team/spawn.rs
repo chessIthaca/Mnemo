@@ -376,7 +376,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             id.clone(),
             generation,
-            self.engine.clone(),
+            self.engine()?,
             session_id,
             receiver,
             self.events.clone(),
@@ -482,7 +482,7 @@ impl TeamRuntime {
             check_commands,
         } = spec;
         let name = trace_identity.agent_name.clone();
-        self.engine
+        self.engine()?
             .spawn(SpawnOptions {
                 name: Some(name),
                 model,

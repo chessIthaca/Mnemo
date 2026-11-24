@@ -575,6 +575,17 @@ impl LeadRuntime {
             .ok_or_else(|| "the headless engine is not running".to_string())
     }
 
+    /// A weak handle to the running engine's memory store — the teardown
+    /// test proves nothing keeps the store alive after shutdown and drop.
+    #[cfg(test)]
+    pub(crate) async fn memory_store_weak(
+        &self,
+    ) -> Option<std::sync::Weak<dyn mnemo::memory::MemoryStoreTrait>> {
+        let engine = self.engine.lock().await.clone()?;
+        let store = engine.memory_store_handle()?;
+        Some(Arc::downgrade(&store))
+    }
+
     /// The shared plan board, once the engine has started.
     pub(crate) fn board_handle(&self) -> Option<Arc<PlanBoard>> {
         self.board.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -1112,6 +1123,12 @@ impl LeadRuntime {
         if let Some(engine) = self.engine.lock().await.take() {
             let _ = engine.shutdown().await;
         }
+        // The board and the external lead's knowledge stores hold the
+        // engine's memory store and code graph: release them with the
+        // engine, so the project's SQLite files close on shutdown rather
+        // than whenever the last handle to this runtime goes away.
+        self.stores.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.board.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     async fn start_engine(&self, provider: Option<Arc<dyn LlmClient>>) -> Result<(), String> {

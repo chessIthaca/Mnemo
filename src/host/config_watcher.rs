@@ -47,6 +47,19 @@ pub struct ConfigWatcher {
     _task: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// Dropping the watcher cancels its debounce task right away. Closing the
+/// event channel alone ends the loop only after its debounce sleep, and
+/// until then the task's `reload` closure keeps everything it captured (a
+/// host's live config handles, and through them the project's stores)
+/// alive — and could still run a reload against a project that is closing.
+impl Drop for ConfigWatcher {
+    fn drop(&mut self) {
+        if let Some(task) = self._task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl ConfigWatcher {
     /// Watch `config_dir` for changes to the four live config files and call
     /// `reload` once per debounced burst.

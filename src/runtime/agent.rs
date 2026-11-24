@@ -71,6 +71,35 @@ enum IdleRace {
     Cut,
 }
 
+/// The host's register of agent background tasks that outlive their agent
+/// loop (the session-end memory consolidation). Each holds the memory store,
+/// so a host that shuts down joins them before it drops the store's owner —
+/// a detached task would keep the project's SQLite files open.
+#[derive(Clone, Default)]
+pub struct BackgroundTasks(Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>);
+
+impl BackgroundTasks {
+    /// Track one task (finished ones are pruned on the way).
+    pub(crate) fn register(&self, task: tokio::task::JoinHandle<()>) {
+        let mut tasks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    /// Wait up to `grace` for every tracked task, then abort the rest and
+    /// wait for them to drop what they hold.
+    pub async fn join(&self, grace: std::time::Duration) {
+        let tasks = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = tokio::time::Instant::now() + grace;
+        for mut task in tasks {
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+}
+
 /// The agent task's state: its conversation history + the agent loop.
 pub struct AgentTask {
     pub id: AgentId,
@@ -114,6 +143,10 @@ pub struct AgentTask {
     /// consolidations. Cleared by the spawned task on completion (success
     /// or failure).
     consolidation_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the background consolidation's task handle is registered, so
+    /// the host can join it on shutdown: the task holds the memory store
+    /// (and its open SQLite files). `None` for a task no host tracks.
+    background_tasks: Option<BackgroundTasks>,
     /// When the agent last finished handling a command (the start of the
     /// current idle spell). `None` before the first command and right after
     /// an idle compaction attempt, so one idle spell compacts at most once.
@@ -278,11 +311,18 @@ impl AgentTask {
             auto_continue_streak: 0,
             unattended: false,
             consolidation_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            background_tasks: None,
             idle_since: None,
             cache_lifetime: None,
             compaction_committed: false,
             compaction_end_sent: false,
         }
+    }
+
+    /// Register this agent's background consolidation tasks in `tasks`
+    /// (the host's [`BackgroundTasks`]), so a shutdown can join them.
+    pub(crate) fn set_background_tasks(&mut self, tasks: BackgroundTasks) {
+        self.background_tasks = Some(tasks);
     }
 
     /// 3a.6 (G5): seed the conversation from a transcript — the resume
@@ -1309,7 +1349,7 @@ impl AgentTask {
                     None,
                     crate::provider::trace::TracePurpose::MemoryConsolidation,
                 );
-                tokio::spawn(async move {
+                let consolidation = tokio::spawn(async move {
                     let _guard = guard;
                     // The policy hook still precedes memory session teardown.
                     policy.on_session_end().await;
@@ -1328,6 +1368,9 @@ impl AgentTask {
                         eprintln!("memory: consolidate_session({sid}) failed: {e}");
                     }
                 });
+                if let Some(tasks) = &self.background_tasks {
+                    tasks.register(consolidation);
+                }
             }
         }
     }

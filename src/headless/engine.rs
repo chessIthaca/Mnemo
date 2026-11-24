@@ -77,8 +77,11 @@ pub struct Engine {
     /// "hash" sentinel mapped to None) — the memory overview's line
     /// (3b.2 D2).
     configured_embedding_model: Option<String>,
-    /// The event pump task — `shutdown` aborts it.
-    pump: tokio::task::JoinHandle<()>,
+    /// The event pump task — `shutdown` aborts and joins it, and a drop
+    /// aborts it. The pump holds the shared state (and through it every
+    /// agent loop and the project's stores), so it must never outlive the
+    /// engine. Behind a lock so `shutdown(&self)` can take it to join.
+    pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether the builder supplied the model transport. An injected
     /// provider remains the transport for model-pinned sessions instead of
     /// being replaced by a config-resolved client.
@@ -209,6 +212,28 @@ fn worktree_binding(
         codegraph,
         check_commands,
     })
+}
+
+/// How long [`Engine::shutdown`] lets in-flight session-end consolidations
+/// finish before it stops them.
+const CONSOLIDATION_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A dropped engine stops its event pump even without a `shutdown`: the
+/// pump task holds the shared state, so a still-running pump would keep the
+/// host runtime, its agent loops and the project's stores alive for as long
+/// as the tokio runtime lives. The agent tasks then end on their next poll,
+/// once the dropped manager has closed their command channels.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Some(pump) = self
+            .pump
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            pump.abort();
+        }
+    }
 }
 
 impl Engine {
@@ -568,24 +593,50 @@ impl Engine {
         }
     }
 
-    /// Shut the engine down (§5.3 :301): cancel every live session,
-    /// deregister, stop the pump. (The session-end consolidation rides
-    /// the kernel's existing shutdown path when the loops' tasks end.)
+    /// Shut the engine down (§5.3 :301): cancel every live agent (the
+    /// sessions, their subagents and the host's main agent) after stopping
+    /// and joining the pump, deregister, and wait (bounded) until their
+    /// loops are released. The session-end consolidations those agents
+    /// start get [`CONSOLIDATION_GRACE`] to finish and are stopped after
+    /// it. Once this returns, nothing the agents left behind holds the
+    /// project's stores: dropping the engine then closes them.
     pub async fn shutdown(&self) -> Result<(), EngineError> {
-        let agents: Vec<crate::runtime::AgentId> = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .values()
-            .copied()
-            .collect();
-        for agent in agents {
-            let mgr = self.inner.host.manager.lock().await;
-            let _ = mgr.send(agent, crate::runtime::AgentCommand::Cancel);
-        }
         self.inner.sessions.lock().await.clear();
-        self.pump.abort();
+        // Stop the pump first, as before: no session event is published
+        // once shutdown has begun. The pump holds the shared state, so it
+        // is joined, not just aborted.
+        let pump = self.pump.lock().expect("pump lock poisoned").take();
+        if let Some(pump) = pump {
+            pump.abort();
+            let _ = pump.await;
+        }
+        let loops: Vec<std::sync::Weak<crate::agent::AgentLoop>> = {
+            let manager = self.inner.host.manager.lock().await;
+            let mut agent_loops = self.inner.host.agent_loops.lock().await;
+            for handle in manager.list() {
+                let _ = manager.send(handle.id, crate::runtime::AgentCommand::Cancel);
+            }
+            agent_loops
+                .drain()
+                .map(|(_, agent_loop)| Arc::downgrade(&agent_loop))
+                .collect()
+        };
+        let released = async {
+            while loops.iter().any(|weak| weak.upgrade().is_some()) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(10), released)
+            .await
+            .is_err()
+        {
+            eprintln!("engine shutdown: an agent loop was still live after 10s");
+        }
+        // The session-end consolidations the cancelled agents started hold
+        // the memory store: give them a bounded grace to finish their
+        // writes, then stop the rest.
+        let background = self.inner.host.manager.lock().await.background_tasks();
+        background.join(CONSOLIDATION_GRACE).await;
         // Drop the engine's bus sender LAST: every subscriber's `recv` then
         // observes `Closed`. `shutdown` borrows `&self` so a shared
         // `Arc<Engine>` can shut down, which means the sender must be
@@ -778,11 +829,9 @@ impl Engine {
             .enable_all()
             .build()
             .map_err(|e| EngineError::start_failed(format!("runtime build failed: {e}")))?;
-        let engine = runtime.block_on(Self::start(opts))?;
-        Ok(Engine {
-            _owned_runtime: Some(runtime),
-            ..engine
-        })
+        let mut engine = runtime.block_on(Self::start(opts))?;
+        engine._owned_runtime = Some(runtime);
+        Ok(engine)
     }
 }
 
@@ -996,7 +1045,7 @@ async fn start_inner(
         host_events_tx,
         default_permissions: opts.permissions,
         configured_embedding_model,
-        pump,
+        pump: std::sync::Mutex::new(Some(pump)),
         has_injected_provider,
         _owned_runtime: None,
     })

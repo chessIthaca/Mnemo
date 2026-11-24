@@ -2955,6 +2955,11 @@ mod tests {
         let second = create(&board, "Second importer");
         board.tick(&second.id, 0, "ok").unwrap();
         board.tick(&second.id, 1, "ok").unwrap();
+        // Windows stamps file mtimes from a coarse clock (one ~15.6 ms tick)
+        // while the plan's creation time is precise: a write in the same tick
+        // can carry an mtime just before the plan's. Step past it, as the
+        // first plan's setup does.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&path, "# SPEC: Importer\n\nAmended durable contract.\n").unwrap();
         let CloseOutcome::Closed {
             knowledge_nudge, ..

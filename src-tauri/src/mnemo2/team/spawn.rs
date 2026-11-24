@@ -27,7 +27,10 @@ use tokio::sync::Mutex;
 use super::dispatch::PlanRef;
 use super::guardrails::guardrails_for;
 use super::nudge::NUDGE_STRIKE_LIMIT;
-use super::record::{kickoff_message, note_model, session_model_spec, WorkerRecord, WorkerStatus};
+use super::record::{
+    fresh_launch_token, kickoff_message, note_model, session_model_spec, WorkerRecord,
+    WorkerStatus,
+};
 use super::routing::{logs_label, outcome_row, ClaudeAgentDispatch};
 use super::pump::pump_worker;
 use super::{LiveWorker, TeamRuntime};
@@ -254,6 +257,7 @@ impl TeamRuntime {
             claude_agent_id: None,
             claude_agent_transcript: None,
             handed_back: None,
+            launch_token: None,
             integrations: Vec::new(),
             integration_note: None,
             base_commit: Some(base_tip.clone()),
@@ -306,6 +310,8 @@ impl TeamRuntime {
         record.status = WorkerStatus::Working;
         record.brief_sent = true;
         record.compacting = false;
+        // The dispatch answer's launch prompt carries a fresh one-time token.
+        record.launch_token = Some(fresh_launch_token());
         note_model(&mut record, &model);
         self.update_worker(&record.id, |worker| {
             worker.claude_agent = record.claude_agent.clone();
@@ -314,6 +320,7 @@ impl TeamRuntime {
             worker.status = WorkerStatus::Working;
             worker.brief_sent = true;
             worker.compacting = false;
+            worker.launch_token = record.launch_token.clone();
             note_model(worker, &model);
         })
         .await;

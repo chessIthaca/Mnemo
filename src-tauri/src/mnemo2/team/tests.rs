@@ -1776,6 +1776,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         claude_agent_id: None,
         claude_agent_transcript: None,
         handed_back: None,
+        launch_token: None,
         integrations: Vec::new(),
         integration_note: None,
         base_commit: None,
@@ -16070,11 +16071,14 @@ async fn agent_dispatch_read_back_uses_the_updated_record_and_reuses_the_same_bl
     let first = claude_agent_block(&record).expect("the first agent block");
     assert!(record.read_back, "the returned record keeps read_back: {record:?}");
     assert!(record.routing.is_some(), "the returned record keeps routing");
+    // The launch token comes first, then the READ_BACK kickoff.
     assert!(
-        first["prompt"]
-            .as_str()
-            .is_some_and(|prompt| prompt.starts_with(super::record::AGENT_READ_BACK_KICKOFF)),
-        "the prompt uses the READ_BACK kickoff"
+        first["prompt"].as_str().is_some_and(|prompt| prompt
+            .starts_with("Mnemo launch token: mnemo-launch-")
+            && prompt
+                .split_once("\n\n")
+                .is_some_and(|(_, rest)| rest.starts_with(super::record::AGENT_READ_BACK_KICKOFF))),
+        "the prompt carries the launch token, then the READ_BACK kickoff"
     );
 
     let mut retry_request = agent_dispatch_request(
@@ -19601,9 +19605,19 @@ async fn team_message_on_an_agent_worker_returns_the_sendmessage_instruction() {
         "{}",
         answer.output
     );
+    // The message for the new agent carries a fresh one-time launch token on
+    // its first line, recorded on the worker for the agent gate.
+    let token = worker.launch_token.clone().expect("a fresh launch token");
+    assert!(token.starts_with("mnemo-launch-"), "{token}");
     assert_eq!(
         answer.data.expect("data")["continue_agent"],
-        json!({"agent_id": null, "worktree": worker.worktree, "message": "Also add the doc comment."})
+        json!({
+            "agent_id": null,
+            "worktree": worker.worktree,
+            "message": format!(
+                "Mnemo launch token: {token} (Mnemo's gate starts this agent without a permission prompt once)\n\nAlso add the doc comment."
+            ),
+        })
     );
     let entry = worker.inbox.last().expect("the inbox entry");
     assert_eq!(entry.sender, MessageSender::ExternalLead);
@@ -19663,7 +19677,16 @@ async fn team_route_fix_on_an_agent_worker_records_the_round_and_returns_the_fix
     assert_eq!(entry.kind, InboxKind::Fix);
     assert!(entry.text.contains("the unchecked path"), "{}", entry.text);
     let block = &answer.data.as_ref().expect("data")["continue_agent"];
-    assert_eq!(block["message"], json!(entry.text));
+    // No agent is registered, so the fix brief goes to a new agent with a
+    // fresh one-time launch token on its first line.
+    let token = worker.launch_token.clone().expect("a fresh launch token");
+    assert_eq!(
+        block["message"],
+        json!(format!(
+            "Mnemo launch token: {token} (Mnemo's gate starts this agent without a permission prompt once)\n\n{}",
+            entry.text
+        ))
+    );
     assert!(
         answer.output.contains("No agent is registered for agentFix01"),
         "{}",

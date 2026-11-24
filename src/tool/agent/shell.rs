@@ -2723,9 +2723,11 @@ mod tests {
     async fn timed_out_call_reaps_its_shell_before_returning() {
         let dir = tempdir().unwrap();
         // A window sized from this host's measured boot: the pid write must
-        // land before the deadline fires even under a concurrent build load.
+        // land before the deadline fires even under a concurrent build load,
+        // where a later boot can take several times the measured one (boot +
+        // 2 s flaked under a full parallel workspace run).
         let boot = measured_shell_boot(dir.path()).await;
-        let tool = tool_in(dir.path()).with_timeout(boot + Duration::from_secs(2));
+        let tool = tool_in(dir.path()).with_timeout(boot * 3 + Duration::from_secs(6));
         let cmd = if cfg!(target_os = "windows") {
             "Set-Content shell.pid $PID; Start-Sleep -Seconds 300"
         } else {

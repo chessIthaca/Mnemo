@@ -651,7 +651,7 @@ impl Engine {
         let detached = background.join(CONSOLIDATION_GRACE).await;
         if detached > 0 {
             eprintln!(
-                "engine shutdown: {detached} memory consolidation(s) still running;                  they finish in the background"
+                "engine shutdown: {detached} memory consolidation(s) still running; they finish in the background"
             );
         }
         // Drop the engine's bus sender LAST: every subscriber's `recv` then

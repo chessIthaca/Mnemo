@@ -9,3 +9,20 @@
 # builds (which use the system linker) are unaffected.
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
+
+# Temp folders: every temp folder a cargo-launched process (tests, build
+# scripts, the children they spawn) creates stays inside this checkout's own
+# target/tmp instead of the user's system temp folder. `tempfile`'s TempDir and
+# every `std::env::temp_dir()` caller read TMP (Windows) or TMPDIR (Unix), so
+# the ~2,600 `TempDir::new()`/`tempdir()` call sites follow without edits.
+#
+# `relative = true` resolves the value against the folder holding this
+# `.cargo` directory, so each worker/pool checkout uses its own
+# <checkout>/target/tmp (`cargo clean` and the Mnemo2 pool trim remove it).
+# `force = true` is required on Windows: TMP and TEMP are always set in the
+# environment, and a non-forced entry is then ignored. `[env]` only reaches
+# processes cargo launches, so installed/release builds are unaffected.
+[env]
+TMP = { value = "target/tmp", relative = true, force = true }
+TEMP = { value = "target/tmp", relative = true, force = true }
+TMPDIR = { value = "target/tmp", relative = true, force = true }

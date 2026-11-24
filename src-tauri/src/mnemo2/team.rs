@@ -1290,6 +1290,14 @@ impl TeamRuntime {
         for worker in &live {
             let _ = worker.session.close_and_wait().await;
         }
+        // The pumps' detached tasks (a transcript refresh running Git in a
+        // checkout, a turn-end proof trigger, the proof jobs it starts)
+        // outlive the aborted pumps: wait for them, bounded, so no child
+        // process is still working in a checkout once shutdown returns.
+        let detached = self.persistence.tasks.join(PUMP_TASK_GRACE).await;
+        if detached > 0 {
+            eprintln!("team shutdown: {detached} worker task(s) still running; they finish in the background");
+        }
         let _ = self.persist().await;
         // The board holds the engine's memory store and code graph.
         self.board.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1299,6 +1307,13 @@ impl TeamRuntime {
             .take();
     }
 }
+
+/// How long [`TeamRuntime::shutdown`] waits for the worker pumps' detached
+/// tasks. They are usually short (a `git rev-parse`, a ledger save); a long
+/// proof job finishes detached. With the engine's own waits (5 s for the
+/// agent loops, 3 s for its background tasks) this stays inside the app's
+/// 10 s `SHUTDOWN_DEADLINE`.
+const PUMP_TASK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn now_key() -> u128 {
     phase3::now_ms()

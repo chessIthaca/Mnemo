@@ -1357,16 +1357,20 @@ mod lifecycle_tests {
             _tools: &[crate::provider::ToolSchema],
             _tool_choice: Option<crate::provider::ToolChoice>,
         ) -> crate::error::Result<futures::stream::BoxStream<'_, crate::provider::LlmEvent>> {
-            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                Ok(Box::pin(futures::stream::iter([
-                    crate::provider::LlmEvent::TextDelta { text: "served".into() },
-                    crate::provider::LlmEvent::Finish {
-                        reason: crate::provider::FinishReason::Stop,
-                    },
-                ])))
+            // The first call serves the session's turn; every later one (the
+            // session-end consolidation) gets an empty answer that ends, so
+            // the consolidation finishes and releases the memory store.
+            let text = if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                "served"
             } else {
-                Ok(Box::pin(futures::stream::pending()))
-            }
+                ""
+            };
+            Ok(Box::pin(futures::stream::iter([
+                crate::provider::LlmEvent::TextDelta { text: text.into() },
+                crate::provider::LlmEvent::Finish {
+                    reason: crate::provider::FinishReason::Stop,
+                },
+            ])))
         }
     }
 

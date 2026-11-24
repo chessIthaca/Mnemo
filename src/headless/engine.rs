@@ -606,12 +606,20 @@ impl Engine {
     /// sessions, their subagents and the host's main agent) after stopping
     /// and joining the pump, deregister, and wait (bounded) until their
     /// loops are released ([`LOOP_RELEASE_WAIT`]). The session-end
-    /// consolidations those agents start get [`CONSOLIDATION_GRACE`] to
-    /// finish; any still running then finish detached, never cut short.
+    /// consolidations those agents start, and the host's other store-holding
+    /// tasks (the startup reconcile and code index, re-embed passes, the
+    /// archive prune), get [`CONSOLIDATION_GRACE`] to finish; any still running then finish
+    /// detached, never cut short. Both waits are sized to fit inside the
+    /// app's shutdown budget (Mnemo2's `SHUTDOWN_DEADLINE`), which the team
+    /// runtime's own `shutdown` shares, so the whole app teardown ends
+    /// before the app gives up on it.
+    ///
     /// After this returns and the engine is dropped, the project's stores
-    /// close once those consolidations (and any loop that outlived the wait,
-    /// with the consolidation it then starts) have finished — immediately in
-    /// the usual case where none is left.
+    /// close once those tasks (and any loop that outlived the wait, with the
+    /// consolidation it then starts) have finished — immediately in the
+    /// usual case where none is left. Caveat: an engine from
+    /// [`Engine::start_blocking`] owns its tokio runtime, so dropping that
+    /// engine shuts the runtime down and cancels the detached tasks with it.
     pub async fn shutdown(&self) -> Result<(), EngineError> {
         self.inner.sessions.lock().await.clear();
         // Stop the pump first, as before: no session event is published
@@ -644,14 +652,15 @@ impl Engine {
                 LOOP_RELEASE_WAIT.as_secs()
             );
         }
-        // The session-end consolidations the cancelled agents started hold
-        // the memory store: give them a bounded grace to finish their
-        // writes; the rest finish detached and release it when they end.
+        // The session-end consolidations the cancelled agents started, and
+        // the host's reconcile, index, re-embed and prune tasks, hold the
+        // project's stores: give them a bounded grace to finish their
+        // writes; the rest finish detached and release them when they end.
         let background = self.inner.host.manager.lock().await.background_tasks();
         let detached = background.join(CONSOLIDATION_GRACE).await;
         if detached > 0 {
             eprintln!(
-                "engine shutdown: {detached} memory consolidation(s) still running; they finish in the background"
+                "engine shutdown: {detached} background task(s) (consolidation, reconcile, index, re-embed) still running; they finish in the background"
             );
         }
         // Drop the engine's bus sender LAST: every subscriber's `recv` then
@@ -1051,8 +1060,13 @@ async fn start_inner(
     // `ARCHIVE_RETENTION_SECS` in the background. Spawned and never awaited —
     // `start` must not wait on a large archive sweep — and it runs for an
     // injected brain too, since the archive belongs to the store either way.
+    // It holds the store, so it is tracked like a re-embed pass and the
+    // shutdown joins it.
     if let Some(store) = brain.factory.memory_handle() {
-        tokio::spawn(maintenance::prune_old_archive_rows(store));
+        brain
+            .factory
+            .background_tasks()
+            .register(tokio::spawn(maintenance::prune_old_archive_rows(store)));
     }
 
     Ok(Engine {

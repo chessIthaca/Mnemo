@@ -917,6 +917,9 @@ impl Setup {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
+        // The re-embed pass holds the store: tracked in the host's register
+        // so the engine's shutdown joins it like a consolidation.
+        let background_tasks = live.factory.background_tasks();
         let head = tokio::spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.await;
@@ -928,7 +931,7 @@ impl Setup {
             .ok()
             .flatten();
             if let Some(reembed) = reembed {
-                tokio::spawn(reembed);
+                background_tasks.register(tokio::spawn(reembed));
             }
         });
         *live
@@ -1542,7 +1545,9 @@ impl Setup {
             let _ = tx.send(Self::embedder_status_to_event(s, SetupStep::EmbedderModel));
         });
         let task_sink = Arc::clone(&sink);
-        tokio::spawn(async move {
+        // The install re-embeds with the store held: tracked in the host's
+        // register so the engine's shutdown joins it.
+        live.factory.background_tasks().register(tokio::spawn(async move {
             // The build flips the shared status itself (Ready or the
             // hash fallback); the install does the fingerprint check
             // + re-embed + swap — the settings save's sequence minus
@@ -1560,7 +1565,7 @@ impl Setup {
                     task_sink(&EmbedderStatus::Failed);
                 }
             }
-        });
+        }));
         Ok(EventReceiver { rx })
     }
 

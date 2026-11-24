@@ -71,41 +71,61 @@ enum IdleRace {
     Cut,
 }
 
-/// The host's register of agent background tasks that outlive their agent
-/// loop (the session-end memory consolidation). Each holds the memory store
-/// until it ends, so a host that shuts down gives them a grace period to
-/// finish before it drops the store's owner. A consolidation is never cut
-/// short: one still running after the grace finishes detached, as before,
-/// and releases the store when it ends.
-#[derive(Clone, Default)]
+/// The host's register of background tasks that hold the project's stores
+/// past their caller: the session-end memory consolidation an agent loop
+/// starts, and the host's startup reconcile, code index, re-embed passes and
+/// archive prune (registered through the agent factory, whose register the
+/// host's `AgentManager` adopts). Each holds the memory store or the code
+/// graph until it ends, so a host that shuts down gives them a grace period
+/// to finish before it drops the stores' owner. A task is never cut short:
+/// one still running after the grace finishes detached, as before, and
+/// releases the store when it ends. A host app may keep its own register for
+/// its own detached work (Mnemo2's team runtime tracks its worker pumps'
+/// tasks in one).
+#[derive(Clone, Default, Debug)]
 pub struct BackgroundTasks(Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>);
 
 impl BackgroundTasks {
     /// Track one task (finished ones are pruned on the way).
-    pub(crate) fn register(&self, task: tokio::task::JoinHandle<()>) {
+    pub fn register(&self, task: tokio::task::JoinHandle<()>) {
         let mut tasks = self.0.lock().unwrap_or_else(|e| e.into_inner());
         tasks.retain(|task| !task.is_finished());
         tasks.push(task);
     }
 
     /// Wait up to `grace` for every tracked task, all of them concurrently
-    /// under one deadline. Tasks still running after it are NOT aborted —
-    /// an aborted consolidation would never write its episodic summary —
-    /// they stay registered and finish detached. Returns how many did.
+    /// under one deadline. A task registered while the join waits (an agent
+    /// cancelled late starts its consolidation) is awaited under the same
+    /// deadline. Tasks still running after it are NOT aborted — an aborted
+    /// consolidation would never write its episodic summary — they stay
+    /// registered and finish detached; finished ones are pruned at the next
+    /// `register` or `join`. Returns how many tasks were still running when
+    /// the join returned.
     pub async fn join(&self, grace: std::time::Duration) -> usize {
-        let mut tasks =
-            std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
         let deadline = tokio::time::Instant::now() + grace;
-        let _ =
-            tokio::time::timeout_at(deadline, futures::future::join_all(tasks.iter_mut())).await;
+        let mut stragglers = Vec::new();
+        loop {
+            let mut tasks =
+                std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+            if tasks.is_empty() {
+                break;
+            }
+            let timed_out = tokio::time::timeout_at(
+                deadline,
+                futures::future::join_all(tasks.iter_mut()),
+            )
+            .await
+            .is_err();
+            tasks.retain(|task| !task.is_finished());
+            stragglers.extend(tasks);
+            if timed_out {
+                break;
+            }
+        }
+        let mut tasks = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.extend(stragglers);
         tasks.retain(|task| !task.is_finished());
-        let still_running = tasks.len();
-        // Keep the stragglers registered (pruned once they finish).
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend(tasks);
-        still_running
+        tasks.len()
     }
 }
 
@@ -1978,8 +1998,10 @@ mod tests {
     use crate::memory::embedder::HashEmbedder;
 
     /// The shutdown join waits for every task concurrently under ONE
-    /// deadline and never aborts a straggler: it finishes detached.
-    #[tokio::test]
+    /// deadline and never aborts a straggler: it finishes detached. Paused
+    /// time makes the deadline exact: awaited one after another the three
+    /// 150 ms tasks would need 450 ms.
+    #[tokio::test(start_paused = true)]
     async fn background_join_is_concurrent_and_never_aborts_a_straggler() {
         let tasks = BackgroundTasks::default();
         let quick_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2012,6 +2034,39 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(straggler_done.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A task registered while the join already waits (a late consolidation)
+    /// is awaited under the same deadline, and one that outlives it is
+    /// counted.
+    #[tokio::test(start_paused = true)]
+    async fn background_join_awaits_and_counts_a_late_registration() {
+        let tasks = BackgroundTasks::default();
+        let late_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (registrar, late) = (tasks.clone(), late_done.clone());
+        tasks.register(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            registrar.register(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                late.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+        }));
+        assert_eq!(tasks.join(std::time::Duration::from_millis(300)).await, 0);
+        assert!(late_done.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        let registrar = tasks.clone();
+        tasks.register(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            registrar.register(tokio::spawn(async move {
+                let _ = hold_rx.await;
+            }));
+        }));
+        assert_eq!(
+            tasks.join(std::time::Duration::from_millis(300)).await,
+            1,
+            "the late straggler is counted"
+        );
     }
 
     /// The concrete app workflow behind a loop's neutral handle (2b.3): the

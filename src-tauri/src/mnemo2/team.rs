@@ -71,6 +71,7 @@ use merge::{
 use persistence::TeamPersistence;
 use pump::{close_worker_session, save_workers_now, save_workers_soon};
 
+pub use agent_watch::{AgentGateView, AgentGateWorker};
 pub use deletion::{
     CleanupReport, DeletionPhase, DeletionProgress, TeamDeleteOutcome, WorkerDeletion,
     WorkerDeletionResult, cleanup_workspace,

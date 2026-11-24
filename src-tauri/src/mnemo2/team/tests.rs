@@ -19702,7 +19702,10 @@ async fn gate_allows_agents_while_an_agent_worker_fixes() {
     team.agent_done("agentGate1", "first run done".into(), false)
         .await
         .expect("the first run closes");
-    assert_eq!(team.claude_agent_working().await, None, "nothing runs while it is reviewed");
+    assert!(
+        team.agent_gate_view().await.running.is_empty(),
+        "nothing runs while it is reviewed"
+    );
     team.update_worker("agentGate1", |worker| {
         worker.status = WorkerStatus::InReview;
         worker.findings.push(open_finding("gateFix1"));
@@ -19716,10 +19719,14 @@ async fn gate_allows_agents_while_an_agent_worker_fixes() {
         )
         .await;
     assert!(answer.success, "{}", answer.output);
-    assert_eq!(
-        team.claude_agent_working().await,
-        Some(("agentGate1".to_string(), "high".to_string()))
-    );
+    let running: Vec<(String, String)> = team
+        .agent_gate_view()
+        .await
+        .running
+        .into_iter()
+        .map(|worker| (worker.id, worker.tier))
+        .collect();
+    assert_eq!(running, vec![("agentGate1".to_string(), "high".to_string())]);
     team.shutdown().await;
 }
 

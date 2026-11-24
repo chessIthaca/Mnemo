@@ -691,20 +691,6 @@ impl TeamRuntime {
         }
     }
 
-    /// A working Claude Code agent worker, for the agent gate: its id and
-    /// the settled tier it runs on, so the gate names what runs while the
-    /// lead's own Agent does the step.
-    pub async fn claude_agent_working(&self) -> Option<(String, String)> {
-        let records = self.records.lock().await;
-        records
-            .iter()
-            .find(|worker| {
-                worker.claude_agent.is_some()
-                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
-            })
-            .map(|worker| (worker.id.clone(), worker.tier.clone().unwrap_or_default()))
-    }
-
     /// Finish a Claude Code agent worker (`team_agent_done`): record its
     /// final report, mark it completed or failed, and bump the turn as the
     /// pump's Finished handling does. Only a worker that runs as a Claude

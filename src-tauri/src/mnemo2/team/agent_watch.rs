@@ -915,14 +915,20 @@ fn progress_now() -> u128 {
 /// The longest progress note, in characters.
 const PROGRESS_NOTE_CHARS: usize = 500;
 
+/// Whether `worker` runs as a Claude Code agent right now: an agent worker in
+/// Working or Fixing, launched or still waiting for its launch.
+pub(crate) fn runs_as_agent(worker: &WorkerRecord) -> bool {
+    worker.claude_agent.is_some()
+        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+}
+
 /// An agent worker whose agent has not been launched yet: it runs as a
 /// Claude Code agent, is Working or Fixing in a checkout, and has no agent
 /// registered. The WorktreeCreate hook hands the next isolated agent to it,
 /// so at most one may exist at a time (plan 4d920eec decision 4).
 pub(super) fn waits_for_agent(worker: &WorkerRecord) -> bool {
-    worker.claude_agent.is_some()
+    runs_as_agent(worker)
         && worker.claude_agent_id.is_none()
-        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
         && !worker.worktree.as_os_str().is_empty()
 }
 
@@ -1238,20 +1244,57 @@ pub(super) fn clip_report(report: &str) -> String {
     format!("{kept}\n[cut: team_status with detail shows the whole report]")
 }
 
+/// An agent worker as the agent gate sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGateWorker {
+    pub id: String,
+    /// The settled tier it runs on; empty when none is recorded.
+    pub tier: String,
+    /// Its checkout path; empty before it has one.
+    pub worktree: String,
+    /// Its `wt/agent-*` branch.
+    pub branch: String,
+}
+
+/// The agent workers the agent gate decides from
+/// ([`TeamRuntime::agent_gate_view`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentGateView {
+    /// The agent worker that waits for its agent to be launched.
+    pub waiting: Option<AgentGateWorker>,
+    /// Every agent worker in Working or Fixing, the waiting one included.
+    pub running: Vec<AgentGateWorker>,
+}
+
 /// The most agent workers that run (Working or Fixing) at once (plan
 /// 4d920eec decision 5). A constant: there is no setting.
 pub(super) const AGENT_WORKER_CAP: usize = 3;
 
 impl TeamRuntime {
-    /// The agent worker that waits for its agent to be launched, if one does:
-    /// the agent gate wants that launch made with isolation "worktree".
-    pub async fn agent_worker_waiting(&self) -> Option<String> {
-        self.records
-            .lock()
-            .await
-            .iter()
-            .find(|worker| waits_for_agent(worker))
-            .map(|worker| worker.id.clone())
+    /// What the agent gate decides from, read under one records lock and
+    /// nothing else (no snapshot, no transcripts), so the PreToolUse hook gets
+    /// its answer well inside its timeout: the agent worker that waits for
+    /// its agent to be launched, if one does, and every agent worker that runs
+    /// (Working or Fixing, the waiting one included).
+    pub async fn agent_gate_view(&self) -> AgentGateView {
+        let records = self.records.lock().await;
+        let gate_worker = |worker: &WorkerRecord| AgentGateWorker {
+            id: worker.id.clone(),
+            tier: worker.tier.clone().unwrap_or_default(),
+            worktree: worker.worktree.to_string_lossy().into_owned(),
+            branch: worker.branch.clone(),
+        };
+        AgentGateView {
+            waiting: records
+                .iter()
+                .find(|worker| waits_for_agent(worker))
+                .map(gate_worker),
+            running: records
+                .iter()
+                .filter(|worker| runs_as_agent(worker))
+                .map(gate_worker)
+                .collect(),
+        }
     }
 
     /// Why another agent worker may not start now, if it may not (plan
@@ -1273,10 +1316,7 @@ impl TeamRuntime {
             ));
         }
         let running: Vec<&str> = others()
-            .filter(|worker| {
-                worker.claude_agent.is_some()
-                    && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
-            })
+            .filter(|worker| runs_as_agent(worker))
             .map(|worker| worker.id.as_str())
             .collect();
         (running.len() >= AGENT_WORKER_CAP).then(|| {

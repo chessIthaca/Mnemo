@@ -238,7 +238,26 @@ pub fn notices(env: &Env, mode: NoticesMode, stdin_text: &str) -> Option<String>
     }
 }
 
-/// `gate-agent`: the PreToolUse JSON when the agent call needs the user's OK.
+/// The most of an Agent prompt the gate sends: it only looks for the waiting
+/// worker's checkout in it, so a huge prompt need not cross the socket (plan
+/// 1b038bb3 decision 3).
+const GATE_PROMPT_BYTES: usize = 64 * 1024;
+
+/// `prompt` cut to [`GATE_PROMPT_BYTES`] on a character boundary.
+fn capped_prompt(prompt: &str) -> &str {
+    if prompt.len() <= GATE_PROMPT_BYTES {
+        return prompt;
+    }
+    let mut end = GATE_PROMPT_BYTES;
+    while !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    &prompt[..end]
+}
+
+/// `gate-agent`: the PreToolUse decision for an agent call — allow one Mnemo
+/// decided on without a prompt, deny a launch the lead must relaunch, or ask
+/// the user.
 pub fn gate_agent(env: &Env, stdin_text: &str) -> Option<String> {
     let input = parse_input(stdin_text);
     let tool_name = input.get("tool_name").and_then(Value::as_str).unwrap_or("");
@@ -258,20 +277,40 @@ pub fn gate_agent(env: &Env, stdin_text: &str) -> Option<String> {
     if let Some(isolation) = input.pointer("/tool_input/isolation").and_then(Value::as_str) {
         body["isolation"] = json!(isolation);
     }
-    let reply = call(&instance, "/lead/gate-agent", &body, HOOK_TIMEOUT)?;
-    if reply.get("decision").and_then(Value::as_str) != Some("ask") {
-        return None;
+    // It allows a launch whose prompt names the waiting worker's checkout, so
+    // it reads the prompt too (plan 1b038bb3 decision 3).
+    if let Some(prompt) = input.pointer("/tool_input/prompt").and_then(Value::as_str) {
+        body["prompt"] = json!(capped_prompt(prompt));
     }
+    let reply = call(&instance, "/lead/gate-agent", &body, HOOK_TIMEOUT)?;
+    let permission = match reply.get("decision").and_then(Value::as_str) {
+        // Only an allow Mnemo marked as auto-approvable — a launch for its own
+        // agent worker — skips Claude Code's permission prompt; every other
+        // allow leaves the decision to Claude Code's own rules (plan 1b038bb3
+        // decision 2).
+        Some("allow") if reply.get("auto_approve").and_then(Value::as_bool) == Some(true) => {
+            "allow"
+        }
+        Some("allow") => return None,
+        Some("ask") => "ask",
+        Some("deny") => "deny",
+        _ => return None,
+    };
+    let fallback = if permission == "ask" {
+        "Mnemo's workers should do this work; Claude Code's own agents need your OK."
+    } else {
+        "Mnemo decided this agent call."
+    };
     let reason = reply
         .get("reason")
         .and_then(Value::as_str)
         .filter(|reason| !reason.is_empty())
-        .unwrap_or("Mnemo's workers should do this work; Claude Code's own agents need your OK.");
+        .unwrap_or(fallback);
     Some(
         json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "ask",
+                "permissionDecision": permission,
                 "permissionDecisionReason": reason,
             }
         })

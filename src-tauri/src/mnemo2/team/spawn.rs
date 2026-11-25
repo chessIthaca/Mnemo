@@ -209,6 +209,7 @@ impl TeamRuntime {
             reasoning_effort,
             branch,
             worktree,
+            remote: None,
             status: WorkerStatus::Dispatching,
             generation: 0,
             transcript: Arc::default(),

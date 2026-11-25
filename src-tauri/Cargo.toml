@@ -10,7 +10,7 @@ license = "MIT"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-mnemo = { path = "..", features = ["browser", "embeddings"] }
+mnemo = { path = "..", features = ["browser", "embeddings", "remote"] }
 tauri = { version = "2", features = ["unstable", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"

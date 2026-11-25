@@ -21,6 +21,7 @@ use crate::mnemo2::dispatch_routing::RoutingMode;
 use crate::mnemo2::phase3::{self, ReviewEvidence};
 
 use super::agent_watch;
+use super::control::ResumeChoice;
 use super::findings_ledger;
 use super::record::{with_launch_token, ChangeSource, MessageSender, WorkerRecord};
 use super::remote::{checks_hash, HostDirectory, Qualification};
@@ -337,7 +338,7 @@ impl TeamRuntime {
                     "action":{"type":"string","enum":["list","pair","revoke"]},
                     "name":{"type":"string","description":"pair: the new host's name (default: its computer name). revoke: the host's name or id."}
                 },"required":["action"]}),
-                safety: SafetyLevel::AutoRun,
+                safety: SafetyLevel::NeedsApproval,
                 timeout_ms: Some(30_000),
             },
         ]
@@ -440,6 +441,11 @@ impl TeamRuntime {
         name: Option<&str>,
     ) -> ToolResult {
         let name = name.map(str::trim).filter(|name| !name.is_empty());
+        if let Some(name) = name {
+            if !valid_host_name(name) {
+                return ToolResult::error(HOST_NAME_REFUSAL);
+            }
+        }
         let offer = match hosts.pair(name).await {
             Ok(offer) => offer,
             Err(error) => {
@@ -489,6 +495,9 @@ impl TeamRuntime {
         let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
             return ToolResult::error("team_hosts revoke requires 'name' (the host's name or id)");
         };
+        if !valid_host_name(name) {
+            return ToolResult::error(HOST_NAME_REFUSAL);
+        }
         let record = match hosts.revoke(name).await {
             Ok(record) => record,
             Err(error) => {
@@ -881,12 +890,14 @@ impl TeamRuntime {
                 } else {
                     Box::pin(self.resume_on_tier(
                         worker_id,
-                        tier.as_deref(),
-                        model,
-                        reasoning_effort,
                         ChangeSource::Lead,
-                        keep_changes,
-                        host,
+                        ResumeChoice {
+                            tier: tier.as_deref(),
+                            model,
+                            reasoning_effort,
+                            keep_changes,
+                            host,
+                        },
                     ))
                     .await
                     .map(|resumed| {
@@ -1259,6 +1270,20 @@ pub(super) struct TeamLeadStatus {
 /// without repeating a full hash in every answer.
 fn tip_prefix(tip: &str) -> String {
     tip.chars().take(8).collect()
+}
+
+/// The refusal for a host name outside [`valid_host_name`].
+const HOST_NAME_REFUSAL: &str =
+    "a host name may use letters, digits, '.', '_' and '-' (at most 64)";
+
+/// Whether `name` matches `^[A-Za-z0-9._-]{1,64}$`: a host name travels into
+/// the `mnemo2-node pair` command the lead shows the user, so nothing a shell
+/// would treat specially is accepted.
+fn valid_host_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// One worker as `team_status` reports it: the compact entry the lead reads

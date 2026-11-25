@@ -49,6 +49,17 @@ use super::routing::{
 /// The refusal of a resume while Mnemo2 shuts the team down.
 const CLOSING_RESUME_ERROR: &str = "Mnemo2 is closing; the worker cannot be resumed now";
 
+/// What the lead chose for a resume onto a tier: the tier or model, the
+/// effort, whether a handed-back worker's dirty checkout may be taken over, and
+/// where the worker continues (`"local"` or nothing).
+pub(super) struct ResumeChoice<'a> {
+    pub(super) tier: Option<&'a str>,
+    pub(super) model: Option<String>,
+    pub(super) reasoning_effort: Option<String>,
+    pub(super) keep_changes: bool,
+    pub(super) host: Option<&'a str>,
+}
+
 /// What a resume onto a tier did: the worker, and the `claude_agent` block
 /// when the move handed its step to the external lead's Claude Code agent
 /// (plan e52e0be1 decision 5) instead of switching its model.
@@ -556,12 +567,13 @@ impl TeamRuntime {
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
-        Box::pin(self.rehome_local(worker_id, host)).await?;
         // A Claude Code agent worker has no session to reattach: the lead
         // continues it with its own agent, and Mnemo finishes it when that agent ends.
         if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
+        // Only a worker that can be resumed at all moves to this computer.
+        Box::pin(self.rehome_local(worker_id, host)).await?;
         Box::pin(self.resume_session(worker_id, keep_changes)).await
     }
 
@@ -580,6 +592,12 @@ impl TeamRuntime {
             .remote
             .server()
             .ok_or_else(|| format!("host '{}' is not connected", remote.node_name))?;
+        if self.remote.host(&remote.node_id).is_err() {
+            return Err(format!(
+                "host '{}' is no longer paired; pass host \"local\" to continue worker '{worker_id}' here",
+                remote.node_name
+            ));
+        }
         if !server.is_connected(&remote.node_id) {
             return Err(format!(
                 "host '{}' is not connected; resume worker '{worker_id}' when it is back, or pass host \"local\" to continue here",
@@ -617,7 +635,25 @@ impl TeamRuntime {
             return Err("team_resume's host only takes \"local\"".to_string());
         }
         let record = self.worker(worker_id).await?;
-        if record.remote.is_none() {
+        let Some(remote) = record.remote.as_ref() else {
+            return Ok(());
+        };
+        // A session still running on the host owns the node checkout: moving
+        // the record here under it would split the worker in two.
+        if self.live.lock().await.contains_key(worker_id) {
+            return Err(format!(
+                "worker '{worker_id}' is still running on host '{}'; stop it first, then resume it with host \"local\"",
+                remote.node_name
+            ));
+        }
+        // A worker the resume refuses anyway stays where it is, so the
+        // refusal reads the same and nothing moved.
+        if matches!(
+            record.status,
+            WorkerStatus::Cancelled | WorkerStatus::Merged | WorkerStatus::Merging
+        ) || audit_finished(&record)
+            || !record.worktree.is_dir()
+        {
             return Ok(());
         }
         let _ = self.sync_remote(worker_id).await;
@@ -663,22 +699,23 @@ impl TeamRuntime {
     /// A tier (with no pinned model) that runs as a Claude Code agent while
     /// Claude Code leads hands the step to the lead's agent instead, through
     /// [`Self::hand_to_agent_locked`].
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn resume_on_tier(
         &self,
         worker_id: &str,
-        tier: Option<&str>,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
         source: ChangeSource,
-        keep_changes: bool,
-        host: Option<&str>,
+        choice: ResumeChoice<'_>,
     ) -> Result<TierResume, String> {
+        let ResumeChoice {
+            tier,
+            model,
+            reasoning_effort,
+            keep_changes,
+            host,
+        } = choice;
         let pinned = model.is_some();
         let model = self.lead_model_choice(tier, model);
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
-        Box::pin(self.rehome_local(worker_id, host)).await?;
         // A Claude Code agent worker has no session to reroute: the lead
         // continues it with its own agent, and Mnemo finishes it when that agent ends.
         if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
@@ -689,6 +726,8 @@ impl TeamRuntime {
                 return Ok(handed);
             }
         }
+        // Only a worker that can be resumed at all moves to this computer.
+        Box::pin(self.rehome_local(worker_id, host)).await?;
         self.resume_on_tier_locked_keeping(
             worker_id,
             tier,

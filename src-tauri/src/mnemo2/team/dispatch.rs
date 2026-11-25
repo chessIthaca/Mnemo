@@ -943,12 +943,23 @@ impl TeamRuntime {
             worker.remote = Some(remote.clone());
         })
         .await;
-        record.remote = Some(remote);
-        let persisted = self.persist().await;
-        if !keep_reserved {
-            self.remote.release_reservation(&choice.node_id, &record.branch);
+        if let Err(error) = self.persist().await {
+            // The record must not name a checkout the saved state does not:
+            // put it back and leave the node checkout to the reconciler.
+            self.update_worker(&record.id, |worker| {
+                worker.remote = None;
+            })
+            .await;
+            self.remote
+                .release_reservation(&choice.node_id, &record.branch);
+            return Err(error);
         }
-        persisted
+        record.remote = Some(remote);
+        if !keep_reserved {
+            self.remote
+                .release_reservation(&choice.node_id, &record.branch);
+        }
+        Ok(())
     }
 
     /// The other steps (0-based) of `plan_id` with an open task: a worker not

@@ -20582,6 +20582,11 @@ async fn team_hosts_schema_and_texts() {
     );
     assert_eq!(hosts.timeout_ms, Some(30_000));
     assert_eq!(
+        hosts.safety,
+        SafetyLevel::NeedsApproval,
+        "pairing and revoking a host change who can run code for the project"
+    );
+    assert_eq!(
         hosts.parameters,
         json!({"type":"object","properties":{
             "action":{"type":"string","enum":["list","pair","revoke"]},

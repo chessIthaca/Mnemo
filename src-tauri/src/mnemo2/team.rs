@@ -959,21 +959,24 @@ impl TeamRuntime {
     /// A host that came back after its node process restarted: the session is
     /// gone, and `team_resume` starts it there again.
     async fn mark_host_restarted(&self, worker_id: &str, remote: &RemoteCheckout) {
+        let active;
         {
             let mut records = self.records.lock().await;
             let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
                 return;
             };
-            // The record may have finished while the notice was in flight; a
-            // restarted host must not reopen a finished worker.
-            if terminal_status(worker.status) {
-                return;
+            // Only a worker that was running a turn is interrupted; any other
+            // worker (finished, in review, merged, stopped, already failed or
+            // interrupted) keeps its status and error. The lost session is
+            // dropped below either way.
+            active = is_active(worker.status);
+            if active {
+                worker.status = WorkerStatus::Interrupted;
+                worker.error = Some(format!(
+                    "host '{}' restarted; its session ended. team_resume continues it there.",
+                    remote.node_name
+                ));
             }
-            worker.status = WorkerStatus::Interrupted;
-            worker.error = Some(format!(
-                "host '{}' restarted; its session ended. team_resume continues it there.",
-                remote.node_name
-            ));
             if let Some(state) = worker.remote.as_mut() {
                 state.offline_since_ms = None;
             }
@@ -989,13 +992,15 @@ impl TeamRuntime {
         if let Err(error) = self.persist().await {
             eprintln!("team: could not save the restarted host of {worker_id}: {error}");
         }
-        self.notify_lead(
-            format!("host-back:{worker_id}"),
-            format!(
-                "Host {} is back; worker {worker_id} continues.",
-                remote.node_name
-            ),
-        );
+        if active {
+            self.notify_lead(
+                format!("host-back:{worker_id}"),
+                format!(
+                    "Host {} is back; worker {worker_id} continues.",
+                    remote.node_name
+                ),
+            );
+        }
         self.signal_board_changed();
     }
 
@@ -1007,39 +1012,40 @@ impl TeamRuntime {
             let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
                 return;
             };
-            // A worker that finished, merged or failed on its own while the
-            // host was away keeps that outcome.
-            if terminal_status(worker.status) {
-                return;
+            // Only a worker that was running a turn fails; any other worker
+            // keeps its status and error (the lost session is dropped below).
+            if !is_active(worker.status) {
+                None
+            } else {
+                let budget = self.remote.outage_budget().as_secs();
+                let name = &remote.node_name;
+                let base = worker
+                    .base_commit
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("");
+                let from = match worker
+                    .remote
+                    .as_ref()
+                    .and_then(|state| state.synced_tip.as_deref())
+                {
+                    Some(tip) => format!(
+                        " from its last synced commit {}",
+                        short_sha(tip)
+                    ),
+                    None if !base.is_empty() => format!(
+                        " from its starting commit {} (nothing was synced from {name})",
+                        short_sha(base)
+                    ),
+                    None => String::new(),
+                };
+                let text = format!(
+                    "host '{name}' has been offline for more than {budget} s; its session there is lost. team_resume continues worker '{worker_id}' on {name} once the host is back, or here with host \"local\"{from}."
+                );
+                worker.status = WorkerStatus::Failed;
+                worker.error = Some(text.clone());
+                Some(text)
             }
-            let budget = self.remote.outage_budget().as_secs();
-            let name = &remote.node_name;
-            let base = worker
-                .base_commit
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("");
-            let from = match worker
-                .remote
-                .as_ref()
-                .and_then(|state| state.synced_tip.as_deref())
-            {
-                Some(tip) => format!(
-                    " from its last synced commit {}",
-                    short_sha(tip)
-                ),
-                None if !base.is_empty() => format!(
-                    " from its starting commit {} (nothing was synced from {name})",
-                    short_sha(base)
-                ),
-                None => String::new(),
-            };
-            let text = format!(
-                "host '{name}' has been offline for more than {budget} s; its session there is lost. team_resume continues worker '{worker_id}' on {name} once the host is back, or here with host \"local\"{from}."
-            );
-            worker.status = WorkerStatus::Failed;
-            worker.error = Some(text.clone());
-            text
         };
         {
             let mut live = self.live.lock().await;
@@ -1050,13 +1056,15 @@ impl TeamRuntime {
         if let Err(error) = self.persist().await {
             eprintln!("team: could not save the failed worker {worker_id}: {error}");
         }
-        self.notify_lead(
-            format!("host-lost:{worker_id}"),
-            format!(
-                "Host {} stayed away too long; worker {worker_id} failed. {message}",
-                remote.node_name
-            ),
-        );
+        if let Some(message) = message {
+            self.notify_lead(
+                format!("host-lost:{worker_id}"),
+                format!(
+                    "Host {} stayed away too long; worker {worker_id} failed. {message}",
+                    remote.node_name
+                ),
+            );
+        }
         self.signal_board_changed();
     }
 
@@ -1071,6 +1079,7 @@ impl TeamRuntime {
             live.keys().cloned().collect()
         };
         let mut failed = Vec::new();
+        let mut lost = Vec::new();
         {
             let mut records = self.records.lock().await;
             for worker in records.iter_mut() {
@@ -1080,7 +1089,14 @@ impl TeamRuntime {
                 let Some(remote) = worker.remote.as_ref() else {
                     continue;
                 };
-                if remote.node_id != node_id || terminal_status(worker.status) {
+                if remote.node_id != node_id {
+                    continue;
+                }
+                // Only a worker that was running a turn fails; any other
+                // worker keeps its status and error, and its lost session is
+                // dropped below all the same.
+                if !is_active(worker.status) {
+                    lost.push(worker.id.clone());
                     continue;
                 }
                 let from = match remote.synced_tip.as_deref() {
@@ -1101,12 +1117,12 @@ impl TeamRuntime {
                 failed.push(worker.id.clone());
             }
         }
-        if failed.is_empty() {
+        if failed.is_empty() && lost.is_empty() {
             return failed;
         }
         {
             let mut live = self.live.lock().await;
-            for id in &failed {
+            for id in failed.iter().chain(lost.iter()) {
                 if let Some(worker) = live.remove(id) {
                     worker.pump.abort();
                 }
@@ -1909,12 +1925,16 @@ fn now_key() -> u128 {
     phase3::now_ms()
 }
 
-/// A worker whose turn is over for good: a late host notice must never reopen
-/// it (plan 9a2f4b67, step 5).
-fn terminal_status(status: WorkerStatus) -> bool {
+/// A worker that is running a turn (or about to, or waiting on an answer in
+/// the middle of one): the only workers a lost or restarted host changes. Every
+/// other status keeps its status and error (plan 9a2f4b67, step 5).
+fn is_active(status: WorkerStatus) -> bool {
     matches!(
         status,
-        WorkerStatus::Completed | WorkerStatus::Merged | WorkerStatus::Failed | WorkerStatus::Stopped
+        WorkerStatus::Dispatching
+            | WorkerStatus::Working
+            | WorkerStatus::NeedsYou
+            | WorkerStatus::Fixing
     )
 }
 

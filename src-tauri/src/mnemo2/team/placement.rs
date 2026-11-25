@@ -100,7 +100,16 @@ impl TeamRuntime {
             return Ok(Placement::Node(choice(&record, true)));
         }
         let mut best: Option<(usize, NodeRecord)> = None;
-        for record in server.nodes().list()? {
+        // Without a pin a broken node registry is never a dispatch failure:
+        // the worker runs here, as before remote workers existed.
+        let nodes = match server.nodes().list() {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                eprintln!("team: could not read the paired hosts: {error}; placing locally");
+                return Ok(Placement::Local);
+            }
+        };
+        for record in nodes {
             if !server.is_connected(&record.node_id) {
                 continue;
             }
@@ -694,6 +703,23 @@ mod tests {
         );
         let expires = paired["expires_in_s"].as_u64().expect("expiry");
         assert!((590..=600).contains(&expires), "{paired}");
+
+        // A host name travels into a command line the user pastes: nothing a
+        // shell treats specially gets through, for pair or revoke.
+        let too_long = "a".repeat(65);
+        for bad in ["bad name", "x;rm -rf", "$(whoami)", "a\"b", too_long.as_str()] {
+            for args in [
+                serde_json::json!({"action": "pair", "name": bad}),
+                serde_json::json!({"action": "revoke", "name": bad}),
+            ] {
+                let refused = team.handle_lead_host_tool("team_hosts", args).await;
+                assert!(!refused.success, "{bad}: {}", refused.output);
+                assert_eq!(
+                    refused.output,
+                    "a host name may use letters, digits, '.', '_' and '-' (at most 64)"
+                );
+            }
+        }
 
         let missing = team
             .handle_lead_host_tool(

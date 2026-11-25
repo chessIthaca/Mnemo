@@ -2382,27 +2382,158 @@ mod tests {
     async fn a_finished_worker_keeps_its_outcome_when_its_host_restarts() {
         let rig = Rig::start().await;
         let team = rig.team().await;
-        let mut record = super::super::tests::worker(rig.root.path(), "abcd1234");
-        record.status = WorkerStatus::Merged;
-        let mut remote = sample_remote(&rig.node_id, None);
-        remote.offline_since_ms = Some(super::super::unix_ms().saturating_sub(5_000));
-        record.remote = Some(remote);
-        team.records.lock().await.push(record.clone());
+        let statuses = [
+            WorkerStatus::Completed,
+            WorkerStatus::InReview,
+            WorkerStatus::Merged,
+            WorkerStatus::Failed,
+            WorkerStatus::Stopped,
+            WorkerStatus::Interrupted,
+            WorkerStatus::Idle,
+        ];
+        for (index, status) in statuses.into_iter().enumerate() {
+            for lost in [false, true] {
+                let id = format!("abcd{index}{}", u8::from(lost));
+                let mut record = super::super::tests::worker(rig.root.path(), &id);
+                record.status = status;
+                record.error = Some("its own error".to_string());
+                let mut remote = sample_remote(&rig.node_id, None);
+                remote.offline_since_ms = Some(super::super::unix_ms().saturating_sub(5_000));
+                record.remote = Some(remote.clone());
+                team.records.lock().await.push(record.clone());
+                team.live
+                    .lock()
+                    .await
+                    .insert(record.id.clone(), live_entry(100 + index as u64));
+                assert!(team.remote.busy_on(&rig.node_id).await >= 1);
+
+                if lost {
+                    team.fail_lost_host(&id, &remote).await;
+                } else {
+                    team.mark_host_restarted(&id, &remote).await;
+                }
+
+                let records = team.records.lock().await;
+                let stored = records
+                    .iter()
+                    .find(|stored| stored.id == id)
+                    .expect("the worker record");
+                assert_eq!(stored.status, status, "{status:?} keeps its status");
+                assert_eq!(
+                    stored.error.as_deref(),
+                    Some("its own error"),
+                    "{status:?} keeps its error"
+                );
+                drop(records);
+                assert!(
+                    !team.live.lock().await.contains_key(&id),
+                    "{status:?}: the lost session is dropped"
+                );
+                assert_eq!(
+                    team.remote.busy_on(&rig.node_id).await,
+                    0,
+                    "{status:?}: the host slot is free"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_local_refuses_a_worker_still_running_on_its_host() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd1111");
+        record.status = WorkerStatus::Idle;
+        std::fs::create_dir_all(&record.worktree).expect("worktree");
+        record.remote = Some(sample_remote(&rig.node_id, None));
+        team.records.lock().await.push(record);
         team.live
             .lock()
             .await
-            .insert(record.id.clone(), live_entry(7));
+            .insert("abcd1111".to_string(), live_entry(31));
 
-        let remote = record.remote.clone().expect("a remote worker");
-        team.mark_host_restarted(&record.id, &remote).await;
-        team.fail_lost_host(&record.id, &remote).await;
+        let answer = team
+            .handle_lead_host_tool(
+                "team_resume",
+                serde_json::json!({"worker_id": "abcd1111", "host": "local"}),
+            )
+            .await;
+        assert!(!answer.success, "{}", answer.output);
+        assert_eq!(
+            answer.output,
+            "worker 'abcd1111' is still running on host 'node-a'; stop it first, then resume it with host \"local\""
+        );
+        let records = team.records.lock().await;
+        assert!(
+            records[0].remote.is_some(),
+            "a refused resume leaves the worker on its host"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_names_a_host_that_is_no_longer_paired() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd2222");
+        record.status = WorkerStatus::Interrupted;
+        std::fs::create_dir_all(&record.worktree).expect("worktree");
+        let mut remote = sample_remote(&"f".repeat(32), None);
+        remote.node_name = "ghost".to_string();
+        record.remote = Some(remote);
+        team.records.lock().await.push(record);
+
+        let answer = team
+            .handle_lead_host_tool("team_resume", serde_json::json!({"worker_id": "abcd2222"}))
+            .await;
+        assert!(!answer.success, "{}", answer.output);
+        assert_eq!(
+            answer.output,
+            "host 'ghost' is no longer paired; pass host \"local\" to continue worker 'abcd2222' here"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_a_host_fails_only_its_running_workers() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        for (id, status) in [
+            ("abcd1111", WorkerStatus::Working),
+            ("abcd2222", WorkerStatus::Completed),
+        ] {
+            let mut record = super::super::tests::worker(rig.root.path(), id);
+            record.status = status;
+            record.remote = Some(sample_remote(&rig.node_id, None));
+            team.records.lock().await.push(record);
+            team.live
+                .lock()
+                .await
+                .insert(id.to_string(), live_entry(if id == "abcd1111" { 21 } else { 22 }));
+        }
+
+        let answer = team
+            .handle_lead_host_tool(
+                "team_hosts",
+                serde_json::json!({"action": "revoke", "name": "node-a"}),
+            )
+            .await;
+        assert!(answer.success, "{}", answer.output);
+        let answer: serde_json::Value = serde_json::from_str(&answer.output).expect("JSON");
+        assert_eq!(answer["failed_workers"], serde_json::json!(["abcd1111"]));
 
         let records = team.records.lock().await;
-        let stored = records
-            .iter()
-            .find(|stored| stored.id == record.id)
-            .expect("the worker record");
-        assert_eq!(stored.status, WorkerStatus::Merged);
-        assert!(stored.error.is_none(), "{:?}", stored.error);
+        let running = records.iter().find(|w| w.id == "abcd1111").expect("running");
+        assert_eq!(running.status, WorkerStatus::Failed);
+        assert!(
+            running.error.as_deref().unwrap_or("").contains("was revoked"),
+            "{:?}",
+            running.error
+        );
+        let finished = records.iter().find(|w| w.id == "abcd2222").expect("finished");
+        assert_eq!(finished.status, WorkerStatus::Completed);
+        drop(records);
+        assert!(
+            team.live.lock().await.is_empty(),
+            "both lost sessions are dropped"
+        );
     }
 }

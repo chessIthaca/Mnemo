@@ -333,10 +333,11 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_hosts".to_string(),
-                description: "Manage worker hosts: other Windows or Mac computers that run Mnemo workers for this project. list: each paired host with its OS, connection, free slots and whether it passed the project's checks. pair: a one-time code (valid for 10 minutes) and the two commands to run on the new host. revoke: remove a host by name or id; its running workers fail and can be resumed. Mnemo places workers on hosts by itself; to choose one, pass host to team_dispatch.".to_string(),
+                description: "Manage worker hosts: other Windows or Mac computers that run Mnemo workers for this project. list: each paired host with its OS, connection, free slots and whether it passed the project's checks. pair: a one-time code (valid for 10 minutes) and the two commands to run on the new host. revoke: remove a host by name or id; its running workers fail and can be resumed. link: tie a host to the SSH connection the lead starts Claude Code sessions on; linking is the user's approval for the lead to start Claude workers there, and unlink withdraws it. Mnemo places workers on hosts by itself; to choose one, pass host to team_dispatch.".to_string(),
                 parameters: json!({"type":"object","properties":{
-                    "action":{"type":"string","enum":["list","pair","revoke"]},
-                    "name":{"type":"string","description":"pair: the new host's name (default: its computer name). revoke: the host's name or id."}
+                    "action":{"type":"string","enum":["list","pair","revoke","link","unlink"]},
+                    "name":{"type":"string","description":"pair: the new host's name (default: its computer name). revoke, link, unlink: the host's name or id."},
+                    "ssh":{"type":"string","description":"link: the name of the saved SSH connection (as the desktop app's list_start_targets shows it) that reaches this host as the same user the node runs as."}
                 },"required":["action"]}),
                 safety: SafetyLevel::NeedsApproval,
                 timeout_ms: Some(30_000),
@@ -344,8 +345,13 @@ impl TeamRuntime {
         ]
     }
 
-    /// `team_hosts`: list, pair, or revoke the paired worker hosts.
-    async fn team_hosts(&self, action: &str, name: Option<&str>) -> ToolResult {
+    /// `team_hosts`: list, pair, revoke, link, or unlink the paired worker hosts.
+    async fn team_hosts(
+        &self,
+        action: &str,
+        name: Option<&str>,
+        ssh: Option<&str>,
+    ) -> ToolResult {
         let Some(hosts) = self
             .hosts
             .read()
@@ -358,7 +364,75 @@ impl TeamRuntime {
             "list" => self.team_hosts_list(&hosts).await,
             "pair" => self.team_hosts_pair(&hosts, name).await,
             "revoke" => self.team_hosts_revoke(&hosts, name).await,
-            _ => ToolResult::error("team_hosts requires 'action' to be list, pair, or revoke"),
+            "link" => self.team_hosts_link(name, ssh),
+            "unlink" => self.team_hosts_unlink(name),
+            _ => ToolResult::error(
+                "team_hosts requires 'action' to be list, pair, revoke, link, or unlink",
+            ),
+        }
+    }
+
+    /// Set or clear the SSH connection on a paired host's record.
+    fn set_host_ssh(
+        &self,
+        name: &str,
+        ssh: Option<&str>,
+    ) -> Result<mnemo::remote::pairing::NodeRecord, String> {
+        let record = self.remote.host(name)?;
+        let server = self
+            .remote
+            .server()
+            .ok_or_else(|| "worker hosts are not available in this window".to_string())?;
+        server.nodes().set_ssh(&record.node_id, ssh)
+    }
+
+    /// `team_hosts link`: tie a host to the saved SSH connection the lead
+    /// starts Claude Code sessions on.
+    fn team_hosts_link(&self, name: Option<&str>, ssh: Option<&str>) -> ToolResult {
+        let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+            return ToolResult::error("team_hosts link requires 'name' (the host's name or id)");
+        };
+        if !valid_host_name(name) {
+            return ToolResult::error(HOST_NAME_REFUSAL);
+        }
+        let Some(ssh) = ssh
+            .map(str::trim)
+            .filter(|ssh| (1..=100).contains(&ssh.chars().count()))
+            .filter(|ssh| !ssh.chars().any(char::is_control))
+        else {
+            return ToolResult::error(
+                "team_hosts link requires 'ssh': the SSH connection's name (1-100 characters)",
+            );
+        };
+        match self.set_host_ssh(name, Some(ssh)) {
+            Ok(record) => ToolResult::success(
+                serde_json::to_string_pretty(&json!({
+                    "action": "team_hosts",
+                    "linked": {"name": record.name, "node_id": record.node_id, "ssh": record.ssh},
+                }))
+                .unwrap_or_default(),
+            ),
+            Err(error) => ToolResult::error(format!("could not link host '{name}': {error}")),
+        }
+    }
+
+    /// `team_hosts unlink`: drop a host's SSH connection.
+    fn team_hosts_unlink(&self, name: Option<&str>) -> ToolResult {
+        let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+            return ToolResult::error("team_hosts unlink requires 'name' (the host's name or id)");
+        };
+        if !valid_host_name(name) {
+            return ToolResult::error(HOST_NAME_REFUSAL);
+        }
+        match self.set_host_ssh(name, None) {
+            Ok(record) => ToolResult::success(
+                serde_json::to_string_pretty(&json!({
+                    "action": "team_hosts",
+                    "unlinked": {"name": record.name, "node_id": record.node_id, "ssh": record.ssh},
+                }))
+                .unwrap_or_default(),
+            ),
+            Err(error) => ToolResult::error(format!("could not unlink host '{name}': {error}")),
         }
     }
 
@@ -409,6 +483,7 @@ impl TeamRuntime {
                 "catalog_ready": Value::Null,
                 "checks": checks_state,
                 "last_seen_ms": record.last_seen_ms,
+                "ssh": record.ssh,
             });
             if connected {
                 if let Ok(status) = server.node(&record.node_id).status().await {
@@ -799,7 +874,8 @@ impl TeamRuntime {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let host_name = args.get("name").and_then(Value::as_str);
-            return Box::pin(self.team_hosts(action, host_name)).await;
+            let ssh = args.get("ssh").and_then(Value::as_str);
+            return Box::pin(self.team_hosts(action, host_name, ssh)).await;
         }
         if name == "team_status" {
             let plan_id = args

@@ -748,6 +748,61 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn team_hosts_links_and_unlinks_ssh() {
+        let rig = Rig::start().await;
+        let team = rig.team_measured().await;
+        let call = |args: serde_json::Value| team.handle_lead_host_tool("team_hosts", args);
+        let list = || async {
+            let listed = call(serde_json::json!({"action": "list"})).await;
+            assert!(listed.success, "{}", listed.output);
+            let listed: serde_json::Value = serde_json::from_str(&listed.output).expect("list JSON");
+            listed["hosts"][0].clone()
+        };
+
+        assert_eq!(list().await["ssh"], serde_json::Value::Null);
+
+        let linked = call(serde_json::json!({"action": "link", "name": "node-a", "ssh": "  studio-ssh "})).await;
+        assert!(linked.success, "{}", linked.output);
+        let linked: serde_json::Value = serde_json::from_str(&linked.output).expect("link JSON");
+        assert_eq!(linked["action"], "team_hosts");
+        assert_eq!(linked["linked"]["name"], "node-a");
+        assert_eq!(linked["linked"]["node_id"], rig.node_id.as_str());
+        assert_eq!(linked["linked"]["ssh"], "studio-ssh");
+        assert_eq!(list().await["ssh"], "studio-ssh");
+        assert_eq!(
+            rig.hub.nodes().get(&rig.node_id).expect("get").expect("record").ssh.as_deref(),
+            Some("studio-ssh")
+        );
+
+        let unlinked = call(serde_json::json!({"action": "unlink", "name": "node-a"})).await;
+        assert!(unlinked.success, "{}", unlinked.output);
+        let unlinked: serde_json::Value = serde_json::from_str(&unlinked.output).expect("unlink JSON");
+        assert_eq!(unlinked["unlinked"]["name"], "node-a");
+        assert_eq!(unlinked["unlinked"]["ssh"], serde_json::Value::Null);
+        assert_eq!(list().await["ssh"], serde_json::Value::Null);
+
+        let too_long = "s".repeat(101);
+        for bad in [serde_json::json!(null), serde_json::json!(""), serde_json::json!("   "), serde_json::json!("a\nb"), serde_json::json!(too_long)] {
+            let mut args = serde_json::json!({"action": "link", "name": "node-a"});
+            if !bad.is_null() {
+                args["ssh"] = bad.clone();
+            }
+            let refused = call(args).await;
+            assert!(!refused.success, "{bad}: {}", refused.output);
+            assert_eq!(
+                refused.output,
+                "team_hosts link requires 'ssh': the SSH connection's name (1-100 characters)"
+            );
+        }
+        assert_eq!(list().await["ssh"], serde_json::Value::Null, "a refused link changes nothing");
+
+        let unknown = call(serde_json::json!({"action": "link", "name": "nobody", "ssh": "x"})).await;
+        assert!(!unknown.success);
+        let nameless = call(serde_json::json!({"action": "unlink"})).await;
+        assert!(!nameless.success);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_reserved_checkout_is_visible_until_released() {
         let rig = Rig::start().await;
         let team = rig.team_measured().await;

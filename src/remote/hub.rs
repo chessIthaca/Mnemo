@@ -64,7 +64,9 @@ pub const SESSION_CLOSE_WAIT: &str = "session.close_and_wait";
 pub const SESSION_LIST: &str = "session.list";
 /// `engine.events`: the node-wide event stream, resumable by sequence.
 pub const ENGINE_EVENTS: &str = "engine.events";
-/// `node.status`: the node's identity, version, OS and workspace.
+/// `node.status`: the node's identity, version, mirrored model-catalog
+/// revision (`catalog_revision`, `null` before the first catalog), OS,
+/// workspace, hub and open sessions.
 pub const NODE_STATUS: &str = "node.status";
 
 /// The hub's note carrying a fresh [`ModelCatalog`] to a node.
@@ -232,6 +234,9 @@ struct HubState {
     /// The per-connection tasks, so a shutdown aborts the ones parked on a
     /// link instead of leaving them to notice the socket went away.
     connections: StdMutex<Vec<JoinHandle<()>>>,
+    /// The [`NodeHandle::events`] follow tasks, so a shutdown aborts the ones
+    /// parked on a link instead of leaving them holding the hub state.
+    followers: StdMutex<Vec<JoinHandle<()>>>,
     changed: watch::Sender<u64>,
     shutdown: watch::Sender<bool>,
     generation: AtomicU64,
@@ -270,6 +275,7 @@ impl HubServer {
             memory: MemoryHandler::new(adapter),
             live: StdMutex::new(HashMap::new()),
             connections: StdMutex::new(Vec::new()),
+            followers: StdMutex::new(Vec::new()),
             changed,
             shutdown,
             generation: AtomicU64::new(0),
@@ -380,6 +386,15 @@ impl HubServer {
         for task in self
             .state
             .connections
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+        for task in self
+            .state
+            .followers
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .drain(..)
@@ -572,7 +587,20 @@ impl NodeHandle {
         let node_id = self.node_id.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(async move { follow_events(state, node_id, tx).await });
+                // The shutdown flag is read under the followers lock and
+                // `halt` sets it before draining that list, so a follower
+                // either is never started or is aborted by the drain.
+                let mut followers = self
+                    .state
+                    .followers
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if !*self.state.shutdown.borrow() {
+                    let task =
+                        runtime.spawn(async move { follow_events(state, node_id, tx).await });
+                    followers.retain(|task| !task.is_finished());
+                    followers.push(task);
+                }
             }
             Err(_) => {
                 eprintln!("mnemo hub: events() needs a Tokio runtime");
@@ -581,7 +609,9 @@ impl NodeHandle {
         rx
     }
 
-    /// The node's identity, version, OS, workspace and open sessions.
+    /// The node's identity, version, mirrored model-catalog revision
+    /// (`catalog_revision`, `null` before the first catalog), OS, workspace,
+    /// hub and open sessions.
     pub async fn status(&self) -> Result<Value, RemoteError> {
         self.call(NODE_STATUS, json!({}), CALL_TIMEOUT).await
     }
@@ -695,6 +725,11 @@ async fn wait_link(state: &Arc<HubState>, node_id: &str) -> Option<Link> {
     let mut changes = state.changed.subscribe();
     let mut shutdown = state.shutdown.subscribe();
     loop {
+        // A fresh `subscribe` marks the current value as seen, so a shutdown
+        // that already happened would never wake `changed()`: read it.
+        if *state.shutdown.borrow() {
+            return None;
+        }
         if let Some(link) = state
             .live
             .lock()
@@ -805,33 +840,52 @@ async fn serve_connection(state: Arc<HubState>, stream: TcpStream) -> Result<(),
         }
     }
     let _ = state.nodes.touch(&node_id);
-    let generation = attach(&state, &node_id, link.clone());
-    link.closed().await;
+    let Some(generation) = attach(&state, &node_id, link.clone()) else {
+        // The hub is shutting down: `attach` already closed the link.
+        return Ok(());
+    };
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::select! {
+        _ = link.closed() => {}
+        // `halt` closes the live links too, but a link that attached around
+        // it is only guaranteed to end through this arm.
+        _ = shutdown.wait_for(|down| *down) => link.close(),
+    }
     detach(&state, &node_id, generation);
     Ok(())
 }
 
 /// Publish a freshly authenticated link for `node_id` and start pushing its
-/// memory version. Answers this attachment's generation.
-fn attach(state: &Arc<HubState>, node_id: &str, link: Link) -> u64 {
+/// memory version. Answers this attachment's generation, or `None` (after
+/// closing the link) while the hub is shutting down.
+fn attach(state: &Arc<HubState>, node_id: &str, link: Link) -> Option<u64> {
     state.llm.sweep();
     let payload = json!({ "catalog": state.services.catalog() });
-    link.notify(CATALOG_CHANGED, payload);
     let adapter = Arc::new(ServicesAdapter(state.services.clone()));
-    let version_watch = spawn_version_watch(adapter, link.clone());
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let previous = state
-        .live
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .insert(
+    let previous = {
+        let mut live = state
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // `halt` sets the flag before it drains this map under the same lock,
+        // so a link is either refused here or drained (and closed) there.
+        if *state.shutdown.borrow() {
+            drop(live);
+            link.close();
+            return None;
+        }
+        link.notify(CATALOG_CHANGED, payload);
+        let version_watch = spawn_version_watch(adapter, link.clone());
+        live.insert(
             node_id.to_string(),
             LiveNode {
                 link,
                 version_watch,
                 generation,
             },
-        );
+        )
+    };
     if let Some(previous) = previous {
         // A second connection for the same node replaces the first: stop its
         // watch and close its link (the previous connection task holds its own
@@ -844,7 +898,7 @@ fn attach(state: &Arc<HubState>, node_id: &str, link: Link) -> u64 {
         current.wrapping_add(1)
     };
     state.changed.send_replace(next);
-    generation
+    Some(generation)
 }
 
 /// Retire this connection's live entry, unless a newer attachment replaced it.

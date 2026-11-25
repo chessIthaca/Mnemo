@@ -21,6 +21,14 @@ serde_json = "1"
 dunce = "1.0"
 uuid = { version = "1", features = ["v4"] }
 
+# `mnemo2-node` copies its stderr into <home>/node.log by swapping the
+# process's stderr handle (src/node/logfile.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [features]
 custom-protocol = ["mnemo-app/custom-protocol"]
 # Installed Mnemo2 builds update themselves (mnemo-app's `auto-update`);
@@ -46,6 +54,13 @@ path = "src/mnemo2_mcp.rs"
 name = "mnemo-models"
 path = "src/mnemo_models.rs"
 
+# The headless worker node of a remote hub (plan a040713f, phase 2 step 6): a
+# console binary (never the GUI `mnemo2`) that pairs once with a hub, dials it,
+# and runs worker sessions whose model calls and memory the hub serves.
+[[bin]]
+name = "mnemo2-node"
+path = "src/bin/mnemo2-node.rs"
+
 [[example]]
 name = "mnemo2_route_eval"
 path = "examples/mnemo2_route_eval.rs"
@@ -56,3 +71,6 @@ path = "examples/mnemo2_memory_eval.rs"
 
 [dev-dependencies]
 tempfile = "3"
+# The two-process node test (tests/node_e2e.rs) scripts the hub's model.
+futures = "0.3"
+async-trait = "0.1"

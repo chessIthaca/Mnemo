@@ -699,6 +699,12 @@ async fn e2e_node_session_uses_hub_model_and_hub_memory() {
 
         handle.close_and_wait(session).await.expect("close");
         node.kill().await;
+        let log = std::fs::read_to_string(node_config.join("node").join("node.log"))
+            .expect("the node writes <home>/node.log");
+        assert!(
+            log.contains(&format!("node {} serving hub", identity.node_id)),
+            "node.log should hold the startup line; it holds:\n{log}"
+        );
         let node_store = node_config.join("node").join("state").join("memory.db");
         assert!(node_store.is_file(), "the node keeps a local store file");
         let local = MemoryStore::open(&node_store, Arc::new(HashEmbedder::new()))
@@ -708,6 +714,34 @@ async fn e2e_node_session_uses_hub_model_and_hub_memory() {
             0,
             "the node's own store must not hold the shared memory"
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_unpair_removes_identity() {
+    within(async {
+        let root = tempfile::tempdir().expect("temp dir");
+        let hub_config = root.path().join("hub-cfg");
+        let node_config = root.path().join("node-cfg");
+        write_hub_config(&hub_config);
+        let hub = start_hub(root.path(), &hub_config, ScriptedModel::new(Vec::new()));
+        pair_node(&hub.server, hub.server.local_addr(), &node_config).await;
+        let identity_file = NodeIdentity::path(&node_config.join("node"));
+        assert!(identity_file.is_file(), "pairing writes node.json");
+        let config = node_config.to_string_lossy().into_owned();
+        let unpair = cli(&["unpair", "--config-dir", &config], &node_config).await;
+        assert_eq!(
+            unpair.status.code(),
+            Some(0),
+            "unpair: {}",
+            text_of(&unpair.stderr)
+        );
+        assert!(!identity_file.exists(), "unpair deletes node.json");
+        let status = cli(&["status", "--config-dir", &config], &node_config).await;
+        assert_eq!(status.status.code(), Some(3), "status after unpair");
+        let again = cli(&["unpair", "--config-dir", &config], &node_config).await;
+        assert_eq!(again.status.code(), Some(0), "unpair when not paired exits 0");
     })
     .await;
 }

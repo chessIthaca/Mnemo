@@ -38,7 +38,8 @@ const USAGE: &str = "usage: mnemo2-node pair --hub <host:port> --code <CODE> [--
     mnemo2-node unpair [--config-dir <dir>]\n\
     \n\
     exit codes: 0 ok, 2 usage, 3 not paired, 4 refused by the hub\n\
-    (unknown_node, bad_proof, bad_code, expired), 5 protocol mismatch, 1 other";
+    (unknown_node, bad_proof, bad_code, expired), 5 protocol mismatch, 1 other\n\
+    unpair exits 0 when the node is not paired (nothing to do)";
 
 /// Exit code: a usage error.
 const EXIT_USAGE: u8 = 2;

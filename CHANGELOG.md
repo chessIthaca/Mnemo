@@ -7,6 +7,26 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
+## [2.9.0] — 2026-11-25
+
+Claude Code agent workers start without a permission prompt and are handed back more patiently, and Mnemo2 shuts down cleanly.
+
+### Added
+- A Claude Code agent worker's launch is approved without a permission prompt: Mnemo puts a one-time token on the first line of each launch prompt it hands the lead, and the gate approves only a launch carrying a live token, once. It covers worker launches and records only, and a launch without the token falls back to Claude Code's own rules.
+- An explicit code-embedder option for the engine: automatic is the default, and off never builds or downloads the code model.
+
+### Changed
+- An agent worker goes back to Mnemo's models only after its Claude Code lead has been away for a grace period (`[routing] agent_hand_back_minutes`, default 30, 0 hands back at once), and Mnemo looks for the agent before handing an unlaunched worker back.
+- A non-isolated agent launch while a worker waits for its agent is denied with a reason that says how to relaunch it.
+- Test temp folders stay inside the checkout's `target` folder instead of the system temp folder, and killed test command trees are reaped so folders stop leaking.
+- Dependencies: svelte 5.59.1 (#154).
+
+### Fixed
+- Shutdown waits for aborted tasks and the last engine handle, and releases the memory store and the code graph.
+- Memory consolidations finish detached and fit within the app's shutdown deadline.
+- In-memory store readers take no shared-cache table locks, so a background write no longer fails with a "table is locked" error.
+- A full test run no longer downloads the code model into a temp folder.
+
 ## [2.8.0] — 2026-11-23
 
 A tier can run as a Claude Code agent, code search finds code by meaning, and one shared model host serves every window.

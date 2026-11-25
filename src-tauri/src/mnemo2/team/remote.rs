@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use mnemo::headless::{SessionEvent, SpawnOptions};
+use mnemo::headless::{SessionEvent, SessionId, SpawnOptions};
 use mnemo::remote::hub::{EngineEventItem, HubServer, NodeHandle, RemoteSpawn, CALL_TIMEOUT};
 use mnemo::remote::pairing::NodeRecord;
 use mnemo::remote::repo::{
@@ -217,7 +217,7 @@ pub(crate) fn environmental_failure(exit_code: Option<i64>, text: &str) -> bool 
 /// which in this repository routinely names PowerShell and Windows-only
 /// compiler gates and would pin every dispatch to a Windows host.
 pub fn requires_windows(commands: &[String]) -> bool {
-    const WINDOWS_SHELLS: [&str; 5] = ["powershell", "powershell.exe", "pwsh", "cmd", "cmd.exe"];
+    const WINDOWS_SHELLS: [&str; 4] = ["powershell", "powershell.exe", "cmd", "cmd.exe"];
     commands.iter().any(|command| {
         let first = command
             .split_whitespace()
@@ -228,6 +228,9 @@ pub fn requires_windows(commands: &[String]) -> bool {
         if WINDOWS_SHELLS.contains(&first.as_str()) {
             return true;
         }
+        // `pwsh` alone runs on macOS and Linux too (PowerShell 7); it is
+        // Windows-only when it runs a PowerShell script, which the file
+        // suffixes below catch.
         let lower = command.to_ascii_lowercase();
         [".ps1", ".bat", ".cmd"]
             .iter()
@@ -365,6 +368,9 @@ pub struct RemoteWorkers {
     /// How long a node may stay away before its worker fails. The production
     /// value is [`mnemo::remote::HUB_OUTAGE_BUDGET`]; tests shorten it.
     outage_budget: StdMutex<Duration>,
+    /// Sessions seen without a live entry on the previous reconcile pass, so a
+    /// session that is still spawning is never closed on its first sighting.
+    seen_orphans: StdMutex<HashSet<(String, SessionId)>>,
 }
 
 impl RemoteWorkers {
@@ -392,6 +398,7 @@ impl RemoteWorkers {
             suitability: StdMutex::new(suitability),
             qualifying: StdMutex::new(HashMap::new()),
             outage_budget: StdMutex::new(mnemo::remote::HUB_OUTAGE_BUDGET),
+            seen_orphans: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -448,8 +455,9 @@ impl RemoteWorkers {
 
     /// How many live workers run on `node_id`.
     pub async fn busy_on(&self, node_id: &str) -> usize {
-        let live = self.live.lock().await;
+        // Locks are always taken records before live.
         let records = self.records.lock().await;
+        let live = self.live.lock().await;
         live.keys()
             .filter(|id| {
                 records.iter().any(|record| {
@@ -851,7 +859,7 @@ impl RemoteWorkers {
                 changed: false,
             });
         }
-        self.fetch_into_shadow(&node, record, remote).await?;
+        let start = self.fetch_into_shadow(&node, record, remote).await?;
         let local = git_value(&record.worktree, &["status", "--porcelain"]).await?;
         if !local.trim().is_empty() {
             return Err(format!(
@@ -864,24 +872,28 @@ impl RemoteWorkers {
         if branch.trim() != record.branch {
             git_value(&record.worktree, &["checkout", "-B", &record.branch]).await?;
         }
-        git_value(&record.worktree, &["reset", "--hard", &answer.tip]).await?;
-        self.remember_sync(&record.id, &answer.tip);
-        self.note_synced(record, &answer.tip).await;
+        git_value(&record.worktree, &["reset", "--hard", &start.tip]).await?;
+        self.remember_sync(&record.id, &start.tip);
+        self.note_synced(record, &start.tip).await;
         Ok(ShadowSync {
-            tip: answer.tip,
-            dirty: answer.dirty,
+            tip: start.tip,
+            dirty: start.dirty,
             changed: true,
         })
     }
 
     /// Stream `repo.fetch_branch` into a bundle and fetch it into the project
     /// repo as `refs/mnemo/remote/<id>`; the caller resets the shadow onto it.
+    ///
+    /// When the node answers `unchanged` (the branch tip is one of the haves
+    /// the hub sent, so there is nothing to carry), no bundle is written and no
+    /// digest is checked; the caller still moves the shadow onto `start.tip`.
     async fn fetch_into_shadow(
         &self,
         node: &NodeHandle,
         record: &WorkerRecord,
         remote: &RemoteCheckout,
-    ) -> Result<(), String> {
+    ) -> Result<FetchStart, String> {
         let haves = self.fetch_haves(record, remote).await;
         let opened = node
             .call_stream(
@@ -898,6 +910,9 @@ impl RemoteWorkers {
         let (start, mut pieces) = opened;
         let start: FetchStart = serde_json::from_value(start)
             .map_err(|error| format!("host '{}': bad fetch start: {error}", remote.node_name))?;
+        if start.unchanged {
+            return Ok(start);
+        }
         let short = &start.tip[..start.tip.len().min(7)];
         let bundle = self
             .bundle_dir()?
@@ -940,7 +955,7 @@ impl RemoteWorkers {
         };
         let _ = std::fs::remove_file(&bundle);
         fetched?;
-        Ok(())
+        Ok(start)
     }
 
     /// The commits the node's bundle may exclude: the shadow tip and the
@@ -1180,19 +1195,31 @@ impl RemoteWorkers {
             .clone()
     }
 
-    /// The ids of every live remote worker's node, for the reconciler.
-    pub async fn live_nodes(&self) -> HashSet<String> {
-        let live = self.live.lock().await;
-        let records = self.records.lock().await;
-        live.keys()
-            .filter_map(|id| {
-                records
-                    .iter()
-                    .find(|record| &record.id == id)
-                    .and_then(|record| record.remote.as_ref())
-                    .map(|remote| remote.node_id.clone())
-            })
-            .collect()
+    /// Whether `branch`'s checkout on `node_id` must survive the reconciler
+    /// because a qualification holds (or is about to hold) that node.
+    pub fn qualification_protects(&self, node_id: &str, branch: &str) -> bool {
+        branch == QUALIFY_BRANCH
+            && self
+                .qualifying
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains_key(node_id)
+    }
+
+    /// The sessions that were already orphans on the previous reconcile pass.
+    pub fn orphans(&self) -> HashSet<(String, SessionId)> {
+        self.seen_orphans
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Replace the orphan set with this pass's sightings.
+    pub fn replace_orphans(&self, orphans: HashSet<(String, SessionId)>) {
+        *self
+            .seen_orphans
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = orphans;
     }
 }
 
@@ -1270,6 +1297,34 @@ mod tests {
                 .ok_or_else(|| format!("no worker host named '{host}'"))?;
             self.server.revoke(&record.node_id).map_err(|error| error.to_string())?;
             Ok(record)
+        }
+    }
+
+    /// A host directory whose hub appears only after it was attached.
+    struct LateHosts {
+        server: StdMutex<Option<Arc<HubServer>>>,
+        address: String,
+    }
+
+    #[async_trait::async_trait]
+    impl HostDirectory for LateHosts {
+        fn server(&self) -> Option<Arc<HubServer>> {
+            self.server
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        }
+
+        fn address(&self) -> Option<String> {
+            Some(self.address.clone())
+        }
+
+        async fn pair(&self, _name: Option<&str>) -> Result<PairOffer, String> {
+            Err("unused".to_string())
+        }
+
+        async fn revoke(&self, _host: &str) -> Result<NodeRecord, String> {
+            Err("unused".to_string())
         }
     }
 
@@ -1475,6 +1530,28 @@ mod tests {
                 .and_then(|record| record.remote.as_ref())
                 .and_then(|remote| remote.synced_tip.clone())
         }
+
+        /// A team runtime over the same project, attached to `hosts`. The
+        /// host is pre-measured so no qualification run starts in a test.
+        async fn team_with(&self, hosts: Arc<dyn HostDirectory>) -> Arc<TeamRuntime> {
+            let team = Arc::new(
+                open_test_team(self.root.path(), self._state.path(), self._config.path()).await,
+            );
+            let commands = super::super::spawn::load_check_commands(self.root.path());
+            team.remote
+                .note_check(&self.node_id, &checks_hash(&commands), true, None);
+            team.attach_hosts(hosts);
+            team
+        }
+
+        /// A team runtime attached to the rig's own hub.
+        async fn team(&self) -> Arc<TeamRuntime> {
+            self.team_with(Arc::new(TestHosts {
+                server: self.hub.clone(),
+                address: self.hub.local_addr().to_string(),
+            }))
+            .await
+        }
     }
 
     impl Drop for Rig {
@@ -1519,6 +1596,10 @@ mod tests {
     fn requires_windows_detects_powershell() {
         assert!(requires_windows(&["powershell -NoProfile -Command x".into()]));
         assert!(requires_windows(&["pwsh -File build.ps1".into()]));
+        assert!(
+            !requires_windows(&[r#"pwsh -Command "npm test""#.into()]),
+            "pwsh alone runs on macOS and Linux too"
+        );
         assert!(requires_windows(&["cmd /c build.bat".into()]));
         assert!(requires_windows(&["node scripts/build.cmd".into()]));
         assert!(!requires_windows(&["cargo test --workspace".into()]));
@@ -1861,5 +1942,273 @@ mod tests {
             error.contains("host 'node-a' is offline; Mnemo cannot read worker 'abcd1234's latest commits"),
             "{error}"
         );
+    }
+
+    async fn checkout_list(rig: &Rig) -> Vec<mnemo::remote::repo::CheckoutInfo> {
+        let value = rig
+            .hub
+            .node(&rig.node_id)
+            .call(
+                mnemo::remote::repo::CHECKOUT_LIST,
+                json!(mnemo::remote::repo::CheckoutList {
+                    project: rig.workers.project().to_string(),
+                }),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("the node lists its checkouts");
+        serde_json::from_value::<mnemo::remote::repo::CheckoutListAnswer>(value)
+            .expect("a checkout list answer")
+            .checkouts
+    }
+
+    async fn sessions(rig: &Rig) -> Vec<mnemo::remote::hub::RemoteSessionInfo> {
+        rig.hub
+            .node(&rig.node_id)
+            .list_sessions()
+            .await
+            .expect("the node lists its sessions")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_shadow_handles_an_unchanged_answer() {
+        let rig = Rig::start().await;
+        let base = rig.base().await;
+        let remote = rig
+            .workers
+            .prepare_checkout(&rig.node_id, "wt/agent-abcd1234", &base, false)
+            .await
+            .expect("prepare the node checkout");
+        let node_checkout = PathBuf::from(&remote.path);
+        std::fs::write(node_checkout.join("work.txt"), "remote work\n").expect("write");
+        run_git(&node_checkout, &["config", "user.name", "Mnemo2 Test"]);
+        run_git(&node_checkout, &["config", "user.email", "mnemo2@example.invalid"]);
+        run_git(&node_checkout, &["add", "-A"]);
+        run_git(&node_checkout, &["commit", "-q", "-m", "remote work"]);
+        let tip = git_value(&node_checkout, &["rev-parse", "HEAD"])
+            .await
+            .expect("the node tip");
+
+        let shadow = rig.root.path().join(".worktrees").join("agent-abcd1234");
+        run_git(
+            rig.root.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                shadow.to_str().expect("utf-8 path"),
+                "-b",
+                "wt/agent-abcd1234",
+                &base,
+            ],
+        );
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd1234");
+        record.branch = "wt/agent-abcd1234".to_string();
+        record.worktree = shadow.clone();
+        record.base_commit = Some(base.clone());
+        record.remote = Some(remote);
+        rig.records.lock().await.push(record.clone());
+
+        // First sync carries the node tip into the hub.
+        rig.workers
+            .sync_shadow(&record, true)
+            .await
+            .expect("the first sync fetches the tip");
+        // Now the hub has the tip as the lead branch's head while the shadow
+        // sits back at the base commit, and the remote ref is gone: the node
+        // answers `unchanged`, so the second sync must not fetch anything.
+        run_git(&shadow, &["reset", "--hard", &base]);
+        run_git(rig.root.path(), &["update-ref", "refs/heads/wt/mnemo", &tip]);
+        run_git(
+            rig.root.path(),
+            &["update-ref", "-d", "refs/mnemo/remote/abcd1234"],
+        );
+
+        let sync = rig
+            .workers
+            .sync_shadow(&record, true)
+            .await
+            .expect("an unchanged answer still moves the shadow");
+        assert!(sync.changed);
+        assert_eq!(sync.tip, tip);
+        assert_eq!(
+            crate::mnemo2::phase3::tip(&shadow).await.expect("shadow tip"),
+            tip
+        );
+        let refetched = std::process::Command::new("git")
+            .arg("-C")
+            .arg(rig.root.path())
+            .args(["rev-parse", "--verify", "refs/mnemo/remote/abcd1234"])
+            .output()
+            .expect("probe the remote ref");
+        assert!(
+            !refetched.status.success(),
+            "an unchanged answer carries no bundle"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_releases_only_unreferenced_checkouts() {
+        let rig = Rig::start().await;
+        let base = rig.base().await;
+        let referenced = rig
+            .workers
+            .prepare_checkout(&rig.node_id, "wt/agent-aaaa1111", &base, false)
+            .await
+            .expect("the referenced checkout");
+        let orphan = rig
+            .workers
+            .prepare_checkout(&rig.node_id, "wt/agent-bbbb2222", &base, false)
+            .await
+            .expect("the unreferenced checkout");
+        assert_ne!(referenced.checkout, orphan.checkout);
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "aaaa1111");
+        record.remote = Some(referenced.clone());
+        team.records.lock().await.push(record);
+
+        team.reconcile_hosts().await;
+
+        let checkouts = checkout_list(&rig).await;
+        let kept = checkouts
+            .iter()
+            .find(|info| info.checkout == referenced.checkout)
+            .expect("the referenced checkout is kept");
+        assert_eq!(kept.branch.as_deref(), Some("wt/agent-aaaa1111"));
+        let released = checkouts
+            .iter()
+            .find(|info| info.checkout == orphan.checkout)
+            .expect("the pool is kept, detached");
+        assert!(
+            released.branch.is_none(),
+            "the unreferenced checkout is released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_closes_an_orphan_only_on_the_second_pass() {
+        let rig = Rig::start().await;
+        let base = rig.base().await;
+        let remote = rig
+            .workers
+            .prepare_checkout(&rig.node_id, "wt/agent-cccc3333", &base, false)
+            .await
+            .expect("the orphan's checkout");
+        let session = rig
+            .hub
+            .node(&rig.node_id)
+            .spawn_session(RemoteSpawn {
+                options: SpawnOptions::default(),
+                checkout: Some(remote.checkout.clone()),
+            })
+            .await
+            .expect("a session the hub does not track");
+        let team = rig.team().await;
+        // Keep the checkout alive so only the session rule is under test.
+        let mut record = super::super::tests::worker(rig.root.path(), "cccc3333");
+        record.remote = Some(remote.clone());
+        team.records.lock().await.push(record);
+
+        team.reconcile_hosts().await;
+        assert!(
+            sessions(&rig).await.iter().any(|info| info.session == session),
+            "a session seen for the first time may still be spawning"
+        );
+        team.reconcile_hosts().await;
+        assert!(
+            !sessions(&rig).await.iter().any(|info| info.session == session),
+            "an orphan is closed on the next pass"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn monitor_starts_when_the_hub_appears_after_attach() {
+        let rig = Rig::start().await;
+        let base = rig.base().await;
+        let orphan = rig
+            .workers
+            .prepare_checkout(&rig.node_id, "wt/agent-dddd4444", &base, false)
+            .await
+            .expect("the unreferenced checkout");
+        let late = Arc::new(LateHosts {
+            server: StdMutex::new(None),
+            address: rig.hub.local_addr().to_string(),
+        });
+        let _team = rig.team_with(late.clone()).await;
+        // No hub yet: nothing may be reconciled.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            checkout_list(&rig)
+                .await
+                .iter()
+                .any(|info| info.checkout == orphan.checkout && info.branch.is_some()),
+            "without a hub the monitor leaves the node alone"
+        );
+        // The hub appears; the already-running monitor must pick it up.
+        *late
+            .server
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(rig.hub.clone());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let released = checkout_list(&rig)
+                .await
+                .iter()
+                .any(|info| info.checkout == orphan.checkout && info.branch.is_none());
+            if released {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the monitor reconciles once the hub appears"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restarted_host_frees_the_slot() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd1234");
+        let mut remote = sample_remote(&rig.node_id, None);
+        remote.offline_since_ms = Some(super::super::unix_ms().saturating_sub(5_000));
+        record.remote = Some(remote);
+        team.records.lock().await.push(record.clone());
+        team.live
+            .lock()
+            .await
+            .insert(record.id.clone(), live_entry(7));
+        assert_eq!(team.remote.busy_on(&rig.node_id).await, 1);
+
+        // The host is back, but its node process no longer has the session.
+        team.poll_hosts().await;
+
+        assert_eq!(
+            team.remote.busy_on(&rig.node_id).await,
+            0,
+            "a restarted host frees its slot"
+        );
+        let records = team.records.lock().await;
+        let stored = records
+            .iter()
+            .find(|stored| stored.id == record.id)
+            .expect("the worker record");
+        assert_eq!(stored.status, WorkerStatus::Interrupted);
+        assert!(
+            stored
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("restarted; its session ended"),
+            "{:?}",
+            stored.error
+        );
+        assert!(stored
+            .remote
+            .as_ref()
+            .expect("a remote worker")
+            .offline_since_ms
+            .is_none());
     }
 }

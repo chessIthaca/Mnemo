@@ -768,22 +768,32 @@ impl TeamRuntime {
     /// before.
     pub fn attach_hosts(self: &Arc<Self>, hosts: Arc<dyn HostDirectory>) {
         self.remote.attach(hosts.clone());
-        let Some(server) = hosts.server() else {
-            return;
-        };
-        let mut links = server.link_changes();
         let team = Arc::downgrade(self);
         tokio::spawn(async move {
-            {
-                let Some(runtime) = team.upgrade() else {
-                    return;
-                };
-                runtime.reconcile_hosts().await;
-            }
+            // The app attaches its directory before the hub's listener exists
+            // (the first pairing starts it), so wait for a server rather than
+            // giving up.
+            let mut links: Option<tokio::sync::watch::Receiver<u64>> = None;
             let mut last_reconcile = std::time::Instant::now();
             loop {
+                if links.is_none() {
+                    let Some(server) = hosts.server() else {
+                        tokio::time::sleep(HOST_POLL).await;
+                        continue;
+                    };
+                    links = Some(server.link_changes());
+                    let Some(runtime) = team.upgrade() else {
+                        return;
+                    };
+                    runtime.reconcile_hosts().await;
+                    last_reconcile = std::time::Instant::now();
+                    continue;
+                }
+                let Some(link) = links.as_mut() else {
+                    continue;
+                };
                 tokio::select! {
-                    changed = links.changed() => {
+                    changed = link.changed() => {
                         if changed.is_err() {
                             return;
                         }
@@ -941,6 +951,14 @@ impl TeamRuntime {
                 state.offline_since_ms = None;
             }
         }
+        {
+            // The session is gone with the node process: end its pump and free
+            // the host slot now, as a lost host does.
+            let mut live = self.live.lock().await;
+            if let Some(worker) = live.remove(worker_id) {
+                worker.pump.abort();
+            }
+        }
         if let Err(error) = self.persist().await {
             eprintln!("team: could not save the restarted host of {worker_id}: {error}");
         }
@@ -1030,6 +1048,8 @@ impl TeamRuntime {
                 })
                 .collect()
         };
+        let previously_orphaned = self.remote.orphans();
+        let mut orphans_now: HashSet<(String, mnemo::headless::SessionId)> = HashSet::new();
         for node_record in nodes
             .iter()
             .filter(|node| server.is_connected(&node.node_id))
@@ -1040,7 +1060,16 @@ impl TeamRuntime {
                     let known = live_sessions
                         .iter()
                         .any(|(node_id, session)| node_id == &node_record.node_id && *session == info.session);
-                    if !known {
+                    if known {
+                        continue;
+                    }
+                    // A dispatch inserts its live entry only after the opening
+                    // prompt, so a session seen for the first time may still be
+                    // spawning: close it only when the previous pass saw it too.
+                    let key = (node_record.node_id.clone(), info.session);
+                    let seen_before = previously_orphaned.contains(&key);
+                    orphans_now.insert(key);
+                    if seen_before {
                         let _ = node.close(info.session).await;
                     }
                 }
@@ -1085,6 +1114,14 @@ impl TeamRuntime {
                             if !branch.starts_with("wt/agent-") {
                                 continue;
                             }
+                            // A qualification holds (or is about to hold) its
+                            // own hostcheck checkout: never release it under it.
+                            if self
+                                .remote
+                                .qualification_protects(&node_record.node_id, branch)
+                            {
+                                continue;
+                            }
                             let released = node
                                 .call(
                                     mnemo::remote::repo::CHECKOUT_RELEASE,
@@ -1113,6 +1150,7 @@ impl TeamRuntime {
                 ),
             }
         }
+        self.remote.replace_orphans(orphans_now);
         self.drop_stale_remote_refs().await;
         let commands = spawn::load_check_commands(&self.workspace_root);
         let hash = remote::checks_hash(&commands);

@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 pub use classifier::{Answer, Classifier, ClassifierStatus, LayaClassifier, NoClassifier, Question};
@@ -48,7 +49,10 @@ pub use types::{
 };
 
 /// A scored memory result.
-#[derive(Debug, Clone)]
+///
+/// Serialisable so a remote worker node's recall result can cross the link:
+/// the hub's shared store scores, the node renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredMemory {
     pub memory: Memory,
     pub score: f64,

@@ -790,7 +790,7 @@ impl OpenAiClient {
             tool_choice.map(|tc| match tc {
                 ToolChoice::Auto => serde_json::json!("auto"),
                 ToolChoice::Required => serde_json::json!("required"),
-                ToolChoice::Function(name) => serde_json::json!({
+                ToolChoice::Function { name } => serde_json::json!({
                     "type": "function",
                     "function": { "name": name }
                 }),
@@ -1000,7 +1000,7 @@ impl OpenAiClient {
             body["tool_choice"] = match tc {
                 ToolChoice::Auto => serde_json::json!("auto"),
                 ToolChoice::Required => serde_json::json!("required"),
-                ToolChoice::Function(name) => serde_json::json!({
+                ToolChoice::Function { name } => serde_json::json!({
                     "type": "function",
                     "name": name,
                 }),

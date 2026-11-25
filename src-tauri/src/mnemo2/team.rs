@@ -39,6 +39,7 @@ mod agent_log;
 mod agent_watch;
 mod audit;
 mod check_run;
+pub mod claude_node;
 mod control;
 mod deletion;
 mod dispatch;

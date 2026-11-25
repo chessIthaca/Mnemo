@@ -568,7 +568,7 @@ impl RepoHost {
         let path = checkout_path(&self.home, &request.checkout)?;
         let project = checkout_project(&request.checkout);
         let checkout_lock = self.lock(request.checkout.clone());
-        let _checkout = checkout_lock.lock().await;
+        let checkout_guard = checkout_lock.lock().await;
         let branch = self.branch(&path).await?;
         self.checkout(&path, &["checkout", "--detach"]).await?;
         self.checkout(&path, &["reset", "--hard"]).await?;
@@ -580,6 +580,10 @@ impl RepoHost {
                 .checkout(&path, &["branch", "-D", branch.as_str()])
                 .await;
         }
+        // Drop our own checkout lock before the trim: `trim_pools` takes the
+        // project lock (as `prepare` does), and holding checkout → project here
+        // would invert `prepare`'s project → checkout order.
+        drop(checkout_guard);
         if let Some(project) = project {
             self.trim_pools(&project).await;
         }
@@ -792,19 +796,32 @@ impl RepoHost {
         Ok(())
     }
 
-    /// Rename and delete every pool above the slot count.
+    /// Rename and delete the pools above the slot count that are genuinely
+    /// idle.
     ///
-    /// The rename happens first, so the pool stops being listed the moment the
-    /// release answers; the recursive delete and the bare repo's worktree
+    /// A host legitimately runs more pools than its slot count — host
+    /// qualification, or an audit while both slots are busy — so a pool is
+    /// only a trim candidate when it is idle: `HEAD` is not on a `wt/agent-*`
+    /// branch, and no other call holds its checkout lock. The lock is taken
+    /// with `try_lock` and held across the rename, so a pool another call is
+    /// driving is skipped rather than deleted; a later release trims it once
+    /// it falls idle.
+    ///
+    /// The project lock is taken first, the same order `prepare` uses
+    /// (project, then checkout), so a trim never races a pool pick. The rename
+    /// happens under those locks, so the pool stops being listed the moment it
+    /// is doomed; the recursive delete and the bare repo's worktree
     /// bookkeeping run on the blocking pool.
     async fn trim_pools(&self, project: &str) {
-        let extra: Vec<(String, PathBuf)> = self
+        let project_lock = self.lock(format!("project:{project}"));
+        let _project = project_lock.lock().await;
+        let candidates: Vec<(String, PathBuf)> = self
             .pools(project)
             .into_iter()
             .filter(|(index, _, _)| *index > self.slots)
             .map(|(_, name, path)| (name, path))
             .collect();
-        if extra.is_empty() {
+        if candidates.is_empty() {
             return;
         }
         let trash = self.home.join(CHECKOUTS_DIR);
@@ -813,11 +830,29 @@ impl RepoHost {
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or(0);
         let mut doomed = Vec::new();
-        for (name, path) in extra {
+        for (name, path) in candidates {
+            // Still on a worker branch: the worker is running there.
+            let busy = self
+                .branch(&path)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|branch| branch.starts_with("wt/agent-"));
+            if busy {
+                continue;
+            }
+            // Try-lock, never block: a pool another call is driving stays put.
+            let Ok(guard) = self.lock(name.clone()).try_lock_owned() else {
+                continue;
+            };
             let target = trash.join(format!("trash-{name}-{stamp}"));
             if std::fs::rename(&path, &target).is_ok() {
                 doomed.push(target);
             }
+            drop(guard);
+        }
+        if doomed.is_empty() {
+            return;
         }
         let repo = self.repo_dir(project);
         tokio::task::spawn_blocking(move || {
@@ -1580,6 +1615,92 @@ mod tests {
             answer.checkouts[0].branch.as_deref(),
             Some("wt/agent-a"),
             "the surviving pool is still on its worker branch"
+        );
+        assert!(
+            !Path::new(&second.path).exists(),
+            "the trimmed pool's folder is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_never_trims_a_busy_pool() {
+        let root = scratch("release-busy");
+        let source = root.join("source");
+        let base = source_repo(&source);
+        let host = RepoHost::new(root.join("home"), 1);
+        let project = "0123456789ab";
+        push_branch(&host, project, &source, "main").await;
+
+        // Two pools on two different worker branches: the second exists only
+        // because the first was busy, exactly like a host running more workers
+        // than its slot count.
+        let first = host
+            .prepare(json!({
+                "project": project,
+                "branch": "wt/agent-a",
+                "base": base,
+            }))
+            .await
+            .expect("first");
+        let first: CheckoutAnswer = serde_json::from_value(first).expect("answer");
+        let second = host
+            .prepare(json!({
+                "project": project,
+                "branch": "wt/agent-b",
+                "base": base,
+            }))
+            .await
+            .expect("second");
+        let second: CheckoutAnswer = serde_json::from_value(second).expect("answer");
+        assert_ne!(first.checkout, second.checkout);
+        assert_eq!(host.slots(), 1, "the second pool is above the slot count");
+
+        // Releasing the FIRST pool must not take the second one with it: it is
+        // still on its worker branch, so it is not idle and not trim-able.
+        host.release(json!({ "checkout": first.checkout }))
+            .await
+            .expect("release the first");
+
+        assert!(
+            Path::new(&second.path).is_dir(),
+            "a busy pool above the slot count must survive a release"
+        );
+        let answer = host
+            .list_checkouts(json!({ "project": project }))
+            .await
+            .expect("list");
+        let answer: CheckoutListAnswer = serde_json::from_value(answer).expect("answer");
+        let surviving = answer
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.checkout == second.checkout)
+            .expect("the busy pool is still listed");
+        assert_eq!(
+            surviving.branch.as_deref(),
+            Some("wt/agent-b"),
+            "the busy pool must still be on its worker branch"
+        );
+
+        // Once the second pool is released too it is idle, and the next trim
+        // takes it: the skipped pool is not leaked forever. The first pool
+        // stays — it is within the slot count, the warm pool the node keeps.
+        host.release(json!({ "checkout": second.checkout }))
+            .await
+            .expect("release the second");
+        let answer = host
+            .list_checkouts(json!({ "project": project }))
+            .await
+            .expect("list after the second release");
+        let answer: CheckoutListAnswer = serde_json::from_value(answer).expect("answer");
+        let names: Vec<&str> = answer
+            .checkouts
+            .iter()
+            .map(|checkout| checkout.checkout.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![first.checkout.as_str()],
+            "the skipped pool is trimmed once it falls idle"
         );
         assert!(
             !Path::new(&second.path).exists(),

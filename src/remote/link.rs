@@ -1347,9 +1347,13 @@ async fn dispatch(inner: &Arc<LinkInner>, envelope: Envelope) {
             }
             if in_flight >= MAX_INFLIGHT {
                 // Answer without running a handler; the link stays healthy.
+                // Best effort, like `notify`: the reader must never wait on
+                // a full outbound queue (it would stop reading and stop
+                // watching peer liveness). A dropped answer is a timed-out
+                // call on the requester's side, never a stalled link.
                 let _ = inner
-                    .send(Envelope::res_err(id, RemoteError::busy()))
-                    .await;
+                    .outbound
+                    .try_send(Outbound::Envelope(Envelope::res_err(id, RemoteError::busy())));
                 return;
             }
             let handler = inner.handler.clone();
@@ -2160,6 +2164,93 @@ mod tests {
             task.abort();
         }
         park.release.notify_waiters();
+    }
+
+    /// Parks every request forever and counts the notes it receives.
+    struct NoteCountHandler {
+        notes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LinkHandler for NoteCountHandler {
+        async fn request(&self, _m: &str, _p: Value, _out: StreamTx) -> Result<Value, RemoteError> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+
+        fn note(&self, _m: &str, _p: Value) {
+            self.notes.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_answer_never_blocks_reader() {
+        let node = Node::new(NODE_ID, "duplex");
+        let token = node.token;
+        // A small socket the raw hub never reads after the handshake: the
+        // writer stalls on it, so the outbound queue can be filled for good.
+        let (node_io, hub_io) = tokio::io::duplex(1 << 16);
+        let hub = tokio::spawn(async move {
+            let ws = raw_hub_ws(hub_io).await;
+            raw_hub_handshake(ws, token).await
+        });
+        let notes = Arc::new(AtomicUsize::new(0));
+        let link = dial_on(
+            node_io,
+            &node.identity,
+            Arc::new(NoteCountHandler {
+                notes: notes.clone(),
+            }),
+        )
+        .await
+        .expect("link established");
+        let (mut ws, key, _nonce) = hub.await.expect("hub task joins");
+
+        // Fill the outbound queue: the stalled writer drains nothing.
+        let filler = json!({ "pad": "x".repeat(1024) });
+        let mut filled = false;
+        for _ in 0..20_000 {
+            link.notify("pad", filler.clone());
+            if link.inner.outbound.capacity() == 0 {
+                filled = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(filled, "the outbound queue is full");
+
+        // Fill the in-flight cap, then one request more: the busy answer.
+        let mut seq = 1u64;
+        for id in 1..=MAX_INFLIGHT as u64 {
+            send_frame(&mut ws, &key, seq, &Envelope::req(id, "park", json!({}))).await;
+            seq += 1;
+        }
+        let over = MAX_INFLIGHT as u64 + 1;
+        send_frame(&mut ws, &key, seq, &Envelope::req(over, "park", json!({}))).await;
+        seq += 1;
+        // The next frame must still be processed although the busy answer
+        // found no room. Yield only (no sleep): virtual time must not move.
+        send_frame(&mut ws, &key, seq, &Envelope::note("after", json!({}))).await;
+        for _ in 0..20_000 {
+            if notes.load(AtomicOrdering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            notes.load(AtomicOrdering::SeqCst),
+            1,
+            "the reader processed the frame after the unanswerable busy request"
+        );
+        assert!(
+            link.closed().now_or_never().is_none(),
+            "a dropped busy answer does not hurt the link"
+        );
+
+        // The watchdog still runs: a silent peer is declared dead.
+        tokio::time::timeout(DEAD_AFTER + PING * 3, link.closed())
+            .await
+            .expect("the DEAD_AFTER watchdog closes the link");
     }
 
     #[tokio::test]

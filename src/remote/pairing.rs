@@ -439,9 +439,15 @@ impl NodeIdentity {
 /// identity to save. The returned identity's `hub_id` is the hub's, not the
 /// hub address.
 pub async fn pair_tcp(hub: &str, code: &str, name: &str) -> Result<NodeIdentity, RemoteError> {
-    let stream = tokio::net::TcpStream::connect(hub)
-        .await
-        .map_err(|error| RemoteError::link_down(format!("could not reach {hub}: {error}")))?;
+    let stream = super::link::within_handshake(
+        async {
+            tokio::net::TcpStream::connect(hub).await.map_err(|error| {
+                RemoteError::link_down(format!("could not reach {hub}: {error}"))
+            })
+        },
+        super::link::HANDSHAKE_TIMEOUT,
+    )
+    .await?;
     pair_with(stream, hub, code, name).await
 }
 

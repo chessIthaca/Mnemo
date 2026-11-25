@@ -41,7 +41,9 @@ use crate::headless::{
 use crate::memory::MemoryStoreTrait;
 use crate::provider::LlmClient;
 use crate::remote::catalog::ModelCatalog;
-use crate::remote::link::{accept_hello, accept_upgrade, HubAuth, Link, LinkHandler, StreamTx};
+use crate::remote::link::{
+    accept_hello, accept_upgrade, HubAuth, Link, LinkHandler, StreamRx, StreamTx,
+};
 use crate::remote::llm::{LlmHandler, LlmService};
 use crate::remote::memory::{spawn_version_watch, MemoryHandler, MemoryService};
 use crate::remote::pairing::{answer_pairing, NodeRegistry, PairRequest, PairingRegistry};
@@ -353,6 +355,64 @@ impl HubServer {
         }
     }
 
+    /// The paired-node registry, for listing and revoking hosts.
+    pub fn nodes(&self) -> Arc<NodeRegistry> {
+        self.state.nodes.clone()
+    }
+
+    /// Whether `node_id` has a live link right now.
+    pub fn is_connected(&self, node_id: &str) -> bool {
+        self.state
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(node_id)
+    }
+
+    /// The ids of every node with a live link right now.
+    pub fn connected(&self) -> Vec<String> {
+        self.state
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// A watch that ticks whenever a link attaches or detaches, so a placement
+    /// decision can re-check the live set without polling.
+    pub fn link_changes(&self) -> watch::Receiver<u64> {
+        self.state.changed.subscribe()
+    }
+
+    /// Revoke a node: drop its record, cut its live link and stop its version
+    /// watch. A node that is not connected is still revoked.
+    pub fn revoke(&self, node_id: &str) -> Result<(), String> {
+        self.state.nodes.revoke(node_id)?;
+        let removed = self
+            .state
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(node_id);
+        if let Some(node) = removed {
+            node.version_watch.abort();
+            node.link.close();
+        }
+        let next = {
+            let current = *self.state.changed.borrow();
+            current.wrapping_add(1)
+        };
+        self.state.changed.send_replace(next);
+        Ok(())
+    }
+
+    /// The revision of the model catalog the hub is offering.
+    pub fn catalog_revision(&self) -> String {
+        self.state.services.catalog().revision
+    }
+
     /// Stop the listener, fail every live link, and stop the housekeeping.
     pub async fn shutdown(self) {
         self.halt();
@@ -461,7 +521,7 @@ impl NodeHandle {
     }
 
     /// One hub→node call with `timeout`.
-    async fn call(
+    pub async fn call(
         &self,
         method: &str,
         params: Value,
@@ -469,6 +529,26 @@ impl NodeHandle {
     ) -> Result<Value, RemoteError> {
         let link = self.link()?;
         link.call(method, params, timeout).await
+    }
+
+    /// Open one hub→node streaming call: the method's `res` payload and the
+    /// item stream. `open_timeout` bounds only the wait for that `res`, so a
+    /// long transfer that keeps producing items never trips it.
+    pub async fn call_stream(
+        &self,
+        method: &str,
+        params: Value,
+        open_timeout: Duration,
+    ) -> Result<(Value, StreamRx), RemoteError> {
+        let link = self.link()?;
+        match tokio::time::timeout(open_timeout, link.call_stream(method, params)).await {
+            Ok(opened) => opened,
+            Err(_) => Err(RemoteError::timeout(format!(
+                "{method} on node {} did not start within {}s",
+                self.node_id,
+                open_timeout.as_secs()
+            ))),
+        }
     }
 
     /// Start one session on the node (spawn budget 180 s).
@@ -577,11 +657,14 @@ impl NodeHandle {
         }
     }
 
-    /// A node-wide event subscription: every session's events, in the node's
-    /// sequence order. It survives reconnects — after a link comes back the
-    /// subscription resumes at `last_seq + 1` — and reports lost ranges as
-    /// [`EngineEventItem::Gap`].
-    pub fn events(&self) -> mpsc::Receiver<EngineEventItem> {
+    /// A node-wide event subscription from `from` (inclusive): every session's
+    /// events, in the node's sequence order. It survives reconnects — after a
+    /// link comes back the subscription resumes where it stopped — and reports
+    /// lost ranges as [`EngineEventItem::Gap`].
+    ///
+    /// Callers that keep their own cursor pass the sequence they still need;
+    /// [`NodeHandle::events`] is `events_from(1)`.
+    pub fn events_from(&self, from: u64) -> mpsc::Receiver<EngineEventItem> {
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
         let state = self.state.clone();
         let node_id = self.node_id.clone();
@@ -596,8 +679,8 @@ impl NodeHandle {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
                 if !*self.state.shutdown.borrow() {
-                    let task =
-                        runtime.spawn(async move { follow_events(state, node_id, tx).await });
+                    let task = runtime
+                        .spawn(async move { follow_events(state, node_id, from, tx).await });
                     followers.retain(|task| !task.is_finished());
                     followers.push(task);
                 }
@@ -607,6 +690,23 @@ impl NodeHandle {
             }
         }
         rx
+    }
+
+    /// A node-wide event subscription from sequence 1.
+    pub fn events(&self) -> mpsc::Receiver<EngineEventItem> {
+        self.events_from(1)
+    }
+
+    /// The node's last event sequence, from `session.list`.
+    ///
+    /// The demux a caller keeps (`events_from(last + 1)`) starts here, and a
+    /// caller that stores it can resume exactly where it stopped.
+    pub async fn last_event_seq(&self) -> Result<u64, RemoteError> {
+        let answer = self.call(SESSION_LIST, json!({}), CALL_TIMEOUT).await?;
+        answer
+            .get("last_seq")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| RemoteError::internal("session.list answered without last_seq"))
     }
 
     /// The node's identity, version, mirrored model-catalog revision
@@ -622,9 +722,10 @@ impl NodeHandle {
 async fn follow_events(
     state: Arc<HubState>,
     node_id: String,
+    from: u64,
     tx: mpsc::Sender<EngineEventItem>,
 ) {
-    let mut next = 1u64;
+    let mut next = from.max(1);
     loop {
         let Some(link) = wait_link(&state, &node_id).await else {
             return;
@@ -977,4 +1078,212 @@ fn sweep_revoked(state: &Arc<HubState>) {
         current.wrapping_add(1)
     };
     state.changed.send_replace(next);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::config::Config;
+    use crate::remote::link::dial;
+    use crate::remote::pairing::{pair_tcp, NodeIdentity};
+    use crate::runtime::channels::SerializableAgentEvent;
+
+    /// A scratch directory under `target/` (never `%TEMP%`).
+    fn scratch(tag: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&root).expect("target dir");
+        let dir = root.join(format!("mnemo-remote-hub-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The minimum a hub must answer for the link-side accessors: no model
+    /// clients and no memory, only the catalog the nodes mirror.
+    struct FakeServices {
+        catalog: ModelCatalog,
+    }
+
+    impl FakeServices {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                catalog: ModelCatalog::from_config(&Config::default(), String::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl HubServices for FakeServices {
+        fn model_client(&self, _model: &ModelRef) -> Option<Arc<dyn LlmClient>> {
+            None
+        }
+
+        fn memory(&self) -> Option<Arc<dyn MemoryStoreTrait>> {
+            None
+        }
+
+        fn catalog(&self) -> ModelCatalog {
+            self.catalog.clone()
+        }
+    }
+
+    /// A node-side handler that serves `session.list` and `engine.events` and
+    /// remembers the sequence each `engine.events` call asked to start at.
+    struct FakeNode {
+        last_seq: u64,
+        asked_from: Arc<StdMutex<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl LinkHandler for FakeNode {
+        async fn request(
+            &self,
+            method: &str,
+            params: Value,
+            out: StreamTx,
+        ) -> Result<Value, RemoteError> {
+            match method {
+                SESSION_LIST => Ok(json!({ "sessions": [], "last_seq": self.last_seq })),
+                ENGINE_EVENTS => {
+                    let from = params
+                        .get("from")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1)
+                        .max(1);
+                    self.asked_from
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(from);
+                    out.start(json!({ "first": from })).await?;
+                    for seq in from..=self.last_seq {
+                        let event = SessionEvent {
+                            agent: 1,
+                            event: SerializableAgentEvent::TextDelta {
+                                text: format!("event {seq}"),
+                            },
+                            rates: None,
+                        };
+                        out.item(json!({ "seq": seq, "event": event })).await?;
+                    }
+                    // Park: like the real node's stream, this stays open until
+                    // the link drops, so the hub never re-opens in a hot loop.
+                    std::future::pending::<()>().await;
+                    Ok(Value::Null)
+                }
+                other => Err(RemoteError::unknown_method(other)),
+            }
+        }
+
+        fn note(&self, _method: &str, _params: Value) {}
+    }
+
+    /// Start a hub over `tag`, pair a fake node into it and dial it.
+    async fn fake_node(
+        tag: &str,
+        last_seq: u64,
+    ) -> (HubServer, NodeIdentity, Link, Arc<StdMutex<Vec<u64>>>) {
+        let root = scratch(tag);
+        let server = HubServer::start(
+            HubOptions {
+                bind: "127.0.0.1:0".parse().expect("loopback"),
+                state_dir: root.join("hub"),
+            },
+            FakeServices::new(),
+        )
+        .expect("hub start");
+        let code = server.pairing().issue_code(tag);
+        let identity = pair_tcp(&server.local_addr().to_string(), &code.code, tag)
+            .await
+            .expect("pair");
+        let asked_from = Arc::new(StdMutex::new(Vec::new()));
+        let link = dial(
+            &identity,
+            Arc::new(FakeNode {
+                last_seq,
+                asked_from: asked_from.clone(),
+            }),
+        )
+        .await
+        .expect("the node dials");
+        assert!(
+            server
+                .wait_connected(&identity.node_id, Duration::from_secs(10))
+                .await,
+            "the node should attach"
+        );
+        (server, identity, link, asked_from)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_from_skips_older_sequences() {
+        let (server, identity, _link, asked_from) = fake_node("events-from", 7).await;
+        let handle = server.node(&identity.node_id);
+        assert_eq!(
+            handle.last_event_seq().await.expect("last seq"),
+            7,
+            "session.list answers the ring's last sequence"
+        );
+
+        let mut rx = handle.events_from(6);
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let item = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the demux should deliver an item")
+                .expect("the channel stays open");
+            match item {
+                EngineEventItem::Event { seq, .. } => seen.push(seq),
+                EngineEventItem::Gap { from, to } => panic!("unexpected gap {from}..={to}"),
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![6, 7],
+            "the subscription must start at the requested sequence, not at 1"
+        );
+        assert_eq!(
+            asked_from
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_slice(),
+            &[6],
+            "the node must be asked to start at 6"
+        );
+        drop(rx);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoke_closes_the_live_link() {
+        let (server, identity, link, _asked) = fake_node("revoke-live", 0).await;
+        assert!(
+            server.is_connected(&identity.node_id),
+            "the node is connected before the revoke"
+        );
+        assert!(server
+            .connected()
+            .iter()
+            .any(|node_id| node_id == &identity.node_id));
+
+        server.revoke(&identity.node_id).expect("revoke");
+
+        assert!(
+            !server.is_connected(&identity.node_id),
+            "a revoked node has no live link"
+        );
+        assert!(
+            !server.connected().contains(&identity.node_id),
+            "a revoked node drops out of the connected set"
+        );
+        assert!(
+            matches!(server.nodes().get(&identity.node_id), Ok(None)),
+            "the registry record is gone"
+        );
+        tokio::time::timeout(Duration::from_secs(5), link.closed())
+            .await
+            .expect("the revoked node's live link must be cut");
+        server.shutdown().await;
+    }
 }

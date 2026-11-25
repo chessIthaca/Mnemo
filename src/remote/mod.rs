@@ -35,6 +35,7 @@ pub mod llm;
 pub mod memory;
 pub mod node;
 pub mod pairing;
+pub mod repo;
 pub mod wire;
 
 pub use link::{HubAuth, Item, Link, LinkHandler, LinkSlot, StreamRx, StreamTx, TokenLookup};

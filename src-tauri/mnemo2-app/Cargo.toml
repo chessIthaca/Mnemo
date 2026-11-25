@@ -11,7 +11,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 mnemo-app = { path = "..", features = ["mnemo2"] }
-mnemo = { path = "../..", features = ["browser", "embeddings"] }
+mnemo = { path = "../..", features = ["browser", "embeddings", "remote"] }
 tauri = { version = "2", features = ["unstable", "tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"

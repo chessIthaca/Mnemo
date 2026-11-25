@@ -40,6 +40,11 @@ embeddings = ["dep:fastembed"]
 # through dev-dependencies so the factories are visible cross-crate. Never
 # enabled in release builds.
 test-support = []
+# Remote worker nodes (plan a040713f, phase 2): the pairing registry, the
+# authenticated multiplexed WebSocket link and its wire format
+# (src/remote). Implies `headless` — a node runs the headless engine. The
+# app (src-tauri) always selects it through mnemo2-app.
+remote = ["headless", "dep:async-tungstenite", "dep:hmac"]
 
 [dependencies]
 # Async runtime
@@ -124,6 +129,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # skip (link-time research 2026-12-07, lever #4). The app (src-tauri) always
 # selects the feature.
 chromiumoxide = { version = "0.9", optional = true }
+
+# Remote worker nodes (plan a040713f): the hub↔node link is one WebSocket
+# between the node (client) and the hub (server), authenticated per frame
+# with HMAC-SHA256. Both crates are already in the tree (chromiumoxide pulls
+# async-tungstenite; hmac is the sha2 sibling), so this adds only the two
+# direct-dependency edges. No TLS feature: the user wraps the transport in
+# Tailscale or an SSH tunnel.
+async-tungstenite = { version = "0.32", default-features = false, features = ["handshake", "futures-03-sink", "tokio-runtime"], optional = true }
+hmac = { version = "0.13", optional = true }
 
 # Temp dirs for the per-launch throwaway Chromium profile (auto-removed on drop)
 tempfile = "3"

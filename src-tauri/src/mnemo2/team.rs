@@ -869,17 +869,43 @@ impl TeamRuntime {
                 .into_iter()
                 .filter_map(|(id, session)| {
                     let record = records.iter().find(|record| record.id == id)?;
+                    // A remote agent worker is followed by the second pass
+                    // below: it is never failed for a lost link.
+                    if agent_watch::runs_as_agent(record) {
+                        return None;
+                    }
                     let remote = record.remote.clone()?;
                     Some((id, remote, session))
                 })
                 .collect()
         };
+        // Remote Claude Code agent workers hold no Mnemo session: copy their
+        // checkouts under the records lock alone, then release it.
+        let agents: Vec<(String, RemoteCheckout)> = {
+            let records = self.records.lock().await;
+            records
+                .iter()
+                .filter(|record| record.claude_agent.is_some() && agent_watch::runs_as_agent(record))
+                .filter_map(|record| Some((record.id.clone(), record.remote.clone()?)))
+                .collect()
+        };
         let budget_ms = u64::try_from(self.remote.outage_budget().as_millis()).unwrap_or(u64::MAX);
         let now = unix_ms();
+        for (id, remote) in agents {
+            // The session runs over SSH and does not depend on the node link:
+            // a lost link only marks the worker offline, and only a revoke
+            // fails it.
+            let linked = connected.contains(&remote.node_id);
+            match remote.offline_since_ms {
+                None if !linked => self.mark_host_offline(&id, &remote, true).await,
+                Some(_) if linked => self.mark_host_back(&id, &remote).await,
+                _ => {}
+            }
+        }
         for (id, remote, session) in watching {
             if !connected.contains(&remote.node_id) {
                 match remote.offline_since_ms {
-                    None => self.mark_host_offline(&id, &remote).await,
+                    None => self.mark_host_offline(&id, &remote, false).await,
                     Some(since) if now.saturating_sub(since) > budget_ms => {
                         self.fail_lost_host(&id, &remote).await;
                     }
@@ -902,8 +928,9 @@ impl TeamRuntime {
         }
     }
 
-    /// Mark a live remote worker's host as away and tell the lead.
-    async fn mark_host_offline(&self, worker_id: &str, remote: &RemoteCheckout) {
+    /// Mark a live remote worker's host as away and tell the lead. `agent` is a
+    /// remote Claude Code agent worker, whose session keeps working over SSH.
+    async fn mark_host_offline(&self, worker_id: &str, remote: &RemoteCheckout, agent: bool) {
         {
             let mut records = self.records.lock().await;
             let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
@@ -920,14 +947,19 @@ impl TeamRuntime {
         if let Err(error) = self.persist().await {
             eprintln!("team: could not save the lost host of {worker_id}: {error}");
         }
-        let budget = self.remote.outage_budget().as_secs();
-        self.notify_lead(
-            format!("host-offline:{worker_id}"),
+        let text = if agent {
+            format!(
+                "Worker {worker_id} lost its host {}; its Claude Code session there may keep working. Mnemo follows it again when the host is back.",
+                remote.node_name
+            )
+        } else {
+            let budget = self.remote.outage_budget().as_secs();
             format!(
                 "Worker {worker_id} lost its host {}; it continues when the host is back (up to {budget} s).",
                 remote.node_name
-            ),
-        );
+            )
+        };
+        self.notify_lead(format!("host-offline:{worker_id}"), text);
     }
 
     /// A host that came back within the outage budget: clear the mark and tell
@@ -1073,7 +1105,9 @@ impl TeamRuntime {
     ///
     /// The session on that host is gone for good, but the record keeps its
     /// remote checkout so `team_resume` with `host "local"` can continue the
-    /// worker from the hub's shadow checkout. Returns the failed worker ids.
+    /// worker from the hub's shadow checkout. A running remote agent worker
+    /// fails too: its Claude Code session may still work there, so its error
+    /// asks the lead to stop it first. Returns the failed worker ids.
     pub(super) async fn fail_revoked_host(&self, node_id: &str, name: &str) -> Vec<String> {
         let running: Vec<String> = {
             let live = self.live.lock().await;
@@ -1084,7 +1118,10 @@ impl TeamRuntime {
         {
             let mut records = self.records.lock().await;
             for worker in records.iter_mut() {
-                if !running.contains(&worker.id) {
+                let agent = worker.claude_agent.is_some() && agent_watch::runs_as_agent(worker);
+                // A remote agent worker holds no Mnemo session, so it is not in
+                // the live set; every other worker is only touched when running.
+                if !agent && !running.contains(&worker.id) {
                     continue;
                 }
                 let Some(remote) = worker.remote.as_ref() else {
@@ -1096,7 +1133,7 @@ impl TeamRuntime {
                 // Only a worker that was running a turn fails; any other
                 // worker keeps its status and error, and its lost session is
                 // dropped below all the same.
-                if !is_active(worker.status) {
+                if !agent && !is_active(worker.status) {
                     lost.push(worker.id.clone());
                     continue;
                 }
@@ -1116,10 +1153,17 @@ impl TeamRuntime {
                         .unwrap_or_default(),
                 };
                 worker.status = WorkerStatus::Failed;
-                worker.error = Some(format!(
-                    "host '{name}' was revoked; its session there is lost. team_resume continues worker '{}' here with host \"local\"{from}.",
-                    worker.id
-                ));
+                worker.error = Some(if agent {
+                    format!(
+                        "host '{name}' was revoked; Mnemo can no longer follow worker '{}'s Claude Code session there. Stop that session (SendMessage it to stop, or end it in the app), then team_resume continues the worker here with host \"local\"{from}.",
+                        worker.id
+                    )
+                } else {
+                    format!(
+                        "host '{name}' was revoked; its session there is lost. team_resume continues worker '{}' here with host \"local\"{from}.",
+                        worker.id
+                    )
+                });
                 failed.push(worker.id.clone());
             }
         }
@@ -1144,6 +1188,9 @@ impl TeamRuntime {
     /// Re-align the node side with the hub: close sessions the hub does not
     /// know, release pools no record holds, drop the refs of deleted workers,
     /// and start a qualification on every connected node that has none.
+    ///
+    /// A remote agent worker has no Mnemo session on its node, but its record
+    /// names its checkout, so that checkout counts as referenced and is kept.
     async fn reconcile_hosts(&self) {
         let Some(server) = self.remote.server() else {
             return;

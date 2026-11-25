@@ -21298,6 +21298,190 @@ async fn agent_retry_on_node_respects_the_cap() {
     assert!(record.remote.is_none(), "no node checkout was prepared");
 }
 
+// ---------------------------------------------------------------------------
+// Remote Claude Code agent workers (plan 5e64ccd5, step 6): a lost node link
+// only marks a remote agent worker offline (its SSH session does not depend on
+// the link), and a revoke fails it with the stop-the-session text.
+// ---------------------------------------------------------------------------
+
+/// Every notice the team has sent since `signals` was last drained, as
+/// `(key, text)`.
+fn drain_host_notices(signals: &mut broadcast::Receiver<BoardSignal>) -> Vec<(String, String)> {
+    let mut notices = Vec::new();
+    while let Ok(signal) = signals.try_recv() {
+        if let BoardSignal::Notice { key, text } = signal {
+            notices.push((key, text));
+        }
+    }
+    notices
+}
+
+/// A running remote agent worker on `node_id`, its session known.
+fn remote_agent_record(root: &std::path::Path, id: &str, node_id: &str) -> WorkerRecord {
+    let mut record = worker(root, id);
+    record.claude_agent = Some("opus".into());
+    record.claude_session = Some(format!("session-{id}"));
+    record.status = WorkerStatus::Working;
+    let mut remote = sample_remote_checkout(Some("studio-ssh"));
+    remote.node_id = node_id.to_string();
+    record.remote = Some(remote);
+    record
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_worker_survives_link_loss_past_budget() {
+    let rig = Rig::start().await;
+    let team = rig.team().await;
+    let mut signals = team.signals.subscribe();
+    team.remote.set_outage_budget(std::time::Duration::from_millis(50));
+
+    // The worker's node is not connected: its link is lost.
+    let lost_node = "d".repeat(32);
+    let record = remote_agent_record(team.workspace_root.as_path(), "remoteagent01", &lost_node);
+    team.records.lock().await.push(record);
+
+    team.poll_hosts().await;
+    let marked_at = {
+        let records = team.records.lock().await;
+        let stored = records
+            .iter()
+            .find(|stored| stored.id == "remoteagent01")
+            .expect("the worker record");
+        assert_eq!(stored.status, WorkerStatus::Working);
+        stored
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.offline_since_ms)
+            .expect("the lost host is marked")
+    };
+    let offline: Vec<(String, String)> = drain_host_notices(&mut signals)
+        .into_iter()
+        .filter(|(key, _)| key == "host-offline:remoteagent01")
+        .collect();
+    assert_eq!(offline.len(), 1, "one offline notice: {offline:?}");
+    assert_eq!(
+        offline[0].1,
+        "Worker remoteagent01 lost its host node-a; its Claude Code session there may keep working. Mnemo follows it again when the host is back."
+    );
+
+    // Well past the (short) outage budget: a Mnemo worker would fail here.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    team.poll_hosts().await;
+    team.poll_hosts().await;
+    {
+        let records = team.records.lock().await;
+        let stored = records
+            .iter()
+            .find(|stored| stored.id == "remoteagent01")
+            .expect("the worker record");
+        assert_eq!(
+            stored.status,
+            WorkerStatus::Working,
+            "an agent worker is never failed for a lost link: {:?}",
+            stored.error
+        );
+        assert!(stored.error.is_none());
+        assert_eq!(
+            stored.remote.as_ref().and_then(|remote| remote.offline_since_ms),
+            Some(marked_at),
+            "the mark stays and is not renewed"
+        );
+    }
+    let later = drain_host_notices(&mut signals);
+    assert!(
+        later.iter().all(|(key, _)| !key.starts_with("host-lost:")),
+        "no lost-host failure notice: {later:?}"
+    );
+    assert!(
+        later.iter().all(|(key, _)| key != "host-offline:remoteagent01"),
+        "the offline notice is sent once: {later:?}"
+    );
+
+    // The host comes back: the mark clears and the lead hears it.
+    team.update_worker("remoteagent01", |worker| {
+        if let Some(remote) = worker.remote.as_mut() {
+            remote.node_id = remote_node_id(&team);
+        }
+    })
+    .await;
+    team.poll_hosts().await;
+    let stored = team.worker("remoteagent01").await.expect("the worker record");
+    assert_eq!(stored.status, WorkerStatus::Working);
+    assert_eq!(
+        stored.remote.as_ref().and_then(|remote| remote.offline_since_ms),
+        None,
+        "the returned host clears the mark"
+    );
+    let back: Vec<(String, String)> = drain_host_notices(&mut signals)
+        .into_iter()
+        .filter(|(key, _)| key == "host-back:remoteagent01")
+        .collect();
+    assert_eq!(back.len(), 1, "one back notice: {back:?}");
+    assert_eq!(
+        back[0].1,
+        "Host node-a is back; worker remoteagent01 continues."
+    );
+    assert!(
+        team.live.lock().await.is_empty(),
+        "a remote agent worker holds no Mnemo session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_host_fails_its_remote_agent_workers() {
+    let rig = Rig::start().await;
+    let team = rig.team().await;
+
+    let mut revoked = remote_agent_record(team.workspace_root.as_path(), "revokedagent01", &remote_node_id(&team));
+    revoked.base_commit = Some("1111111111111111111111111111111111111111".to_string());
+    if let Some(remote) = revoked.remote.as_mut() {
+        remote.synced_tip = Some("2222222222222222222222222222222222222222".to_string());
+    }
+    // A finished agent worker of the same host keeps its outcome, and a
+    // running one on another host is not touched.
+    let mut finished = remote_agent_record(team.workspace_root.as_path(), "finishedagent1", &remote_node_id(&team));
+    finished.status = WorkerStatus::Completed;
+    let elsewhere = remote_agent_record(team.workspace_root.as_path(), "otherhostagent1", &"e".repeat(32));
+    {
+        let mut records = team.records.lock().await;
+        records.push(revoked);
+        records.push(finished);
+        records.push(elsewhere);
+    }
+
+    let answer = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "revoke", "name": "node-a"}),
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let answer_json: Value = serde_json::from_str(&answer.output).expect("the revoke answer");
+    assert_eq!(
+        answer_json["failed_workers"],
+        serde_json::json!(["revokedagent01"]),
+        "{answer_json}"
+    );
+
+    let failed = team.worker("revokedagent01").await.expect("the failed record");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("host 'node-a' was revoked; Mnemo can no longer follow worker 'revokedagent01's Claude Code session there. Stop that session (SendMessage it to stop, or end it in the app), then team_resume continues the worker here with host \"local\" from its last synced commit 2222222.")
+    );
+    assert!(
+        failed.remote.is_some(),
+        "the record keeps its checkout for team_resume"
+    );
+
+    let finished = team.worker("finishedagent1").await.expect("the finished record");
+    assert_eq!(finished.status, WorkerStatus::Completed);
+    assert!(finished.error.is_none());
+    let other = team.worker("otherhostagent1").await.expect("the other record");
+    assert_eq!(other.status, WorkerStatus::Working);
+    assert!(other.error.is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pinned_agent_prepare_failure_retry_stays_an_agent() {
     let rig = Rig::start().await;

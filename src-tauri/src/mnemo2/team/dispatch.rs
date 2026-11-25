@@ -22,13 +22,14 @@ use crate::mnemo2::phase3;
 
 use serde_json::{json, Value};
 
+use super::agent_watch::agent_refusal_retry_hint;
 use super::lead_tools::{team_tool_error, worker_status_view};
 use super::placement::{NodeChoice, Placement, PlacementRequest};
 use super::record::{
-    agent_prompt, validate_worker_id, with_launch_token, InboxKind, MessageSender, WorkerRecord, WorkerRouting,
-    WorkerStatus,
+    agent_prompt, remote_agent_prompt, session_name, validate_worker_id, with_launch_token,
+    InboxKind, MessageSender, WorkerRecord, WorkerRouting, WorkerStatus,
 };
-use super::routing::RoutedDispatch;
+use super::routing::{ClaudeAgentDispatch, RoutedDispatch};
 use super::TeamRuntime;
 
 /// A boxed future: helpers that big async callers await return one so the
@@ -173,9 +174,14 @@ pub(super) fn dispatch_lead_override_row(
 /// The `claude_agent` block of a dispatch answer: everything the lead's own
 /// Claude Code agent needs to run the step — the model, the agent effort (or
 /// `null`), the prepared worktree and branch, and the full self-contained
-/// prompt ([`record::agent_prompt`]). `None` for an ordinary Mnemo worker.
+/// prompt ([`record::agent_prompt`]). `None` for an ordinary Mnemo worker and for
+/// an agent worker placed on a host, whose session the lead starts over SSH
+/// ([`claude_session_block`]).
 pub(super) fn claude_agent_block(worker: &WorkerRecord) -> Option<Value> {
     worker.claude_agent.as_ref()?;
+    if worker.remote.is_some() {
+        return None;
+    }
     Some(json!({
         // Claude Code's own isolation: Mnemo's WorktreeCreate hook hands the
         // agent this worker's warm checkout (plan 4d920eec).
@@ -185,6 +191,43 @@ pub(super) fn claude_agent_block(worker: &WorkerRecord) -> Option<Value> {
         "branch": worker.branch,
         "prompt": with_launch_token(agent_prompt(worker), worker.launch_token.as_deref()),
         "effort": worker.claude_agent_effort,
+    }))
+}
+
+/// What the lead tells the desktop app its remote Claude Code session is.
+pub(super) const REMOTE_SESSION_BACKGROUND: &str = "Mnemo2 team worker. The prompt holds the plan step and its rules. Work only in this folder on its branch, commit there, never push or switch branches; end your turn with the report the prompt asks for.";
+
+/// The `claude_session` block of a dispatch answer (plan 5e64ccd5): everything
+/// the lead needs to start this agent worker's Claude Code session on its host
+/// through the desktop app's SSH sessions — the connection, the node checkout
+/// the session works in, and the full prompt ([`record::remote_agent_prompt`]).
+/// `None` for a local agent worker and for a Mnemo worker: Mnemo never starts
+/// the session itself and never launches `claude`.
+pub(super) fn claude_session_block(worker: &WorkerRecord) -> Option<Value> {
+    worker.claude_agent.as_ref()?;
+    let remote = worker.remote.as_ref()?;
+    let ssh = remote.ssh.as_deref()?;
+    let title = match worker.plan_step {
+        Some(step) => format!("Mnemo {}: plan step {}", worker.id, step + 1),
+        None => format!("Mnemo {}", worker.id),
+    };
+    Some(json!({
+        "target": "ssh",
+        "host": ssh,
+        "cwd": remote.path,
+        "use_worktree": false,
+        "context": "fresh",
+        "initiation": "user_asked",
+        "name": session_name(&worker.id),
+        "title": title.chars().take(60).collect::<String>(),
+        "model": worker.claude_agent,
+        "effort": worker.claude_agent_effort,
+        "wake_when_done": true,
+        "background": REMOTE_SESSION_BACKGROUND,
+        "prompt": remote_agent_prompt(worker),
+        "worker_id": worker.id,
+        "branch": worker.branch,
+        "node": remote.node_name,
     }))
 }
 
@@ -227,15 +270,22 @@ pub(super) fn dispatch_result(
                 _ => None,
             };
             let claude_agent = claude_agent_block(&worker);
+            let claude_session = claude_session_block(&worker);
+            let mut result = json!({
+                "worker": worker_status_view(&worker, false),
+                "reused": reused,
+                "routing_note": routing_note,
+                "claude_agent": claude_agent.clone(),
+                "warnings": warnings.clone(),
+            });
+            // Only a worker placed on a host carries the block: every other
+            // answer stays byte-identical, so the key is absent, not null.
+            if let Some(block) = &claude_session {
+                result["claude_session"] = block.clone();
+            }
             let output = serde_json::to_string(&json!({
                 "action": action,
-                "result": {
-                    "worker": worker_status_view(&worker, false),
-                    "reused": reused,
-                    "routing_note": routing_note,
-                    "claude_agent": claude_agent.clone(),
-                    "warnings": warnings.clone(),
-                },
+                "result": result,
             }))
             .unwrap_or_else(|_| action.to_string());
             let mut lines = Vec::new();
@@ -245,22 +295,40 @@ pub(super) fn dispatch_result(
             if let Some(note) = &routing_note {
                 lines.push(note.clone());
             }
+            if let Some(block) = &claude_session {
+                lines.push(claude_session_line(&worker, block));
+            }
             let output = if lines.is_empty() {
                 output
             } else {
                 format!("{output}\n{}", lines.join("\n"))
             };
             let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
-            ToolResult::success(output).with_data(json!({
+            let mut payload = json!({
                 "worker": data,
                 "reused": reused,
                 "routing_note": routing_note,
                 "claude_agent": claude_agent,
                 "warnings": warnings,
-            }))
+            });
+            if let Some(block) = claude_session {
+                payload["claude_session"] = block;
+            }
+            ToolResult::success(output).with_data(payload)
         }
         Err(err) => team_tool_error(err),
     }
+}
+
+/// The dispatch answer's instruction for a worker placed on a host: how the lead
+/// starts its Claude Code session there and reports the start back.
+fn claude_session_line(worker: &WorkerRecord, block: &Value) -> String {
+    let node = block["node"].as_str().unwrap_or_default();
+    let ssh = block["host"].as_str().unwrap_or_default();
+    format!(
+        "{} runs on host {node} as a Claude Code session over SSH connection '{ssh}'. The user approved Claude workers on '{ssh}' by linking it: call start_session with the claude_session block's fields unchanged (target \"ssh\", host, cwd, use_worktree false, context \"fresh\", initiation \"user_asked\", name, title, model, effort, background, prompt, wake_when_done true), then call team_agent_started with worker_id and the session id start_session returned. Mnemo follows the session's transcript on the host and finishes the worker when the session ends its turn.",
+        worker.id
+    )
 }
 
 pub(super) fn dispatch_routing_line(
@@ -606,6 +674,13 @@ impl TeamRuntime {
         routed: Option<RoutedDispatch>,
         host: Option<String>,
     ) -> Result<(WorkerRecord, bool, bool), String> {
+        // The gate the router applies to a Claude Code agent dispatch: an
+        // external-lead dispatch by tier, with no explicit model. A reused
+        // worker id skips routing, so the retry path needs it here.
+        let agent_gate = request.sender == MessageSender::ExternalLead
+            && request.source == DispatchSource::LeadTool
+            && request.model.is_none()
+            && self.external_lead_attached();
         let DispatchRequest {
             brief,
             tier,
@@ -682,6 +757,14 @@ impl TeamRuntime {
                     return Err(format!("worker '{id}' has an invalid branch identity"));
                 }
                 self.validate_model(&existing.model, &existing.reasoning_effort)?;
+                if let Some(agent) = self
+                    .agent_retry_target(&existing, routed.as_ref(), tier.as_deref(), agent_gate)
+                    .await
+                {
+                    return Box::pin(self.retry_agent_worker(existing, agent, host.as_deref()))
+                        .await
+                        .map(|worker| (worker, true, false));
+                }
                 if !existing.brief_sent
                     && !self.live.lock().await.contains_key(id)
                     && matches!(
@@ -797,7 +880,12 @@ impl TeamRuntime {
             }
         }
         if claude_agent.is_some() {
-            if let Some(refusal) = self.agent_launch_refusal(None).await {
+            // A worker placed on a host gets no WorktreeCreate launch, so only
+            // the agent cap applies to it; a local start also refuses while a
+            // local agent worker waits for its agent (see
+            // [`TeamRuntime::agent_launch_refusal_for`]).
+            let remote = matches!(placement, Placement::Node(_));
+            if let Some(refusal) = self.agent_launch_refusal_for(None, remote).await {
                 return Err(refusal);
             }
         }
@@ -852,8 +940,22 @@ impl TeamRuntime {
                     // The worker keeps its local shadow checkout; a node
                     // checkout is prepared beside it and synced with bundles.
                     let base = record.base_commit.clone().unwrap_or_default();
-                    match Box::pin(self.prepare_remote_checkout(&mut record, choice, &base, false))
-                        .await
+                    // An agent worker's session is started on the node over SSH:
+                    // the connection rides the record so `team_status` and the
+                    // dispatch answer can name it.
+                    let ssh = if claude_agent.is_some() {
+                        choice.ssh.clone()
+                    } else {
+                        None
+                    };
+                    match Box::pin(self.prepare_remote_checkout(
+                        &mut record,
+                        choice,
+                        &base,
+                        false,
+                        ssh,
+                    ))
+                    .await
                     {
                         Ok(()) => {}
                         Err(error) if choice.pinned => {
@@ -872,7 +974,27 @@ impl TeamRuntime {
                             let active = self.active_workers_for_slots().await;
                             let slots = self.persistence.slots.load(Ordering::SeqCst);
                             if active >= slots {
-                                return Err(format!("all {slots} worker slots are busy"));
+                                let text = format!("all {slots} worker slots are busy");
+                                self.fail_worker(&record.id, text.clone()).await;
+                                return Err(text);
+                            }
+                            // The fallback starts the worker on this computer,
+                            // so an agent worker must pass the waiting-worker
+                            // check the local placement makes: two waiting agent
+                            // workers would leave the one WorktreeCreate hook
+                            // refusing every launch (audit finding on plan
+                            // 5e64ccd5).
+                            if claude_agent.is_some() {
+                                if let Some(refusal) =
+                                    self.agent_launch_refusal_for(None, false).await
+                                {
+                                    let text = format!(
+                                        "{refusal}; {}",
+                                        agent_refusal_retry_hint(&refusal)
+                                    );
+                                    self.fail_worker(&record.id, text.clone()).await;
+                                    return Err(text);
+                                }
                             }
                         }
                     }
@@ -911,12 +1033,18 @@ impl TeamRuntime {
     /// only names it once that call returned; the reconciler must not release
     /// the fresh `wt/agent-*` checkout in between. The reservation is dropped
     /// once the record is persisted, or as soon as preparation failed.
+    ///
+    /// `ssh` is the connection a Claude Code agent worker's session is started
+    /// on; it lands on the record in the same write as the checkout, so a
+    /// persisted remote record always names the connection its session needs.
+    /// Every other caller passes `None`.
     pub(super) async fn prepare_remote_checkout(
         &self,
         record: &mut WorkerRecord,
         choice: &NodeChoice,
         base: &str,
         keep_reserved: bool,
+        ssh: Option<String>,
     ) -> Result<(), String> {
         if base.trim().is_empty() {
             return Err("the worker has no base commit to send".to_string());
@@ -932,13 +1060,14 @@ impl TeamRuntime {
             .remote
             .prepare_checkout(&choice.node_id, &record.branch, base, false)
             .await;
-        let remote = match prepared {
+        let mut remote = match prepared {
             Ok(remote) => remote,
             Err(error) => {
                 self.remote.release_reservation(&choice.node_id, &record.branch);
                 return Err(error);
             }
         };
+        remote.ssh = ssh;
         self.update_worker(&record.id, |worker| {
             worker.remote = Some(remote.clone());
         })
@@ -1070,6 +1199,96 @@ impl TeamRuntime {
                 }
             }
         })
+    }
+
+    /// The Claude Code agent a re-dispatched step must run as, when its first
+    /// dispatch failed before the agent started: no agent, no brief handed over,
+    /// `Dispatching`, `Failed` or `Interrupted` (the statuses the restart path
+    /// accepts), and no live session. `None` for every other reuse, which keeps
+    /// the Mnemo restart path (audit finding on plan 5e64ccd5).
+    async fn agent_retry_target(
+        &self,
+        existing: &WorkerRecord,
+        routed: Option<&RoutedDispatch>,
+        tier: Option<&str>,
+        agent_gate: bool,
+    ) -> Option<ClaudeAgentDispatch> {
+        if existing.claude_agent.is_some()
+            || existing.brief_sent
+            || !matches!(
+                existing.status,
+                WorkerStatus::Dispatching | WorkerStatus::Failed | WorkerStatus::Interrupted
+            )
+            || self.live.lock().await.contains_key(&existing.id)
+        {
+            return None;
+        }
+        if let Some(agent) = routed.and_then(|routed| routed.claude_agent.clone()) {
+            return Some(agent);
+        }
+        if !agent_gate {
+            return None;
+        }
+        // A reused worker id skips routing: ask the tier the lead asked for, or
+        // the one the record settled on.
+        // "auto" asks for no tier in particular, like an absent one.
+        let tier = tier
+            .filter(|tier| *tier != "auto")
+            .or(existing.tier.as_deref());
+        self.claude_agent_rung(tier)
+    }
+
+    /// Take the agent path again for a re-dispatched step that never started:
+    /// place the worker (honouring the lead's pin), prepare its checkout and
+    /// hand the lead the session again. It never starts a Mnemo session.
+    async fn retry_agent_worker(
+        &self,
+        existing: WorkerRecord,
+        agent: ClaudeAgentDispatch,
+        host: Option<&str>,
+    ) -> Result<WorkerRecord, String> {
+        let id = existing.id.clone();
+        self.proving_guard(&id)?;
+        if !existing.worktree.is_dir() {
+            return Err(format!("worker '{id}' has no recoverable worktree"));
+        }
+        self.handed_back_takeover_refusal(&existing, false).await?;
+        let mut existing = self.refresh_before_redispatch(existing).await;
+        let placement = self
+            .place_worker(PlacementRequest {
+                pinned: host,
+                claude_agent: true,
+            })
+            .await?;
+        match &placement {
+            Placement::Node(choice) => {
+                // A worker on a host gets no WorktreeCreate launch, so only
+                // the agent cap applies.
+                if let Some(refusal) = self.agent_launch_refusal_for(None, true).await {
+                    return Err(refusal);
+                }
+                let base = existing.base_commit.clone().unwrap_or_default();
+                Box::pin(self.prepare_remote_checkout(
+                    &mut existing,
+                    choice,
+                    &base,
+                    false,
+                    choice.ssh.clone(),
+                ))
+                .await?;
+            }
+            Placement::Local => {
+                let active = self.active_workers_for_slots().await;
+                let slots = self.persistence.slots.load(Ordering::SeqCst);
+                if active >= slots {
+                    return Err(format!("all {slots} worker slots are busy"));
+                }
+                if let Some(refusal) = self.agent_launch_refusal_for(None, false).await {
+                    return Err(refusal);
+                }
+            }
+        }
+        Box::pin(self.start_agent_worker(existing, agent)).await
     }
 
     /// The re-dispatch half of the refresh guard: fast-forward a worker that

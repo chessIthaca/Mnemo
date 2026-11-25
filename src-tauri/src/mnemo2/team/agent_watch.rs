@@ -986,6 +986,14 @@ pub(super) fn waits_for_agent(worker: &WorkerRecord) -> bool {
         && !worker.worktree.as_os_str().is_empty()
 }
 
+/// A waiting agent worker whose agent the WorktreeCreate hook can still hand a
+/// checkout to: a local one. A remote agent worker's session is started on its
+/// host, where no hook runs and no launch token exists, so it never blocks the
+/// next local launch (phase 4).
+pub(super) fn waits_for_local_agent(worker: &WorkerRecord) -> bool {
+    waits_for_agent(worker) && worker.remote.is_none()
+}
+
 /// The phase of a Claude Code agent worker that `team_status` and the
 /// window show (derived, never stored): `awaiting_launch` until its agent is
 /// launched, then `running`, `stalled` or `finished` from the agent's
@@ -1341,7 +1349,7 @@ impl TeamRuntime {
         AgentGateView {
             waiting: records
                 .iter()
-                .find(|worker| waits_for_agent(worker))
+                .find(|worker| waits_for_local_agent(worker))
                 .map(gate_worker),
             running: records
                 .iter()
@@ -1403,18 +1411,35 @@ impl TeamRuntime {
     /// isolated launch could be handed the wrong checkout, or
     /// [`AGENT_WORKER_CAP`] agent workers already run. `except` is the worker
     /// being started or moved, which never counts against itself.
+    ///
+    /// A local start checks the waiting worker too; [`agent_launch_refusal_for`]
+    /// says why a remote start does not.
     pub(super) async fn agent_launch_refusal(&self, except: Option<&str>) -> Option<String> {
+        self.agent_launch_refusal_for(except, false).await
+    }
+
+    /// [`agent_launch_refusal`] for a worker starting on a host: no
+    /// WorktreeCreate hook runs there, so a waiting local agent worker cannot
+    /// be handed the remote session's checkout, and only the cap applies.
+    /// Remote agent workers count against the cap like local ones.
+    pub(super) async fn agent_launch_refusal_for(
+        &self,
+        except: Option<&str>,
+        remote: bool,
+    ) -> Option<String> {
         let records = self.records.lock().await;
         let others = || {
             records
                 .iter()
                 .filter(move |worker| Some(worker.id.as_str()) != except)
         };
-        if let Some(waiting) = others().find(|worker| waits_for_agent(worker)) {
-            return Some(format!(
-                "{} is waiting for its agent: launch it (Agent with isolation \"worktree\") before dispatching another agent step.",
-                waiting.id
-            ));
+        if !remote {
+            if let Some(waiting) = others().find(|worker| waits_for_local_agent(worker)) {
+                return Some(format!(
+                    "{} is waiting for its agent: launch it (Agent with isolation \"worktree\") before dispatching another agent step.",
+                    waiting.id
+                ));
+            }
         }
         let running: Vec<&str> = others()
             .filter(|worker| runs_as_agent(worker))
@@ -1426,6 +1451,17 @@ impl TeamRuntime {
                 running.join(", ")
             )
         })
+    }
+}
+
+/// What the lead can do about an [`agent_launch_refusal_for`] refusal, for a
+/// dispatch that failed its worker over it: wait for the waiting worker's
+/// launch, or for a running agent worker to finish (the cap).
+pub(super) fn agent_refusal_retry_hint(refusal: &str) -> &'static str {
+    if refusal.contains("is waiting for its agent") {
+        "retry with the same worker ID once the waiting worker is launched"
+    } else {
+        "retry with the same worker ID when an agent worker finishes"
     }
 }
 
@@ -1576,7 +1612,7 @@ impl TeamRuntime {
             .lock()
             .await
             .iter()
-            .filter(|worker| waits_for_agent(worker))
+            .filter(|worker| waits_for_local_agent(worker))
             .map(|worker| worker.id.clone())
             .collect();
         let worker_id = match waiting.as_slice() {

@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mnemo::headless::HostToolSpec;
 use mnemo::memory::transcript_index::{
@@ -21,9 +22,10 @@ use crate::mnemo2::dispatch_routing::RoutingMode;
 use crate::mnemo2::phase3::{self, ReviewEvidence};
 
 use super::agent_watch;
+use super::claude_node::{ClaudeStatusAnswer, CLAUDE_STATUS};
 use super::control::ResumeChoice;
 use super::findings_ledger;
-use super::record::{with_launch_token, ChangeSource, MessageSender, WorkerRecord};
+use super::record::{with_launch_token, ChangeSource, MessageSender, RemoteCheckout, WorkerRecord};
 use super::remote::{checks_hash, HostDirectory, Qualification};
 use super::routing::tier_ids;
 use super::spawn;
@@ -111,7 +113,7 @@ impl TeamRuntime {
             HostToolSpec {
                 name: "team_dispatch".to_string(),
                 description: "Delegate one implementation task through TeamManager to a full executor worker, under a step of a plan on the plan board (plan first: plan_create, then dispatch with its plan_id and 1-based step). The worker receives the plan and its step automatically, so your brief is only the task-specific instructions. A step is checked off when one of its tasks merges and none is still open. Workers run in their own worktree and branch with file_edit, file_write, shell, git, and tests, and have no token or cost budget: give them whole, self-contained implementation tasks (code, tests, verification, commit), never read-only, content-only, or 'send me the file text' briefs. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires that plan to declare observable acceptance scenarios (plan_create acceptance_scenarios or plan_update add_acceptance_scenarios). The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
-                parameters: json!({"type":"object","properties":{"host":{"type":"string","description":"Optional. Where the worker runs: \"local\" for this computer, or the name of a paired host from team_hosts. Omit it to let Mnemo choose: a connected host with a free slot that passed the project's checks, otherwise this computer. Claude Code agent tiers always run on this computer."},"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"review_risk":{"type":"string","enum":["standard","high"],"description":"Optional; omitted means standard. Pass high for shared contracts, persistence, concurrency, security, or large/cross-cutting work: the worker then cannot merge without a fresh independent audit, and the plan must declare observable acceptance scenarios."},"read_back":{"type":"boolean","description":"Optional. When true, the worker's first turn only reads its spec and the files it names, then messages the lead with numbered questions (ambiguities, contradictions with the code, open decisions) or exactly 'No questions.', and waits for the lead's reply before changing files. Use it for large or subtle specs."}},"required":dispatch_required}),
+                parameters: json!({"type":"object","properties":{"host":{"type":"string","description":"Optional. Where the worker runs: \"local\" for this computer, or the name of a paired host from team_hosts. Omit it to let Mnemo choose: a connected host with a free slot that passed the project's checks, otherwise this computer. Claude Code agent tiers run on a host only when it is linked to an SSH connection (team_hosts link); otherwise on this computer."},"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"plan_id":{"type":"string","description":"The board plan this task belongs to (from plan_create or plan_list). Required."},"step":{"type":"integer","minimum":1,"description":"The 1-based step of that plan this task works on. Required; an unknown, closed, or abandoned plan, a missing step, or a step that is already done is refused."},"brief":{"type":"string","description":"Task-specific instructions only. The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step; do not repeat them."},"tier":tier.clone(),"model":model.clone(),"reasoning_effort":reasoning_effort.clone(),"review_risk":{"type":"string","enum":["standard","high"],"description":"Optional; omitted means standard. Pass high for shared contracts, persistence, concurrency, security, or large/cross-cutting work: the worker then cannot merge without a fresh independent audit, and the plan must declare observable acceptance scenarios."},"read_back":{"type":"boolean","description":"Optional. When true, the worker's first turn only reads its spec and the files it names, then messages the lead with numbered questions (ambiguities, contradictions with the code, open decisions) or exactly 'No questions.', and waits for the lead's reply before changing files. Use it for large or subtle specs."}},"required":dispatch_required}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -484,6 +486,7 @@ impl TeamRuntime {
                 "checks": checks_state,
                 "last_seen_ms": record.last_seen_ms,
                 "ssh": record.ssh,
+                "claude_home": Value::Null,
             });
             if connected {
                 if let Ok(status) = server.node(&record.node_id).status().await {
@@ -495,6 +498,23 @@ impl TeamRuntime {
                     );
                 }
                 entry["busy"] = json!(self.remote.busy_on(&record.node_id).await);
+                // Whether the node has a Claude Code config folder: shown so the
+                // lead can tell the user to sign in there, and never a gate
+                // (plan 5e64ccd5 decision D2).
+                let remote = RemoteCheckout {
+                    node_id: record.node_id.clone(),
+                    node_name: record.name.clone(),
+                    ..Default::default()
+                };
+                if let Ok(answer) = self
+                    .remote
+                    .call_node(&remote, CLAUDE_STATUS, json!({}), Duration::from_secs(30))
+                    .await
+                {
+                    if let Ok(answer) = serde_json::from_value::<ClaudeStatusAnswer>(answer) {
+                        entry["claude_home"] = json!(answer.exists);
+                    }
+                }
             }
             listed.push(entry);
         }

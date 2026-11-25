@@ -1778,6 +1778,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         claude_agent_transcript: None,
         handed_back: None,
         launch_token: None,
+        claude_session: None,
         integrations: Vec::new(),
         integration_note: None,
         base_commit: None,
@@ -20601,7 +20602,7 @@ async fn team_hosts_schema_and_texts() {
         .expect("team_dispatch");
     assert_eq!(
         dispatch.parameters["properties"]["host"],
-        json!({"type":"string","description":"Optional. Where the worker runs: \"local\" for this computer, or the name of a paired host from team_hosts. Omit it to let Mnemo choose: a connected host with a free slot that passed the project's checks, otherwise this computer. Claude Code agent tiers always run on this computer."})
+        json!({"type":"string","description":"Optional. Where the worker runs: \"local\" for this computer, or the name of a paired host from team_hosts. Omit it to let Mnemo choose: a connected host with a free slot that passed the project's checks, otherwise this computer. Claude Code agent tiers run on a host only when it is linked to an SSH connection (team_hosts link); otherwise on this computer."})
     );
     assert!(
         !dispatch.parameters["required"]
@@ -20651,6 +20652,7 @@ async fn team_status_shows_host() {
         path: "/Users/mini/mnemo/checkouts/pool-1".to_string(),
         synced_tip: None,
         offline_since_ms: None,
+        ssh: None,
     });
     let team = open_test_team(root.path(), state.path(), vec![local, remote]).await;
 
@@ -20720,4 +20722,649 @@ async fn hub_injected_worker_text_names_no_os() {
         }
     }
     team.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Remote Claude Code agent workers (plan 5e64ccd5, step 4): an agent-tier
+// dispatch on a host that links an SSH connection answers with the
+// claude_session block the lead starts there; without a link it stays local
+// exactly as before.
+// ---------------------------------------------------------------------------
+
+use crate::mnemo2::team::check_run::remote_testkit::Rig;
+
+/// A rig's team with the agent fixture's tiers (the high tier runs as the Claude
+/// Code agent `opus`) and a one-step plan on its board, so an explicit high-tier
+/// dispatch from the external lead settles on an agent worker. The plan board's
+/// folder is returned too: the board reads it while the worker is dispatched.
+async fn remote_agent_team(
+    rig: &Rig,
+) -> (
+    std::sync::Arc<super::TeamRuntime>,
+    String,
+    tempfile::TempDir,
+) {
+    use mnemo::app::plan_board::{PlanBoard, PlanDraft};
+
+    let team = rig.team().await;
+    let mut dto = tiers_dto! {
+        difficult: vec!["test/scripted-difficult".into()],
+        average: vec!["test/scripted-average".into()],
+        simple: vec!["test/scripted-simple".into()],
+    };
+    dto.tiers[3].claude_agent = Some("opus".into());
+    team.set_catalog(
+        vec![
+            lead_model("scripted-difficult"),
+            lead_model("scripted-average"),
+            lead_model("scripted-simple"),
+        ],
+        dto,
+        Vec::new(),
+    );
+    let plans = tempfile::tempdir().expect("plan board");
+    let board = std::sync::Arc::new(PlanBoard::new(
+        plans.path().join("plans"),
+        plans.path().join("reviews"),
+    ));
+    let plan = board
+        .create(PlanDraft {
+            title: "Remote agent worker test".into(),
+            goal: "Start a Claude Code agent worker on a paired host".into(),
+            context: "A linked SSH connection is the user's approval to start it there.".into(),
+            steps: vec![
+                "Implement the requested remote behavior in src-tauri/src/mnemo2/team.rs and verify it with focused regression tests".into(),
+            ],
+            ..PlanDraft::default()
+        })
+        .expect("create the remote plan");
+    team.attach_board(board);
+    assert!(team.attach_external_lead());
+    (team, plan.id, plans)
+}
+
+/// The `team_dispatch` args an external lead sends for one agent-tier step.
+fn remote_agent_dispatch_args(plan_id: &str, worker_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "worker_id": worker_id,
+        "plan_id": plan_id,
+        "step": 1,
+        "brief": "Implement the remote session watch",
+        "tier": "high",
+    })
+}
+
+/// A remote checkout for the record-level tests: node-a's pool checkout.
+fn sample_remote_checkout(ssh: Option<&str>) -> super::record::RemoteCheckout {
+    super::record::RemoteCheckout {
+        node_id: "a".repeat(32),
+        node_name: "node-a".to_string(),
+        os: "windows".to_string(),
+        project: "0123456789ab".to_string(),
+        checkout: "pool-1".to_string(),
+        path: "C:/node/checkouts/pool-1".to_string(),
+        synced_tip: None,
+        offline_since_ms: None,
+        ssh: ssh.map(str::to_string),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_dispatch_answers_claude_session_block() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    // Linking the host to the connection is the user's approval to start Claude
+    // workers there (plan decision D1 revised).
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&plan_id, "remoteagent01"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let answer_json: Value =
+        serde_json::from_str(answer.output.lines().next().expect("the answer's JSON line"))
+            .expect("the dispatch answer JSON");
+    let result = &answer_json["result"];
+    let block = &result["claude_session"];
+    assert!(!block.is_null(), "the answer carries claude_session: {answer_json}");
+    assert!(
+        result["claude_agent"].is_null(),
+        "a remote agent worker gets no local launch block: {answer_json}"
+    );
+
+    let record = team.worker("remoteagent01").await.expect("the worker record");
+    let remote = record.remote.as_ref().expect("the worker runs on the host");
+    assert_eq!(
+        remote.node_id,
+        team.remote.host("node-a").expect("the paired host").node_id
+    );
+    assert_eq!(remote.ssh.as_deref(), Some("studio-ssh"));
+    assert!(
+        record.launch_token.is_none(),
+        "a remote session carries no launch token"
+    );
+    assert!(record.claude_session.is_none(), "no session id until the lead reports it");
+
+    // Everything the lead passes to start_session, unchanged.
+    assert_eq!(block["target"], "ssh");
+    assert_eq!(block["host"], "studio-ssh");
+    assert_eq!(block["cwd"], remote.path);
+    assert_eq!(block["use_worktree"], false);
+    assert_eq!(block["context"], "fresh");
+    assert_eq!(block["initiation"], "user_asked");
+    assert_eq!(block["name"], "mnemo-remoteagent01");
+    assert_eq!(block["title"], "Mnemo remoteagent01: plan step 1");
+    assert_eq!(block["model"], "opus");
+    assert_eq!(block["effort"], Value::Null);
+    assert_eq!(block["wake_when_done"], true);
+    assert_eq!(block["background"], super::dispatch::REMOTE_SESSION_BACKGROUND);
+    assert_eq!(block["worker_id"], "remoteagent01");
+    assert_eq!(block["branch"], record.branch);
+    assert_eq!(block["node"], "node-a");
+    assert!(
+        std::path::Path::new(remote.path.as_str()).is_dir(),
+        "the session works in the node checkout: {}",
+        remote.path
+    );
+
+    // The prompt opens with the marker the host's transcript watch finds the
+    // session by, names the node checkout, and carries no token.
+    let prompt = block["prompt"].as_str().expect("the prompt text");
+    let marker = format!(
+        "Mnemo worker remoteagent01 on branch {}: this Claude Code session runs on host node-a; Mnemo follows its transcript.",
+        record.branch
+    );
+    assert!(prompt.starts_with(&marker), "{prompt}");
+    let checkout_line = format!(
+        "- This session runs in Mnemo's checkout {} on host node-a, on branch {}; commit your work there.",
+        remote.path, record.branch
+    );
+    assert!(prompt.contains(&checkout_line), "{prompt}");
+    assert!(prompt.contains("Never push"), "{prompt}");
+    assert!(prompt.contains("git stash"), "{prompt}");
+    assert!(prompt.contains("Implement the remote session watch"), "{prompt}");
+    assert!(!prompt.contains("launch token"), "the remote prompt carries no token: {prompt}");
+
+    // The output tells the lead how to start the session and report it back.
+    assert!(
+        answer.output.contains(
+            "remoteagent01 runs on host node-a as a Claude Code session over SSH connection 'studio-ssh'."
+        ),
+        "{}",
+        answer.output
+    );
+    assert!(answer.output.contains("call start_session"), "{}", answer.output);
+    assert!(answer.output.contains("call team_agent_started"), "{}", answer.output);
+
+    // Both halves of the answer carry the block.
+    assert_eq!(
+        answer.data.as_ref().expect("the answer data")["claude_session"]["prompt"].as_str(),
+        Some(prompt),
+        "data carries the same block"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unlinked_agent_dispatch_keeps_claude_agent_block() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&plan_id, "localtier01"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let answer_json: Value =
+        serde_json::from_str(answer.output.lines().next().expect("the answer's JSON line"))
+            .expect("the dispatch answer JSON");
+    let result = &answer_json["result"];
+
+    let record = team.worker("localtier01").await.expect("the worker record");
+    assert!(
+        record.remote.is_none(),
+        "an agent worker stays local while no host links an SSH connection"
+    );
+    let block = claude_agent_block(&record).expect("the dispatch answer's claude_agent block");
+    assert_eq!(result["claude_agent"]["prompt"], block["prompt"]);
+
+    // The unlinked answer is the answer it always was: the same keys, no
+    // claude_session half, and no session-start text.
+    let keys: Vec<&String> = result.as_object().expect("an answer object").keys().collect();
+    assert_eq!(
+        keys,
+        vec!["claude_agent", "reused", "routing_note", "warnings", "worker"],
+        "{answer_json}"
+    );
+    assert!(
+        answer.data.as_ref().expect("the answer data").get("claude_session").is_none(),
+        "data carries no claude_session key"
+    );
+    assert!(!answer.output.contains("start_session"), "{}", answer.output);
+    assert!(!answer.output.contains("over SSH connection"), "{}", answer.output);
+    assert!(
+        record.launch_token.is_some(),
+        "a local agent worker still carries its one-time launch token"
+    );
+}
+
+#[tokio::test]
+async fn remote_agent_worker_is_not_the_waiting_local_worker() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let mut remote = worker(root.path(), "remoteagent01");
+    remote.claude_agent = Some("opus".into());
+    remote.status = WorkerStatus::Working;
+    remote.remote = Some(sample_remote_checkout(Some("studio-ssh")));
+    team.records.lock().await.push(remote);
+
+    // No WorktreeCreate hook runs on the host, so a remote agent worker never
+    // blocks the next local launch and the hook hands out no checkout for it.
+    assert!(
+        team.agent_gate_view().await.waiting.is_none(),
+        "a remote agent worker is no waiting local worker"
+    );
+    assert_eq!(
+        team.claim_agent_checkout("agent-remote01", None)
+            .await
+            .expect("the hook asks"),
+        None,
+        "the hook gets no checkout for a remote worker"
+    );
+
+    // The local counterpart is still the one waiting worker.
+    let mut local = worker(root.path(), "localagent01");
+    local.claude_agent = Some("opus".into());
+    local.status = WorkerStatus::Working;
+    team.records.lock().await.push(local);
+    let view = team.agent_gate_view().await;
+    assert_eq!(
+        view.waiting.as_ref().map(|worker| worker.id.as_str()),
+        Some("localagent01")
+    );
+    assert_eq!(
+        team.claim_agent_checkout("agent-local001", None)
+            .await
+            .expect("the hook asks")
+            .map(|(_, worker_id)| worker_id),
+        Some("localagent01".to_string())
+    );
+}
+
+#[tokio::test]
+async fn remote_agent_workers_use_host_slots_not_local() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let node_id = "a".repeat(32);
+
+    let mut remote = worker(root.path(), "remoteagent01");
+    remote.claude_agent = Some("opus".into());
+    remote.status = WorkerStatus::Working;
+    remote.remote = Some(sample_remote_checkout(Some("studio-ssh")));
+    team.records.lock().await.push(remote);
+
+    // A remote agent worker takes the host's slot, never this computer's.
+    assert_eq!(
+        team.active_workers_for_slots().await,
+        0,
+        "a remote agent worker takes no local slot"
+    );
+    assert_eq!(team.remote.busy_on(&node_id).await, 1, "the host counts it");
+
+    // A local agent worker still takes a local slot, and no host slot.
+    let mut local = worker(root.path(), "localagent01");
+    local.claude_agent = Some("opus".into());
+    local.status = WorkerStatus::Working;
+    team.records.lock().await.push(local);
+    assert_eq!(team.active_workers_for_slots().await, 1);
+    assert_eq!(team.remote.busy_on(&node_id).await, 1);
+
+    // Once the remote worker is finished, the host offers its slot again.
+    team.update_worker("remoteagent01", |worker| {
+        worker.status = WorkerStatus::Completed;
+    })
+    .await;
+    assert_eq!(team.remote.busy_on(&node_id).await, 0);
+}
+
+/// The project's current tip, the base a node checkout is prepared on.
+async fn remote_project_tip(team: &super::TeamRuntime) -> String {
+    crate::mnemo2::team::remote::git_value(&team.workspace_root, &["rev-parse", "HEAD"])
+        .await
+        .expect("the project tip")
+}
+
+/// The paired host's node id.
+fn remote_node_id(team: &super::TeamRuntime) -> String {
+    team.remote
+        .host("node-a")
+        .expect("the paired host")
+        .node_id
+}
+
+/// Put a plain file where the worker's node checkout would go, so the next
+/// `checkout.prepare` for its branch fails on the node; returns that path.
+async fn block_node_checkout(
+    team: &super::TeamRuntime,
+    worker_id: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let branch = agent_branch(worker_id);
+    let checkout = team
+        .remote
+        .prepare_checkout(
+            &remote_node_id(team),
+            &branch,
+            &remote_project_tip(team).await,
+            false,
+        )
+        .await
+        .expect("a node checkout to break");
+    std::fs::remove_dir_all(&checkout.path).expect("remove the prepared checkout");
+    std::fs::write(&checkout.path, "not a checkout").expect("block the checkout path");
+    let path = std::path::PathBuf::from(&checkout.path);
+    let home = std::path::Path::parent(path.parent().expect("the checkouts dir"))
+        .expect("the node home");
+    let repo = home
+        .join("repos")
+        .join(format!("{}.git", team.remote.project()));
+    (path, repo)
+}
+
+/// Undo [`block_node_checkout`]: free the path and prune the node's stale
+/// worktree entry, exactly as the node repairs itself after a deleted pool.
+async fn unblock_node_checkout(blocked: &(std::path::PathBuf, std::path::PathBuf)) {
+    std::fs::remove_file(&blocked.0).expect("free the checkout path");
+    let text = blocked.1.to_string_lossy().into_owned();
+    crate::mnemo2::team::remote::git_value(
+        blocked.1.parent().expect("the node home"),
+        &["--git-dir", &text, "worktree", "prune"],
+    )
+    .await
+    .expect("prune the node's worktrees");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatch_agent_fallback_respects_the_waiting_worker() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    // One local agent worker already waits for its agent: the one
+    // WorktreeCreate hook cannot tell two checkouts apart.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut waiting = worker(scratch.path(), "waiting01");
+    waiting.claude_agent = Some("opus".into());
+    waiting.status = WorkerStatus::Working;
+    waiting.brief_sent = true;
+    team.records.lock().await.push(waiting);
+    team.persist().await.expect("persist the waiting worker");
+
+    // The node's checkout cannot be prepared, so the unpinned dispatch falls
+    // back to this computer — where a second waiting agent worker must not
+    // start.
+    let blocked = block_node_checkout(&team, "fallback01").await;
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&plan_id, "fallback01"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!answer.success, "the fallback must refuse: {}", answer.output);
+    let refusal = team
+        .agent_launch_refusal_for(None, false)
+        .await
+        .expect("the waiting worker still refuses a launch");
+    let expected =
+        format!("{refusal}; retry with the same worker ID once the waiting worker is launched");
+    assert_eq!(answer.output, expected);
+
+    let record = team.worker("fallback01").await.expect("the worker record");
+    assert_eq!(record.status, WorkerStatus::Failed);
+    assert_eq!(record.error.as_deref(), Some(expected.as_str()));
+    assert!(
+        record.claude_agent.is_none(),
+        "the fallback started no second waiting agent worker: {}",
+        record.error.as_deref().unwrap_or_default()
+    );
+    assert!(record.remote.is_none());
+    let waiting_workers = team
+        .records
+        .lock()
+        .await
+        .iter()
+        .filter(|worker| super::agent_watch::waits_for_local_agent(worker))
+        .map(|worker| worker.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(waiting_workers, vec!["waiting01".to_string()]);
+
+    unblock_node_checkout(&blocked).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_retry_after_busy_slots_stays_an_agent() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    // The node's checkout cannot be prepared and this computer has no free
+    // slot: the unpinned fallback refuses.
+    let blocked = block_node_checkout(&team, "busyslots01").await;
+    team.persistence
+        .slots
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let args = remote_agent_dispatch_args(&plan_id, "busyslots01");
+    let first = team
+        .handle_lead_host_tool_from("team_dispatch", args.clone(), MessageSender::ExternalLead)
+        .await;
+    assert!(!first.success, "the fallback must refuse: {}", first.output);
+    assert_eq!(first.output, "all 0 worker slots are busy");
+
+    // The refusal fails the record: it never stays Dispatching.
+    let failed = team.worker("busyslots01").await.expect("the failed record");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert_eq!(failed.error.as_deref(), Some("all 0 worker slots are busy"));
+    assert!(failed.claude_agent.is_none(), "the step never started");
+    assert!(!failed.brief_sent);
+
+    // The node is back: the retry takes the agent path again.
+    unblock_node_checkout(&blocked).await;
+    team.persistence
+        .slots
+        .store(8, std::sync::atomic::Ordering::SeqCst);
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(retry.success, "{}", retry.output);
+    let record = team.worker("busyslots01").await.expect("the retried record");
+    assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+    assert!(record.remote.is_some(), "the retry runs on the node");
+    assert!(team.live.lock().await.is_empty(), "no Mnemo session started");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_retry_with_auto_tier_stays_an_agent() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    let blocked = block_node_checkout(&team, "autotier01").await;
+    let mut args = remote_agent_dispatch_args(&plan_id, "autotier01");
+    args["host"] = serde_json::json!("node-a");
+    let first = team
+        .handle_lead_host_tool_from("team_dispatch", args.clone(), MessageSender::ExternalLead)
+        .await;
+    assert!(!first.success, "the first dispatch fails to prepare: {}", first.output);
+    let failed = team.worker("autotier01").await.expect("the failed record");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert!(failed.claude_agent.is_none());
+
+    // The retry asks for tier "auto": it means the tier the record settled on,
+    // so the step stays an agent worker.
+    unblock_node_checkout(&blocked).await;
+    args["tier"] = serde_json::json!("auto");
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(retry.success, "{}", retry.output);
+    let record = team.worker("autotier01").await.expect("the retried record");
+    assert_eq!(
+        record.claude_agent.as_deref(),
+        Some("opus"),
+        "an auto-tier retry stayed an agent worker"
+    );
+    assert!(record.remote.is_some());
+    assert!(team.live.lock().await.is_empty(), "no Mnemo session started");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_retry_on_node_respects_the_cap() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    let blocked = block_node_checkout(&team, "capretry01").await;
+    let mut args = remote_agent_dispatch_args(&plan_id, "capretry01");
+    args["host"] = serde_json::json!("node-a");
+    let first = team
+        .handle_lead_host_tool_from("team_dispatch", args.clone(), MessageSender::ExternalLead)
+        .await;
+    assert!(!first.success, "the first dispatch fails to prepare: {}", first.output);
+    unblock_node_checkout(&blocked).await;
+
+    // The cap is reached by running agent workers meanwhile.
+    let scratch = tempfile::tempdir().expect("scratch");
+    for index in 0..super::agent_watch::AGENT_WORKER_CAP {
+        let mut running = worker(scratch.path(), &format!("running{index:02}"));
+        running.claude_agent = Some("opus".into());
+        running.claude_agent_id = Some(format!("agent-{index}"));
+        running.status = WorkerStatus::Working;
+        running.brief_sent = true;
+        team.records.lock().await.push(running);
+    }
+    let refusal = team
+        .agent_launch_refusal_for(None, true)
+        .await
+        .expect("the cap refuses");
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(!retry.success, "the retry must refuse: {}", retry.output);
+    assert!(retry.output.contains(&refusal), "{}", retry.output);
+    let record = team.worker("capretry01").await.expect("the record");
+    assert_eq!(record.status, WorkerStatus::Failed);
+    assert!(record.claude_agent.is_none());
+    assert!(record.remote.is_none(), "no node checkout was prepared");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_agent_prepare_failure_retry_stays_an_agent() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    // The host takes the worker but its checkout cannot be prepared: the pinned
+    // arm fails the worker and keeps none of it.
+    let blocked = block_node_checkout(&team, "pinned01").await;
+    let mut args = remote_agent_dispatch_args(&plan_id, "pinned01");
+    args["host"] = serde_json::json!("node-a");
+    let first = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            args.clone(),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!first.success, "the first dispatch fails to prepare: {}", first.output);
+    let failed = team.worker("pinned01").await.expect("the failed record");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert!(failed.claude_agent.is_none(), "the step never started");
+    assert!(!failed.brief_sent);
+    assert!(failed.remote.is_none());
+
+    // The node is back: the retry takes the agent path again instead of
+    // turning the step into a Mnemo session.
+    unblock_node_checkout(&blocked).await;
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(retry.success, "{}", retry.output);
+    let answer_json: Value =
+        serde_json::from_str(retry.output.lines().next().expect("the answer's JSON line"))
+            .expect("the retry answer JSON");
+    let result = &answer_json["result"];
+    assert_eq!(result["claude_session"]["target"], "ssh");
+    assert_eq!(result["claude_session"]["host"], "studio-ssh");
+    assert!(
+        result["claude_agent"].is_null(),
+        "the retry answers the session block, not a local launch: {answer_json}"
+    );
+    assert!(retry.output.contains("call team_agent_started"), "{}", retry.output);
+
+    let record = team.worker("pinned01").await.expect("the retried record");
+    assert_eq!(
+        record.claude_agent.as_deref(),
+        Some("opus"),
+        "the retry stayed an agent worker"
+    );
+    assert!(record.launch_token.is_none());
+    assert!(record.claude_session.is_none());
+    let remote = record.remote.as_ref().expect("the retried node checkout");
+    assert_eq!(remote.ssh.as_deref(), Some("studio-ssh"));
+    assert!(
+        std::path::Path::new(remote.path.as_str()).is_dir(),
+        "the retried session works in the node checkout: {}",
+        remote.path
+    );
+    assert!(
+        team.live.lock().await.is_empty(),
+        "no Mnemo session started for an agent tier"
+    );
 }

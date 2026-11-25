@@ -278,6 +278,15 @@ impl AgentSession {
         }
     }
 
+    /// Whether the session is still registered with the engine: `false`
+    /// once it is closed, the same membership check [`send`](Self::send)
+    /// makes first. A host that holds the handle uses it to tell a closed
+    /// session from a live one, because [`snapshot`](Self::snapshot) of a
+    /// closed session still answers (with an empty snapshot).
+    pub async fn is_open(&self) -> bool {
+        self.inner.sessions.lock().await.contains_key(&self.id)
+    }
+
     /// Send a command (§5.3 :327-338). On a closed session every command
     /// fails with `EngineError` code `session_closed` (§7 row 15).
     pub async fn send(&self, command: SessionCommand) -> Result<(), EngineError> {

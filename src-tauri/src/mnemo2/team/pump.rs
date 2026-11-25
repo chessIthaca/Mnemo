@@ -14,8 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mnemo::{SerializableAgentEvent, route_question};
 use mnemo::app::plan_board::PlanBoard;
 use mnemo::headless::{
-    AgentSession, Engine, EventReceiver, PendingInteraction, SessionCommand, SessionEvent,
-    SessionId, Transcript,
+    EventReceiver, PendingInteraction, SessionCommand, SessionEvent, SessionId, Transcript,
 };
 use mnemo::tool::ToolResult;
 use mnemo::tool::agent::shell::validated_check_command;
@@ -37,6 +36,7 @@ use super::record::{
 };
 use super::review::{CheckRecorder, clear_review_for_a_newer_tip};
 use super::routing::{logs_label, outcome_row, ModelInventory, UsageLimits};
+use super::worker_session::SharedWorkerSession;
 
 /// The plan coordinate a worker may read: its own plan, or for an audit the
 /// plan of the worker it audits. The step stays 0-based, like the record.
@@ -147,20 +147,17 @@ const REPEATED_REPORT_REFUSED: &str =
 
 /// Send a host-tool result back to the worker session.
 async fn send_worker_host_result(
-    engine: &Arc<Engine>,
-    session_id: SessionId,
+    session: &SharedWorkerSession,
     call_id: String,
     result: ToolResult,
 ) {
-    if let Some(session) = engine.session(&session_id).await {
-        let _ = session
-            .send(SessionCommand::HostToolResult {
-                call_id,
-                result: Some(result),
-                error: None,
-            })
-            .await;
-    }
+    let _ = session
+        .send(SessionCommand::HostToolResult {
+            call_id,
+            result: Some(result),
+            error: None,
+        })
+        .await;
 }
 
 /// Record an audit's final assistant text as its report (bug 2026-11-16):
@@ -209,16 +206,16 @@ async fn deliver_plain_text_report(
 /// — an inbox receipt plus the prompt that starts a new turn — so the audit
 /// stays live and available to answer. Returns whether the ask was sent.
 async fn ask_audit_for_its_report(
-    engine: &Arc<Engine>,
-    session_id: SessionId,
+    session: &SharedWorkerSession,
     worker_id: &str,
     records: &Arc<Mutex<Vec<WorkerRecord>>>,
     busy: &Arc<AtomicBool>,
 ) -> bool {
     let ask = "Your audit report did not reach the lead. Send your complete findings with message_parent now, then end your turn.";
-    let Some(session) = engine.session(&session_id).await else {
+    // A closed session takes no ask: nothing is written to the inbox for it.
+    if !session.is_open().await {
         return false;
-    };
+    }
     {
         let mut records = records.lock().await;
         let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
@@ -490,8 +487,7 @@ async fn fire_turn_end_proofs(
 pub(super) async fn pump_worker(
     worker_id: String,
     generation: u64,
-    engine: Arc<Engine>,
-    session_id: SessionId,
+    session: SharedWorkerSession,
     mut receiver: EventReceiver<SessionEvent>,
     events: broadcast::Sender<TeamEvent>,
     busy: Arc<AtomicBool>,
@@ -516,6 +512,7 @@ pub(super) async fn pump_worker(
     proof: super::proving::ProofCtx,
     usage_limits: UsageLimits,
 ) {
+    let session_id = session.id();
     let mut turn_active = false;
     // A steered turn end is held here until its follow-up turn starts (the
     // held `Finished`) or `FOLLOW_UP_GRACE` passes (the deadline). Both are
@@ -694,7 +691,7 @@ pub(super) async fn pump_worker(
                         plan_stamp.as_ref(),
                     )
                     .await;
-                    send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
+                    send_worker_host_result(&session, call_id.clone(), result).await;
                     // An audit's report is the message_parent call that
                     // delivered it (plan 5779641): mark the record the
                     // moment the message is recorded, so the turn's
@@ -715,8 +712,7 @@ pub(super) async fn pump_worker(
                     // notice. The worker is told to end its turn now.
                     suppressed_report = true;
                     send_worker_host_result(
-                        &engine,
-                        session_id,
+                        &session,
                         call_id.clone(),
                         ToolResult::success(REPEATED_REPORT_REFUSED),
                     )
@@ -730,9 +726,7 @@ pub(super) async fn pump_worker(
                         // the normal `Finished` path below — the lead's
                         // "finished its turn" notice, and the worker
                         // left idle for review.
-                        if let Some(session) = engine.session(&session_id).await {
-                            let _ = session.send(SessionCommand::Interrupt).await;
-                        }
+                        let _ = session.send(SessionCommand::Interrupt).await;
                     }
                 }
             } else {
@@ -748,7 +742,7 @@ pub(super) async fn pump_worker(
                     plan_stamp.as_ref(),
                 )
                 .await;
-                send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
+                send_worker_host_result(&session, call_id.clone(), result).await;
             }
         }
         // The nudge strike counter (design §4.6): fingerprint every finished
@@ -861,14 +855,11 @@ pub(super) async fn pump_worker(
         let usage_model = if matches!(&event.event, SerializableAgentEvent::Usage { .. })
             && worker_lacks_model_id(&records, &worker_id, generation).await
         {
-            match engine.session(&session_id).await {
-                Some(session) => session
-                    .snapshot()
-                    .await
-                    .ok()
-                    .and_then(|snapshot| snapshot_model(&snapshot)),
-                None => None,
-            }
+            session
+                .snapshot()
+                .await
+                .ok()
+                .and_then(|snapshot| snapshot_model(&snapshot))
         } else {
             None
         };
@@ -1316,7 +1307,7 @@ pub(super) async fn pump_worker(
                 // One ask per audit session: the ask itself starts a new
                 // turn, so a per-turn guard would ask a silent audit forever.
                 if silent_audit_asked_turn.is_none()
-                    && ask_audit_for_its_report(&engine, session_id, &worker_id, &records, &busy)
+                    && ask_audit_for_its_report(&session, &worker_id, &records, &busy)
                         .await
                 {
                     silent_audit_asked_turn = Some(turn);
@@ -1477,22 +1468,25 @@ pub(super) async fn pump_worker(
             .await;
         }
         if terminal || refresh {
-            let engine = engine.clone();
+            let session = session.clone();
             let records = records.clone();
             let usage = usage.clone();
             let save_lock = save_lock.clone();
             let persistence = persistence.clone();
             let worker_id = worker_id.clone();
             // Tracked: the refresh runs `git rev-parse HEAD` in the checkout
-            // and holds the engine, so the team's shutdown waits for it.
+            // and holds the session (and through it the engine), so the team's
+            // shutdown waits for it.
             let tasks = persistence.tasks.clone();
             tasks.register(tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                let handle = engine.session(&session_id).await;
-                let Some(handle) = handle else {
+                // A session closed meanwhile (a stop, a release) already
+                // folded its own snapshot: a closed session's empty answer
+                // must not overwrite the record.
+                if !session.is_open().await {
                     return;
-                };
-                let Ok(snapshot) = handle.snapshot().await else {
+                }
+                let Ok(snapshot) = session.snapshot().await else {
                     return;
                 };
                 let worktree = {
@@ -1536,16 +1530,13 @@ pub(super) async fn pump_worker(
 /// injected close failure. Shared by [`TeamRuntime::stop_inner`] and the
 /// audit release below so both paths behave identically.
 pub(super) async fn close_worker_session(
-    session: &AgentSession,
+    session: &SharedWorkerSession,
     fail_next_close: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     if fail_next_close.swap(false, Ordering::SeqCst) {
         return Err("injected close failure for transition tests".to_string());
     }
-    session
-        .close_and_wait()
-        .await
-        .map_err(|error| error.to_string())
+    session.close_and_wait().await
 }
 
 /// The shared ledger handles a worker pump holds: the record store plus

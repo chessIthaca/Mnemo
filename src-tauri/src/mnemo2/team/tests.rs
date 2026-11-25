@@ -6,7 +6,7 @@ use mnemo::app::worktrees::{
     agent_branch, agent_short_id, discard_and_release_pool_checkout, provision_agent_worktree,
     release_pool_checkout,
 };
-use mnemo::headless::{GateVerdict, Transcript};
+use mnemo::headless::{GateVerdict, SessionCommand, Transcript};
 use mnemo::SerializableAgentEvent;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use serde_json::{json, Value};
@@ -40,6 +40,7 @@ use super::review::CheckRecorder;
 use super::record::{append_inbox, audit_finished, MessageSender, WORKER_INBOX_LIMIT};
 use super::review::clear_review_for_a_newer_tip;
 use super::routing::final_tier;
+use super::worker_session::{LocalWorkerSession, SharedWorkerSession};
 
 macro_rules! tiers_dto {
     (difficult: $difficult:expr, average: $average:expr, simple: $simple:expr $(,)?) => {{
@@ -14047,7 +14048,8 @@ async fn scripted_proof_fixture(
 /// which the team's own spawn path never sets — wire the REAL pump over it,
 /// with the pump's own steer flag preset, then prompt it. The handles are the
 /// team's own, exactly as `start_worker` wires them. The session stays with
-/// the team's live map: `AgentSession` has no `Clone`.
+/// the team's live map: the engine's session handle has no `Clone`, so the
+/// pump and the live map share one `SharedWorkerSession`.
 async fn manual_pump_worker(
     team: &Arc<TeamRuntime>,
     worker: &WorkerRecord,
@@ -14081,7 +14083,7 @@ async fn manual_pump_worker(
         })
         .await
         .expect("spawn the scripted session");
-    let session_id = session.id();
+    let session: SharedWorkerSession = Arc::new(LocalWorkerSession::new(session));
     let busy = Arc::new(AtomicBool::new(false));
     let receiver = session.events();
     let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
@@ -14089,8 +14091,7 @@ async fn manual_pump_worker(
     let pump = tokio::spawn(pump_worker(
         worker.id.clone(),
         generation,
-        team.engine().expect("the team's engine"),
-        session_id,
+        session.clone(),
         receiver,
         team.events.clone(),
         busy.clone(),
@@ -20457,5 +20458,98 @@ async fn lowering_slots_trims_idle_pools_above_the_new_count() {
     assert!(!pools[2].exists(), "pool-3 is removed with the lower cap");
     assert!(pools[0].is_dir(), "pool-1 stays: it is at the slot count");
     assert!(warm.exists(), "pool-1 keeps its warm target/");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn event_receiver_from_broadcast_delivers_events() {
+    let (sender, receiver) = tokio::sync::broadcast::channel::<u32>(4);
+    let mut receiver = mnemo::headless::EventReceiver::from_broadcast(receiver);
+    sender.send(7).expect("a live receiver");
+    assert_eq!(receiver.recv().await, Ok(7));
+    assert_eq!(receiver.try_recv(), Ok(None));
+    drop(sender);
+    assert_eq!(
+        receiver.recv().await,
+        Err(mnemo::headless::RecvError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn local_worker_session_reports_closed_after_close() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let worker = worker(root.path(), "00000001000000000001");
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        worker.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision worker");
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    let session = team
+        .spawn_worker_session(WorkerSessionSpec {
+            model: None,
+            reasoning_effort: None,
+            worktree: worker.worktree.clone(),
+            resume: None,
+            kind: "implementation".to_string(),
+            trace_identity: TeamRuntime::worker_trace_identity(&worker),
+            pinned_task: None,
+            check_commands: Arc::new(Vec::new()),
+        })
+        .await
+        .expect("spawn worker session");
+
+    session
+        .send(SessionCommand::Interrupt)
+        .await
+        .expect("an open session takes a command");
+    session.close().await.expect("close the session");
+    let error = session
+        .send(SessionCommand::Interrupt)
+        .await
+        .expect_err("a closed session refuses commands");
+    assert!(error.contains("closed"), "unexpected error: {error}");
+    team.shutdown().await;
+}
+
+#[tokio::test]
+async fn local_worker_session_is_open_until_closed() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let worker = worker(root.path(), "00000001000000000001");
+    provision_agent_worktree(
+        root.path().to_path_buf(),
+        worker.id.clone(),
+        "main".to_string(),
+    )
+    .await
+    .expect("provision worker");
+    let team = open_test_team(root.path(), state.path(), vec![worker.clone()]).await;
+    let session = team
+        .spawn_worker_session(WorkerSessionSpec {
+            model: None,
+            reasoning_effort: None,
+            worktree: worker.worktree.clone(),
+            resume: None,
+            kind: "implementation".to_string(),
+            trace_identity: TeamRuntime::worker_trace_identity(&worker),
+            pinned_task: None,
+            check_commands: Arc::new(Vec::new()),
+        })
+        .await
+        .expect("spawn worker session");
+
+    assert!(session.is_open().await, "a spawned session is open");
+    session.close().await.expect("close the session");
+    assert!(!session.is_open().await, "a closed session is not open");
+    // The reason the check exists: a closed session still answers a snapshot,
+    // with an empty one.
+    let snapshot = session.snapshot().await.expect("a closed snapshot answers");
+    assert!(snapshot.transcript.messages.is_empty());
     team.shutdown().await;
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use mnemo::app::plan_board::{BoardPlan, BoardStatus, BoardStep, PlanBoard};
 use mnemo::route_question;
 use mnemo::headless::{
-    AgentSession, Engine, SessionEvent, SessionId, Transcript,
+    Engine, SessionEvent, SessionId, Transcript,
 };
 use mnemo::EmbedderGetter;
 use mnemo::RouteKnn;
@@ -60,6 +60,7 @@ mod record;
 mod review;
 mod routing;
 mod spawn;
+mod worker_session;
 
 use control::recover_worker;
 use deletion::schedule_trash_sweep;
@@ -70,6 +71,7 @@ use merge::{
 };
 use persistence::TeamPersistence;
 use pump::{close_worker_session, save_workers_now, save_workers_soon};
+use worker_session::SharedWorkerSession;
 
 pub use agent_watch::{AgentGateView, AgentGateWorker};
 pub use deletion::{
@@ -300,7 +302,7 @@ pub struct TeamRuntimeOptions {
 }
 
 struct LiveWorker {
-    session: AgentSession,
+    session: SharedWorkerSession,
     busy: Arc<AtomicBool>,
     pump: JoinHandle<()>,
     /// A failed close aborted the pump; only cleanup retries may use this handle.
@@ -560,7 +562,7 @@ impl TeamRuntime {
             .collect()
     }
 
-    async fn close_session_for_cleanup(&self, session: &AgentSession) -> Result<(), String> {
+    async fn close_session_for_cleanup(&self, session: &SharedWorkerSession) -> Result<(), String> {
         close_worker_session(session, &self.fail_next_close).await
     }
 

@@ -888,7 +888,6 @@ impl TeamRuntime {
                 check_commands: check_commands.clone(),
             })
             .await?;
-        let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(false));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
@@ -896,8 +895,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             worker_id.to_string(),
             generation,
-            self.engine()?,
-            session_id,
+            session.clone(),
             receiver,
             self.events.clone(),
             busy.clone(),

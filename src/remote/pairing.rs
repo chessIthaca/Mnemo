@@ -24,6 +24,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use futures::SinkExt as _;
+
 use super::auth::{self, Token};
 use super::{RemoteError, PAIRING_ATTEMPTS, PAIRING_TTL};
 
@@ -556,58 +558,98 @@ async fn serve_pairing_within<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut ws =
-        async_tungstenite::tokio::accept_async_with_config(stream, Some(super::link::ws_config()))
-            .await
-            .map_err(|error| RemoteError::link_down(format!("websocket handshake failed: {error}")))?;
-    let request = super::link::read_handshake_reply(&mut ws).await?;
-    let result = match request {
-        super::wire::Handshake::Pair {
+    let (mut ws, request) = super::link::accept_upgrade(stream).await?;
+    let super::wire::Handshake::Pair {
+        proto,
+        code,
+        name,
+        os,
+        ..
+    } = request
+    else {
+        return Err(RemoteError::internal(format!(
+            "unexpected pairing request: {}",
+            request.kind()
+        )));
+    };
+    answer_pairing(
+        &mut ws,
+        PairRequest {
             proto,
-            code,
-            name,
-            os,
-            ..
-        } => {
-            if proto != super::PROTO {
-                super::link::send_handshake_refusal(
-                    &mut ws,
-                    PairingRefusal::Proto.reason(),
-                    Some(super::PROTO),
-                )
-                .await?;
-                return Ok(None);
+            code: &code,
+            name: &name,
+            os: &os,
+        },
+        pairing,
+        nodes,
+        hub_id,
+    )
+    .await
+}
+
+/// The fields of one `pair` request a hub connection answers.
+pub(crate) struct PairRequest<'a> {
+    /// The node's protocol version.
+    pub proto: u32,
+    /// The one-time pairing code.
+    pub code: &'a str,
+    /// The operator-visible node name (empty = the code's hint).
+    pub name: &'a str,
+    /// `windows`, `macos` or `linux`.
+    pub os: &'a str,
+}
+
+/// Answer one `pair` request whose WebSocket upgrade already happened (a
+/// single hub listener routes pairing and link connections by their first
+/// handshake message). `Ok(None)` means the code was refused; the refusal was
+/// sent. Closes the socket.
+pub(crate) async fn answer_pairing<W>(
+    ws: &mut W,
+    request: PairRequest<'_>,
+    pairing: &PairingRegistry,
+    nodes: &NodeRegistry,
+    hub_id: &str,
+) -> Result<Option<NodeRecord>, RemoteError>
+where
+    W: futures::Sink<async_tungstenite::tungstenite::Message, Error = async_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    let result = async {
+        if request.proto != super::PROTO {
+            super::link::send_handshake_refusal(
+                ws,
+                PairingRefusal::Proto.reason(),
+                Some(super::PROTO),
+            )
+            .await?;
+            return Ok(None);
+        }
+        match pairing.redeem(request.code) {
+            Ok(name_hint) => {
+                let name = if request.name.trim().is_empty() {
+                    name_hint
+                } else {
+                    request.name.to_string()
+                };
+                let record = nodes.register(&name, request.os).map_err(|error| {
+                    RemoteError::internal(format!("could not register the node: {error}"))
+                })?;
+                let answer = super::wire::Handshake::Paired {
+                    node_id: record.node_id.clone(),
+                    token: record.token.clone(),
+                    hub_id: hub_id.to_string(),
+                };
+                super::link::send_handshake(ws, &answer).await?;
+                Ok(Some(record))
             }
-            match pairing.redeem(&code) {
-                Ok(name_hint) => {
-                    let name = if name.trim().is_empty() {
-                        name_hint
-                    } else {
-                        name
-                    };
-                    let record = nodes.register(&name, &os).map_err(|error| {
-                        RemoteError::internal(format!("could not register the node: {error}"))
-                    })?;
-                    let answer = super::wire::Handshake::Paired {
-                        node_id: record.node_id.clone(),
-                        token: record.token.clone(),
-                        hub_id: hub_id.to_string(),
-                    };
-                    super::link::send_handshake(&mut ws, &answer).await?;
-                    Ok(Some(record))
-                }
-                Err(refusal) => {
-                    super::link::send_handshake_refusal(&mut ws, refusal.reason(), None).await?;
-                    Ok(None)
-                }
+            Err(refusal) => {
+                super::link::send_handshake_refusal(ws, refusal.reason(), None).await?;
+                Ok(None)
             }
         }
-        other => Err(RemoteError::internal(format!(
-            "unexpected pairing request: {}",
-            other.kind()
-        ))),
-    };
-    let _ = ws.close(None).await;
+    }
+    .await;
+    let _ = ws.close().await;
     result
 }
 

@@ -245,6 +245,23 @@ enum Outbound {
     Envelope(Envelope),
 }
 
+/// Frees one inbound call's slot when its handler task ends — including when
+/// the handler panics or the task is aborted by a `cancel`.
+struct InboundSlot {
+    inner: Arc<LinkInner>,
+    id: u64,
+}
+
+impl Drop for InboundSlot {
+    fn drop(&mut self) {
+        self.inner
+            .inbound
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.id);
+    }
+}
+
 /// A pending call or stream on the requester's side.
 enum Pending {
     /// A plain call waiting for its `res`.
@@ -826,14 +843,50 @@ async fn accept_handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let mut ws =
-        async_tungstenite::tokio::accept_async_with_config(stream, Some(ws_config()))
-            .await
-            .map_err(|error| {
-                RemoteError::link_down(format!("websocket handshake failed: {error}"))
-            })?;
+    let (ws, first) = accept_upgrade(stream).await?;
+    accept_hello(ws, first, authz, handler).await
+}
 
-    let (node_id, node_nonce) = match read_handshake_reply(&mut ws).await? {
+/// Hub side: upgrade one connected stream and read the peer's first plain-JSON
+/// handshake message. A single listener uses this to tell a pairing connection
+/// (`pair`) from a link connection (`hello`) before either exchange starts.
+pub(crate) async fn accept_upgrade<S>(
+    stream: S,
+) -> Result<
+    (
+        async_tungstenite::WebSocketStream<async_tungstenite::tokio::TokioAdapter<S>>,
+        Handshake,
+    ),
+    RemoteError,
+>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut ws = async_tungstenite::tokio::accept_async_with_config(stream, Some(ws_config()))
+        .await
+        .map_err(|error| {
+            RemoteError::link_down(format!("websocket handshake failed: {error}"))
+        })?;
+    let first = read_handshake_reply(&mut ws).await?;
+    Ok((ws, first))
+}
+
+/// Finish the link handshake over an upgraded socket whose first message was
+/// already read by [`accept_upgrade`].
+pub(crate) async fn accept_hello<W>(
+    mut ws: W,
+    first: Handshake,
+    authz: HubAuth,
+    handler: Arc<dyn LinkHandler>,
+) -> Result<Link, RemoteError>
+where
+    W: Stream<Item = Result<Message, WsError>>
+        + Sink<Message, Error = WsError>
+        + Unpin
+        + Send
+        + 'static,
+{
+    let (node_id, node_nonce) = match first {
         Handshake::Hello {
             proto,
             node_id,
@@ -842,7 +895,7 @@ where
         } => {
             if proto != PROTO {
                 send_handshake_refusal(&mut ws, "proto", Some(PROTO)).await?;
-                let _ = ws.close(None).await;
+                let _ = ws.close().await;
                 return Err(RemoteError::refused("proto"));
             }
             let node_nonce = auth::parse_32_hex(&nonce)
@@ -859,7 +912,7 @@ where
 
     let Some(token) = authz.token(&node_id) else {
         send_handshake_refusal(&mut ws, "unknown_node", None).await?;
-        let _ = ws.close(None).await;
+        let _ = ws.close().await;
         return Err(RemoteError::refused("unknown_node"));
     };
 
@@ -883,7 +936,7 @@ where
         &auth::node_proof(&token, &node_nonce, &hub_nonce),
     ) {
         send_handshake_refusal(&mut ws, "bad_proof", None).await?;
-        let _ = ws.close(None).await;
+        let _ = ws.close().await;
         return Err(RemoteError::refused("bad_proof"));
     }
 
@@ -1243,16 +1296,26 @@ async fn dispatch(inner: &Arc<LinkInner>, envelope: Envelope) {
         Envelope::Item { id, n, d } => {
             // Clone the queue out of the map so the map is not borrowed while
             // the item is offered to it.
-            let queue = {
+            let (queue, before_res) = {
                 let pending = inner
                     .pending
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
                 match pending.get(&id) {
-                    Some(Pending::Stream(queue)) => Some(queue.clone()),
-                    _ => None,
+                    Some(Pending::Stream(queue)) => (Some(queue.clone()), false),
+                    Some(Pending::StreamInit(_, _)) => (None, true),
+                    _ => (None, false),
                 }
             };
+            if before_res {
+                // A stream item before its `res` is the peer's protocol
+                // violation: the call's answer stream would be corrupt, so
+                // fail the link rather than silently drop the item.
+                inner.fail(RemoteError::link_down(format!(
+                    "the peer sent an item for stream {id} before its response"
+                )));
+                return;
+            }
             let Some(queue) = queue else { return };
             let expected = queue.state.next_n.load(Ordering::SeqCst) + 1;
             if n != expected {
@@ -1360,13 +1423,16 @@ async fn dispatch(inner: &Arc<LinkInner>, envelope: Envelope) {
             let task_inner = inner.clone();
             let out = StreamTx::new(inner.clone(), id);
             let task = tokio::spawn(async move {
+                // Frees the inbound slot even when the handler panics: a
+                // panicking task never reaches its own cleanup line, and a
+                // leaked slot would make the peer's next reuse of this id look
+                // like a protocol violation.
+                let _slot = InboundSlot {
+                    inner: task_inner.clone(),
+                    id,
+                };
                 let result = handler.request(&m, p, out.clone()).await;
                 task_inner.finish_request(id, &out, result).await;
-                task_inner
-                    .inbound
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .remove(&id);
             });
             inner
                 .inbound

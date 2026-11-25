@@ -29,9 +29,11 @@
 
 pub mod auth;
 pub mod catalog;
+pub mod hub;
 pub mod link;
 pub mod llm;
 pub mod memory;
+pub mod node;
 pub mod pairing;
 pub mod wire;
 

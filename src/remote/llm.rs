@@ -693,6 +693,14 @@ impl LlmHandler {
         &self.calls
     }
 
+    /// Forget every call that ended longer than the log's TTL ago. The hub's
+    /// housekeeping runs this every [`super::hub::CALL_SWEEP`] and whenever a
+    /// node's link attaches, so a call whose `llm.ack` never arrived (a node
+    /// that vanished mid-call) does not stay in the log forever.
+    pub fn sweep(&self) {
+        self.calls.sweep();
+    }
+
     /// Serve one `llm.*` call for `node_id`. `None` when the method is not a
     /// model method (the caller routes it elsewhere).
     pub async fn request(

@@ -2471,6 +2471,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn resume_local_with_no_free_local_slot_leaves_the_worker_on_its_host() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd3333");
+        record.status = WorkerStatus::Interrupted;
+        std::fs::create_dir_all(&record.worktree).expect("worktree");
+        record.remote = Some(sample_remote(&"f".repeat(32), None));
+        team.records.lock().await.push(record);
+        // No local slot is free.
+        team.persistence
+            .slots
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let answer = team
+            .handle_lead_host_tool(
+                "team_resume",
+                serde_json::json!({"worker_id": "abcd3333", "host": "local"}),
+            )
+            .await;
+        assert!(!answer.success, "{}", answer.output);
+        assert_eq!(answer.output, "all 0 worker slots are busy");
+        let records = team.records.lock().await;
+        assert!(
+            records[0].remote.is_some(),
+            "a refused resume leaves the record on its host"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resume_names_a_host_that_is_no_longer_paired() {
         let rig = Rig::start().await;
         let team = rig.team().await;
@@ -2502,6 +2531,7 @@ mod tests {
         ] {
             let mut record = super::super::tests::worker(rig.root.path(), id);
             record.status = status;
+            record.base_commit = Some("1111111111111111111111111111111111111111".to_string());
             record.remote = Some(sample_remote(&rig.node_id, None));
             team.records.lock().await.push(record);
             team.live
@@ -2525,6 +2555,15 @@ mod tests {
         assert_eq!(running.status, WorkerStatus::Failed);
         assert!(
             running.error.as_deref().unwrap_or("").contains("was revoked"),
+            "{:?}",
+            running.error
+        );
+        assert!(
+            running
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("from its starting commit 1111111 (nothing was synced from node-a)"),
             "{:?}",
             running.error
         );

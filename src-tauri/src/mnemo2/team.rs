@@ -1106,7 +1106,12 @@ impl TeamRuntime {
                         .as_deref()
                         .map(str::trim)
                         .filter(|base| !base.is_empty())
-                        .map(|base| format!(" from its starting commit {}", short_sha(base)))
+                        .map(|base| {
+                            format!(
+                                " from its starting commit {} (nothing was synced from {name})",
+                                short_sha(base)
+                            )
+                        })
                         .unwrap_or_default(),
                 };
                 worker.status = WorkerStatus::Failed;

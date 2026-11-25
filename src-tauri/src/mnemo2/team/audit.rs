@@ -454,6 +454,15 @@ impl TeamRuntime {
                     "team: could not place audit {} on host '{}': {error}; running it locally",
                     record.id, choice.name
                 );
+                // The audit stays on this computer after all: it needs one of
+                // this computer's slots, as it would without a host.
+                let active = self.active_workers_for_slots().await;
+                let slots = self.persistence.slots.load(Ordering::SeqCst);
+                if active >= slots {
+                    self.remote
+                        .release_reservation(&choice.node_id, &record.branch);
+                    return Err(format!("all {slots} worker slots are busy"));
+                }
             }
         }
         let started = self.start_audit_worker(record, base_tip).await;

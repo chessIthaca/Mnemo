@@ -1280,7 +1280,9 @@ const HOST_NAME_REFUSAL: &str =
 /// the `mnemo2-node pair` command the lead shows the user, so nothing a shell
 /// would treat specially is accepted.
 fn valid_host_name(name: &str) -> bool {
+    // A leading '-' would read as a flag in the `mnemo2-node pair` command.
     (1..=64).contains(&name.len())
+        && !name.starts_with('-')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))

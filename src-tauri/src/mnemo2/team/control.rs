@@ -656,10 +656,26 @@ impl TeamRuntime {
         {
             return Ok(());
         }
+        // The worker will run on this computer, so it needs one of this
+        // computer's slots: asked before it moves, so a refusal leaves the
+        // record on its host.
+        let active = self.active_workers_for_slots().await;
+        let slots = self.persistence.slots.load(Ordering::SeqCst);
+        if active >= slots {
+            return Err(format!("all {slots} worker slots are busy"));
+        }
         let _ = self.sync_remote(worker_id).await;
+        // After the sync, which records the tip it copied.
+        let moved = self.worker(worker_id).await?.remote;
         self.update_worker(worker_id, |worker| worker.remote = None)
             .await;
-        self.persist().await
+        if let Err(error) = self.persist().await {
+            // The saved state still names the host: so must the record.
+            self.update_worker(worker_id, |worker| worker.remote = moved)
+                .await;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Refuse a Mnemo session on a handed-back worker whose checkout has

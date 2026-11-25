@@ -707,7 +707,7 @@ mod tests {
         // A host name travels into a command line the user pastes: nothing a
         // shell treats specially gets through, for pair or revoke.
         let too_long = "a".repeat(65);
-        for bad in ["bad name", "x;rm -rf", "$(whoami)", "a\"b", too_long.as_str()] {
+        for bad in ["bad name", "-rf", "x;rm -rf", "$(whoami)", "a\"b", too_long.as_str()] {
             for args in [
                 serde_json::json!({"action": "pair", "name": bad}),
                 serde_json::json!({"action": "revoke", "name": bad}),

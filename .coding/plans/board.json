@@ -4287,6 +4287,39 @@
       "schema": "spec-driven@1",
       "sections": {},
       "no_spec_impact": "Gate decision plumbing between the plugin hook and the external-lead server plus skill wording; the external-lead capability's requirements are unchanged (the gate already allowed agent-worker launches; this makes the allow effective)."
+    },
+    {
+      "id": "f7a2d880",
+      "status": "closed",
+      "created_at_ms": 1795591011706,
+      "closed_at_ms": 1795592060906,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-f7a2d880-20261125-073420.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Release housekeeping: a dependency patch, version bump and CHANGELOG; no specified behaviour changes."
+    },
+    {
+      "id": "c8a1a6f5",
+      "status": "open",
+      "created_at_ms": 1795591164117,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Pure refactor: the worker session is reached through a trait object instead of the concrete engine handle; dispatch routing, notices and persistence are unchanged."
+    },
+    {
+      "id": "a040713f",
+      "status": "open",
+      "created_at_ms": 1795591259825,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Phase 2 adds a new node runtime and protocol; it changes no specified behaviour of existing capabilities. Spec deltas for a new remote-workers capability are added when the implementation steps are recorded."
     }
   ]
 }

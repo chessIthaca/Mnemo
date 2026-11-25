@@ -28,7 +28,10 @@
 //! server / node runtime (step 5) build on [`Link`].
 
 pub mod auth;
+pub mod catalog;
 pub mod link;
+pub mod llm;
+pub mod memory;
 pub mod pairing;
 pub mod wire;
 
@@ -72,8 +75,10 @@ pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 /// Upper bound of one WebSocket frame (the WebSocket `max_frame_size`).
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// Inbound requests a link runs concurrently. A peer that exceeds the cap gets
-/// an `err` with code `busy` instead of a handler task.
+/// Inbound requests a link runs concurrently. A peer that exceeds the cap is
+/// answered with a **best-effort** `err` carrying code `busy` instead of a
+/// handler task: the answer is dropped when the outbound queue is full, and
+/// the requester then times out rather than seeing `busy`.
 pub const MAX_INFLIGHT: usize = 256;
 
 // The stable error codes of an RPC failure (the handshake additionally reports
@@ -100,7 +105,9 @@ pub const CODE_MODEL_NOT_CONFIGURED: &str = "model_not_configured";
 /// The requester cancelled the call.
 pub const CODE_CANCELLED: &str = "cancelled";
 /// The peer already has the cap of inbound requests in flight ([`MAX_INFLIGHT`]);
-/// retry once one finishes.
+/// retry once one finishes. Best effort: the `busy` answer itself may be
+/// dropped when the peer's outbound queue is full, in which case the call
+/// times out instead.
 pub const CODE_BUSY: &str = "busy";
 /// A stream's item buffer overflowed; that stream (only) was ended with this
 /// code and cancelled on the peer. The link itself stays up.

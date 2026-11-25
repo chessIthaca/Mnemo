@@ -28,8 +28,8 @@ use super::dispatch::PlanRef;
 use super::guardrails::guardrails_for;
 use super::nudge::NUDGE_STRIKE_LIMIT;
 use super::record::{
-    fresh_launch_token, kickoff_message, note_model, session_model_spec, WorkerRecord,
-    WorkerStatus,
+    fresh_launch_token, kickoff_message, note_model, session_model_spec, RemoteCheckout,
+    WorkerRecord, WorkerStatus,
 };
 use super::routing::{logs_label, outcome_row, ClaudeAgentDispatch};
 use super::pump::pump_worker;
@@ -56,6 +56,9 @@ pub(crate) struct WorkerSessionSpec {
     pub(crate) pinned_task: Option<String>,
     /// Exact commands measured and accepted for automatic worker checks.
     pub(crate) check_commands: Arc<Vec<String>>,
+    /// The node checkout the session runs in, when the worker was placed on a
+    /// paired host; `None` runs it on this computer.
+    pub(crate) remote: Option<RemoteCheckout>,
 }
 
 #[derive(Deserialize)]
@@ -332,10 +335,16 @@ impl TeamRuntime {
 
 
     pub(super) async fn start_worker(&self, record: WorkerRecord) -> Result<WorkerRecord, String> {
-        let active = self.active_workers_for_slots().await;
-        let slots = self.persistence.slots.load(Ordering::SeqCst);
-        if active >= slots {
-            return Err(format!("all {slots} worker slots are busy"));
+        // A remote worker counts against its host's slots, not this
+        // computer's; the node-side spawn also re-checks them.
+        if let Some(remote) = record.remote.as_ref() {
+            Box::pin(self.start_remote_slot_gate(remote)).await?;
+        } else {
+            let active = self.active_workers_for_slots().await;
+            let slots = self.persistence.slots.load(Ordering::SeqCst);
+            if active >= slots {
+                return Err(format!("all {slots} worker slots are busy"));
+            }
         }
         let id = record.id.clone();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -366,6 +375,7 @@ impl TeamRuntime {
                         .unwrap_or_else(|| record.brief.clone()),
                 ),
                 check_commands: check_commands.clone(),
+                remote: record.remote.clone(),
             })
             .await
         {
@@ -491,7 +501,39 @@ impl TeamRuntime {
             trace_identity,
             pinned_task,
             check_commands,
+            remote,
         } = spec;
+        if let Some(remote) = remote {
+            // The session lives in the node's checkout; the hub's shadow
+            // checkout is only a place to review and merge from.
+            return Box::pin(self.remote.spawn_session(
+                &remote,
+                SpawnOptions {
+                    name: Some(trace_identity.agent_name.clone()),
+                    model,
+                    reasoning_effort,
+                    worktree: None,
+                    check_commands: check_commands.as_ref().clone(),
+                    permissions: Some(PermissionPolicy::OverridePermissions),
+                    policy: None,
+                    resume,
+                    limits: None,
+                    host_tools: self.worker_host_tools(),
+                    external_policy: None,
+                    guardrails: Some(guardrails_for(&kind)),
+                    trace_identity: Some(trace_identity),
+                    pinned_task,
+                    skip_turn_routing: true,
+                },
+            ))
+            .await
+            .map_err(|err| {
+                format!(
+                    "could not spawn the worker session on host '{}': {err}",
+                    remote.node_name
+                )
+            });
+        }
         let name = trace_identity.agent_name.clone();
         let session = self
             .engine()?
@@ -527,10 +569,33 @@ impl TeamRuntime {
         Ok(Arc::new(LocalWorkerSession::new(session)))
     }
 
+    /// Refuse to start a worker whose host has no free slot, and push the
+    /// current model catalog before the session is spawned there.
+    async fn start_remote_slot_gate(&self, remote: &RemoteCheckout) -> Result<(), String> {
+        let server = self
+            .remote
+            .server()
+            .ok_or_else(|| format!("host '{}' is not connected", remote.node_name))?;
+        if !server.is_connected(&remote.node_id) {
+            return Err(format!("host '{}' is not connected", remote.node_name));
+        }
+        let record = self.remote.host(&remote.node_id)?;
+        let slots = self.remote.slots_of(&record).await;
+        if self.remote.busy_on(&remote.node_id).await >= slots {
+            return Err(format!(
+                "all {slots} slots on host '{}' are busy",
+                remote.node_name
+            ));
+        }
+        self.remote
+            .ensure_catalog(&server.node(&remote.node_id), &remote.node_name)
+            .await
+    }
+
     /// Mark a worker failed after its session could not spawn or resume.
     /// Failed-and-stopped is a terminal status (design §4.7): the worker's
     /// `outcome` row is appended once the record persists.
-    async fn fail_worker(&self, worker_id: &str, error: String) {
+    pub(super) async fn fail_worker(&self, worker_id: &str, error: String) {
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Failed;
             worker.error = Some(error);

@@ -17,6 +17,7 @@ use mnemo::app::worktrees::{
 use crate::mnemo2::phase3;
 use crate::mnemo2::phase3::ReviewEvidence;
 
+use super::placement::{Placement, PlacementRequest};
 use super::record::{audit_finished, validate_worker_id, WorkerRecord, WorkerStatus};
 use super::routing::tier_ids;
 use super::TeamRuntime;
@@ -233,6 +234,11 @@ impl TeamRuntime {
         if self.worker_is_busy(worker_id).await {
             return Err("the implementation worker must be idle before audit dispatch".to_string());
         }
+        if target.remote.is_some() {
+            // The audit must inspect the branch as the hub shadow has it, not
+            // whatever the shadow held at the last check.
+            self.sync_remote(worker_id).await?;
+        }
         let tip = self.worker_tip(&target).await?;
         // Reuse semantics: the same reviewer may be retried for the same
         // worker at the same tip; a moved tip needs a fresh reviewer id so
@@ -339,10 +345,19 @@ impl TeamRuntime {
             depth_hint.as_deref(),
         )
         .await?;
-        let active = self.active_workers_for_slots().await;
-        let slots = self.persistence.slots.load(Ordering::SeqCst);
-        if active >= slots {
-            return Err(format!("all {slots} worker slots are busy"));
+        // Audits follow the same placement as implementation workers; only
+        // the local computer counts against its own slots.
+        let placement = Box::pin(self.place_worker(PlacementRequest {
+            pinned: None,
+            claude_agent: false,
+        }))
+        .await?;
+        if matches!(placement, Placement::Local) {
+            let active = self.active_workers_for_slots().await;
+            let slots = self.persistence.slots.load(Ordering::SeqCst);
+            if active >= slots {
+                return Err(format!("all {slots} worker slots are busy"));
+            }
         }
         // The audit worktree checks out the audited branch itself so the
         // reviewer reads the exact tree it is auditing.
@@ -359,7 +374,7 @@ impl TeamRuntime {
         .map_err(|err| format!("could not provision the audit worktree: {err}"))?;
         let base_tip = phase3::tip(&worktree).await?;
         let millis = phase3::now_ms();
-        let record = WorkerRecord {
+        let mut record = WorkerRecord {
             id: reviewer_id.to_string(),
             inbox: Vec::new(),
             name: format!("Audit {}", agent_short_id(reviewer_id)),
@@ -425,7 +440,27 @@ impl TeamRuntime {
             routing: None,
             reroutes: Vec::new(),
         };
-        let audit = self.start_audit_worker(record, base_tip).await?;
+        // The checkout stays reserved until the audit record is stored, which
+        // is what names it to the reconciler.
+        let mut reserved: Option<(String, String)> = None;
+        if let Placement::Node(choice) = &placement {
+            // The audit reads the exact audited tree, so its node checkout is
+            // prepared at the audit's own base tip.
+            reserved = Some((choice.node_id.clone(), record.branch.clone()));
+            if let Err(error) =
+                Box::pin(self.prepare_remote_checkout(&mut record, choice, &base_tip, true)).await
+            {
+                eprintln!(
+                    "team: could not place audit {} on host '{}': {error}; running it locally",
+                    record.id, choice.name
+                );
+            }
+        }
+        let started = self.start_audit_worker(record, base_tip).await;
+        if let Some((node_id, branch)) = reserved {
+            self.remote.release_reservation(&node_id, &branch);
+        }
+        let audit = started?;
         // One audit per audit worker: retrying the same reviewer at the same
         // tip reuses its record, so it is not a new round.
         self.update_worker(worker_id, |worker| worker.audits += 1)

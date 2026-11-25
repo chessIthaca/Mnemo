@@ -217,7 +217,13 @@ pub(crate) fn environmental_failure(exit_code: Option<i64>, text: &str) -> bool 
 /// which in this repository routinely names PowerShell and Windows-only
 /// compiler gates and would pin every dispatch to a Windows host.
 pub fn requires_windows(commands: &[String]) -> bool {
-    const WINDOWS_SHELLS: [&str; 4] = ["powershell", "powershell.exe", "cmd", "cmd.exe"];
+    const WINDOWS_SHELLS: [&str; 5] = [
+        "powershell",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd",
+        "cmd.exe",
+    ];
     commands.iter().any(|command| {
         let first = command
             .split_whitespace()
@@ -228,14 +234,20 @@ pub fn requires_windows(commands: &[String]) -> bool {
         if WINDOWS_SHELLS.contains(&first.as_str()) {
             return true;
         }
-        // `pwsh` and `pwsh.exe` alone run on macOS and Linux too (PowerShell
-        // 7; the `.exe` spelling is only how a Windows config writes it): they
-        // are Windows-only when they run a PowerShell script, which the file
-        // suffixes below catch. Neither is in the list above on purpose.
-        let lower = command.to_ascii_lowercase();
-        [".ps1", ".bat", ".cmd"]
-            .iter()
-            .any(|suffix| lower.contains(suffix))
+        // `pwsh` alone runs on macOS and Linux too (PowerShell 7), so it is
+        // Windows-only only when it runs a PowerShell script; the `.exe`
+        // spelling is how a Windows config runs it, so that one names Windows
+        // directly. The file suffixes match a whole token, never the middle of
+        // one: `bats tests/e2e.bats` is not a Windows batch file.
+        command.split_whitespace().any(|token| {
+            let token = token
+                .trim_matches('"')
+                .trim_end_matches([',', ';'])
+                .to_ascii_lowercase();
+            [".ps1", ".bat", ".cmd"]
+                .iter()
+                .any(|suffix| token.ends_with(suffix))
+        })
     })
 }
 
@@ -372,6 +384,10 @@ pub struct RemoteWorkers {
     /// Sessions seen without a live entry on the previous reconcile pass, so a
     /// session that is still spawning is never closed on its first sighting.
     seen_orphans: StdMutex<HashSet<(String, SessionId)>>,
+    /// The `(node_id, branch)` checkouts a dispatch is preparing right now.
+    /// The record that names them is stored only after `prepare_checkout`
+    /// returns, so the reconciler must leave them alone until then.
+    reservations: StdMutex<HashSet<(String, String)>>,
 }
 
 impl RemoteWorkers {
@@ -400,6 +416,7 @@ impl RemoteWorkers {
             qualifying: StdMutex::new(HashMap::new()),
             outage_budget: StdMutex::new(mnemo::remote::HUB_OUTAGE_BUDGET),
             seen_orphans: StdMutex::new(HashSet::new()),
+            reservations: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -452,6 +469,37 @@ impl RemoteWorkers {
             .into_iter()
             .find(|record| record.node_id == name_or_id || record.name == name_or_id)
             .ok_or_else(|| format!("no worker host named '{name_or_id}'"))
+    }
+
+    /// Keep the reconciler's hands off `branch`'s checkout on `node_id` while
+    /// a dispatch prepares it.
+    ///
+    /// The worker record that will name the checkout is stored only after
+    /// `prepare_checkout` returns; without the reservation the reconciler
+    /// could list the fresh `wt/agent-*` checkout as an orphan and release it
+    /// under the dispatch.
+    pub fn reserve(&self, node_id: &str, branch: &str) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert((node_id.to_string(), branch.to_string()));
+    }
+
+    /// Drop a reservation once the record names the checkout, or the dispatch
+    /// failed before there was one.
+    pub fn release_reservation(&self, node_id: &str, branch: &str) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&(node_id.to_string(), branch.to_string()));
+    }
+
+    /// Whether a dispatch is preparing `branch`'s checkout on `node_id`.
+    pub fn is_reserved(&self, node_id: &str, branch: &str) -> bool {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&(node_id.to_string(), branch.to_string()))
     }
 
     /// How many live workers run on `node_id`.
@@ -1619,12 +1667,16 @@ mod tests {
         );
         assert!(requires_windows(&["pwsh.exe -File build.ps1".into()]));
         assert!(
-            !requires_windows(&[r#"pwsh.exe -Command "npm test""#.into()]),
-            "pwsh.exe alone is the same as pwsh"
+            requires_windows(&[r#"pwsh.exe -Command "npm test""#.into()]),
+            "only a Windows config spells the executable pwsh.exe"
         );
-        assert!(!requires_windows(&[r#""C:\Program Files\PowerShell\pwsh.exe" -Command x"#.into()]));
+        assert!(!requires_windows(&[r#""C:\Program Files\PowerShell\pwsh.exe" -Command x"#.into()]));
         assert!(requires_windows(&["cmd /c build.bat".into()]));
         assert!(requires_windows(&["node scripts/build.cmd".into()]));
+        assert!(
+            !requires_windows(&["bats tests/e2e.bats".into()]),
+            "a .bats suite is not a Windows batch file"
+        );
         assert!(!requires_windows(&["cargo test --workspace".into()]));
         assert!(!requires_windows(&["npm run check --workspace mnemo2".into()]));
         assert!(!requires_windows(&[]));
@@ -1755,6 +1807,8 @@ mod tests {
         team.attach_hosts(Arc::new(TestHosts { server: hub, address }));
 
         let mut record = super::super::tests::worker(root.path(), "abcd1234");
+        // A worker that is still running: a finished one keeps its outcome.
+        record.status = WorkerStatus::Working;
         record.base_commit = Some("1111111111111111111111111111111111111111".to_string());
         record.remote = Some(sample_remote(
             "deadbeefdeadbeefdeadbeefdeadbeef",
@@ -2109,6 +2163,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_keeps_a_checkout_a_dispatch_is_preparing() {
+        let rig = Rig::start().await;
+        let base = rig.base().await;
+        let preparing = rig
+            .workers
+            .prepare_checkout(&rig.node_id, "wt/agent-cccc3333", &base, false)
+            .await
+            .expect("the checkout being prepared");
+        let team = rig.team().await;
+        team.remote.reserve(&rig.node_id, "wt/agent-cccc3333");
+
+        team.reconcile_hosts().await;
+        let kept = checkout_list(&rig)
+            .await
+            .into_iter()
+            .find(|info| info.checkout == preparing.checkout)
+            .expect("the checkout is listed");
+        assert_eq!(
+            kept.branch.as_deref(),
+            Some("wt/agent-cccc3333"),
+            "a reserved checkout is not an orphan"
+        );
+
+        team.remote.release_reservation(&rig.node_id, "wt/agent-cccc3333");
+        team.reconcile_hosts().await;
+        let released = checkout_list(&rig)
+            .await
+            .into_iter()
+            .find(|info| info.checkout == preparing.checkout)
+            .expect("the checkout is listed");
+        assert!(
+            released.branch.is_none(),
+            "once released it is an orphan like any other"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn reconcile_keeps_a_running_qualification_checkout() {
         let rig = Rig::start().await;
         // A check that takes several seconds, so the qualification is still
@@ -2244,6 +2335,8 @@ mod tests {
         let rig = Rig::start().await;
         let team = rig.team().await;
         let mut record = super::super::tests::worker(rig.root.path(), "abcd1234");
+        // A worker that is still running: a finished one keeps its outcome.
+        record.status = WorkerStatus::Working;
         let mut remote = sample_remote(&rig.node_id, None);
         remote.offline_since_ms = Some(super::super::unix_ms().saturating_sub(5_000));
         record.remote = Some(remote);
@@ -2283,5 +2376,33 @@ mod tests {
             .expect("a remote worker")
             .offline_since_ms
             .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_worker_keeps_its_outcome_when_its_host_restarts() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd1234");
+        record.status = WorkerStatus::Merged;
+        let mut remote = sample_remote(&rig.node_id, None);
+        remote.offline_since_ms = Some(super::super::unix_ms().saturating_sub(5_000));
+        record.remote = Some(remote);
+        team.records.lock().await.push(record.clone());
+        team.live
+            .lock()
+            .await
+            .insert(record.id.clone(), live_entry(7));
+
+        let remote = record.remote.clone().expect("a remote worker");
+        team.mark_host_restarted(&record.id, &remote).await;
+        team.fail_lost_host(&record.id, &remote).await;
+
+        let records = team.records.lock().await;
+        let stored = records
+            .iter()
+            .find(|stored| stored.id == record.id)
+            .expect("the worker record");
+        assert_eq!(stored.status, WorkerStatus::Merged);
+        assert!(stored.error.is_none(), "{:?}", stored.error);
     }
 }

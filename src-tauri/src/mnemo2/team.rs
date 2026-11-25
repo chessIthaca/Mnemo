@@ -51,6 +51,7 @@ mod lead_tools;
 mod merge;
 mod nudge;
 mod persistence;
+mod placement;
 // Public: the proof engine's contract is part of the crate's API, so a step
 // that adds it before the team calls it does not trip the dead-code lint.
 pub mod proof;
@@ -446,6 +447,9 @@ pub struct TeamRuntime {
     /// bundle round trips, node-side checks and host suitability. With no
     /// [`HostDirectory`] attached every worker is local.
     remote: Arc<RemoteWorkers>,
+    /// The app's host directory once [`TeamRuntime::attach_hosts`] ran; the
+    /// `team_hosts` tool pairs, lists, and revokes hosts through it.
+    hosts: std::sync::RwLock<Option<Arc<dyn HostDirectory>>>,
     /// The external lead's attach flag, notice queue and activity clock.
     external: std::sync::Mutex<ExternalLead>,
     /// Wakes [`TeamRuntime::wait_external_notices`] on a push or a detach.
@@ -706,6 +710,7 @@ impl TeamRuntime {
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
             remote,
+            hosts: std::sync::RwLock::new(None),
             external: std::sync::Mutex::new(ExternalLead::away_since(unix_ms())),
             external_wake: tokio::sync::Notify::new(),
         };
@@ -767,6 +772,10 @@ impl TeamRuntime {
     /// running hub, so an app whose user never paired a node behaves exactly as
     /// before.
     pub fn attach_hosts(self: &Arc<Self>, hosts: Arc<dyn HostDirectory>) {
+        *self
+            .hosts
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(hosts.clone());
         self.remote.attach(hosts.clone());
         let team = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -955,6 +964,11 @@ impl TeamRuntime {
             let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
                 return;
             };
+            // The record may have finished while the notice was in flight; a
+            // restarted host must not reopen a finished worker.
+            if terminal_status(worker.status) {
+                return;
+            }
             worker.status = WorkerStatus::Interrupted;
             worker.error = Some(format!(
                 "host '{}' restarted; its session ended. team_resume continues it there.",
@@ -993,6 +1007,11 @@ impl TeamRuntime {
             let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
                 return;
             };
+            // A worker that finished, merged or failed on its own while the
+            // host was away keeps that outcome.
+            if terminal_status(worker.status) {
+                return;
+            }
             let budget = self.remote.outage_budget().as_secs();
             let name = &remote.node_name;
             let base = worker
@@ -1039,6 +1058,65 @@ impl TeamRuntime {
             ),
         );
         self.signal_board_changed();
+    }
+
+    /// Fail every running worker of a host the lead just revoked.
+    ///
+    /// The session on that host is gone for good, but the record keeps its
+    /// remote checkout so `team_resume` with `host "local"` can continue the
+    /// worker from the hub's shadow checkout. Returns the failed worker ids.
+    pub(super) async fn fail_revoked_host(&self, node_id: &str, name: &str) -> Vec<String> {
+        let running: Vec<String> = {
+            let live = self.live.lock().await;
+            live.keys().cloned().collect()
+        };
+        let mut failed = Vec::new();
+        {
+            let mut records = self.records.lock().await;
+            for worker in records.iter_mut() {
+                if !running.contains(&worker.id) {
+                    continue;
+                }
+                let Some(remote) = worker.remote.as_ref() else {
+                    continue;
+                };
+                if remote.node_id != node_id || terminal_status(worker.status) {
+                    continue;
+                }
+                let from = match remote.synced_tip.as_deref() {
+                    Some(tip) => format!(" from its last synced commit {}", short_sha(tip)),
+                    None => worker
+                        .base_commit
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|base| !base.is_empty())
+                        .map(|base| format!(" from its starting commit {}", short_sha(base)))
+                        .unwrap_or_default(),
+                };
+                worker.status = WorkerStatus::Failed;
+                worker.error = Some(format!(
+                    "host '{name}' was revoked; its session there is lost. team_resume continues worker '{}' here with host \"local\"{from}.",
+                    worker.id
+                ));
+                failed.push(worker.id.clone());
+            }
+        }
+        if failed.is_empty() {
+            return failed;
+        }
+        {
+            let mut live = self.live.lock().await;
+            for id in &failed {
+                if let Some(worker) = live.remove(id) {
+                    worker.pump.abort();
+                }
+            }
+        }
+        if let Err(error) = self.persist().await {
+            eprintln!("team: could not save the workers of the revoked host {name}: {error}");
+        }
+        self.signal_board_changed();
+        failed
     }
 
     /// Re-align the node side with the hub: close sessions the hub does not
@@ -1141,6 +1219,12 @@ impl TeamRuntime {
                                 .remote
                                 .qualification_protects(&node_record.node_id, branch)
                             {
+                                continue;
+                            }
+                            // A dispatch is still preparing this checkout; its
+                            // record only names it once `prepare_checkout`
+                            // returned.
+                            if self.remote.is_reserved(&node_record.node_id, branch) {
                                 continue;
                             }
                             let released = node
@@ -1823,6 +1907,15 @@ const PUMP_TASK_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn now_key() -> u128 {
     phase3::now_ms()
+}
+
+/// A worker whose turn is over for good: a late host notice must never reopen
+/// it (plan 9a2f4b67, step 5).
+fn terminal_status(status: WorkerStatus) -> bool {
+    matches!(
+        status,
+        WorkerStatus::Completed | WorkerStatus::Merged | WorkerStatus::Failed | WorkerStatus::Stopped
+    )
 }
 
 /// `path` relative to the project root with forward slashes; the path as-is

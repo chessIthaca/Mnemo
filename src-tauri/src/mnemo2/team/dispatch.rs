@@ -23,6 +23,7 @@ use crate::mnemo2::phase3;
 use serde_json::{json, Value};
 
 use super::lead_tools::{team_tool_error, worker_status_view};
+use super::placement::{NodeChoice, Placement, PlacementRequest};
 use super::record::{
     agent_prompt, validate_worker_id, with_launch_token, InboxKind, MessageSender, WorkerRecord, WorkerRouting,
     WorkerStatus,
@@ -548,8 +549,19 @@ impl TeamRuntime {
         &self,
         request: DispatchRequest,
     ) -> Result<(WorkerRecord, bool, bool), String> {
+        self.dispatch_request_on(request, None).await
+    }
+
+    /// [`Self::dispatch_request`] with the lead's optional `host` pin: `None`
+    /// lets placement choose, `Some("local")` keeps the worker here, and
+    /// `Some(name)` names a paired host.
+    pub(super) async fn dispatch_request_on(
+        &self,
+        request: DispatchRequest,
+        host: Option<String>,
+    ) -> Result<(WorkerRecord, bool, bool), String> {
         let routed = self.prepare_dispatch_routing(&request).await?;
-        let result = self.dispatch_locked(request, routed).await;
+        let result = self.dispatch_locked(request, routed, host).await;
         if matches!(result, Ok((_, false, _))) {
             self.signal_board_changed();
         }
@@ -592,6 +604,7 @@ impl TeamRuntime {
         &self,
         request: DispatchRequest,
         routed: Option<RoutedDispatch>,
+        host: Option<String>,
     ) -> Result<(WorkerRecord, bool, bool), String> {
         let DispatchRequest {
             brief,
@@ -766,10 +779,22 @@ impl TeamRuntime {
                 ));
             }
         }
-        let active = self.active_workers_for_slots().await;
-        let slots = self.persistence.slots.load(Ordering::SeqCst);
-        if active >= slots {
-            return Err(format!("all {slots} worker slots are busy"));
+        // Placement runs after the tier and model are settled: a remote worker
+        // does not count against this computer's slots, so the local gate runs
+        // only when the worker stays here (its message stays byte-identical).
+        // Boxed: dispatch is already a deep future, and placement talks to
+        // hosts.
+        let placement = Box::pin(self.place_worker(PlacementRequest {
+            pinned: host.as_deref(),
+            claude_agent: claude_agent.is_some(),
+        }))
+        .await?;
+        if matches!(placement, Placement::Local) {
+            let active = self.active_workers_for_slots().await;
+            let slots = self.persistence.slots.load(Ordering::SeqCst);
+            if active >= slots {
+                return Err(format!("all {slots} worker slots are busy"));
+            }
         }
         if claude_agent.is_some() {
             if let Some(refusal) = self.agent_launch_refusal(None).await {
@@ -817,12 +842,41 @@ impl TeamRuntime {
                     self.spawn_pending_classification(pending, record.id.clone());
                     pending_spawned = true;
                 }
-                let record = WorkerRecord {
+                let mut record = WorkerRecord {
                     read_back,
                     routing,
                     opening_prompt,
                     ..record
                 };
+                if let Placement::Node(choice) = &placement {
+                    // The worker keeps its local shadow checkout; a node
+                    // checkout is prepared beside it and synced with bundles.
+                    let base = record.base_commit.clone().unwrap_or_default();
+                    match Box::pin(self.prepare_remote_checkout(&mut record, choice, &base, false))
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(error) if choice.pinned => {
+                            let text = format!(
+                                "could not prepare a checkout on host '{}': {error}; worker '{}' keeps its local checkout; retry with the same worker ID",
+                                choice.name, record.id
+                            );
+                            self.fail_worker(&record.id, text.clone()).await;
+                            return Err(text);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "team: could not place worker {} on host '{}' ({}): {error}; running it locally",
+                                record.id, choice.name, choice.os
+                            );
+                            let active = self.active_workers_for_slots().await;
+                            let slots = self.persistence.slots.load(Ordering::SeqCst);
+                            if active >= slots {
+                                return Err(format!("all {slots} worker slots are busy"));
+                            }
+                        }
+                    }
+                }
                 if let Some(agent) = claude_agent {
                     Box::pin(self.start_agent_worker(record, agent)).await
                 } else {
@@ -849,6 +903,52 @@ impl TeamRuntime {
             }
         }
         result.map(|worker| (worker, false, pending_spawned))
+    }
+
+    /// Prepare `record`'s checkout on a worker node and store it on the record.
+    ///
+    /// The checkout is reserved before `prepare_checkout` because the record
+    /// only names it once that call returned; the reconciler must not release
+    /// the fresh `wt/agent-*` checkout in between. The reservation is dropped
+    /// once the record is persisted, or as soon as preparation failed.
+    pub(super) async fn prepare_remote_checkout(
+        &self,
+        record: &mut WorkerRecord,
+        choice: &NodeChoice,
+        base: &str,
+        keep_reserved: bool,
+    ) -> Result<(), String> {
+        if base.trim().is_empty() {
+            return Err("the worker has no base commit to send".to_string());
+        }
+        let node = self
+            .remote
+            .server()
+            .ok_or_else(|| "worker hosts are not available in this window".to_string())?
+            .node(&choice.node_id);
+        self.remote.ensure_catalog(&node, &choice.name).await?;
+        self.remote.reserve(&choice.node_id, &record.branch);
+        let prepared = self
+            .remote
+            .prepare_checkout(&choice.node_id, &record.branch, base, false)
+            .await;
+        let remote = match prepared {
+            Ok(remote) => remote,
+            Err(error) => {
+                self.remote.release_reservation(&choice.node_id, &record.branch);
+                return Err(error);
+            }
+        };
+        self.update_worker(&record.id, |worker| {
+            worker.remote = Some(remote.clone());
+        })
+        .await;
+        record.remote = Some(remote);
+        let persisted = self.persist().await;
+        if !keep_reserved {
+            self.remote.release_reservation(&choice.node_id, &record.branch);
+        }
+        persisted
     }
 
     /// The other steps (0-based) of `plan_id` with an open task: a worker not

@@ -24,6 +24,7 @@ mod logfile;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mnemo::config::resolve_config_dir;
@@ -240,9 +241,11 @@ async fn run(home: &Path, workspace: &Path, slots: usize) -> u8 {
         // checkout and reads it with the file tools.
         index_codegraph: false,
         slots,
-        // The binary serves the session surface and the repo host; nothing
-        // extends it yet (step 6 plugs the proof runs in here).
-        extension: None,
+        // The binary serves the session surface, the repo host, and the two proof
+        // runs a dispatched remote worker needs on this host (plan 9a2f4b67).
+        extension: Some(Arc::new(
+            mnemo_app::mnemo2::team::proof::ProofNodeExtension,
+        )),
     };
     match node::run(cfg, shutdown_signal()).await {
         Ok(()) => {

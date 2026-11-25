@@ -331,12 +331,84 @@ async fn worker_lacks_model_id(
         .is_some_and(|worker| worker.model_id.is_none())
 }
 
+/// Where a counted check ran: the hub's own checkout, or a worker node's.
+pub(super) enum CheckoutRoot<'a> {
+    /// A checkout on this machine.
+    Local(&'a Path),
+    /// A checkout on a worker node, named by its path on that host
+    /// ([`super::record::RemoteCheckout::path`]).
+    Remote(&'a str),
+}
+
+impl CheckoutRoot<'_> {
+    /// Whether a tool's reported `cwd` is this checkout's root.
+    ///
+    /// A local path is canonicalized on both sides, exactly like the counting
+    /// rule always did. A node path cannot be canonicalized from the hub, so
+    /// both strings are normalised instead: a `\\?\` prefix dropped, `\` as
+    /// `/`, one trailing `/` dropped, compared ASCII case-insensitively (a
+    /// Windows node may report either case). An empty or `.` cwd is the root;
+    /// any other relative path names a subfolder and never matches.
+    fn cwd_is_root(&self, cwd: &str) -> bool {
+        match self {
+            CheckoutRoot::Local(checkout) => {
+                let Ok(root) = checkout.canonicalize() else {
+                    return false;
+                };
+                let cwd = cwd.trim();
+                if cwd.is_empty() || cwd == "." {
+                    return true;
+                }
+                let cwd = Path::new(cwd);
+                let cwd = if cwd.is_absolute() {
+                    cwd.to_path_buf()
+                } else {
+                    root.join(cwd)
+                };
+                cwd.canonicalize().ok().as_deref() == Some(root.as_path())
+            }
+            CheckoutRoot::Remote(checkout) => {
+                let cwd = cwd.trim();
+                if cwd.is_empty() || cwd == "." {
+                    return true;
+                }
+                let normalize = |path: &str| {
+                    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+                    let mut path = path.replace('\\', "/");
+                    if path.len() > 1 && path.ends_with('/') {
+                        path.pop();
+                    }
+                    path
+                };
+                normalize(checkout).eq_ignore_ascii_case(&normalize(cwd))
+            }
+        }
+    }
+}
+
 /// Return an allow-listed passing shell command and its unchanged tree.
 pub(super) fn counted_check(
     tool: &str,
     args: &Value,
     result: &ToolResult,
     checkout: &Path,
+    check_commands: &[String],
+) -> Option<(String, String)> {
+    counted_check_at(
+        tool,
+        args,
+        result,
+        &CheckoutRoot::Local(checkout),
+        check_commands,
+    )
+}
+
+/// [`counted_check`] against a hub or node checkout.
+pub(super) fn counted_check_at(
+    tool: &str,
+    args: &Value,
+    result: &ToolResult,
+    checkout: &CheckoutRoot<'_>,
     check_commands: &[String],
 ) -> Option<(String, String)> {
     if tool != "shell" || !result.success {
@@ -350,19 +422,9 @@ pub(super) fn counted_check(
     if !check_commands.iter().any(|allowed| allowed == command) {
         return None;
     }
-    let checkout = checkout.canonicalize().ok()?;
     if let Some(cwd) = args.get("cwd") {
-        let cwd = cwd.as_str()?.trim();
-        if !cwd.is_empty() {
-            let cwd = Path::new(cwd);
-            let cwd = if cwd.is_absolute() {
-                cwd.to_path_buf()
-            } else {
-                checkout.join(cwd)
-            };
-            if cwd.canonicalize().ok()? != checkout {
-                return None;
-            }
+        if !checkout.cwd_is_root(cwd.as_str()?) {
+            return None;
         }
     }
     let tree_before = data.get("tree_before")?.as_str()?;
@@ -392,6 +454,28 @@ pub(super) fn counted_checks(
             .into_iter()
             .collect();
     }
+    counted_checks_at(
+        tool,
+        args,
+        result,
+        &CheckoutRoot::Local(checkout),
+        check_commands,
+    )
+}
+
+/// [`counted_checks`] against a hub or node checkout.
+pub(super) fn counted_checks_at(
+    tool: &str,
+    args: &Value,
+    result: &ToolResult,
+    checkout: &CheckoutRoot<'_>,
+    check_commands: &[String],
+) -> Vec<(String, String)> {
+    if tool == "shell" {
+        return counted_check_at(tool, args, result, checkout, check_commands)
+            .into_iter()
+            .collect();
+    }
     if tool != "run_checks" || !result.success {
         return Vec::new();
     }
@@ -401,9 +485,6 @@ pub(super) fn counted_checks(
         .and_then(|data| data.get("checks"))
         .and_then(Value::as_array)
     else {
-        return Vec::new();
-    };
-    let Ok(checkout) = checkout.canonicalize() else {
         return Vec::new();
     };
     entries
@@ -418,13 +499,7 @@ pub(super) fn counted_checks(
             }
             // `run_checks` always runs from the checkout root; an entry naming
             // anything else is not this worker's checkout.
-            let cwd = Path::new(entry.get("cwd")?.as_str()?);
-            let cwd = if cwd.is_absolute() {
-                cwd.to_path_buf()
-            } else {
-                checkout.join(cwd)
-            };
-            if cwd.canonicalize().ok()? != checkout {
+            if !checkout.cwd_is_root(entry.get("cwd")?.as_str()?) {
                 return None;
             }
             let tree_before = entry.get("tree_before")?.as_str()?;
@@ -435,6 +510,37 @@ pub(super) fn counted_checks(
             Some((command.to_string(), tree_before.to_string()))
         })
         .collect()
+}
+
+/// Bring a remote worker's hub shadow up to its node before the turn-end
+/// bookkeeping reads it.
+///
+/// A local worker is left alone. A link error is logged rather than failing
+/// the pump: the shadow keeps its last synced tip, and the next entry point
+/// (a check, a review, a merge) syncs again and reports the host there.
+async fn sync_shadow_quietly(
+    proof: &super::proving::ProofCtx,
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    worker_id: &str,
+    generation: u64,
+) {
+    let record = {
+        let records = records.lock().await;
+        records
+            .iter()
+            .find(|worker| {
+                worker.id == worker_id && (worker.generation == 0 || worker.generation == generation)
+            })
+            .cloned()
+    };
+    let Some(record) = record.filter(|record| record.remote.is_some()) else {
+        return;
+    };
+    if let Err(error) = proof.remote.sync_shadow(&record, true).await {
+        eprintln!(
+            "team: could not sync the shadow of {worker_id} before its turn-end bookkeeping: {error}"
+        );
+    }
 }
 
 async fn record_turn_checks(
@@ -604,6 +710,7 @@ pub(super) async fn pump_worker(
                     }
                     busy.store(false, Ordering::SeqCst);
                     if held.is_some() {
+                        sync_shadow_quietly(&proof, &records, &worker_id, generation).await;
                         record_turn_checks(
                             &worker_id,
                             generation,
@@ -829,16 +936,30 @@ pub(super) async fn pump_worker(
                                     && (worker.generation == 0
                                         || worker.generation == generation)
                             })
-                            .map(|worker| worker.worktree.clone())
+                            .map(|worker| (worker.worktree.clone(), worker.remote.clone()))
                     };
-                    if let Some(checkout) = checkout {
-                        for (check, tree) in counted_checks(
-                            &name,
-                            &parsed,
-                            result,
-                            &checkout,
-                            check_commands.as_slice(),
-                        ) {
+                    if let Some((worktree, remote)) = checkout {
+                        // A remote worker's tool results name the node's
+                        // checkout, not the hub shadow; a local worker's name
+                        // its worktree. The counting rule reads the same
+                        // either way.
+                        let counted = match &remote {
+                            Some(remote) => counted_checks_at(
+                                &name,
+                                &parsed,
+                                result,
+                                &CheckoutRoot::Remote(&remote.path),
+                                check_commands.as_slice(),
+                            ),
+                            None => counted_checks(
+                                &name,
+                                &parsed,
+                                result,
+                                &worktree,
+                                check_commands.as_slice(),
+                            ),
+                        };
+                        for (check, tree) in counted {
                             check_observations.insert(check, tree);
                         }
                     }
@@ -1328,6 +1449,7 @@ pub(super) async fn pump_worker(
         if (terminal && matches!(&event.event, SerializableAgentEvent::Finished { .. }))
             || settled_parked_finish.is_some()
         {
+            sync_shadow_quietly(&proof, &records, &worker_id, generation).await;
             record_turn_checks(
                 &worker_id,
                 generation,
@@ -1474,6 +1596,7 @@ pub(super) async fn pump_worker(
             let save_lock = save_lock.clone();
             let persistence = persistence.clone();
             let worker_id = worker_id.clone();
+            let proofs = proof.remote.clone();
             // Tracked: the refresh runs `git rev-parse HEAD` in the checkout
             // and holds the session (and through it the engine), so the team's
             // shutdown waits for it.
@@ -1489,21 +1612,32 @@ pub(super) async fn pump_worker(
                 let Ok(snapshot) = session.snapshot().await else {
                     return;
                 };
-                let worktree = {
+                let record = {
                     let records = records.lock().await;
                     records
                         .iter()
                         .find(|worker| worker.id == worker_id && worker.generation == generation)
-                        .map(|worker| worker.worktree.clone())
+                        .cloned()
                 };
-                let Some(worktree) = worktree else {
+                let Some(record) = record else {
                     return;
                 };
+                // A remote worker's latest commits live on its node: refresh the
+                // hub shadow before the probe reads it. A link error leaves the
+                // last synced tip in place; the next entry point retries.
+                if record.remote.is_some() {
+                    if let Err(error) = proofs.sync_shadow(&record, true).await {
+                        eprintln!(
+                            "team: could not sync the shadow of {} before the tip probe: {error}",
+                            record.id
+                        );
+                    }
+                }
                 // The tip probe runs outside the ledger lock, so a review recorded
                 // while it ran (the lead reviewing the commit it just made) is newer
                 // than this observation and cannot be stale against it.
                 let tip_read_ms = phase3::now_ms();
-                let current_tip = phase3::tip(&worktree).await.ok();
+                let current_tip = phase3::tip(&record.worktree).await.ok();
                 {
                     let mut records = records.lock().await;
                     if let Some(worker) = records
@@ -1730,5 +1864,98 @@ fn limit_label(which: mnemo::provider::LimitKind) -> &'static str {
         LimitKind::MaxCostMicros => "cost",
         LimitKind::WallClock => "wall-clock",
         LimitKind::Idle => "idle",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `run_checks` result of one exit-0 command in `cwd`.
+    fn result(cwd: &str) -> ToolResult {
+        ToolResult {
+            success: true,
+            output: String::new(),
+            data: Some(serde_json::json!({"checks": [{
+                "command": "cargo test --workspace",
+                "exit_code": 0,
+                "tree_before": "tree",
+                "tree_after": "tree",
+                "cwd": cwd,
+            }]})),
+        }
+    }
+
+    /// A node checkout's own path is the checkout however the node spells it;
+    /// a subfolder or another folder never is.
+    #[test]
+    fn counted_checks_at_remote_matches_node_path() {
+        let commands = vec!["cargo test --workspace".to_string()];
+        let checkout = CheckoutRoot::Remote(r"C:\Users\mnemo\checkouts\0123456789ab-1");
+        for cwd in [
+            r"C:\Users\mnemo\checkouts\0123456789ab-1",
+            r"\\?\C:\Users\mnemo\checkouts\0123456789ab-1",
+            "C:/Users/mnemo/checkouts/0123456789ab-1",
+            "c:/users/MNEMO/checkouts/0123456789ab-1/",
+            "",
+            ".",
+        ] {
+            assert_eq!(
+                counted_checks_at(
+                    "run_checks",
+                    &serde_json::json!({}),
+                    &result(cwd),
+                    &checkout,
+                    &commands
+                ),
+                vec![("cargo test --workspace".to_string(), "tree".to_string())],
+                "{cwd:?}"
+            );
+        }
+        for cwd in [r"D:\elsewhere", "src", "./sub"] {
+            assert!(
+                counted_checks_at(
+                    "run_checks",
+                    &serde_json::json!({}),
+                    &result(cwd),
+                    &checkout,
+                    &commands
+                )
+                .is_empty(),
+                "{cwd:?}"
+            );
+        }
+    }
+
+    /// The local wrapper still counts exactly the checkout it always did: the
+    /// root counts, a subfolder does not.
+    #[test]
+    fn counted_checks_local_wrapper_unchanged() {
+        let dir = tempfile::tempdir().expect("checkout");
+        let checkout = dir.path();
+        let commands = vec!["cargo test --workspace".to_string()];
+        assert_eq!(
+            counted_checks(
+                "run_checks",
+                &serde_json::json!({}),
+                &result(&checkout.display().to_string()),
+                checkout,
+                &commands
+            ),
+            vec![("cargo test --workspace".to_string(), "tree".to_string())]
+        );
+        let sub = checkout.join("src");
+        std::fs::create_dir_all(&sub).expect("subfolder");
+        assert!(
+            counted_checks(
+                "run_checks",
+                &serde_json::json!({}),
+                &result(&sub.display().to_string()),
+                checkout,
+                &commands
+            )
+            .is_empty(),
+            "a subfolder is not the checkout"
+        );
     }
 }

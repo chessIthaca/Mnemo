@@ -36,7 +36,8 @@ use super::findings_ledger;
 use super::persistence::TeamPersistence;
 use super::proof::{self, Mutant, MutationCfg, RedOutcome, RegressionCfg};
 use super::pump::save_workers;
-use super::record::{WorkerCheck, WorkerRecord, WorkerStatus};
+use super::record::{RemoteCheckout, WorkerCheck, WorkerRecord, WorkerStatus};
+use super::remote::RemoteWorkers;
 use super::review::CheckRecorder;
 use super::{now_key, BoardSignal, LiveWorker, TeamRuntime};
 
@@ -240,6 +241,100 @@ impl ProofRunner for RealProofs {
     }
 }
 
+/// The remote runner: the two proofs executed on a worker node, in the
+/// worker's own checkout there (plan 9a2f4b67, decision 4).
+///
+/// The hub keeps an ordinary shadow checkout of the same branch, so review,
+/// diff and merge read it locally, but the proofs run where the warm build
+/// cache and the right operating system are.
+pub(super) struct RemoteProofRunner {
+    /// The remote-worker seam: the node calls.
+    pub(super) remote: Arc<RemoteWorkers>,
+    /// The worker's checkout on the node.
+    pub(super) checkout: RemoteCheckout,
+    /// The project key the node names the project by.
+    pub(super) project: String,
+}
+
+#[async_trait]
+impl ProofRunner for RemoteProofRunner {
+    async fn prove(&self, request: ProveRequest) -> Result<RedOutcome, String> {
+        let params = serde_json::json!({
+            "checkout": self.checkout.checkout,
+            "base": request.base,
+            "tip": request.tip,
+            "cfg": request.cfg,
+            "test": request.test,
+        });
+        let answer = self
+            .remote
+            .call_node(
+                &self.checkout,
+                proof::PROOF_PROVE,
+                params,
+                proof::PROOF_TIMEOUT,
+            )
+            .await?;
+        serde_json::from_value(answer).map_err(|error| {
+            format!(
+                "the node's {} answer did not parse: {error}",
+                proof::PROOF_PROVE
+            )
+        })
+    }
+
+    async fn mutate(&self, request: MutateRequest) -> Result<Vec<Mutant>, String> {
+        let params = serde_json::json!({
+            "checkout": self.checkout.checkout,
+            "project": self.project,
+            "base": request.base,
+            "tip": request.tip,
+            "cfg": request.cfg,
+            "worker_id": request.worker_id,
+        });
+        let answer = self
+            .remote
+            .call_node(
+                &self.checkout,
+                proof::PROOF_MUTATE,
+                params,
+                proof::MUTATE_TIMEOUT,
+            )
+            .await?;
+        serde_json::from_value(answer).map_err(|error| {
+            format!(
+                "the node's {} answer did not parse: {error}",
+                proof::PROOF_MUTATE
+            )
+        })
+    }
+}
+
+/// The refusal a remote worker's uncommitted node changes earn: a proof or a
+/// merge would own a checkout the worker still edits.
+pub(super) fn dirty_remote_error(worker_id: &str, host: &str, dirty: &[String]) -> String {
+    let first: Vec<&str> = dirty.iter().take(5).map(String::as_str).collect();
+    format!(
+        "worker '{worker_id}' has uncommitted changes on host '{host}': {}; ask it to commit them",
+        first.join(", ")
+    )
+}
+
+/// Push `sha` to the node's repo, so a proof there can diff against the base.
+async fn push_base(
+    remote: &RemoteWorkers,
+    checkout: &RemoteCheckout,
+    sha: &str,
+) -> Result<(), String> {
+    let Some(server) = remote.server() else {
+        return Err(format!(
+            "worker host '{}' is not connected",
+            checkout.node_name
+        ));
+    };
+    remote.push_commit(&server.node(&checkout.node_id), sha).await
+}
+
 /// Which proof a worker is being asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProofJob {
@@ -341,6 +436,9 @@ pub(crate) struct ProofCtx {
     pub(super) merge_lock: Arc<Mutex<()>>,
     /// The live sessions, for the busy test [`ProofCtx::worker_busy`].
     pub(super) live: Arc<Mutex<HashMap<String, LiveWorker>>>,
+    /// The remote-worker seam: the shadow sync and the node calls a remote
+    /// worker's proofs need. A local worker never touches it.
+    pub(super) remote: Arc<RemoteWorkers>,
 }
 
 impl ProofCtx {
@@ -716,8 +814,32 @@ impl ProofCtx {
                  .coding/checks.toml"
             ));
         };
-        let tip = phase3::tip(&worker.worktree).await?;
+        // A remote worker's commits live on its node: bring the hub shadow onto
+        // the node tip first, refuse a node checkout the worker still edits, and
+        // give the node the base commit its diff needs. A local worker keeps the
+        // warm checkout it built in.
+        let remote_sync = match worker.remote.as_ref() {
+            Some(_) => {
+                let sync = self.remote.sync_shadow(&worker, true).await?;
+                if !sync.dirty.is_empty() {
+                    return Err(dirty_remote_error(
+                        worker_id,
+                        worker.host_label(),
+                        &sync.dirty,
+                    ));
+                }
+                Some(sync)
+            }
+            None => None,
+        };
+        let tip = match &remote_sync {
+            Some(sync) => sync.tip.clone(),
+            None => phase3::tip(&worker.worktree).await?,
+        };
         let base = phase3::git_value(&self.workspace_root, &["merge-base", "HEAD", &tip]).await?;
+        if let Some(remote) = worker.remote.as_ref() {
+            push_base(&self.remote, remote, &base).await?;
+        }
         let request = ProveRequest {
             checkout: worker.worktree.clone(),
             base: base.clone(),
@@ -732,10 +854,29 @@ impl ProofCtx {
             return Ok(format!(
                 "regression proof for {worker_id} skipped: the worker started a turn"
             ));
+        } else if let Some(remote) = worker.remote.as_ref() {
+            let runner = RemoteProofRunner {
+                remote: Arc::clone(&self.remote),
+                checkout: remote.clone(),
+                project: remote.project.clone(),
+            };
+            runner.prove(request).await?
         } else {
             self.runner.prove(request).await?
         };
-        if !checkout_at(&worker.worktree, &tip).await {
+        // The tip the proof ran at is the NODE's for a remote worker, so the
+        // freshness check must ask the node, not the shadow the hub happens to
+        // hold.
+        let on_tip = match worker.remote.as_ref() {
+            Some(remote) => self
+                .remote
+                .node_tip(remote)
+                .await
+                .map(|answer| answer.tip == tip)
+                .unwrap_or(false),
+            None => checkout_at(&worker.worktree, &tip).await,
+        };
+        if !on_tip {
             return Ok(format!(
                 "regression proof for {worker_id} discarded: the tip moved while it ran"
             ));
@@ -841,8 +982,31 @@ impl ProofCtx {
         // substituted command carries this worker's own `{out}` path, so it
         // never repeats.
         let command = cfg.command.clone();
-        let tip = phase3::tip(&worker.worktree).await?;
+        // A remote worker's commits live on its node: bring the hub shadow onto
+        // the node tip first, refuse a node checkout the worker still edits, and
+        // give the node the base commit its diff needs.
+        let remote_sync = match worker.remote.as_ref() {
+            Some(_) => {
+                let sync = self.remote.sync_shadow(&worker, true).await?;
+                if !sync.dirty.is_empty() {
+                    return Err(dirty_remote_error(
+                        worker_id,
+                        worker.host_label(),
+                        &sync.dirty,
+                    ));
+                }
+                Some(sync)
+            }
+            None => None,
+        };
+        let tip = match &remote_sync {
+            Some(sync) => sync.tip.clone(),
+            None => phase3::tip(&worker.worktree).await?,
+        };
         let base = phase3::git_value(&self.workspace_root, &["merge-base", "HEAD", &tip]).await?;
+        if let Some(remote) = worker.remote.as_ref() {
+            push_base(&self.remote, remote, &base).await?;
+        }
         let request = MutateRequest {
             main_root: self.workspace_root.clone(),
             checkout: worker.worktree.clone(),
@@ -861,7 +1025,18 @@ impl ProofCtx {
         // for this worker at this tip, whatever its outcome, so a turn end at
         // the same tip starts no second run (decision 2026-11-19).
         self.remember_mutation_tip(worker_id, &tip);
-        let mutants = match self.runner.mutate(request).await {
+        let mutants = match match worker.remote.as_ref() {
+            Some(remote) => {
+                RemoteProofRunner {
+                    remote: Arc::clone(&self.remote),
+                    checkout: remote.clone(),
+                    project: remote.project.clone(),
+                }
+                .mutate(request)
+                .await
+            }
+            None => self.runner.mutate(request).await,
+        } {
             Ok(mutants) => {
                 // A run that worked proves the tool is installed: a later
                 // failure is a new situation, not a repeat.
@@ -870,18 +1045,20 @@ impl ProofCtx {
             }
             Err(error) => {
                 return self
-                    .mutation_failure(
-                        worker_id,
-                        &worker.worktree,
-                        &tip,
-                        &command,
-                        &error,
-                        requested,
-                    )
+                    .mutation_failure(&worker, &tip, &command, &error, requested)
                     .await;
             }
         };
-        if !checkout_at(&worker.worktree, &tip).await {
+        let on_tip = match worker.remote.as_ref() {
+            Some(remote) => self
+                .remote
+                .node_tip(remote)
+                .await
+                .map(|answer| answer.tip == tip)
+                .unwrap_or(false),
+            None => checkout_at(&worker.worktree, &tip).await,
+        };
+        if !on_tip {
             return Ok(Some(format!(
                 "mutation check for {worker_id} discarded: the tip moved while it ran"
             )));
@@ -927,18 +1104,32 @@ impl ProofCtx {
     /// 2026-11-19).
     async fn mutation_failure(
         &self,
-        worker_id: &str,
-        checkout: &Path,
+        worker: &WorkerRecord,
         tip: &str,
         command: &str,
         error: &str,
         requested: bool,
     ) -> Result<Option<String>, String> {
-        let clean = checkout_at(checkout, tip).await
-            && matches!(
-                phase3::git_value(checkout, &["status", "--porcelain", "-uall"]).await,
-                Ok(status) if status.is_empty()
-            );
+        // The real checkout is the node's for a remote worker: ask the node
+        // whether its tip is still the one the run started at and its tree is
+        // still clean. A shadow can only be stale against that.
+        let clean = match worker.remote.as_ref() {
+            Some(remote) => self
+                .remote
+                .node_tip(remote)
+                .await
+                .map(|answer| answer.tip == tip && answer.dirty.is_empty())
+                .unwrap_or(false),
+            None => {
+                checkout_at(&worker.worktree, tip).await
+                    && matches!(
+                        phase3::git_value(&worker.worktree, &["status", "--porcelain", "-uall"])
+                            .await,
+                        Ok(status) if status.is_empty()
+                    )
+            }
+        };
+        let worker_id = worker.id.as_str();
         if !clean {
             return Err(error.to_string());
         }
@@ -1225,6 +1416,11 @@ pub(super) async fn spawn_turn_proofs(ctx: &ProofCtx, worker_id: String) {
 /// - a checkout still at the marker's tip and dirty is restored with the same
 ///   restore the proof itself uses (`git reset --hard <tip>`, `git clean -ffd`,
 ///   never `-x`), and the repair logs one line.
+///
+/// The marker names the worker's HUB checkout, so a remote worker's proof —
+/// which ran in the node's checkout — cannot be repaired here: that checkout
+/// stays reverse-applied until the node's next `checkout.prepare` resets it
+/// onto its branch tip, which is the only state a later run accepts.
 ///
 /// The marker is deleted once processed.
 pub(super) async fn repair_interrupted_proofs(workspace_root: &Path, workers: &[WorkerRecord]) {

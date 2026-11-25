@@ -241,6 +241,10 @@ pub struct NodeRecord {
     pub created_ms: u64,
     /// Unix milliseconds of the last accepted connection.
     pub last_seen_ms: u64,
+    /// The saved SSH connection (as the desktop app lists it) that reaches
+    /// this host as the user the node runs as; `None` until linked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<String>,
 }
 
 impl NodeRecord {
@@ -292,6 +296,7 @@ impl NodeRegistry {
             token: auth::hex_encode(&auth::random_token()),
             created_ms: now,
             last_seen_ms: now,
+            ssh: None,
         };
         self.write(&record)?;
         Ok(record)
@@ -323,6 +328,16 @@ impl NodeRegistry {
         };
         record.last_seen_ms = (self.clock)();
         self.write(&record)
+    }
+
+    /// Link a node to a saved SSH connection, or unlink it with `None`.
+    pub fn set_ssh(&self, node_id: &str, ssh: Option<&str>) -> Result<NodeRecord, String> {
+        let Some(mut record) = self.get(node_id)? else {
+            return Err(format!("node {node_id} is not registered"));
+        };
+        record.ssh = ssh.map(str::to_string);
+        self.write(&record)?;
+        Ok(record)
     }
 
     /// Revoke a node: delete its record. A missing file is not an error.
@@ -759,6 +774,58 @@ mod tests {
             "{} accepts the user-only restriction",
             path.display()
         );
+    }
+
+    #[test]
+    fn node_record_without_ssh_loads() {
+        let dir = test_dir("no-ssh");
+        let registry = NodeRegistry::new(&dir);
+        let node_id = "a".repeat(32);
+        let old = format!(
+            "{{\"node_id\":\"{node_id}\",\"name\":\"mac\",\"os\":\"macos\",\"token\":\"{}\",\"created_ms\":5,\"last_seen_ms\":6}}",
+            "b".repeat(64)
+        );
+        std::fs::write(registry.path(&node_id), old).expect("write old record");
+        let record = registry
+            .get(&node_id)
+            .expect("an old record decodes")
+            .expect("the record exists");
+        assert_eq!(record.ssh, None);
+        assert_eq!(record.last_seen_ms, 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_ssh_roundtrips_and_survives_touch() {
+        let dir = test_dir("set-ssh");
+        let (clock, now) = test_clock(1_000);
+        let registry = NodeRegistry::with_clock(&dir, now);
+        let node = registry.register("studio", "macos").expect("register");
+        assert_eq!(node.ssh, None);
+
+        let linked = registry.set_ssh(&node.node_id, Some("studio-ssh")).expect("link");
+        assert_eq!(linked.ssh.as_deref(), Some("studio-ssh"));
+        assert_eq!(
+            registry.get(&node.node_id).expect("get").expect("record").ssh.as_deref(),
+            Some("studio-ssh")
+        );
+
+        clock.store(2_000, Ordering::SeqCst);
+        registry.touch(&node.node_id).expect("touch");
+        let touched = registry.get(&node.node_id).expect("get").expect("record");
+        assert_eq!(touched.ssh.as_deref(), Some("studio-ssh"), "a reconnect keeps the link");
+        assert_eq!(touched.last_seen_ms, 2_000);
+
+        let unlinked = registry.set_ssh(&node.node_id, None).expect("unlink");
+        assert_eq!(unlinked.ssh, None);
+        let text = std::fs::read_to_string(registry.path(&node.node_id)).expect("file");
+        assert!(!text.contains("ssh"), "an unlinked record omits the field: {text}");
+
+        assert_eq!(
+            registry.set_ssh(&"c".repeat(32), Some("x")),
+            Err(format!("node {} is not registered", "c".repeat(32)))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

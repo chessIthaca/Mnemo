@@ -20578,7 +20578,7 @@ async fn team_hosts_schema_and_texts() {
         .expect("team_hosts is exposed to the lead");
     assert_eq!(
         hosts.description,
-        "Manage worker hosts: other Windows or Mac computers that run Mnemo workers for this project. list: each paired host with its OS, connection, free slots and whether it passed the project's checks. pair: a one-time code (valid for 10 minutes) and the two commands to run on the new host. revoke: remove a host by name or id; its running workers fail and can be resumed. Mnemo places workers on hosts by itself; to choose one, pass host to team_dispatch."
+        "Manage worker hosts: other Windows or Mac computers that run Mnemo workers for this project. list: each paired host with its OS, connection, free slots and whether it passed the project's checks. pair: a one-time code (valid for 10 minutes) and the two commands to run on the new host. revoke: remove a host by name or id; its running workers fail and can be resumed. link: tie a host to the SSH connection the lead starts Claude Code sessions on, so agent tiers may run there; unlink removes it. Mnemo places workers on hosts by itself; to choose one, pass host to team_dispatch."
     );
     assert_eq!(hosts.timeout_ms, Some(30_000));
     assert_eq!(
@@ -20589,8 +20589,9 @@ async fn team_hosts_schema_and_texts() {
     assert_eq!(
         hosts.parameters,
         json!({"type":"object","properties":{
-            "action":{"type":"string","enum":["list","pair","revoke"]},
-            "name":{"type":"string","description":"pair: the new host's name (default: its computer name). revoke: the host's name or id."}
+            "action":{"type":"string","enum":["list","pair","revoke","link","unlink"]},
+            "name":{"type":"string","description":"pair: the new host's name (default: its computer name). revoke, link, unlink: the host's name or id."},
+            "ssh":{"type":"string","description":"link: the name of the saved SSH connection (as the desktop app's list_start_targets shows it) that reaches this host as the same user the node runs as."}
         },"required":["action"]})
     );
 

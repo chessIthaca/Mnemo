@@ -81,7 +81,16 @@ Passing `model` always means a Mnemo worker: `team_dispatch` starts one on it, a
 
 ### Agent tiers on a worker host
 
-When a host is linked to an SSH connection (`team_hosts` action `link`, with the connection name from `list_start_targets`), an agent-tier dispatch may run there. The answer then carries a `claude_session` block instead of `claude_agent`. Linking the host was the user's approval for Claude workers on that connection, so start it without asking: call `start_session` with every field of the block unchanged (`target` "ssh", `host`, `cwd`, `use_worktree` false, `context` "fresh", `initiation` "user_asked", `name`, `title`, `model`, `effort`, `background`, `prompt`, `wake_when_done` true). If the desktop app refuses the start or asks to confirm it, pass that question to the user. Right after, call `team_agent_started` with the `worker_id` and the session id `start_session` returned. Mnemo follows the session's transcript on the host: `team_status` shows its host, phase and activity, and Mnemo finishes the worker when the session ends its turn. The session's end note also reaches you; if Mnemo has not finished the worker, call `team_agent_done`. To continue such a worker (`team_message`, `team_route_fix`), send `continue_session.message` with `SendMessage` to `continue_session.session`. If the user declines, `team_resume` with `host` "local" moves the worker here and answers with a `claude_agent` block. Never start `claude` yourself on the host, and never pass credentials. If the host is revoked, stop the session there before you resume the worker locally.
+When a host is linked to an SSH connection (`team_hosts` action `link`, with the connection name from `list_start_targets`), an agent-tier worker may run there. An answer that carries a `claude_session` block instead of `claude_agent` (from `team_dispatch`, `team_resume`, or an escalation onto an agent tier) means: start that session. Linking the host was the user's approval for Claude workers on that connection, so do not ask again:
+
+1. Call `start_session` with every field of the block unchanged (`target` "ssh", `host`, `cwd`, `use_worktree` false, `context` "fresh", `initiation` "user_asked", `name`, `title`, `model`, `effort`, `background`, `prompt`, `wake_when_done` true).
+2. Call `team_agent_started` with the `worker_id` and the session id `start_session` returned.
+
+If the desktop app refuses the start or asks to confirm it, pass that question to the user. If the session does not start, `team_resume` with `host` "local" moves the worker to this computer and answers with a `claude_agent` block.
+
+Mnemo follows the session's transcript on the host: `team_status` shows its host, phase and activity, and Mnemo finishes the worker when the session ends its turn. The session's end note also reaches you; if Mnemo has not finished the worker by then, call `team_agent_done`. To continue such a worker (`team_message`, `team_route_fix`), send `continue_session.message` with `SendMessage` to `continue_session.session`.
+
+Never start `claude` on the host yourself, and never pass credentials. If the host is revoked, stop its session (with `SendMessage`, or in the app) before you resume the worker on this computer.
 
 ## Briefs
 

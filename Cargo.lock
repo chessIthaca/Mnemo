@@ -3347,6 +3347,7 @@ version = "2.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "async-tungstenite",
  "base64 0.23.1",
  "chromiumoxide",
  "clap",
@@ -3355,6 +3356,7 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
+ "hmac",
  "image",
  "libc",
  "notify",

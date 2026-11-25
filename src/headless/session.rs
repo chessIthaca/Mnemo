@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Mutex, oneshot};
 
 use crate::headless::error::EngineError;
@@ -247,7 +248,8 @@ pub struct AgentSession {
 /// switch. The `model` payload is the serving model id — the same string
 /// the kernel's `model_changed` event carries once the new model first
 /// serves, and the one a caller's records keep for the served model.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelSwitch {
     /// Pinned now — the new model serves the session's very next request
     /// (the request in flight, if any, finishes on the old model).
@@ -1676,6 +1678,33 @@ mod model_tests {
     use crate::provider::Message;
     use crate::runtime::channels::SerializableAgentEvent;
     use std::sync::{Arc, Mutex};
+
+    /// A live model switch crosses the link (the node's `set_model` reply), so
+    /// the outcome must serialise as a `kind`-tagged object.
+    #[test]
+    fn model_switch_serde_shape() {
+        let switch = ModelSwitch::NextRequest {
+            model: "m".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_string(&switch).unwrap(),
+            r#"{"kind":"next_request","model":"m"}"#
+        );
+        let back: ModelSwitch = serde_json::from_str(r#"{"kind":"next_request","model":"m"}"#).unwrap();
+        assert_eq!(back, switch);
+
+        let deferred = ModelSwitch::CompactsFirst {
+            model: "m".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_string(&deferred).unwrap(),
+            r#"{"kind":"compacts_first","model":"m"}"#
+        );
+        let back: ModelSwitch =
+            serde_json::from_str(r#"{"kind":"compacts_first","model":"m"}"#).unwrap();
+        assert_eq!(back, deferred);
+    }
+
 
     /// One scripted SSE response, optionally held behind a gate so the test
     /// can switch the model while the request is in flight.

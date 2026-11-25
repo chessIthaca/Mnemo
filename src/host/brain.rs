@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::agent::context::ContextManager;
 use crate::agent::factory::AgentLoopFactory;
-use crate::config::{Config, SafetyMode};
+use crate::config::{Config, ModelRef, SafetyMode};
 use crate::host::index_progress::{
     clear_startup_index, ensure_startup_index_visible, mark_startup_index_active,
     record_startup_index_progress, startup_should_forward, IndexProgressEvent,
@@ -27,8 +27,8 @@ use crate::provider::{LlmClient, ProviderKind};
 use crate::safety_rules::SafetyRules;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::provider::client_factory::{
-    build_client, build_embedder, build_vision_client, embedder_startup_plan,
-    EmbedderStartupPlan,
+    build_client, build_embedder, build_vision_client, embedder_startup_plan, EmbedderStartupPlan,
+    UnavailableClient,
 };
 use crate::provider::openai::{OpenAiClient, OpenAiClientConfig};
 
@@ -160,6 +160,18 @@ pub(crate) struct BrainMemoryOptions {
     /// ([`crate::headless::CodeEmbedder`]; the headless Engine passes its
     /// builder's choice).
     pub code_embedder: crate::headless::CodeEmbedder,
+    /// The remote-node seam: when set, every provider built here comes from
+    /// this transport (the hub-proxied model client) instead of the local
+    /// endpoint config, no vision client is built, and the resolver routes
+    /// every turn through it. `None` = today's purely local wiring.
+    pub model_transport: Option<Arc<dyn crate::provider::client_factory::ModelTransport>>,
+    /// Whether to start the derived-memory-index OS file watcher
+    /// ([`crate::host::memory_watcher::MemoryWatcher`]). `true` for every
+    /// existing caller — the host app watches `.coding/` so a merge or a hand
+    /// edit reaches `memory_search` without a restart. A remote node starts it
+    /// off: its `.coding/` is fed by the hub's bundles, and the hub already
+    /// runs the watcher for the one shared index.
+    pub watch_derived_index: bool,
 }
 
 /// Process-shared resources (G8, §5.9.8 :729-731) — Rust-only, injected
@@ -218,6 +230,8 @@ pub(crate) fn wire_brain(
         injected_store,
         shared,
         code_embedder,
+        model_transport,
+        watch_derived_index,
     } = memory;
     // The shared request/response trace log — created first so every provider
     // built below (default, dummy fallback, resolver) records into the same
@@ -279,7 +293,29 @@ pub(crate) fn wire_brain(
         None => "max".to_string(),
     };
 
-    let provider: Arc<dyn LlmClient> = if let Some(ep) = endpoint {
+    let provider: Arc<dyn LlmClient> = if let Some(transport) = &model_transport {
+        // Remote worker node: the hub owns the keys, the tiers and the
+        // endpoints, so the startup provider is whatever the transport serves
+        // for the resolved default model. A transport with no client for that
+        // model (an empty hub catalog) falls back to an explicit, non-retryable
+        // "model not found" client rather than an unconfigured HTTP endpoint —
+        // the node runs, and the first turn reports the real problem.
+        endpoint
+            .and_then(|ep| {
+                let model_ref = ModelRef {
+                    endpoint: ep.name.clone(),
+                    model: model.clone(),
+                    reasoning_effort: None,
+                };
+                transport.client_for(&config, &model_ref)
+            })
+            .unwrap_or_else(|| {
+                Arc::new(UnavailableClient::new(
+                    model.clone(),
+                    "model not found: the hub catalog has no default model",
+                ))
+            })
+    } else if let Some(ep) = endpoint {
         // The shared construction path resolves the api key (stored key →
         // kind-appropriate env var → "dummy") and dispatches by endpoint kind
         // (OpenAI/Local → OpenAI-compatible client, Anthropic → native
@@ -875,8 +911,19 @@ pub(crate) fn wire_brain(
     // Vision client from config (shared helper — also used by Settings rewire).
     // Still useful when the main provider is multimodal (the image tools read
     // on-disk image files). Warn if configured but endpoint is missing.
-    let vision = build_vision_client(&config);
-    if config.general.general.vision_model.is_some() && vision.is_none() {
+    //
+    // A transport-backed brain (the remote node) has NO vision client: vision
+    // tools are a phase-3+ item for a node, and building one here would
+    // resolve an endpoint + API key the node does not have.
+    let vision = if model_transport.is_some() {
+        None
+    } else {
+        build_vision_client(&config)
+    };
+    if model_transport.is_none()
+        && config.general.general.vision_model.is_some()
+        && vision.is_none()
+    {
         if let Some(vm) = &config.general.general.vision_model {
             eprintln!(
                 "warning: vision_model endpoint '{}' not found in endpoints.toml; \
@@ -901,7 +948,11 @@ pub(crate) fn wire_brain(
         )
         // Per-context model overrides honour the same machine-wide endpoint
         // slots and shared 429 cooldowns as the startup provider.
-        .with_run_dir(Some(config_dir.join("run"))),
+        .with_run_dir(Some(config_dir.join("run")))
+        // The remote-node seam: with a transport, every turn's provider is
+        // the hub-proxied client for the resolved ModelRef (the spawn model
+        // pin included) — never the local endpoint build.
+        .with_transport(model_transport.clone()),
     );
     // The shared headless debug browser — one instance for the agent tools
     // and the host's browser UI. Lazily spawned on first use.
@@ -1274,26 +1325,34 @@ pub(crate) fn wire_brain(
     // pass is silent by design (the startup events are unchanged). Best-effort:
     // a start failure logs + disables live refresh, never fatal. The handle
     // MUST live on Brain — dropping it stops the watch.
-    let memory_watcher = store_trait.clone().and_then(|store| {
-        match crate::host::memory_watcher::MemoryWatcher::spawn(
-            store,
-            workspace.state_dir.clone(),
-            // The machine corpus is a second watched root (plan d3336a8a
-            // step 8): a machine record written by another instance or by
-            // hand reaches this project's store without a restart.
-            Some(crate::memory::knowledge::machine_knowledge_dir(&config_dir)),
-            std::time::Duration::from_millis(1500),
-        ) {
-            Ok(w) => {
-                eprintln!("memory: file watcher started (live index refresh)");
-                Some(w)
+    //
+    // `watch_derived_index: false` (the remote-node wiring) skips it entirely:
+    // the hub owns the shared index and already watches the hub's `.coding/`,
+    // and a node's clone is fed by bundles rather than edited in place.
+    let memory_watcher = if watch_derived_index {
+        store_trait.clone().and_then(|store| {
+            match crate::host::memory_watcher::MemoryWatcher::spawn(
+                store,
+                workspace.state_dir.clone(),
+                // The machine corpus is a second watched root (plan d3336a8a
+                // step 8): a machine record written by another instance or by
+                // hand reaches this project's store without a restart.
+                Some(crate::memory::knowledge::machine_knowledge_dir(&config_dir)),
+                std::time::Duration::from_millis(1500),
+            ) {
+                Ok(w) => {
+                    eprintln!("memory: file watcher started (live index refresh)");
+                    Some(w)
+                }
+                Err(e) => {
+                    eprintln!("memory: file watcher failed to start: {e}; live refresh disabled");
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("memory: file watcher failed to start: {e}; live refresh disabled");
-                None
-            }
-        }
-    });
+        })
+    } else {
+        None
+    };
 
     Ok(Brain {
         factory,

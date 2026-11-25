@@ -4668,3 +4668,44 @@ fn cosine_pool_ranks_5000_rows_under_200ms_in_debug() {
         "the 5,000-row cosine pass took {fastest:?} (best of 5) (debug budget 200 ms; release target 20 ms)"
     );
 }
+
+/// The link carries a recall's filter one way and the scored result the other
+/// way, so both shapes must survive JSON — and an omitted filter field must
+/// keep the exclusion DEFAULTS (`true`), never deserialize to `false`.
+#[test]
+fn memory_filter_and_scored_memory_round_trip() {
+    let filter = MemoryFilter::default()
+        .tier(MemoryTier::Semantic)
+        .limit(7);
+    let json = serde_json::to_string(&filter).unwrap();
+    let back: MemoryFilter = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.tier, Some(MemoryTier::Semantic));
+    assert_eq!(back.limit, Some(7));
+    assert!(back.exclude_working);
+    assert!(back.exclude_superseded);
+    assert!(back.exclude_quarantined);
+
+    // A minimal payload (a link caller naming only a limit) keeps the defaults.
+    let sparse: MemoryFilter = serde_json::from_str(r#"{"limit":3}"#).unwrap();
+    assert_eq!(sparse.limit, Some(3));
+    assert_eq!(sparse.tier, None);
+    assert!(sparse.exclude_working, "exclude_working must default to true");
+    assert!(
+        sparse.exclude_superseded,
+        "exclude_superseded must default to true"
+    );
+    assert!(
+        sparse.exclude_quarantined,
+        "exclude_quarantined must default to true"
+    );
+
+    let scored = ScoredMemory {
+        memory: Memory::new(MemoryTier::Semantic, "title", "body", 1000),
+        score: 0.75,
+    };
+    let json = serde_json::to_string(&scored).unwrap();
+    let back: ScoredMemory = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.memory.id, scored.memory.id);
+    assert_eq!(back.memory.title, "title");
+    assert!((back.score - 0.75).abs() < f64::EPSILON);
+}

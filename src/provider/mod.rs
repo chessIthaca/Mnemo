@@ -855,18 +855,34 @@ impl ToolSchema {
 }
 
 /// How the model should choose tools.
-#[derive(Debug, Clone)]
+///
+/// Serialised as a `type`-tagged object (`{"type":"auto"}` /
+/// `{"type":"function","name":"…"}` / `{"type":"required"}`) so a remote
+/// worker node can relay a turn's tool choice over the link. The struct
+/// variant (not the old tuple variant) is what an internally tagged enum
+/// requires; the provider request builders read `name` and emit the same
+/// wire JSON as before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {
     /// Let the model decide.
     Auto,
     /// Force a specific tool.
-    Function(String),
+    Function {
+        /// The tool name to force.
+        name: String,
+    },
     /// Force any tool call.
     Required,
 }
 
 /// A single event from the LLM stream.
-#[derive(Debug, Clone)]
+///
+/// Serialised as a `type`-tagged object (`{"type":"text_delta","text":"…"}`)
+/// so a remote worker node can relay a hub-served model stream over the link
+/// (the per-event shape is the link's `item` payload).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum LlmEvent {
     /// A fragment of assistant text.
     TextDelta { text: String },
@@ -1635,5 +1651,143 @@ mod tests {
         // No panic, no changes (no raw to strip, no flag set).
         assert!(!messages[0].reasoning_stripped);
         assert!(!messages[1].reasoning_stripped);
+        assert!(!messages[0].reasoning_stripped);
+        assert!(!messages[1].reasoning_stripped);
+    }
+
+    /// The link carries `LlmEvent` as its `item` payload, so EVERY variant
+    /// must survive a JSON round trip with its `type` tag intact — a variant
+    /// that loses a field would silently corrupt a hub-served model stream on
+    /// a remote node.
+    #[test]
+    fn llm_event_serde_round_trips_every_variant() {
+        let mut meta = serde_json::Map::new();
+        meta.insert("thought_signature".to_string(), serde_json::json!("sig"));
+        let events = vec![
+            LlmEvent::TextDelta {
+                text: "hello".to_string(),
+            },
+            LlmEvent::ReasoningDelta {
+                text: "thinking".to_string(),
+            },
+            LlmEvent::ToolCallStart {
+                index: 2,
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 2,
+                fragment: "{\"path\":".to_string(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::LimitReached {
+                    which: LimitKind::MaxTurns,
+                },
+            },
+            LlmEvent::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                reasoning_tokens: 3,
+                cached_tokens: 4,
+                ttft_ms: Some(120),
+                generation_ms: Some(340),
+            },
+            LlmEvent::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                reasoning_tokens: 0,
+                cached_tokens: 0,
+                ttft_ms: None,
+                generation_ms: None,
+            },
+            LlmEvent::Error {
+                error: "boom".to_string(),
+            },
+            LlmEvent::ProviderMeta {
+                tool_call_index: Some(1),
+                meta: meta.clone(),
+            },
+            LlmEvent::ProviderMeta {
+                tool_call_index: None,
+                meta: serde_json::Map::new(),
+            },
+            LlmEvent::RawAssistantDelta {
+                delta: serde_json::json!({"content": "raw"}),
+            },
+            LlmEvent::ResponseId {
+                id: "resp-1".to_string(),
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            // The internally tagged shape: a `type` key on every variant.
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(
+                value.get("type").is_some(),
+                "every LlmEvent must carry a type tag: {json}"
+            );
+            let back: LlmEvent = serde_json::from_str(&json).unwrap();
+            // `LlmEvent` is not PartialEq (it never needed to be), so compare
+            // the re-serialised form — a lost field shows up as a different
+            // object.
+            assert_eq!(
+                json,
+                serde_json::to_string(&back).unwrap(),
+                "round trip changed the event"
+            );
+        }
+    }
+
+    /// `ToolChoice` crosses the link as a `type`-tagged object; the forced
+    /// tool keeps its name through the struct variant.
+    #[test]
+    fn tool_choice_serde_round_trip() {
+        let cases = vec![
+            (ToolChoice::Auto, r#"{"type":"auto"}"#),
+            (ToolChoice::Required, r#"{"type":"required"}"#),
+            (
+                ToolChoice::Function {
+                    name: "read_file".to_string(),
+                },
+                r#"{"type":"function","name":"read_file"}"#,
+            ),
+        ];
+        for (choice, expected) in cases {
+            let json = serde_json::to_string(&choice).unwrap();
+            assert_eq!(json, expected);
+            let back: ToolChoice = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+    }
+
+    /// The link carries whole messages (a node's tool results are echoed to
+    /// the hub), and the raw provider echo must survive byte-identical — it is
+    /// the request builder's Rule 1 source of truth.
+    #[test]
+    fn message_with_raw_round_trips_byte_identical() {
+        let message = Message {
+            raw: Some(serde_json::json!({
+                "role": "assistant",
+                "content": "answer",
+                "reasoning_content": "think",
+                "thought_signature": "sig-1",
+                "unknown_key": {"nested": [1, 2, 3]},
+            })),
+            ..Message::assistant_text("answer")
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            message.raw, back.raw,
+            "the raw provider echo must round-trip unchanged"
+        );
+        assert_eq!(
+            json,
+            serde_json::to_string(&back).unwrap(),
+            "the serialised message must be byte-identical after a round trip"
+        );
     }
 }

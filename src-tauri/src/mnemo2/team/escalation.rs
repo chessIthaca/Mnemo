@@ -195,9 +195,10 @@ impl TeamRuntime {
             // A tier that runs as a Claude Code agent while Claude Code leads
             // takes the step to the lead's agent instead (plan e52e0be1
             // decision 5), whether or not a Mnemo model is left on it.
-            // While another agent waits for its launch, or the agent cap is
-            // reached, the worker folds onto the tier's Mnemo model instead.
-            let agent_blocked = self.agent_launch_refusal(Some(worker_id)).await.is_some();
+            // While another agent waits for its launch, the agent cap is
+            // reached, or the worker's host has no linked SSH connection, the
+            // worker folds onto the tier's Mnemo model instead.
+            let agent_blocked = self.agent_handoff_blocked(&record).await.is_some();
             if let (Some((tier, _)), false) = (&tier, agent_blocked) {
                 let lead_in = format!(
                     "Mnemo marked {failed_spec} unavailable until {} after a usage limit.",
@@ -285,7 +286,7 @@ It could not be told to continue ({error}); team_message it to continue."
         };
         self.agent_handoff_target(&record, to_tier).is_some()
             && !self.worker_is_busy(worker_id).await
-            && self.agent_launch_refusal(Some(worker_id)).await.is_none()
+            && self.agent_handoff_blocked(&record).await.is_none()
     }
 
     /// [`Self::escalate_to_agent_locked`] under the merge lock, for the pump.
@@ -305,11 +306,12 @@ It could not be told to continue ({error}); team_message it to continue."
         let Some(to_tier) = record.routing.as_ref().and_then(|r| r.nudged.clone()) else {
             return Ok(false);
         };
-        // Another agent waiting for its launch, or the agent cap, leaves the
-        // escalation to today's model switch on that tier.
+        // Another agent waiting for its launch, the agent cap, or a host
+        // without a linked SSH connection leaves the escalation to today's
+        // model switch on that tier.
         if self.agent_handoff_target(&record, &to_tier).is_none()
             || self.worker_is_busy(worker_id).await
-            || self.agent_launch_refusal(Some(worker_id)).await.is_some()
+            || self.agent_handoff_blocked(&record).await.is_some()
         {
             return Ok(false);
         }

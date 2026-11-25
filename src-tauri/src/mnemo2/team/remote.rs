@@ -2113,7 +2113,7 @@ mod tests {
         let rig = Rig::start().await;
         // A check that takes several seconds, so the qualification is still
         // running while the reconcile pass below looks at its checkout.
-        let slow = if cfg!(windows) {
+        let slow = if std::env::consts::OS == "windows" {
             "ping -n 8 127.0.0.1"
         } else {
             "ping -c 8 127.0.0.1"

@@ -39,7 +39,7 @@ use mnemo::config::{Config, ModelRef};
 use mnemo::headless::{Engine, EngineOptions, MemoryBackend, SpawnOptions};
 use mnemo::memory::plan_format::PlanKind;
 use mnemo::memory::indexer::MACHINE_SOURCE;
-use mnemo::memory::{Memory, MemoryClass, MemoryStoreTrait, MemoryTier};
+use mnemo::memory::{Memory, MemoryClass, MemoryFilter, MemoryStoreTrait, MemoryTier};
 use mnemo::provider::trace::LlmRequestContext;
 use mnemo::provider::{
     Capabilities, FinishReason, LlmClient, LlmEvent, Message, ProviderKind, ToolChoice, ToolSchema,
@@ -89,6 +89,9 @@ enum Script {
 struct ScriptedModel {
     scripts: Mutex<VecDeque<Script>>,
     requests: Mutex<Vec<String>>,
+    /// The message list of every request, in order: what the node's worker
+    /// sent the hub, tool results included.
+    conversations: Mutex<Vec<Vec<Message>>>,
 }
 
 impl ScriptedModel {
@@ -96,6 +99,7 @@ impl ScriptedModel {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
             requests: Mutex::new(Vec::new()),
+            conversations: Mutex::new(Vec::new()),
         })
     }
 
@@ -105,6 +109,19 @@ impl ScriptedModel {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+}
+
+impl ScriptedModel {
+    /// The messages of the last request the hub served: the worker's whole
+    /// conversation up to its final turn.
+    fn last_conversation(&self) -> Vec<Message> {
+        self.conversations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -135,10 +152,15 @@ impl LlmClient for ScriptedClient {
 
     async fn complete(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolSchema],
         _tool_choice: Option<ToolChoice>,
     ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        self.shared
+            .conversations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(messages.to_vec());
         self.shared
             .requests
             .lock()
@@ -594,6 +616,17 @@ async fn e2e_remote_worker_dispatch_check_review_merge() {
         machine.record_class = MemoryClass::Derived;
         machine.data = json!({"source": MACHINE_SOURCE});
         store.write(machine).await.expect("write the machine row");
+        // Positive control: the hub's own store DOES return the row, so its
+        // absence from the node's search below comes from the hub's filter.
+        let hub_hits = store
+            .recall_peek(MACHINE_TITLE, &MemoryFilter::default())
+            .await
+            .expect("recall on the hub store");
+        assert!(
+            hub_hits.iter().any(|hit| hit.memory.title == MACHINE_TITLE),
+            "the hub store must find its own machine row; hits: {:?}",
+            hub_hits.iter().map(|hit| hit.memory.title.clone()).collect::<Vec<_>>()
+        );
 
         // (3) the team over the same engine and project, with the plan its
         // dispatch belongs to.
@@ -756,11 +789,35 @@ async fn e2e_remote_worker_dispatch_check_review_merge() {
             requests.iter().all(|model| model == "scripted"),
             "every model request must arrive as the catalog model, got {requests:?}"
         );
-        let transcript =
-            serde_json::to_string(worker.transcript.as_ref()).expect("the transcript serializes");
+        // The remote worker's conversation lives on the node, so read it from
+        // the requests it sent the hub. The final request carries every tool
+        // result of the turn. The memory_search call (call-5) must have run
+        // and returned, or its result would hide nothing.
+        let conversation = scripted.last_conversation();
+        let search_result = conversation
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-5"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the worker conversation has no memory_search result; tool results: {:?}",
+                    conversation
+                        .iter()
+                        .filter_map(|message| message.tool_call_id.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        let search_text = search_result.content.as_text();
         assert!(
-            !transcript.contains(MACHINE_TITLE),
-            "a node session must never see the hub's machine knowledge:\n{transcript}"
+            !search_result.tool_is_error && !search_text.contains("[tool error]"),
+            "memory_search must succeed on the node, got: {search_text}"
+        );
+        assert!(
+            search_text.contains("memories matched") || search_text.contains("no memories matched"),
+            "memory_search must return a search answer, got: {search_text}"
+        );
+        assert!(
+            !search_text.contains(MACHINE_TITLE),
+            "a node session must never see the hub's machine knowledge: {search_text}"
         );
 
         // (9) the project's checks run on the node, at the worker tip.

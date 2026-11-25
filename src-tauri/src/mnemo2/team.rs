@@ -1430,6 +1430,7 @@ impl TeamRuntime {
             mutation_memory: self.mutation_memory.clone(),
             merge_lock: self.merge_lock.clone(),
             live: self.live.clone(),
+            remote: self.remote.clone(),
         }
     }
 

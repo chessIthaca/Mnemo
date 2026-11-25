@@ -228,9 +228,10 @@ pub fn requires_windows(commands: &[String]) -> bool {
         if WINDOWS_SHELLS.contains(&first.as_str()) {
             return true;
         }
-        // `pwsh` alone runs on macOS and Linux too (PowerShell 7); it is
-        // Windows-only when it runs a PowerShell script, which the file
-        // suffixes below catch.
+        // `pwsh` and `pwsh.exe` alone run on macOS and Linux too (PowerShell
+        // 7; the `.exe` spelling is only how a Windows config writes it): they
+        // are Windows-only when they run a PowerShell script, which the file
+        // suffixes below catch. Neither is in the list above on purpose.
         let lower = command.to_ascii_lowercase();
         [".ps1", ".bat", ".cmd"]
             .iter()
@@ -455,10 +456,13 @@ impl RemoteWorkers {
 
     /// How many live workers run on `node_id`.
     pub async fn busy_on(&self, node_id: &str) -> usize {
-        // Locks are always taken records before live.
+        // Never hold `records` and `live` together: the delivery path takes
+        // `records` while it holds `live`. Copy the live ids, drop that lock,
+        // then read the records.
+        let live_ids: Vec<String> = self.live.lock().await.keys().cloned().collect();
         let records = self.records.lock().await;
-        let live = self.live.lock().await;
-        live.keys()
+        live_ids
+            .iter()
             .filter(|id| {
                 records.iter().any(|record| {
                     &record.id == *id
@@ -1544,6 +1548,19 @@ mod tests {
             team
         }
 
+        /// A team runtime attached to the rig's own hub with the host NOT
+        /// pre-measured: the first reconcile pass starts a qualification.
+        async fn team_unmeasured(&self) -> Arc<TeamRuntime> {
+            let team = Arc::new(
+                open_test_team(self.root.path(), self._state.path(), self._config.path()).await,
+            );
+            team.attach_hosts(Arc::new(TestHosts {
+                server: self.hub.clone(),
+                address: self.hub.local_addr().to_string(),
+            }));
+            team
+        }
+
         /// A team runtime attached to the rig's own hub.
         async fn team(&self) -> Arc<TeamRuntime> {
             self.team_with(Arc::new(TestHosts {
@@ -1600,6 +1617,12 @@ mod tests {
             !requires_windows(&[r#"pwsh -Command "npm test""#.into()]),
             "pwsh alone runs on macOS and Linux too"
         );
+        assert!(requires_windows(&["pwsh.exe -File build.ps1".into()]));
+        assert!(
+            !requires_windows(&[r#"pwsh.exe -Command "npm test""#.into()]),
+            "pwsh.exe alone is the same as pwsh"
+        );
+        assert!(!requires_windows(&[r#""C:\Program Files\PowerShell\pwsh.exe" -Command x"#.into()]));
         assert!(requires_windows(&["cmd /c build.bat".into()]));
         assert!(requires_windows(&["node scripts/build.cmd".into()]));
         assert!(!requires_windows(&["cargo test --workspace".into()]));
@@ -2082,6 +2105,56 @@ mod tests {
         assert!(
             released.branch.is_none(),
             "the unreferenced checkout is released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_keeps_a_running_qualification_checkout() {
+        let rig = Rig::start().await;
+        // A check that takes several seconds, so the qualification is still
+        // running while the reconcile pass below looks at its checkout.
+        let slow = if cfg!(windows) {
+            "ping -n 8 127.0.0.1"
+        } else {
+            "ping -c 8 127.0.0.1"
+        };
+        std::fs::create_dir_all(rig.root.path().join(".coding")).expect("coding dir");
+        std::fs::write(
+            rig.root.path().join(".coding/checks.toml"),
+            format!("commands = [\"{slow}\"]\n"),
+        )
+        .expect("checks file");
+        let team = rig.team_unmeasured().await;
+        // The monitor's first pass starts the qualification; wait until its
+        // hostcheck checkout is prepared.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let held = checkout_list(&rig)
+                .await
+                .iter()
+                .any(|info| info.branch.as_deref() == Some(QUALIFY_BRANCH));
+            if held {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the qualification prepares its hostcheck checkout"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            team.remote.qualifying_checkout(&rig.node_id).is_some(),
+            "the qualification is still running"
+        );
+
+        team.reconcile_hosts().await;
+
+        assert!(
+            checkout_list(&rig)
+                .await
+                .iter()
+                .any(|info| info.branch.as_deref() == Some(QUALIFY_BRANCH)),
+            "a reconcile pass must not release the checkout a qualification is using"
         );
     }
 

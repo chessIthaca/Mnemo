@@ -776,6 +776,11 @@ impl TeamRuntime {
             let mut links: Option<tokio::sync::watch::Receiver<u64>> = None;
             let mut last_reconcile = std::time::Instant::now();
             loop {
+                // A dropped team ends the monitor, also while it is still
+                // waiting for the hub to appear.
+                if team.upgrade().is_none() {
+                    return;
+                }
                 if links.is_none() {
                     let Some(server) = hosts.server() else {
                         tokio::time::sleep(HOST_POLL).await;
@@ -840,14 +845,22 @@ impl TeamRuntime {
             return;
         };
         let connected: HashSet<String> = server.connected().into_iter().collect();
-        let watching: Vec<(String, RemoteCheckout, SharedWorkerSession)> = {
-            let records = self.records.lock().await;
+        // One lock at a time: the delivery path holds `live` while it takes
+        // `records`, so nesting them here in the other order would deadlock.
+        let sessions: Vec<(String, SharedWorkerSession)> = {
             let live = self.live.lock().await;
             live.iter()
-                .filter_map(|(id, worker)| {
-                    let record = records.iter().find(|record| &record.id == id)?;
+                .map(|(id, worker)| (id.clone(), worker.session.clone()))
+                .collect()
+        };
+        let watching: Vec<(String, RemoteCheckout, SharedWorkerSession)> = {
+            let records = self.records.lock().await;
+            sessions
+                .into_iter()
+                .filter_map(|(id, session)| {
+                    let record = records.iter().find(|record| record.id == id)?;
                     let remote = record.remote.clone()?;
-                    Some((id.clone(), remote, worker.session.clone()))
+                    Some((id, remote, session))
                 })
                 .collect()
         };
@@ -1037,14 +1050,22 @@ impl TeamRuntime {
         };
         let project = self.remote.project().to_string();
         let nodes = server.nodes().list().unwrap_or_default();
-        let live_sessions: Vec<(String, mnemo::headless::SessionId)> = {
-            let records = self.records.lock().await;
+        // One lock at a time (see `poll_hosts`): copy the live sessions, drop
+        // `live`, then read the records.
+        let live_ids: Vec<(String, mnemo::headless::SessionId)> = {
             let live = self.live.lock().await;
             live.iter()
-                .filter_map(|(id, worker)| {
-                    let record = records.iter().find(|record| &record.id == id)?;
+                .map(|(id, worker)| (id.clone(), worker.session.id()))
+                .collect()
+        };
+        let live_sessions: Vec<(String, mnemo::headless::SessionId)> = {
+            let records = self.records.lock().await;
+            live_ids
+                .into_iter()
+                .filter_map(|(id, session)| {
+                    let record = records.iter().find(|record| record.id == id)?;
                     let remote = record.remote.as_ref()?;
-                    Some((remote.node_id.clone(), worker.session.id()))
+                    Some((remote.node_id.clone(), session))
                 })
                 .collect()
         };
@@ -1444,12 +1465,13 @@ impl TeamRuntime {
                     )
             })
             .count();
+        // One lock at a time: copy the live ids, drop `live`, then read the
+        // records (the delivery path nests them live-then-records).
+        let live_ids: Vec<String> = self.live.lock().await.keys().cloned().collect();
         let local = {
             let records = self.records.lock().await;
-            self.live
-                .lock()
-                .await
-                .keys()
+            live_ids
+                .iter()
                 .filter(|id| {
                     records
                         .iter()

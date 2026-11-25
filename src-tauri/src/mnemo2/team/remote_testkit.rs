@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use mnemo::remote::catalog::ModelCatalog;
 use mnemo::remote::hub::{HubOptions, HubServer, HubServices};
-use mnemo::remote::node::{self, NodeConfig};
+use mnemo::remote::node::{self, NodeConfig, NodeExtension};
 use mnemo::remote::pairing::NodeRecord;
+use serde_json::Value;
 
 use tokio::sync::Mutex;
 
@@ -149,6 +150,16 @@ pub(crate) struct Rig {
 
 impl Rig {
     pub(crate) async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// A rig whose node also serves `extension`: the Claude session watch the
+    /// node binary carries, or none, exactly as [`Rig::start`].
+    pub(crate) async fn start_with_extension(extension: Arc<dyn NodeExtension>) -> Self {
+        Self::start_with(Some(extension)).await
+    }
+
+    async fn start_with(extension: Option<Arc<dyn NodeExtension>>) -> Self {
         let root = tempfile::tempdir().expect("project root");
         init_repo(root.path());
         let state = tempfile::tempdir().expect("team state");
@@ -180,7 +191,7 @@ impl Rig {
             outage_budget: mnemo::remote::HUB_OUTAGE_BUDGET,
             index_codegraph: false,
             slots: 2,
-            extension: None,
+            extension,
         };
         tokio::spawn(node::run(cfg, async move {
             let _ = shutdown_rx.await;
@@ -213,6 +224,18 @@ impl Rig {
             node_id: identity.node_id,
             shutdown: Some(shutdown),
         }
+    }
+
+    /// One call into the rig's node, for a test of an extension the rig
+    /// started with.
+    pub(crate) async fn call_node(
+        &self,
+        remote: &RemoteCheckout,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        self.workers.call_node(remote, method, params, timeout).await
     }
 
     pub(super) async fn base(&self) -> String {

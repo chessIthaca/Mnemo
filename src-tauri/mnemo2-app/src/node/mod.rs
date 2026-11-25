@@ -241,10 +241,12 @@ async fn run(home: &Path, workspace: &Path, slots: usize) -> u8 {
         // checkout and reads it with the file tools.
         index_codegraph: false,
         slots,
-        // The binary serves the session surface, the repo host, and the two proof
-        // runs a dispatched remote worker needs on this host (plan 9a2f4b67).
+        // The binary serves the session surface, the repo host, the two proof
+        // runs a dispatched remote worker needs on this host (plan 9a2f4b67),
+        // and the Claude Code session watch a remote agent worker is followed
+        // with (plan 5e64ccd5).
         extension: Some(Arc::new(
-            mnemo_app::mnemo2::team::proof::ProofNodeExtension,
+            mnemo_app::mnemo2::team::claude_node::MnemoNodeExtension::default(),
         )),
     };
     match node::run(cfg, shutdown_signal()).await {

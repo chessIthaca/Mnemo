@@ -28,6 +28,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use mnemo::app::worktrees::is_link_or_junction;
+use mnemo::provider::Role;
 
 use crate::mnemo2::phase3;
 use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
@@ -74,8 +75,12 @@ impl AgentView {
 }
 
 /// The reading state of one registered agent.
+///
+/// The counters and the turn state are read by the node's Claude session watch
+/// too ([`super::claude_node`]), which follows a transcript without a
+/// registration.
 #[derive(Default)]
-struct Observed {
+pub(super) struct Observed {
     /// The agent id this state belongs to; a new registration starts over.
     agent_id: String,
     /// The file the counters were read from.
@@ -91,8 +96,17 @@ struct Observed {
     /// Length and hash of the file's first bytes when last read: a changed
     /// hash means the file was replaced.
     fingerprint: Option<(u64, u64)>,
-    tool_calls: u64,
-    tokens: u64,
+    /// Tool calls the transcript's assistant records carried.
+    pub(super) tool_calls: u64,
+    /// Tokens the transcript's assistant records reported.
+    pub(super) tokens: u64,
+    /// Who spoke last in the transcript: the turn's last word.
+    pub(super) last_role: Option<Role>,
+    /// The latest non-null `stop_reason` among the current turn's assistant
+    /// records.
+    pub(super) last_stop: Option<String>,
+    /// Whether the latest assistant record ended by asking for a tool.
+    pub(super) last_tool_use: bool,
     /// When Mnemo first saw this registration: the silence clock when
     /// neither a transcript nor the record says anything.
     registered_ms: u128,
@@ -425,6 +439,8 @@ fn epoch_ms(time: std::time::SystemTime) -> u128 {
 /// Count one transcript line into `observed`; anything malformed adds
 /// nothing.
 fn read_line(observed: &mut Observed, line: &[u8]) {
+    // A CRLF line ends in `\r`, which JSON treats as whitespace like `\n`.
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     let Ok(value) = serde_json::from_slice::<Value>(line) else {
         return;
     };
@@ -433,8 +449,42 @@ fn read_line(observed: &mut Observed, line: &[u8]) {
     };
     let assistant = message.get("role").and_then(Value::as_str) == Some("assistant")
         || value.get("type").and_then(Value::as_str) == Some("assistant");
+    let user = message.get("role").and_then(Value::as_str) == Some("user")
+        || value.get("type").and_then(Value::as_str) == Some("user");
+    if user && !assistant {
+        // A real user turn — not Claude Code's own bookkeeping and not a record
+        // that only carries tool results — is the turn's last word: whatever
+        // ended the previous turn no longer speaks for this one.
+        let text = user_message_text(message);
+        let only_results = message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                !blocks.is_empty()
+                    && blocks.iter().all(|block| {
+                        block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+            });
+        if !only_results && !meta_user_entry(&value, &text) {
+            observed.last_role = Some(Role::User);
+            observed.last_stop = None;
+        }
+        return;
+    }
     if !assistant {
         return;
+    }
+    observed.last_role = Some(Role::Assistant);
+    observed.last_tool_use = message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        });
+    if let Some(stop) = message.get("stop_reason").and_then(Value::as_str) {
+        observed.last_stop = Some(stop.to_string());
     }
     if let Some(blocks) = message.get("content").and_then(Value::as_array) {
         let calls = blocks
@@ -486,6 +536,9 @@ impl Observed {
         self.offset = 0;
         self.tool_calls = 0;
         self.tokens = 0;
+        self.last_role = None;
+        self.last_stop = None;
+        self.last_tool_use = false;
         self.tail.clear();
         self.skipping = false;
         self.fingerprint = None;
@@ -529,7 +582,7 @@ impl Observed {
 
 /// Read what the file gained since the last look: only new bytes, in
 /// chunks, and only complete lines are parsed.
-fn read_new(observed: &mut Observed, path: &Path, length: u64) {
+pub(super) fn read_new(observed: &mut Observed, path: &Path, length: u64) {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
         return;
@@ -1065,7 +1118,7 @@ pub(super) struct Launched {
 const FIRST_MESSAGE_BYTES: u64 = 1024 * 1024;
 
 /// Whether `path` exists and is no link or junction.
-fn plain_entry(path: &Path) -> bool {
+pub(super) fn plain_entry(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| !is_link_or_junction(&meta))
 }
 
@@ -1102,7 +1155,7 @@ fn meta_user_entry(value: &Value, text: &str) -> bool {
 /// The text of a transcript's first real user message (its prompt), skipping
 /// meta and caveat entries ([`meta_user_entry`]), read from at most
 /// [`FIRST_MESSAGE_BYTES`].
-fn first_user_text(path: &Path) -> Option<String> {
+pub(super) fn first_user_text(path: &Path) -> Option<String> {
     use std::io::{BufRead, Read};
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file.take(FIRST_MESSAGE_BYTES));
@@ -1135,7 +1188,7 @@ fn first_user_text(path: &Path) -> Option<String> {
 /// branch name. Only this phrase counts (plan ee73bd2f, step 1 audit): a
 /// brief routinely names other workers' checkouts and branches ("never
 /// touch …"), which must not match.
-fn prompt_names_branch(text: &str, branch: &str) -> bool {
+pub(super) fn prompt_names_branch(text: &str, branch: &str) -> bool {
     let branch = branch.trim();
     if branch.is_empty() {
         return false;

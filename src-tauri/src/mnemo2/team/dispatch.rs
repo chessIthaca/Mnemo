@@ -28,7 +28,7 @@ use super::record::{
     agent_prompt, remote_agent_prompt, session_name, validate_worker_id, with_launch_token,
     InboxKind, MessageSender, WorkerRecord, WorkerRouting, WorkerStatus,
 };
-use super::routing::RoutedDispatch;
+use super::routing::{ClaudeAgentDispatch, RoutedDispatch};
 use super::TeamRuntime;
 
 /// A boxed future: helpers that big async callers await return one so the
@@ -673,6 +673,13 @@ impl TeamRuntime {
         routed: Option<RoutedDispatch>,
         host: Option<String>,
     ) -> Result<(WorkerRecord, bool, bool), String> {
+        // The gate the router applies to a Claude Code agent dispatch: an
+        // external-lead dispatch by tier, with no explicit model. A reused
+        // worker id skips routing, so the retry path needs it here.
+        let agent_gate = request.sender == MessageSender::ExternalLead
+            && request.source == DispatchSource::LeadTool
+            && request.model.is_none()
+            && self.external_lead_attached();
         let DispatchRequest {
             brief,
             tier,
@@ -749,6 +756,14 @@ impl TeamRuntime {
                     return Err(format!("worker '{id}' has an invalid branch identity"));
                 }
                 self.validate_model(&existing.model, &existing.reasoning_effort)?;
+                if let Some(agent) = self
+                    .agent_retry_target(&existing, routed.as_ref(), tier.as_deref(), agent_gate)
+                    .await
+                {
+                    return Box::pin(self.retry_agent_worker(existing, agent, host.as_deref()))
+                        .await
+                        .map(|worker| (worker, true, false));
+                }
                 if !existing.brief_sent
                     && !self.live.lock().await.contains_key(id)
                     && matches!(
@@ -960,6 +975,23 @@ impl TeamRuntime {
                             if active >= slots {
                                 return Err(format!("all {slots} worker slots are busy"));
                             }
+                            // The fallback starts the worker on this computer,
+                            // so an agent worker must pass the waiting-worker
+                            // check the local placement makes: two waiting agent
+                            // workers would leave the one WorktreeCreate hook
+                            // refusing every launch (audit finding on plan
+                            // 5e64ccd5).
+                            if claude_agent.is_some() {
+                                if let Some(refusal) =
+                                    self.agent_launch_refusal_for(None, false).await
+                                {
+                                    let text = format!(
+                                        "{refusal}; retry with the same worker ID once the waiting worker is launched"
+                                    );
+                                    self.fail_worker(&record.id, text.clone()).await;
+                                    return Err(text);
+                                }
+                            }
                         }
                     }
                 }
@@ -1163,6 +1195,83 @@ impl TeamRuntime {
                 }
             }
         })
+    }
+
+    /// The Claude Code agent a re-dispatched step must run as, when its first
+    /// dispatch failed before the agent started: no agent, no brief handed over,
+    /// `Failed`, and no live session. `None` for every other reuse, which keeps
+    /// the Mnemo restart path (audit finding on plan 5e64ccd5).
+    async fn agent_retry_target(
+        &self,
+        existing: &WorkerRecord,
+        routed: Option<&RoutedDispatch>,
+        tier: Option<&str>,
+        agent_gate: bool,
+    ) -> Option<ClaudeAgentDispatch> {
+        if existing.claude_agent.is_some()
+            || existing.brief_sent
+            || existing.status != WorkerStatus::Failed
+            || self.live.lock().await.contains_key(&existing.id)
+        {
+            return None;
+        }
+        if let Some(agent) = routed.and_then(|routed| routed.claude_agent.clone()) {
+            return Some(agent);
+        }
+        if !agent_gate {
+            return None;
+        }
+        // A reused worker id skips routing: ask the tier the lead asked for, or
+        // the one the record settled on.
+        self.claude_agent_rung(tier.or(existing.tier.as_deref()))
+    }
+
+    /// Take the agent path again for a re-dispatched step that never started:
+    /// place the worker (honouring the lead's pin), prepare its checkout and
+    /// hand the lead the session again. It never starts a Mnemo session.
+    async fn retry_agent_worker(
+        &self,
+        existing: WorkerRecord,
+        agent: ClaudeAgentDispatch,
+        host: Option<&str>,
+    ) -> Result<WorkerRecord, String> {
+        let id = existing.id.clone();
+        self.proving_guard(&id)?;
+        if !existing.worktree.is_dir() {
+            return Err(format!("worker '{id}' has no recoverable worktree"));
+        }
+        self.handed_back_takeover_refusal(&existing, false).await?;
+        let mut existing = self.refresh_before_redispatch(existing).await;
+        let placement = self
+            .place_worker(PlacementRequest {
+                pinned: host,
+                claude_agent: true,
+            })
+            .await?;
+        match &placement {
+            Placement::Node(choice) => {
+                let base = existing.base_commit.clone().unwrap_or_default();
+                Box::pin(self.prepare_remote_checkout(
+                    &mut existing,
+                    choice,
+                    &base,
+                    false,
+                    choice.ssh.clone(),
+                ))
+                .await?;
+            }
+            Placement::Local => {
+                let active = self.active_workers_for_slots().await;
+                let slots = self.persistence.slots.load(Ordering::SeqCst);
+                if active >= slots {
+                    return Err(format!("all {slots} worker slots are busy"));
+                }
+                if let Some(refusal) = self.agent_launch_refusal_for(None, false).await {
+                    return Err(refusal);
+                }
+            }
+        }
+        Box::pin(self.start_agent_worker(existing, agent)).await
     }
 
     /// The re-dispatch half of the refresh guard: fast-forward a worker that

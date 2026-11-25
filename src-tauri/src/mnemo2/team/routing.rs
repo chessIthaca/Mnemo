@@ -898,7 +898,6 @@ impl TeamRuntime {
         request: &DispatchRequest,
         settled_tier: Option<&str>,
     ) -> Option<ClaudeAgentDispatch> {
-        let tier = settled_tier?;
         if request.sender != MessageSender::ExternalLead
             || request.source != DispatchSource::LeadTool
             || request.model.is_some()
@@ -906,6 +905,16 @@ impl TeamRuntime {
         {
             return None;
         }
+        self.claude_agent_rung(settled_tier)
+    }
+
+    /// The Claude Code agent `tier`'s rung runs as, if it runs as one.
+    ///
+    /// [`Self::claude_agent_dispatch`] applies the request gate and then asks
+    /// this; a re-dispatch of an existing worker id skips routing, so the retry
+    /// path asks it directly with the tier it settled on.
+    pub(super) fn claude_agent_rung(&self, tier: Option<&str>) -> Option<ClaudeAgentDispatch> {
+        let tier = tier?;
         let ladder = self.tier_ladder();
         let rung = ladder.get(tier)?;
         let model = rung.claude_agent.clone()?;

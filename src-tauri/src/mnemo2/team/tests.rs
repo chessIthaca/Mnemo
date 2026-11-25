@@ -21043,3 +21043,194 @@ async fn remote_agent_workers_use_host_slots_not_local() {
     .await;
     assert_eq!(team.remote.busy_on(&node_id).await, 0);
 }
+
+/// The project's current tip, the base a node checkout is prepared on.
+async fn remote_project_tip(team: &super::TeamRuntime) -> String {
+    crate::mnemo2::team::remote::git_value(&team.workspace_root, &["rev-parse", "HEAD"])
+        .await
+        .expect("the project tip")
+}
+
+/// The paired host's node id.
+fn remote_node_id(team: &super::TeamRuntime) -> String {
+    team.remote
+        .host("node-a")
+        .expect("the paired host")
+        .node_id
+}
+
+/// Put a plain file where the worker's node checkout would go, so the next
+/// `checkout.prepare` for its branch fails on the node; returns that path.
+async fn block_node_checkout(
+    team: &super::TeamRuntime,
+    worker_id: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let branch = agent_branch(worker_id);
+    let checkout = team
+        .remote
+        .prepare_checkout(
+            &remote_node_id(team),
+            &branch,
+            &remote_project_tip(team).await,
+            false,
+        )
+        .await
+        .expect("a node checkout to break");
+    std::fs::remove_dir_all(&checkout.path).expect("remove the prepared checkout");
+    std::fs::write(&checkout.path, "not a checkout").expect("block the checkout path");
+    let path = std::path::PathBuf::from(&checkout.path);
+    let home = std::path::Path::parent(path.parent().expect("the checkouts dir"))
+        .expect("the node home");
+    let repo = home
+        .join("repos")
+        .join(format!("{}.git", team.remote.project()));
+    (path, repo)
+}
+
+/// Undo [`block_node_checkout`]: free the path and prune the node's stale
+/// worktree entry, exactly as the node repairs itself after a deleted pool.
+async fn unblock_node_checkout(blocked: &(std::path::PathBuf, std::path::PathBuf)) {
+    std::fs::remove_file(&blocked.0).expect("free the checkout path");
+    let text = blocked.1.to_string_lossy().into_owned();
+    crate::mnemo2::team::remote::git_value(
+        blocked.1.parent().expect("the node home"),
+        &["--git-dir", &text, "worktree", "prune"],
+    )
+    .await
+    .expect("prune the node's worktrees");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatch_agent_fallback_respects_the_waiting_worker() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    // One local agent worker already waits for its agent: the one
+    // WorktreeCreate hook cannot tell two checkouts apart.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut waiting = worker(scratch.path(), "waiting01");
+    waiting.claude_agent = Some("opus".into());
+    waiting.status = WorkerStatus::Working;
+    waiting.brief_sent = true;
+    team.records.lock().await.push(waiting);
+    team.persist().await.expect("persist the waiting worker");
+
+    // The node's checkout cannot be prepared, so the unpinned dispatch falls
+    // back to this computer — where a second waiting agent worker must not
+    // start.
+    let blocked = block_node_checkout(&team, "fallback01").await;
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&plan_id, "fallback01"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!answer.success, "the fallback must refuse: {}", answer.output);
+    let refusal = team
+        .agent_launch_refusal_for(None, false)
+        .await
+        .expect("the waiting worker still refuses a launch");
+    let expected =
+        format!("{refusal}; retry with the same worker ID once the waiting worker is launched");
+    assert_eq!(answer.output, expected);
+
+    let record = team.worker("fallback01").await.expect("the worker record");
+    assert_eq!(record.status, WorkerStatus::Failed);
+    assert_eq!(record.error.as_deref(), Some(expected.as_str()));
+    assert!(
+        record.claude_agent.is_none(),
+        "the fallback started no second waiting agent worker: {}",
+        record.error.as_deref().unwrap_or_default()
+    );
+    assert!(record.remote.is_none());
+    let waiting_workers = team
+        .records
+        .lock()
+        .await
+        .iter()
+        .filter(|worker| super::agent_watch::waits_for_local_agent(worker))
+        .map(|worker| worker.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(waiting_workers, vec!["waiting01".to_string()]);
+
+    unblock_node_checkout(&blocked).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_agent_prepare_failure_retry_stays_an_agent() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    // The host takes the worker but its checkout cannot be prepared: the pinned
+    // arm fails the worker and keeps none of it.
+    let blocked = block_node_checkout(&team, "pinned01").await;
+    let mut args = remote_agent_dispatch_args(&plan_id, "pinned01");
+    args["host"] = serde_json::json!("node-a");
+    let first = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            args.clone(),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!first.success, "the first dispatch fails to prepare: {}", first.output);
+    let failed = team.worker("pinned01").await.expect("the failed record");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert!(failed.claude_agent.is_none(), "the step never started");
+    assert!(!failed.brief_sent);
+    assert!(failed.remote.is_none());
+
+    // The node is back: the retry takes the agent path again instead of
+    // turning the step into a Mnemo session.
+    unblock_node_checkout(&blocked).await;
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(retry.success, "{}", retry.output);
+    let answer_json: Value =
+        serde_json::from_str(retry.output.lines().next().expect("the answer's JSON line"))
+            .expect("the retry answer JSON");
+    let result = &answer_json["result"];
+    assert_eq!(result["claude_session"]["target"], "ssh");
+    assert_eq!(result["claude_session"]["host"], "studio-ssh");
+    assert!(
+        result["claude_agent"].is_null(),
+        "the retry answers the session block, not a local launch: {answer_json}"
+    );
+    assert!(retry.output.contains("call team_agent_started"), "{}", retry.output);
+
+    let record = team.worker("pinned01").await.expect("the retried record");
+    assert_eq!(
+        record.claude_agent.as_deref(),
+        Some("opus"),
+        "the retry stayed an agent worker"
+    );
+    assert!(record.launch_token.is_none());
+    assert!(record.claude_session.is_none());
+    let remote = record.remote.as_ref().expect("the retried node checkout");
+    assert_eq!(remote.ssh.as_deref(), Some("studio-ssh"));
+    assert!(
+        std::path::Path::new(remote.path.as_str()).is_dir(),
+        "the retried session works in the node checkout: {}",
+        remote.path
+    );
+    assert!(
+        team.live.lock().await.is_empty(),
+        "no Mnemo session started for an agent tier"
+    );
+}

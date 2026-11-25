@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mnemo::app::worktrees::{
     agent_short_id, current_branch, provision_agent_checkout, rollback_agent_checkout,
 };
-use mnemo::headless::{AgentSession, SessionCommand, SpawnOptions, Transcript};
+use mnemo::headless::{SessionCommand, SpawnOptions, Transcript};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, route_question};
 
@@ -33,6 +33,7 @@ use super::record::{
 };
 use super::routing::{logs_label, outcome_row, ClaudeAgentDispatch};
 use super::pump::pump_worker;
+use super::worker_session::{LocalWorkerSession, SharedWorkerSession};
 use super::{LiveWorker, TeamRuntime};
 
 /// The inputs one live worker session needs: where and on what it runs, its
@@ -376,7 +377,6 @@ impl TeamRuntime {
                 return Err(error);
             }
         };
-        let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(true));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
@@ -384,8 +384,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             id.clone(),
             generation,
-            self.engine()?,
-            session_id,
+            session.clone(),
             receiver,
             self.events.clone(),
             busy.clone(),
@@ -481,7 +480,7 @@ impl TeamRuntime {
     pub(crate) async fn spawn_worker_session(
         &self,
         spec: WorkerSessionSpec,
-    ) -> Result<AgentSession, String> {
+    ) -> Result<SharedWorkerSession, String> {
         let WorkerSessionSpec {
             model,
             reasoning_effort,
@@ -493,7 +492,8 @@ impl TeamRuntime {
             check_commands,
         } = spec;
         let name = trace_identity.agent_name.clone();
-        self.engine()?
+        let session = self
+            .engine()?
             .spawn(SpawnOptions {
                 name: Some(name),
                 model,
@@ -522,7 +522,8 @@ impl TeamRuntime {
                 skip_turn_routing: true,
             })
             .await
-            .map_err(|err| format!("could not spawn the worker session: {err}"))
+            .map_err(|err| format!("could not spawn the worker session: {err}"))?;
+        Ok(Arc::new(LocalWorkerSession::new(session)))
     }
 
     /// Mark a worker failed after its session could not spawn or resume.

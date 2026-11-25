@@ -326,6 +326,14 @@ pub struct EventReceiver<T> {
 }
 
 impl<T: Clone> EventReceiver<T> {
+    /// Wrap a broadcast receiver. It lets a host build a receiver for a
+    /// session that is not engine-owned (one whose events arrive from
+    /// somewhere else, such as a remote worker), with the same `recv` /
+    /// `try_recv` / [`RecvError`] behavior as an engine session's.
+    pub fn from_broadcast(rx: tokio::sync::broadcast::Receiver<T>) -> Self {
+        Self { rx }
+    }
+
     /// Receive the next event. `Err(RecvError::Closed)` once the session
     /// ended and the buffer drained; `Err(RecvError::Lagged(n))` after
     /// falling `n` events behind.

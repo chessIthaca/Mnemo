@@ -7618,7 +7618,17 @@ async fn executor_profile_uses_mnemo2_tools_not_mnemo_workflow_reviewer() {
         })
         .await
         .expect("spawn executor");
-    let tools = session.tool_names().await.expect("registered tool names");
+    // The team hands out a `WorkerSession`; the registered tool names are an
+    // engine-session diagnostic, read through the engine's own handle.
+    let tools = team
+        .engine()
+        .expect("the team's engine")
+        .session(&session.id())
+        .await
+        .expect("the executor session is live")
+        .tool_names()
+        .await
+        .expect("registered tool names");
     for name in ["file_edit", "file_write", "shell", "git", "git_read"] {
         assert!(
             tools.iter().any(|tool| tool == name),
@@ -7664,7 +7674,15 @@ async fn executor_profile_uses_mnemo2_tools_not_mnemo_workflow_reviewer() {
         })
         .await
         .expect("spawn audit");
-    let audit_tools = audit.tool_names().await.expect("registered audit tools");
+    let audit_tools = team
+        .engine()
+        .expect("the team's engine")
+        .session(&audit.id())
+        .await
+        .expect("the audit session is live")
+        .tool_names()
+        .await
+        .expect("registered audit tools");
     for name in ["read_files", "search", "git_read", "graph_search", "message_parent"] {
         assert!(
             audit_tools.iter().any(|tool| tool == name),

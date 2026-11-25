@@ -46,6 +46,7 @@ use crate::remote::link::{dial, LinkHandler, LinkSlot, StreamTx};
 use crate::remote::llm::RemoteTransport;
 use crate::remote::memory::{RoutedMemoryStore, MEM_VERSION};
 use crate::remote::pairing::NodeIdentity;
+use crate::remote::repo::RepoHost;
 use crate::remote::{RemoteError, CODE_LINK_DOWN};
 use crate::workspace::Workspace;
 
@@ -76,10 +77,10 @@ const STABLE_LINK: Duration = Duration::from_secs(10);
 
 /// What one node runtime needs: its home, the project it runs sessions in, and
 /// how long a call may wait for a dropped link.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NodeConfig {
     /// The node's config home (`node.json`, `hub-config/`, `state/`,
-    /// `checkouts/`).
+    /// `checkouts/`, `repos/`).
     pub home: PathBuf,
     /// The workspace root sessions without a checkout run in.
     pub workspace: PathBuf,
@@ -88,6 +89,50 @@ pub struct NodeConfig {
     pub outage_budget: Duration,
     /// Whether the node's engine indexes the code graph.
     pub index_codegraph: bool,
+    /// How many pool checkouts the node keeps warm per project.
+    pub slots: usize,
+    /// Extra hub→node methods beyond the session and repo surface (step 6's
+    /// proof runs plug in here).
+    pub extension: Option<Arc<dyn NodeExtension>>,
+}
+
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeConfig")
+            .field("home", &self.home)
+            .field("workspace", &self.workspace)
+            .field("outage_budget", &self.outage_budget)
+            .field("index_codegraph", &self.index_codegraph)
+            .field("slots", &self.slots)
+            .field("extension", &self.extension.is_some())
+            .finish()
+    }
+}
+
+/// What an extension's calls learn about the node they run on: the home the
+/// repo host works in, and the config dir the node's machine slots live under.
+#[derive(Debug, Clone)]
+pub struct NodeCallCtx {
+    /// The node's home.
+    pub home: PathBuf,
+    /// The node's config dir (`home.parent()`, or `home` when it has none).
+    pub config_dir: PathBuf,
+}
+
+/// Extra hub→node methods a node binary serves on top of the session surface
+/// and the repo host (step 6's proof runs).
+///
+/// The handler is asked only after [`crate::remote::repo::RepoHost`] declines
+/// the method, so a repo method can never be shadowed.
+#[async_trait]
+pub trait NodeExtension: Send + Sync + 'static {
+    /// Answer `method`, or `None` when the method is not this extension's.
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        ctx: &NodeCallCtx,
+    ) -> Option<Result<Value, RemoteError>>;
 }
 
 /// A node-runtime failure.
@@ -269,8 +314,10 @@ struct NodeState {
     sessions: Mutex<HashMap<u64, SessionEntry>>,
     /// The node-wide event ring.
     ring: Arc<StdMutex<Ring>>,
-    /// The model-catalog revision currently mirrored.
-    catalog: StdMutex<Option<String>>,
+    /// The model catalog currently mirrored, with the revision it carries.
+    applied: StdMutex<Option<ModelCatalog>>,
+    /// The repo, checkout and check surface the hub's `repo.*` calls drive.
+    repo: RepoHost,
     /// The last hub epoch this node attached to.
     last_epoch: StdMutex<Option<String>>,
     /// Set when the runtime stops; the forwarder and the dial loop watch it.
@@ -287,6 +334,7 @@ impl NodeState {
     fn new(cfg: NodeConfig, identity: NodeIdentity) -> Self {
         let (engine_ready, _) = watch::channel(false);
         let (shutdown, _) = watch::channel(false);
+        let repo = RepoHost::new(cfg.home.clone(), cfg.slots);
         Self {
             cfg,
             identity,
@@ -296,7 +344,8 @@ impl NodeState {
             routed: StdMutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             ring: Arc::new(StdMutex::new(Ring::new())),
-            catalog: StdMutex::new(None),
+            applied: StdMutex::new(None),
+            repo,
             last_epoch: StdMutex::new(None),
             shutdown,
         }
@@ -343,6 +392,15 @@ impl NodeState {
     /// The engine, once the first catalog built it.
     async fn engine(&self) -> Option<Arc<Engine>> {
         self.engine.lock().await.clone()
+    }
+
+    /// The node's config dir: the parent of its home, or the home itself.
+    fn config_dir(&self) -> PathBuf {
+        self.cfg
+            .home
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.cfg.home.clone())
     }
 
     /// The engine, waiting up to [`CATALOG_WAIT`] for the first catalog.
@@ -412,7 +470,24 @@ impl LinkHandler for NodeHandler {
             SESSION_LIST => self.state.list_sessions().await,
             ENGINE_EVENTS => self.state.events(params, out, self.cancel.clone()).await,
             NODE_STATUS => Ok(self.state.status().await),
-            other => Err(RemoteError::unknown_method(other)),
+            // The repo/checkout/check surface, then whatever the node binary
+            // added on top of it (step 6's proof runs). A repo method can never
+            // be shadowed by an extension.
+            other => {
+                if let Some(answer) = self.state.repo.handle(other, params.clone(), out).await {
+                    return answer;
+                }
+                if let Some(extension) = self.state.cfg.extension.as_ref() {
+                    let ctx = NodeCallCtx {
+                        home: self.state.cfg.home.clone(),
+                        config_dir: self.state.config_dir(),
+                    };
+                    if let Some(answer) = extension.request(other, params, &ctx).await {
+                        return answer;
+                    }
+                }
+                Err(RemoteError::unknown_method(other))
+            }
         }
     }
 
@@ -457,10 +532,11 @@ impl LinkHandler for NodeHandler {
 async fn apply_catalog(state: Arc<NodeState>, catalog: ModelCatalog) -> Result<(), NodeError> {
     let mut engine = state.engine.lock().await;
     let current = state
-        .catalog
+        .applied
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .clone();
+        .as_ref()
+        .map(|applied| applied.revision.clone());
     if current.as_deref() == Some(catalog.revision.as_str()) {
         return Ok(());
     }
@@ -470,17 +546,25 @@ async fn apply_catalog(state: Arc<NodeState>, catalog: ModelCatalog) -> Result<(
         .map_err(|error| NodeError::Io(format!("could not mirror the hub config: {error}")))?;
     let config = Config::load(&mirror)
         .map_err(|error| NodeError::Io(format!("could not load the mirrored config: {error}")))?;
-    match engine.as_ref() {
-        Some(engine) => engine.set_model_config(config),
+    let built = match engine.as_ref() {
+        Some(engine) => {
+            engine.set_model_config(config);
+            false
+        }
         None => {
             *engine = Some(Arc::new(build_engine(&state, config).await?));
-            state.engine_ready.send_replace(true);
+            true
         }
-    }
+    };
+    // Record the catalog BEFORE signalling readiness: a spawn that wakes on
+    // the signal must never see a catalog the node has not applied yet.
     *state
-        .catalog
+        .applied
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner()) = Some(catalog.revision);
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(catalog);
+    if built {
+        state.engine_ready.send_replace(true);
+    }
     Ok(())
 }
 
@@ -561,7 +645,8 @@ fn spawn_forwarder(
 /// sequence, or the session handler's answer.
 impl NodeState {
     /// `node.status`: the node's identity, workspace, mirrored catalog
-    /// revision (`null` before the first catalog) and open sessions.
+    /// revision (`null` before the first catalog), slot count, git version and
+    /// open sessions.
     async fn status(&self) -> Value {
         let sessions: Vec<Value> = {
             let open = self.sessions.lock().await;
@@ -572,10 +657,11 @@ impl NodeState {
                 .collect()
         };
         let catalog_revision = self
-            .catalog
+            .applied
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
+            .as_ref()
+            .map(|applied| applied.revision.clone());
         json!({
             "node_id": self.identity.node_id,
             "version": env!("CARGO_PKG_VERSION"),
@@ -583,8 +669,41 @@ impl NodeState {
             "os": std::env::consts::OS,
             "workspace": self.cfg.workspace.to_string_lossy(),
             "hub": self.identity.hub,
+            "slots": self.repo.slots(),
+            "git": git_version(&self.cfg.home).await,
             "sessions": sessions,
         })
+    }
+
+    /// Refuse a model spec the applied catalog does not know (decision 5a).
+    ///
+    /// A spec is `endpoint/model`; the endpoint must exist in the catalog the
+    /// node mirrored, and it must list a model with that id. Silently running
+    /// on the default model instead would look like a working dispatch.
+    fn require_model(&self, spec: &str) -> Result<(), RemoteError> {
+        let applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let revision = applied
+            .as_ref()
+            .map(|catalog| catalog.revision.as_str())
+            .unwrap_or("none");
+        let known = spec.split_once('/').is_some_and(|(endpoint, model)| {
+            applied.as_ref().is_some_and(|catalog| {
+                catalog.endpoints.iter().any(|entry| {
+                    entry.name == endpoint
+                        && entry.models.iter().any(|candidate| candidate.id == model)
+                })
+            })
+        });
+        if known {
+            return Ok(());
+        }
+        Err(RemoteError::bad_params(format!(
+            "model '{spec}' is not in this node's model catalog (revision {revision}); \
+             the hub must push its catalog first"
+        )))
     }
 
     /// `session.spawn`: validate the checkout, spawn on the engine, remember
@@ -602,6 +721,12 @@ impl NodeState {
             None => None,
         };
         let engine = self.wait_engine().await?;
+        // The catalog check runs against the catalog the node has applied, so
+        // it comes after the wait: a spawn that races the first catalog push
+        // must not be refused for a model the hub is about to announce.
+        if let Some(model) = spawn.options.model.as_deref() {
+            self.require_model(model)?;
+        }
         let name = spawn
             .options
             .name
@@ -667,6 +792,7 @@ impl NodeState {
             .and_then(Value::as_str)
             .ok_or_else(|| RemoteError::bad_params("session.set_model carries no model"))?
             .to_string();
+        self.require_model(&model)?;
         let effort = params
             .get("reasoning_effort")
             .and_then(Value::as_str)
@@ -798,7 +924,7 @@ fn session_id(params: &Value) -> Result<SessionId, RemoteError> {
 ///
 /// The name must be a single path component (no separators, no `..`) and the
 /// directory must already exist — the hub never names an absolute path.
-fn checkout_path(home: &Path, name: &str) -> Result<PathBuf, RemoteError> {
+pub fn checkout_path(home: &Path, name: &str) -> Result<PathBuf, RemoteError> {
     let mut components = Path::new(name).components();
     let single = matches!(components.next(), Some(Component::Normal(_)))
         && components.next().is_none();
@@ -814,6 +940,24 @@ fn checkout_path(home: &Path, name: &str) -> Result<PathBuf, RemoteError> {
         )));
     }
     Ok(path)
+}
+
+/// The node's git, as the first line of `git --version` (empty when git is
+/// missing, so `node.status` never fails over it).
+async fn git_version(home: &Path) -> String {
+    let root = home.to_path_buf();
+    let version = tokio::task::spawn_blocking(move || {
+        crate::project::git_ops::git_raw(&root, &["--version"])
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+    version
+        .as_deref()
+        .and_then(|text| text.lines().next())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One entry of the node's event ring.
@@ -1305,6 +1449,8 @@ mod tests {
             workspace,
             outage_budget: budget,
             index_codegraph: false,
+            slots: crate::remote::repo::DEFAULT_NODE_SLOTS,
+            extension: None,
         };
         let (stop, mut rx) = watch::channel(false);
         let task = tokio::spawn(async move {
@@ -1839,6 +1985,8 @@ mod tests {
             workspace,
             outage_budget: Duration::from_secs(20),
             index_codegraph: false,
+            slots: crate::remote::repo::DEFAULT_NODE_SLOTS,
+            extension: None,
         };
         let task = tokio::spawn(async move {
             run(cfg, async move {
@@ -1991,6 +2139,8 @@ mod tests {
             workspace,
             outage_budget: Duration::from_secs(30),
             index_codegraph: false,
+            slots: crate::remote::repo::DEFAULT_NODE_SLOTS,
+            extension: None,
         };
         let task = tokio::spawn(async move {
             run(cfg, async move {
@@ -2087,6 +2237,8 @@ mod tests {
             workspace,
             outage_budget: Duration::from_secs(2),
             index_codegraph: false,
+            slots: crate::remote::repo::DEFAULT_NODE_SLOTS,
+            extension: None,
         };
         let task = tokio::spawn(async move {
             run(cfg, async move {
@@ -2183,6 +2335,8 @@ mod tests {
             workspace,
             outage_budget: Duration::from_secs(2),
             index_codegraph: false,
+            slots: crate::remote::repo::DEFAULT_NODE_SLOTS,
+            extension: None,
         };
         let (never, mut rx) = watch::channel(false);
         let result = tokio::time::timeout(
@@ -2481,6 +2635,8 @@ mod tests {
             workspace,
             outage_budget: Duration::from_secs(20),
             index_codegraph: false,
+            slots: crate::remote::repo::DEFAULT_NODE_SLOTS,
+            extension: None,
         };
         let task = tokio::spawn(async move {
             run(cfg, async move {
@@ -2500,5 +2656,84 @@ mod tests {
             attempts >= 2,
             "the node should still retry; saw {attempts} dials in 2 s"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_refuses_a_model_missing_from_the_catalog() {
+        let hub = TestHub::start("spawn-unknown-model").await;
+        let node = paired_node(&hub.server, "spawn-unknown-model", Duration::from_secs(20)).await;
+        assert!(hub
+            .server
+            .wait_connected(&node.node_id, Duration::from_secs(15))
+            .await);
+        let handle = hub.server.node(&node.node_id);
+
+        // `hub/other` is not in the catalog the node mirrored: the spawn must
+        // be refused, never silently run on the default model.
+        let error = handle
+            .spawn_session(spawn_options("hub/other"))
+            .await
+            .expect_err("an unknown model must be refused");
+        assert_eq!(error.code, crate::remote::CODE_BAD_PARAMS);
+        assert!(
+            error.message.contains("hub/other") && error.message.contains("model catalog"),
+            "the refusal should name the model and the catalog: {}",
+            error.message
+        );
+
+        // The endpoint is known but the model id is not.
+        let error = handle
+            .spawn_session(spawn_options("hub/nope"))
+            .await
+            .expect_err("an unknown model id must be refused");
+        assert_eq!(error.code, crate::remote::CODE_BAD_PARAMS);
+
+        // An endpoint the catalog never heard of.
+        let error = handle
+            .spawn_session(spawn_options("elsewhere/m"))
+            .await
+            .expect_err("an unknown endpoint must be refused");
+        assert_eq!(error.code, crate::remote::CODE_BAD_PARAMS);
+
+        // The known model still spawns, so the refusal is not a blanket one.
+        let session = handle
+            .spawn_session(spawn_options("hub/m"))
+            .await
+            .expect("the catalog's own model spawns");
+        handle.close_and_wait(session).await.expect("close");
+        node.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_model_refuses_a_model_missing_from_the_catalog() {
+        let hub = TestHub::start("set-model-unknown").await;
+        let node = paired_node(&hub.server, "set-model-unknown", Duration::from_secs(20)).await;
+        assert!(hub
+            .server
+            .wait_connected(&node.node_id, Duration::from_secs(15))
+            .await);
+        let handle = hub.server.node(&node.node_id);
+        let session = handle
+            .spawn_session(spawn_options("hub/m"))
+            .await
+            .expect("spawn");
+
+        let error = handle
+            .set_model(session, "hub/other", None)
+            .await
+            .expect_err("an unknown model must be refused");
+        assert_eq!(error.code, crate::remote::CODE_BAD_PARAMS);
+        assert!(
+            error.message.contains("hub/other"),
+            "the refusal should name the model: {}",
+            error.message
+        );
+
+        handle
+            .set_model(session, "hub/m", None)
+            .await
+            .expect("the catalog's own model is accepted");
+        handle.close_and_wait(session).await.expect("close");
+        node.stop().await;
     }
 }

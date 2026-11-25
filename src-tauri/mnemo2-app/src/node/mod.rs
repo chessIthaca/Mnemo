@@ -33,13 +33,17 @@ use mnemo::remote::HUB_OUTAGE_BUDGET;
 
 /// The usage text printed on a usage error and on `--help`.
 const USAGE: &str = "usage: mnemo2-node pair --hub <host:port> --code <CODE> [--name <name>] [--config-dir <dir>]\n       \
-    mnemo2-node run --workspace <dir> [--config-dir <dir>]\n       \
+    mnemo2-node run --workspace <dir> [--slots <n>] [--config-dir <dir>]\n       \
     mnemo2-node status [--config-dir <dir>]\n       \
     mnemo2-node unpair [--config-dir <dir>]\n\
     \n\
+    --slots <n> keeps n pool checkouts warm per project (1..=8, default 2)\n\
     exit codes: 0 ok, 2 usage, 3 not paired, 4 refused by the hub\n\
     (unknown_node, bad_proof, bad_code, expired), 5 protocol mismatch, 1 other\n\
     unpair exits 0 when the node is not paired (nothing to do)";
+
+/// The most pool checkouts a node may be asked to keep warm.
+const MAX_SLOTS: usize = 8;
 
 /// Exit code: a usage error.
 const EXIT_USAGE: u8 = 2;
@@ -66,6 +70,7 @@ enum Command {
     },
     Run {
         workspace: PathBuf,
+        slots: usize,
         config_dir: Option<PathBuf>,
     },
     Status {
@@ -120,6 +125,7 @@ fn execute(command: Command) -> u8 {
         }
         Command::Run {
             workspace,
+            slots,
             config_dir,
         } => {
             let home = node_home(config_dir);
@@ -127,7 +133,7 @@ fn execute(command: Command) -> u8 {
                 return EXIT_FAILURE;
             };
             let log = logfile::start(&home);
-            let code = runtime.block_on(run(&home, &workspace));
+            let code = runtime.block_on(run(&home, &workspace, slots));
             runtime.shutdown_timeout(RUNTIME_WIND_DOWN);
             if let Some(log) = log {
                 log.finish();
@@ -196,7 +202,7 @@ async fn pair(home: &Path, hub: &str, code: &str, name: &str) -> u8 {
 }
 
 /// `run`: serve the hub until Ctrl-C (or SIGTERM on Unix).
-async fn run(home: &Path, workspace: &Path) -> u8 {
+async fn run(home: &Path, workspace: &Path, slots: usize) -> u8 {
     let identity = match NodeIdentity::load(home) {
         Ok(Some(identity)) => identity,
         Ok(None) => {
@@ -233,6 +239,10 @@ async fn run(home: &Path, workspace: &Path) -> u8 {
         // The node's engine keeps no code-graph index: a session works in a
         // checkout and reads it with the file tools.
         index_codegraph: false,
+        slots,
+        // The binary serves the session surface and the repo host; nothing
+        // extends it yet (step 6 plugs the proof runs in here).
+        extension: None,
     };
     match node::run(cfg, shutdown_signal()).await {
         Ok(()) => {
@@ -339,9 +349,21 @@ fn parse(args: &[String]) -> Result<Command, String> {
             })
         }
         "run" => {
-            let mut flags = Flags::parse(rest, &["workspace", "config-dir"])?;
+            let mut flags = Flags::parse(rest, &["workspace", "config-dir", "slots"])?;
+            let slots = match flags.take("slots") {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(slots) if (1..=MAX_SLOTS).contains(&slots) => slots,
+                    _ => {
+                        return Err(format!(
+                            "--slots must be a number from 1 to {MAX_SLOTS}, got {value}"
+                        ))
+                    }
+                },
+                None => mnemo::remote::repo::DEFAULT_NODE_SLOTS,
+            };
             Ok(Command::Run {
                 workspace: PathBuf::from(flags.require("workspace")?),
+                slots,
                 config_dir: flags.take("config-dir").map(PathBuf::from),
             })
         }
@@ -451,6 +473,7 @@ mod tests {
             parse(&args(&["run", "--workspace", "repo"])).expect("run"),
             Command::Run {
                 workspace: PathBuf::from("repo"),
+                slots: mnemo::remote::repo::DEFAULT_NODE_SLOTS,
                 config_dir: None,
             }
         );
@@ -465,6 +488,38 @@ mod tests {
             }
         );
         assert_eq!(parse(&args(&["--help"])).expect("help"), Command::Help);
+    }
+
+    #[test]
+    fn run_accepts_slots() {
+        assert_eq!(
+            parse(&args(&["run", "--workspace", "repo", "--slots", "4"])).expect("slots"),
+            Command::Run {
+                workspace: PathBuf::from("repo"),
+                slots: 4,
+                config_dir: None,
+            }
+        );
+        assert_eq!(
+            parse(&args(&[
+                "run",
+                "--slots=1",
+                "--workspace",
+                "repo",
+                "--config-dir",
+                "cfg"
+            ]))
+            .expect("slots with every flag"),
+            Command::Run {
+                workspace: PathBuf::from("repo"),
+                slots: 1,
+                config_dir: Some(PathBuf::from("cfg")),
+            }
+        );
+        for bad in ["0", "9", "many", "-1"] {
+            let line = args(&["run", "--workspace", "repo", "--slots", bad]);
+            assert!(parse(&line).is_err(), "--slots {bad} should be a usage error");
+        }
     }
 
     #[test]

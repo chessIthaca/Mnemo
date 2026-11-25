@@ -1355,7 +1355,12 @@ pub async fn workbench_diff(
     worker_id: String,
 ) -> Result<DiffSnapshot, String> {
     let runtime = current(&state).await?;
-    let worker = current_team(&state).await?.worker(&worker_id).await?;
+    let team = current_team(&state).await?;
+    // A remote worker's commits reach its hub shadow checkout only when the
+    // hub pulls them: sync first so the tab shows the node's current work.
+    // An offline node leaves the last synced tip readable instead of failing.
+    let _ = team.sync_remote(&worker_id).await;
+    let worker = team.worker(&worker_id).await?;
     workbench::worker_diff(runtime.workspace_root(), &worker).await
 }
 

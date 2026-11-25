@@ -755,6 +755,32 @@ fn client_builds_request_with_tools() {
 }
 
 #[test]
+fn client_builds_request_with_function_tool_choice() {
+    // The node relays a turn's `ToolChoice::Function` over the link in the
+    // struct form; the OpenAI request must emit exactly the wire JSON the
+    // provider expects (plan a040713f, step 4 decision d).
+    let client = OpenAiClient::new(OpenAiClientConfig::test_default());
+    let tools = vec![ToolSchema::new(
+        "file_read",
+        "read a file",
+        serde_json::json!({"type": "object"}),
+    )];
+    let body = client
+        .build_request_json(
+            &[Message::user_text("hi")],
+            &tools,
+            Some(ToolChoice::Function {
+                name: "file_read".to_string(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        body["tool_choice"],
+        serde_json::json!({"type": "function", "function": {"name": "file_read"}})
+    );
+}
+
+#[test]
 fn local_client_omits_tool_choice() {
     let client = OpenAiClient::new(OpenAiClientConfig {
         kind: ProviderKind::Local,

@@ -72,6 +72,10 @@ pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 /// Upper bound of one WebSocket frame (the WebSocket `max_frame_size`).
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// Inbound requests a link runs concurrently. A peer that exceeds the cap gets
+/// an `err` with code `busy` instead of a handler task.
+pub const MAX_INFLIGHT: usize = 256;
+
 // The stable error codes of an RPC failure (the handshake additionally reports
 // the hub's refusal reason verbatim, see [`RemoteError::refused`]).
 /// The link closed (peer gone, MAC/sequence violation, or local shutdown)
@@ -95,6 +99,15 @@ pub const CODE_MEMORY: &str = "memory";
 pub const CODE_MODEL_NOT_CONFIGURED: &str = "model_not_configured";
 /// The requester cancelled the call.
 pub const CODE_CANCELLED: &str = "cancelled";
+/// The peer already has the cap of inbound requests in flight ([`MAX_INFLIGHT`]);
+/// retry once one finishes.
+pub const CODE_BUSY: &str = "busy";
+/// A stream's item buffer overflowed; that stream (only) was ended with this
+/// code and cancelled on the peer. The link itself stays up.
+pub const CODE_OVERFLOW: &str = "overflow";
+/// The peer violated the stream protocol (an item sequence gap); that stream
+/// (only) was ended with this code.
+pub const CODE_PROTOCOL: &str = "protocol";
 /// Anything else (serialization, internal invariant, protocol violation).
 pub const CODE_INTERNAL: &str = "internal";
 
@@ -104,6 +117,10 @@ pub const CODE_INTERNAL: &str = "internal";
 /// The wire form is `{"code","message","engine"?}`; `engine` carries the
 /// node's own [`EngineError`] when the failure came from the headless engine,
 /// so the hub can match on the engine code the same way it does locally.
+///
+/// The stable codes are `link_down`, `timeout`, `unknown_method`, `bad_params`,
+/// `unknown_call`, `engine`, `provider`, `memory`, `model_not_configured`,
+/// `cancelled`, `busy`, `overflow`, `protocol` and `internal`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteError {
     /// The stable machine code (one of the `CODE_*` constants, or the hub's
@@ -154,6 +171,24 @@ impl RemoteError {
     /// The requester cancelled the call.
     pub fn cancelled() -> Self {
         Self::new(CODE_CANCELLED, "the call was cancelled")
+    }
+
+    /// The peer has too many inbound requests in flight.
+    pub fn busy() -> Self {
+        Self::new(
+            CODE_BUSY,
+            format!("more than {MAX_INFLIGHT} inbound requests are in flight"),
+        )
+    }
+
+    /// A stream's item buffer overflowed; only that stream ended.
+    pub fn overflow(message: impl Into<String>) -> Self {
+        Self::new(CODE_OVERFLOW, message)
+    }
+
+    /// The peer violated the stream protocol; only that stream ended.
+    pub fn protocol(message: impl Into<String>) -> Self {
+        Self::new(CODE_PROTOCOL, message)
     }
 
     /// An engine failure on the node.

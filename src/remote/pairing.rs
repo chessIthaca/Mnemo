@@ -456,6 +456,23 @@ pub async fn pair_with<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    super::link::within_handshake(
+        pair_within(stream, hub, code, name),
+        super::link::HANDSHAKE_TIMEOUT,
+    )
+    .await
+}
+
+/// The upgrade and the `pair`/`paired` exchange, without the outer budget.
+async fn pair_within<S>(
+    stream: S,
+    hub: &str,
+    code: &str,
+    name: &str,
+) -> Result<NodeIdentity, RemoteError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let url = format!("ws://{hub}{}", super::PATH);
     let (mut ws, _response) =
         async_tungstenite::tokio::client_async_with_config(url, stream, Some(super::link::ws_config()))
@@ -508,6 +525,23 @@ where
 /// the code was refused (the refusal was sent); an `Err` means the transport
 /// failed.
 pub async fn serve_pairing<S>(
+    stream: S,
+    pairing: &PairingRegistry,
+    nodes: &NodeRegistry,
+    hub_id: &str,
+) -> Result<Option<NodeRecord>, RemoteError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    super::link::within_handshake(
+        serve_pairing_within(stream, pairing, nodes, hub_id),
+        super::link::HANDSHAKE_TIMEOUT,
+    )
+    .await
+}
+
+/// The upgrade and the `pair`/`paired` exchange, without the outer budget.
+async fn serve_pairing_within<S>(
     stream: S,
     pairing: &PairingRegistry,
     nodes: &NodeRegistry,

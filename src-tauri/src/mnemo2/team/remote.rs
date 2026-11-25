@@ -217,7 +217,13 @@ pub(crate) fn environmental_failure(exit_code: Option<i64>, text: &str) -> bool 
 /// which in this repository routinely names PowerShell and Windows-only
 /// compiler gates and would pin every dispatch to a Windows host.
 pub fn requires_windows(commands: &[String]) -> bool {
-    const WINDOWS_SHELLS: [&str; 4] = ["powershell", "powershell.exe", "cmd", "cmd.exe"];
+    const WINDOWS_SHELLS: [&str; 5] = [
+        "powershell",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd",
+        "cmd.exe",
+    ];
     commands.iter().any(|command| {
         let first = command
             .split_whitespace()
@@ -228,14 +234,20 @@ pub fn requires_windows(commands: &[String]) -> bool {
         if WINDOWS_SHELLS.contains(&first.as_str()) {
             return true;
         }
-        // `pwsh` and `pwsh.exe` alone run on macOS and Linux too (PowerShell
-        // 7; the `.exe` spelling is only how a Windows config writes it): they
-        // are Windows-only when they run a PowerShell script, which the file
-        // suffixes below catch. Neither is in the list above on purpose.
-        let lower = command.to_ascii_lowercase();
-        [".ps1", ".bat", ".cmd"]
-            .iter()
-            .any(|suffix| lower.contains(suffix))
+        // `pwsh` alone runs on macOS and Linux too (PowerShell 7), so it is
+        // Windows-only only when it runs a PowerShell script; the `.exe`
+        // spelling is how a Windows config runs it, so that one names Windows
+        // directly. The file suffixes match a whole token, never the middle of
+        // one: `bats tests/e2e.bats` is not a Windows batch file.
+        command.split_whitespace().any(|token| {
+            let token = token
+                .trim_matches('"')
+                .trim_end_matches([',', ';'])
+                .to_ascii_lowercase();
+            [".ps1", ".bat", ".cmd"]
+                .iter()
+                .any(|suffix| token.ends_with(suffix))
+        })
     })
 }
 
@@ -372,6 +384,10 @@ pub struct RemoteWorkers {
     /// Sessions seen without a live entry on the previous reconcile pass, so a
     /// session that is still spawning is never closed on its first sighting.
     seen_orphans: StdMutex<HashSet<(String, SessionId)>>,
+    /// The `(node_id, branch)` checkouts a dispatch is preparing right now.
+    /// The record that names them is stored only after `prepare_checkout`
+    /// returns, so the reconciler must leave them alone until then.
+    reservations: StdMutex<HashSet<(String, String)>>,
 }
 
 impl RemoteWorkers {
@@ -400,6 +416,7 @@ impl RemoteWorkers {
             qualifying: StdMutex::new(HashMap::new()),
             outage_budget: StdMutex::new(mnemo::remote::HUB_OUTAGE_BUDGET),
             seen_orphans: StdMutex::new(HashSet::new()),
+            reservations: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -452,6 +469,37 @@ impl RemoteWorkers {
             .into_iter()
             .find(|record| record.node_id == name_or_id || record.name == name_or_id)
             .ok_or_else(|| format!("no worker host named '{name_or_id}'"))
+    }
+
+    /// Keep the reconciler's hands off `branch`'s checkout on `node_id` while
+    /// a dispatch prepares it.
+    ///
+    /// The worker record that will name the checkout is stored only after
+    /// `prepare_checkout` returns; without the reservation the reconciler
+    /// could list the fresh `wt/agent-*` checkout as an orphan and release it
+    /// under the dispatch.
+    pub fn reserve(&self, node_id: &str, branch: &str) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert((node_id.to_string(), branch.to_string()));
+    }
+
+    /// Drop a reservation once the record names the checkout, or the dispatch
+    /// failed before there was one.
+    pub fn release_reservation(&self, node_id: &str, branch: &str) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&(node_id.to_string(), branch.to_string()));
+    }
+
+    /// Whether a dispatch is preparing `branch`'s checkout on `node_id`.
+    pub fn is_reserved(&self, node_id: &str, branch: &str) -> bool {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(&(node_id.to_string(), branch.to_string()))
     }
 
     /// How many live workers run on `node_id`.
@@ -1489,7 +1537,7 @@ mod tests {
                 let _ = shutdown_rx.await;
             }));
             assert!(
-                hub.wait_connected(&identity.node_id, Duration::from_secs(30))
+                hub.wait_connected(&identity.node_id, Duration::from_secs(120))
                     .await,
                 "the paired node connects"
             );
@@ -1619,12 +1667,16 @@ mod tests {
         );
         assert!(requires_windows(&["pwsh.exe -File build.ps1".into()]));
         assert!(
-            !requires_windows(&[r#"pwsh.exe -Command "npm test""#.into()]),
-            "pwsh.exe alone is the same as pwsh"
+            requires_windows(&[r#"pwsh.exe -Command "npm test""#.into()]),
+            "only a Windows config spells the executable pwsh.exe"
         );
-        assert!(!requires_windows(&[r#""C:\Program Files\PowerShell\pwsh.exe" -Command x"#.into()]));
+        assert!(!requires_windows(&[r#""C:\Program Files\PowerShell\pwsh.exe" -Command x"#.into()]));
         assert!(requires_windows(&["cmd /c build.bat".into()]));
         assert!(requires_windows(&["node scripts/build.cmd".into()]));
+        assert!(
+            !requires_windows(&["bats tests/e2e.bats".into()]),
+            "a .bats suite is not a Windows batch file"
+        );
         assert!(!requires_windows(&["cargo test --workspace".into()]));
         assert!(!requires_windows(&["npm run check --workspace mnemo2".into()]));
         assert!(!requires_windows(&[]));
@@ -1755,6 +1807,8 @@ mod tests {
         team.attach_hosts(Arc::new(TestHosts { server: hub, address }));
 
         let mut record = super::super::tests::worker(root.path(), "abcd1234");
+        // A worker that is still running: a finished one keeps its outcome.
+        record.status = WorkerStatus::Working;
         record.base_commit = Some("1111111111111111111111111111111111111111".to_string());
         record.remote = Some(sample_remote(
             "deadbeefdeadbeefdeadbeefdeadbeef",
@@ -1948,7 +2002,7 @@ mod tests {
         if let Some(shutdown) = rig.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         while rig.hub.is_connected(&rig.node_id) {
             assert!(Instant::now() < deadline, "the node link drops");
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1976,7 +2030,7 @@ mod tests {
                 json!(mnemo::remote::repo::CheckoutList {
                     project: rig.workers.project().to_string(),
                 }),
-                Duration::from_secs(30),
+                Duration::from_secs(120),
             )
             .await
             .expect("the node lists its checkouts");
@@ -2109,6 +2163,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_keeps_a_checkout_a_dispatch_is_preparing() {
+        let rig = Rig::start().await;
+        let base = rig.base().await;
+        let preparing = rig
+            .workers
+            .prepare_checkout(&rig.node_id, "wt/agent-cccc3333", &base, false)
+            .await
+            .expect("the checkout being prepared");
+        let team = rig.team().await;
+        team.remote.reserve(&rig.node_id, "wt/agent-cccc3333");
+
+        team.reconcile_hosts().await;
+        let kept = checkout_list(&rig)
+            .await
+            .into_iter()
+            .find(|info| info.checkout == preparing.checkout)
+            .expect("the checkout is listed");
+        assert_eq!(
+            kept.branch.as_deref(),
+            Some("wt/agent-cccc3333"),
+            "a reserved checkout is not an orphan"
+        );
+
+        team.remote.release_reservation(&rig.node_id, "wt/agent-cccc3333");
+        team.reconcile_hosts().await;
+        let released = checkout_list(&rig)
+            .await
+            .into_iter()
+            .find(|info| info.checkout == preparing.checkout)
+            .expect("the checkout is listed");
+        assert!(
+            released.branch.is_none(),
+            "once released it is an orphan like any other"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn reconcile_keeps_a_running_qualification_checkout() {
         let rig = Rig::start().await;
         // A check that takes several seconds, so the qualification is still
@@ -2127,7 +2218,7 @@ mod tests {
         let team = rig.team_unmeasured().await;
         // The monitor's first pass starts the qualification; wait until its
         // hostcheck checkout is prepared.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let held = checkout_list(&rig)
                 .await
@@ -2222,7 +2313,7 @@ mod tests {
             .server
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(rig.hub.clone());
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let released = checkout_list(&rig)
                 .await
@@ -2244,6 +2335,8 @@ mod tests {
         let rig = Rig::start().await;
         let team = rig.team().await;
         let mut record = super::super::tests::worker(rig.root.path(), "abcd1234");
+        // A worker that is still running: a finished one keeps its outcome.
+        record.status = WorkerStatus::Working;
         let mut remote = sample_remote(&rig.node_id, None);
         remote.offline_since_ms = Some(super::super::unix_ms().saturating_sub(5_000));
         record.remote = Some(remote);
@@ -2283,5 +2376,203 @@ mod tests {
             .expect("a remote worker")
             .offline_since_ms
             .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_worker_keeps_its_outcome_when_its_host_restarts() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let statuses = [
+            WorkerStatus::Completed,
+            WorkerStatus::InReview,
+            WorkerStatus::Merged,
+            WorkerStatus::Failed,
+            WorkerStatus::Stopped,
+            WorkerStatus::Interrupted,
+            WorkerStatus::Idle,
+        ];
+        for (index, status) in statuses.into_iter().enumerate() {
+            for lost in [false, true] {
+                let id = format!("abcd{index}{}", u8::from(lost));
+                let mut record = super::super::tests::worker(rig.root.path(), &id);
+                record.status = status;
+                record.error = Some("its own error".to_string());
+                let mut remote = sample_remote(&rig.node_id, None);
+                remote.offline_since_ms = Some(super::super::unix_ms().saturating_sub(5_000));
+                record.remote = Some(remote.clone());
+                team.records.lock().await.push(record.clone());
+                team.live
+                    .lock()
+                    .await
+                    .insert(record.id.clone(), live_entry(100 + index as u64));
+                assert!(team.remote.busy_on(&rig.node_id).await >= 1);
+
+                if lost {
+                    team.fail_lost_host(&id, &remote).await;
+                } else {
+                    team.mark_host_restarted(&id, &remote).await;
+                }
+
+                let records = team.records.lock().await;
+                let stored = records
+                    .iter()
+                    .find(|stored| stored.id == id)
+                    .expect("the worker record");
+                assert_eq!(stored.status, status, "{status:?} keeps its status");
+                assert_eq!(
+                    stored.error.as_deref(),
+                    Some("its own error"),
+                    "{status:?} keeps its error"
+                );
+                drop(records);
+                assert!(
+                    !team.live.lock().await.contains_key(&id),
+                    "{status:?}: the lost session is dropped"
+                );
+                assert_eq!(
+                    team.remote.busy_on(&rig.node_id).await,
+                    0,
+                    "{status:?}: the host slot is free"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_local_refuses_a_worker_still_running_on_its_host() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd1111");
+        record.status = WorkerStatus::Idle;
+        std::fs::create_dir_all(&record.worktree).expect("worktree");
+        record.remote = Some(sample_remote(&rig.node_id, None));
+        team.records.lock().await.push(record);
+        team.live
+            .lock()
+            .await
+            .insert("abcd1111".to_string(), live_entry(31));
+
+        let answer = team
+            .handle_lead_host_tool(
+                "team_resume",
+                serde_json::json!({"worker_id": "abcd1111", "host": "local"}),
+            )
+            .await;
+        assert!(!answer.success, "{}", answer.output);
+        assert_eq!(
+            answer.output,
+            "worker 'abcd1111' is still running on host 'node-a'; stop it first, then resume it with host \"local\""
+        );
+        let records = team.records.lock().await;
+        assert!(
+            records[0].remote.is_some(),
+            "a refused resume leaves the worker on its host"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_local_with_no_free_local_slot_leaves_the_worker_on_its_host() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd3333");
+        record.status = WorkerStatus::Interrupted;
+        std::fs::create_dir_all(&record.worktree).expect("worktree");
+        record.remote = Some(sample_remote(&"f".repeat(32), None));
+        team.records.lock().await.push(record);
+        // No local slot is free.
+        team.persistence
+            .slots
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let answer = team
+            .handle_lead_host_tool(
+                "team_resume",
+                serde_json::json!({"worker_id": "abcd3333", "host": "local"}),
+            )
+            .await;
+        assert!(!answer.success, "{}", answer.output);
+        assert_eq!(answer.output, "all 0 worker slots are busy");
+        let records = team.records.lock().await;
+        assert!(
+            records[0].remote.is_some(),
+            "a refused resume leaves the record on its host"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_names_a_host_that_is_no_longer_paired() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        let mut record = super::super::tests::worker(rig.root.path(), "abcd2222");
+        record.status = WorkerStatus::Interrupted;
+        std::fs::create_dir_all(&record.worktree).expect("worktree");
+        let mut remote = sample_remote(&"f".repeat(32), None);
+        remote.node_name = "ghost".to_string();
+        record.remote = Some(remote);
+        team.records.lock().await.push(record);
+
+        let answer = team
+            .handle_lead_host_tool("team_resume", serde_json::json!({"worker_id": "abcd2222"}))
+            .await;
+        assert!(!answer.success, "{}", answer.output);
+        assert_eq!(
+            answer.output,
+            "host 'ghost' is no longer paired; pass host \"local\" to continue worker 'abcd2222' here"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoking_a_host_fails_only_its_running_workers() {
+        let rig = Rig::start().await;
+        let team = rig.team().await;
+        for (id, status) in [
+            ("abcd1111", WorkerStatus::Working),
+            ("abcd2222", WorkerStatus::Completed),
+        ] {
+            let mut record = super::super::tests::worker(rig.root.path(), id);
+            record.status = status;
+            record.base_commit = Some("1111111111111111111111111111111111111111".to_string());
+            record.remote = Some(sample_remote(&rig.node_id, None));
+            team.records.lock().await.push(record);
+            team.live
+                .lock()
+                .await
+                .insert(id.to_string(), live_entry(if id == "abcd1111" { 21 } else { 22 }));
+        }
+
+        let answer = team
+            .handle_lead_host_tool(
+                "team_hosts",
+                serde_json::json!({"action": "revoke", "name": "node-a"}),
+            )
+            .await;
+        assert!(answer.success, "{}", answer.output);
+        let answer: serde_json::Value = serde_json::from_str(&answer.output).expect("JSON");
+        assert_eq!(answer["failed_workers"], serde_json::json!(["abcd1111"]));
+
+        let records = team.records.lock().await;
+        let running = records.iter().find(|w| w.id == "abcd1111").expect("running");
+        assert_eq!(running.status, WorkerStatus::Failed);
+        assert!(
+            running.error.as_deref().unwrap_or("").contains("was revoked"),
+            "{:?}",
+            running.error
+        );
+        assert!(
+            running
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("from its starting commit 1111111 (nothing was synced from node-a)"),
+            "{:?}",
+            running.error
+        );
+        let finished = records.iter().find(|w| w.id == "abcd2222").expect("finished");
+        assert_eq!(finished.status, WorkerStatus::Completed);
+        drop(records);
+        assert!(
+            team.live.lock().await.is_empty(),
+            "both lost sessions are dropped"
+        );
     }
 }

@@ -2582,6 +2582,7 @@ async fn spawn_live_worker(team: &TeamRuntime, worker: &WorkerRecord) {
             trace_identity: TeamRuntime::worker_trace_identity(worker),
             pinned_task: None,
             check_commands: std::sync::Arc::new(Vec::new()),
+            remote: None,
         })
         .await
         .expect("spawn worker session");
@@ -2677,6 +2678,7 @@ async fn a_leftover_checkout_does_not_block_deleting_its_worker() {
                 trace_identity: TeamRuntime::worker_trace_identity(worker),
                 pinned_task: None,
                 check_commands: std::sync::Arc::new(Vec::new()),
+            remote: None,
             })
             .await
             .expect("open a worktree-bound session and its code graph");
@@ -3192,6 +3194,7 @@ async fn merge_closes_a_live_session_before_finishing_its_checkout() {
             trace_identity: TeamRuntime::worker_trace_identity(&worker),
             pinned_task: None,
             check_commands: std::sync::Arc::new(Vec::new()),
+            remote: None,
         })
         .await
         .expect("open a worktree-bound session and its code graph");
@@ -20310,6 +20313,7 @@ async fn an_adjudicated_audit_is_closed_and_frees_its_slot() {
             trace_identity: TeamRuntime::worker_trace_identity(&audit_record),
             pinned_task: None,
             check_commands: std::sync::Arc::new(Vec::new()),
+            remote: None,
         })
         .await
         .expect("open the audit session");
@@ -20500,6 +20504,7 @@ async fn local_worker_session_reports_closed_after_close() {
             trace_identity: TeamRuntime::worker_trace_identity(&worker),
             pinned_task: None,
             check_commands: Arc::new(Vec::new()),
+            remote: None,
         })
         .await
         .expect("spawn worker session");
@@ -20541,6 +20546,7 @@ async fn local_worker_session_is_open_until_closed() {
             trace_identity: TeamRuntime::worker_trace_identity(&worker),
             pinned_task: None,
             check_commands: Arc::new(Vec::new()),
+            remote: None,
         })
         .await
         .expect("spawn worker session");
@@ -20552,5 +20558,165 @@ async fn local_worker_session_is_open_until_closed() {
     // with an empty one.
     let snapshot = session.snapshot().await.expect("a closed snapshot answers");
     assert!(snapshot.transcript.messages.is_empty());
+    team.shutdown().await;
+}
+
+/// The three host-related lead tools keep their exact wording, and without a
+/// host directory (a window that runs no hub) `team_hosts` says so instead of
+/// failing obscurely (plan 9a2f4b67, step 5).
+#[tokio::test]
+async fn team_hosts_schema_and_texts() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+    let specs = team.lead_host_tools();
+
+    let hosts = specs
+        .iter()
+        .find(|spec| spec.name == "team_hosts")
+        .expect("team_hosts is exposed to the lead");
+    assert_eq!(
+        hosts.description,
+        "Manage worker hosts: other Windows or Mac computers that run Mnemo workers for this project. list: each paired host with its OS, connection, free slots and whether it passed the project's checks. pair: a one-time code (valid for 10 minutes) and the two commands to run on the new host. revoke: remove a host by name or id; its running workers fail and can be resumed. Mnemo places workers on hosts by itself; to choose one, pass host to team_dispatch."
+    );
+    assert_eq!(hosts.timeout_ms, Some(30_000));
+    assert_eq!(
+        hosts.safety,
+        SafetyLevel::NeedsApproval,
+        "pairing and revoking a host change who can run code for the project"
+    );
+    assert_eq!(
+        hosts.parameters,
+        json!({"type":"object","properties":{
+            "action":{"type":"string","enum":["list","pair","revoke"]},
+            "name":{"type":"string","description":"pair: the new host's name (default: its computer name). revoke: the host's name or id."}
+        },"required":["action"]})
+    );
+
+    let dispatch = specs
+        .iter()
+        .find(|spec| spec.name == "team_dispatch")
+        .expect("team_dispatch");
+    assert_eq!(
+        dispatch.parameters["properties"]["host"],
+        json!({"type":"string","description":"Optional. Where the worker runs: \"local\" for this computer, or the name of a paired host from team_hosts. Omit it to let Mnemo choose: a connected host with a free slot that passed the project's checks, otherwise this computer. Claude Code agent tiers always run on this computer."})
+    );
+    assert!(
+        !dispatch.parameters["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .any(|name| name == "host"),
+        "host is optional"
+    );
+    let resume = specs
+        .iter()
+        .find(|spec| spec.name == "team_resume")
+        .expect("team_resume");
+    assert_eq!(
+        resume.parameters["properties"]["host"],
+        json!({"type":"string","description":"Optional. \"local\" continues a worker from another host on this computer, from its last synced commit. Omit it to continue the worker where it ran."})
+    );
+
+    for args in [
+        json!({"action": "list"}),
+        json!({"action": "pair"}),
+        json!({"action": "revoke", "name": "node-a"}),
+    ] {
+        let result = team.handle_lead_host_tool("team_hosts", args).await;
+        assert!(!result.success, "{}", result.output);
+        assert_eq!(result.output, "worker hosts are not available in this window");
+    }
+    team.shutdown().await;
+}
+
+/// `team_status` names the host of every worker: "local" for a local one, the
+/// node's name for a remote one, and how long a remote worker's host has been
+/// away.
+#[tokio::test]
+async fn team_status_shows_host() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let local = reviewed_worker(root.path(), "00000001000000000001");
+    let mut remote = reviewed_worker(root.path(), "00000001000000000002");
+    remote.remote = Some(super::record::RemoteCheckout {
+        node_id: "a".repeat(32),
+        node_name: "mac-mini".to_string(),
+        os: "macos".to_string(),
+        project: "0123456789ab".to_string(),
+        checkout: "pool-1".to_string(),
+        path: "/Users/mini/mnemo/checkouts/pool-1".to_string(),
+        synced_tip: None,
+        offline_since_ms: None,
+    });
+    let team = open_test_team(root.path(), state.path(), vec![local, remote]).await;
+
+    let answer = team_status_answer(&team, json!({})).await;
+    let entries = answer["result"].as_array().expect("a worker array");
+    let by_id = |id: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap_or_else(|| panic!("{id} listed: {answer}"))
+    };
+    assert_eq!(by_id("00000001000000000001")["host"], "local");
+    assert!(by_id("00000001000000000001").get("host_offline_s").is_none());
+    assert_eq!(by_id("00000001000000000002")["host"], "mac-mini");
+    assert!(
+        by_id("00000001000000000002").get("host_offline_s").is_none(),
+        "a connected host has no offline age"
+    );
+
+    team.update_worker("00000001000000000002", |worker| {
+        if let Some(remote) = worker.remote.as_mut() {
+            remote.offline_since_ms = Some(phase3::now_ms() as u64 - 30_000);
+        }
+    })
+    .await;
+    let answer = team_status_answer(&team, json!({})).await;
+    let entry = answer["result"]
+        .as_array()
+        .expect("a worker array")
+        .iter()
+        .find(|entry| entry["id"] == "00000001000000000002")
+        .expect("the remote worker");
+    assert_eq!(entry["host"], "mac-mini");
+    let offline = entry["host_offline_s"].as_u64().expect("an offline age");
+    assert!((30..40).contains(&offline), "{entry}");
+    team.shutdown().await;
+}
+
+/// Everything the hub itself injects into a worker's prompt names no operating
+/// system or shell: the worker's own host supplies those (a remote worker runs
+/// on whatever OS its node has), so the text is the same on every host.
+#[tokio::test]
+async fn hub_injected_worker_text_names_no_os() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let team = open_test_team(root.path(), state.path(), Vec::new()).await;
+
+    let mut texts = vec![
+        ("KICKOFF".to_string(), super::record::KICKOFF.to_string()),
+        (
+            "READ_BACK_KICKOFF".to_string(),
+            super::record::READ_BACK_KICKOFF.to_string(),
+        ),
+        (
+            "executor prompt identity".to_string(),
+            super::guardrails::executor_prompt().identity,
+        ),
+    ];
+    for spec in team.worker_host_tools() {
+        texts.push((format!("{} description", spec.name), spec.description.clone()));
+        texts.push((format!("{} schema", spec.name), spec.parameters.to_string()));
+    }
+    for (label, text) in texts {
+        for word in ["PowerShell", "Windows", "bash"] {
+            assert!(!text.contains(word), "{label} names {word}: {text}");
+        }
+    }
     team.shutdown().await;
 }

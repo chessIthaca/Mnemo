@@ -76,6 +76,10 @@ pub struct AppHub {
     services: Arc<AppHubServices>,
     /// The held `hub.lock` file; dropping the handle frees the claim.
     lock: StdMutex<Option<std::fs::File>>,
+    /// The address the listener binds: every interface in the app, loopback in
+    /// tests (a test executable binding all interfaces raises the OS firewall
+    /// prompt on every rebuild).
+    bind_ip: IpAddr,
 }
 
 impl AppHub {
@@ -88,6 +92,17 @@ impl AppHub {
             server: StdMutex::new(None),
             services: Arc::new(AppHubServices::new()),
             lock: StdMutex::new(None),
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        }
+    }
+
+    /// A hub whose listener binds loopback only, so a test never triggers a
+    /// firewall prompt.
+    #[cfg(test)]
+    fn new_loopback(config_dir: &Path) -> Self {
+        Self {
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..Self::new(config_dir)
         }
     }
 
@@ -233,7 +248,7 @@ impl AppHub {
                 // All interfaces: a node on the tailnet connects to this
                 // machine's LAN address. Windows may raise its firewall prompt
                 // for the first bind; the hub's state stays in `state_dir`.
-                bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+                bind: SocketAddr::new(self.bind_ip, port),
                 state_dir: self.state_dir.clone(),
             },
             self.services.clone(),
@@ -508,10 +523,29 @@ mod tests {
         )
     }
 
+    /// The test module never binds all interfaces: that raises the OS firewall
+    /// prompt for every rebuilt test executable.
+    #[test]
+    fn tests_never_bind_all_interfaces() {
+        let source = include_str!("remote_hub.rs");
+        // The marker and the needles are assembled so this test's own text
+        // contains none of them.
+        let marker = concat!("mod ", "tests {");
+        let (_, test_module) = source
+            .split_once(marker)
+            .expect("the test module is in this file");
+        for needle in [concat!("UNSPEC", "IFIED"), concat!("0.0.", "0.0")] {
+            assert!(
+                !test_module.contains(needle),
+                "tests must bind loopback, never every interface ({needle})"
+            );
+        }
+    }
+
     #[test]
     fn no_listener_before_pairing() {
         let config = config_dir();
-        let hub = Arc::new(AppHub::new(config.path()));
+        let hub = Arc::new(AppHub::new_loopback(config.path()));
         hub.start_if_paired()
             .expect("an unpaired profile starts nothing");
         assert!(
@@ -545,7 +579,7 @@ mod tests {
         let config = config_dir();
         // Hand the hub a free port as its persisted choice: it must bind that
         // exact port instead of drifting to an ephemeral one.
-        let probe = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("probe a free port");
+        let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe a free port");
         let port = probe.local_addr().expect("probe address").port();
         drop(probe);
         std::fs::create_dir_all(config.path().join("hub")).expect("hub dir");
@@ -555,7 +589,7 @@ mod tests {
         )
         .expect("persisted port");
 
-        let hub = Arc::new(AppHub::new(config.path()));
+        let hub = Arc::new(AppHub::new_loopback(config.path()));
         let offer = hub
             .pair(Some("node-a"))
             .await
@@ -588,10 +622,10 @@ mod tests {
     #[tokio::test]
     async fn second_instance_sees_the_hub_lock() {
         let config = config_dir();
-        let first = Arc::new(AppHub::new(config.path()));
+        let first = Arc::new(AppHub::new_loopback(config.path()));
         first.pair(None).await.expect("the first hub starts");
 
-        let second = Arc::new(AppHub::new(config.path()));
+        let second = Arc::new(AppHub::new_loopback(config.path()));
         let error = second
             .pair(Some("node-b"))
             .await
@@ -661,7 +695,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn unbinding_an_older_project_keeps_the_newer_binding() {
         let config = config_dir();
-        let hub = Arc::new(AppHub::new(config.path()));
+        let hub = Arc::new(AppHub::new_loopback(config.path()));
         let older_dir = config.path().join("older");
         let newer_dir = config.path().join("newer");
         let older = test_engine(&older_dir, "older-project").await;

@@ -172,6 +172,10 @@ pub(crate) struct BrainMemoryOptions {
     /// off: its `.coding/` is fed by the hub's bundles, and the hub already
     /// runs the watcher for the one shared index.
     pub watch_derived_index: bool,
+    /// Whether the factory writes typed knowledge records into each agent's
+    /// own root instead of the project-wide store (plan 9a2f4b67 step 2). The
+    /// remote node engine sets it; every other caller keeps `false`.
+    pub worktree_knowledge: bool,
 }
 
 /// Process-shared resources (G8, §5.9.8 :729-731) — Rust-only, injected
@@ -232,6 +236,7 @@ pub(crate) fn wire_brain(
         code_embedder,
         model_transport,
         watch_derived_index,
+        worktree_knowledge,
     } = memory;
     // The shared request/response trace log — created first so every provider
     // built below (default, dummy fallback, resolver) records into the same
@@ -1235,6 +1240,10 @@ pub(crate) fn wire_brain(
             crate::memory::knowledge::machine_knowledge_dir(&config_dir),
         ),
     )))
+    // Whether typed knowledge records land in each agent's own root (the
+    // remote node engine) instead of this project-wide store (plan 9a2f4b67
+    // step 2). Off for every other caller.
+    .with_worktree_knowledge(worktree_knowledge)
     // Wire the machine-wide heavy-command slots ([general.machine]): the limit
     // and the slot directory are read per command by shell / run_checks / jobs /
     // step_verify, so a Settings save lands on the next heavy command.

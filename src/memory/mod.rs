@@ -3194,7 +3194,7 @@ impl MemoryStoreTrait for MemoryStore {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = conn.lock().expect("conn lock poisoned");
             conn.execute(
-                "INSERT INTO savings_events \
+                "INSERT OR IGNORE INTO savings_events \
                  (id, session_id, kind, detail, tokens_before, tokens_after, tokens_saved, \
                   measured, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -3258,7 +3258,7 @@ impl MemoryStoreTrait for MemoryStore {
             let conn = conn.lock().expect("conn lock poisoned");
             let step_index = event.step_index.map(|s| s as i64);
             conn.execute(
-                "INSERT INTO spend_events \
+                "INSERT OR IGNORE INTO spend_events \
                  (id, session_id, turn_id, agent_id, plan_id, step_index, lane, model, \
                   reason, tokens_in, tokens_out, cached_tokens, detail, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",

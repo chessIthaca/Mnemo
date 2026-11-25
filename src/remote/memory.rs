@@ -21,8 +21,9 @@
 //! stays down past the outage budget reports the same "hub link down" string
 //! the model proxy uses.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -74,13 +75,32 @@ pub const MEM_TOP_RECALLED: &str = "mem.top_recalled";
 pub const MEM_CONFIG: &str = "mem.config";
 /// Hub store-version push note.
 pub const MEM_VERSION: &str = "mem.version";
+/// Mirror the node's spend/savings ledger rows to the hub, so plan spend and
+/// the budget reports see what ran on the node. Params
+/// `{"spend": [SpendEvent], "savings": [SavingsEvent]}` (at most
+/// [`MIRROR_BATCH`] rows per call), answer `{"spend": n, "savings": m}`.
+pub const MEM_MIRROR_ROWS: &str = "mem.mirror_rows";
 
-/// Error code: the hub has no live shared memory store.
-pub const CODE_MEMORY: &str = "memory";
+/// The most ledger rows one [`MEM_MIRROR_ROWS`] call carries.
+pub const MIRROR_BATCH: usize = 200;
+
+/// The most ledger rows the node holds while the link is down. Past this the
+/// oldest rows are dropped (with one log line per overflow episode) — the
+/// mirror never blocks a turn and never grows without bound.
+pub const MIRROR_QUEUE: usize = 10_000;
+
+/// How long one [`MEM_MIRROR_ROWS`] call may wait for the hub.
+const MIRROR_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The extra hits a hub recall asks for so dropping its machine-corpus rows
+/// cannot shorten a node's answer below the requested limit.
+const MACHINE_HEADROOM: usize = 32;
 
 /// How often an attached hub link checks its store version for a push.
 pub const VERSION_POLL: Duration = Duration::from_millis(500);
 
+/// Error code: the hub has no live shared memory store.
+pub const CODE_MEMORY: &str = "memory";
 /// The message a routed call reports when the link stays down past the
 /// outage budget.
 fn down_message(budget: Duration) -> String {
@@ -88,6 +108,144 @@ fn down_message(budget: Duration) -> String {
         "hub link down: no connection to the hub for {}s",
         budget.as_secs_f64()
     )
+}
+
+/// Whether `memory` was indexed from the MACHINE knowledge corpus
+/// (`<config dir>/knowledge/`, plan d3336a8a step 8). Those rows belong to
+/// the host that owns the corpus; a routed session never sees another host's.
+fn is_machine_row(memory: &Memory) -> bool {
+    memory.data.get("source").and_then(Value::as_str)
+        == Some(crate::memory::indexer::MACHINE_SOURCE)
+}
+
+/// One ledger row the node recorded and the hub has not accepted yet.
+enum MirrorRow {
+    /// A spend-ledger row.
+    Spend(SpendEvent),
+    /// A savings-ledger row.
+    Savings(SavingsEvent),
+}
+
+/// The spend/savings rows a node owes its hub, and the one task that ships
+/// them. Its own `Arc` so a trait method holding only `&RoutedMemoryStore`
+/// can still spawn the flush.
+struct Mirror {
+    /// The rows, oldest first.
+    queue: StdMutex<VecDeque<MirrorRow>>,
+    /// Whether the flush task is running (one at a time).
+    flushing: AtomicBool,
+    /// Whether the current queue-overflow episode was already reported.
+    overflowed: AtomicBool,
+    /// The link the rows travel over.
+    slot: Arc<LinkSlot>,
+}
+
+impl Mirror {
+    fn new(slot: Arc<LinkSlot>) -> Arc<Self> {
+        Arc::new(Self {
+            queue: StdMutex::new(VecDeque::new()),
+            flushing: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
+            slot,
+        })
+    }
+
+    /// Queue one row and start the flush task when it is not running. The
+    /// queue never blocks a turn: a row waits for the link in memory and is
+    /// lost only if the node process exits first.
+    fn push(self: &Arc<Self>, row: MirrorRow) {
+        let overflowed = {
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let overflowed = queue.len() >= MIRROR_QUEUE;
+            if overflowed {
+                queue.pop_front();
+            }
+            queue.push_back(row);
+            overflowed
+        };
+        if overflowed && !self.overflowed.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "mnemo node: the spend/savings mirror queue is full ({MIRROR_QUEUE} rows) — dropping the oldest rows"
+            );
+        }
+        self.flush();
+    }
+
+    /// Send every queued row to the hub, up to [`MIRROR_BATCH`] per call,
+    /// while a link is published. At most one task runs at a time; a failed
+    /// call leaves the rows queued for the next link. A no-op outside a tokio
+    /// runtime — the node's link-up flush then drains the queue.
+    fn flush(self: &Arc<Self>) {
+        if self.flushing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.flushing.store(false, Ordering::SeqCst);
+            return;
+        }
+        let mirror = self.clone();
+        tokio::spawn(async move {
+            mirror.drain().await;
+            mirror.flushing.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// The body of [`Mirror::flush`]: send batches until the queue is empty or
+    /// a call fails.
+    async fn drain(&self) {
+        loop {
+            let Some(link) = self.slot.current() else {
+                return;
+            };
+            let (spend, savings, count) = {
+                let queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let mut spend = Vec::new();
+                let mut savings = Vec::new();
+                for row in queue.iter().take(MIRROR_BATCH) {
+                    match row {
+                        MirrorRow::Spend(event) => spend.push(event.clone()),
+                        MirrorRow::Savings(event) => savings.push(event.clone()),
+                    }
+                }
+                let count = spend.len() + savings.len();
+                (spend, savings, count)
+            };
+            if count == 0 {
+                self.overflowed.store(false, Ordering::Relaxed);
+                return;
+            }
+            let payload = json!({ "spend": spend, "savings": savings });
+            if link
+                .call(MEM_MIRROR_ROWS, payload, MIRROR_TIMEOUT)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut queue = self
+                .queue
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            for _ in 0..count {
+                queue.pop_front();
+            }
+        }
+    }
+
+    /// The rows still queued for the hub (tests and diagnostics).
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
+    }
 }
 
 /// The node's memory store: session-local rows stay in `local`, shared
@@ -100,6 +258,7 @@ pub struct RoutedMemoryStore {
     hub_version: AtomicU64,
     /// The hub's search knobs, cached because `memory_search_config` is sync.
     search_config: RwLock<MemorySearchConfig>,
+    mirror: Arc<Mirror>,
 }
 
 impl RoutedMemoryStore {
@@ -107,10 +266,11 @@ impl RoutedMemoryStore {
     pub fn new(local: Arc<MemoryStore>, slot: Arc<LinkSlot>, budget: Duration) -> Arc<Self> {
         Arc::new(Self {
             local,
-            slot,
+            slot: slot.clone(),
             budget,
             hub_version: AtomicU64::new(0),
             search_config: RwLock::new(MemorySearchConfig::default()),
+            mirror: Mirror::new(slot),
         })
     }
 
@@ -157,6 +317,18 @@ impl RoutedMemoryStore {
             }
             _ => false,
         }
+    }
+
+    /// Queue one ledger row and start the mirror task when it is not running.
+    fn push_mirror(&self, row: MirrorRow) {
+        self.mirror.push(row);
+    }
+
+    /// Send every queued ledger row to the hub, up to [`MIRROR_BATCH`] per
+    /// call, while a link is published. A no-op outside a tokio runtime — the
+    /// node's link-up flush then drains the queue.
+    pub fn flush_mirror(self: &Arc<Self>) {
+        self.mirror.flush();
     }
 
     /// One routed call: wait for the link within the outage budget, call the
@@ -210,6 +382,37 @@ impl RoutedMemoryStore {
     }
 }
 
+/// Merge this host's local hits into a hub answer: the whole local list where
+/// the working-tier merge applies (`tier` unset, working included), otherwise
+/// only the local rows the hub never holds — its machine corpus. Sorted by
+/// score, deduped by id, truncated to the filter's limit.
+fn merge_hits(
+    local: Vec<ScoredMemory>,
+    hub: Vec<ScoredMemory>,
+    filter: &MemoryFilter,
+) -> Vec<ScoredMemory> {
+    let keep_all_local = filter.tier.is_none() && !filter.exclude_working;
+    let mut merged: Vec<ScoredMemory> = hub
+        .into_iter()
+        .chain(
+            local
+                .into_iter()
+                .filter(|hit| keep_all_local || is_machine_row(&hit.memory)),
+        )
+        .collect();
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut seen = std::collections::HashSet::new();
+    merged.retain(|hit| seen.insert(hit.memory.id.clone()));
+    if let Some(limit) = filter.limit {
+        merged.truncate(limit);
+    }
+    merged
+}
+
 #[async_trait]
 impl MemoryStoreTrait for RoutedMemoryStore {
     async fn write(&self, memory: Memory) -> Result<String> {
@@ -229,56 +432,29 @@ impl MemoryStoreTrait for RoutedMemoryStore {
         if filter.tier == Some(MemoryTier::Working) {
             return self.local.recall(query, filter).await;
         }
-        if filter.tier.is_none() && !filter.exclude_working {
-            let answer = self
-                .call(MEM_RECALL, json!({ "query": query, "filter": filter }))
-                .await?;
-            let mut hits = Self::hits(answer)?;
-            // The node-local working tier is session data: merge it with the
-            // hub's shared hits and let the engine see one ranked list.
-            let mut local = self.local.recall(query, filter).await?;
-            local.append(&mut hits);
-            local.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            if let Some(limit) = filter.limit {
-                local.truncate(limit);
-            }
-            return Ok(local);
-        }
         let answer = self
             .call(MEM_RECALL, json!({ "query": query, "filter": filter }))
             .await?;
-        Self::hits(answer)
+        let hits = Self::hits(answer)?;
+        // Every hub-answered path merges this host's own rows: the whole local
+        // list where the working-tier merge applies (a node's working tier is
+        // session data), and only the local MACHINE rows otherwise — the hub
+        // filters its own machine corpus out of a node's answers, so a worker
+        // sees exactly the corpus of the host it runs on.
+        let local = self.local.recall(query, filter).await?;
+        Ok(merge_hits(local, hits, filter))
     }
 
     async fn recall_peek(&self, query: &str, filter: &MemoryFilter) -> Result<Vec<ScoredMemory>> {
         if filter.tier == Some(MemoryTier::Working) {
             return self.local.recall_peek(query, filter).await;
         }
-        if filter.tier.is_none() && !filter.exclude_working {
-            let answer = self
-                .call(MEM_RECALL_PEEK, json!({ "query": query, "filter": filter }))
-                .await?;
-            let mut hits = Self::hits(answer)?;
-            let mut local = self.local.recall_peek(query, filter).await?;
-            local.append(&mut hits);
-            local.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            if let Some(limit) = filter.limit {
-                local.truncate(limit);
-            }
-            return Ok(local);
-        }
         let answer = self
             .call(MEM_RECALL_PEEK, json!({ "query": query, "filter": filter }))
             .await?;
-        Self::hits(answer)
+        let hits = Self::hits(answer)?;
+        let local = self.local.recall_peek(query, filter).await?;
+        Ok(merge_hits(local, hits, filter))
     }
 
     async fn access(&self, id: &str) -> Result<()> {
@@ -450,7 +626,15 @@ impl MemoryStoreTrait for RoutedMemoryStore {
         let answer = self
             .call(MEM_LIST_FILTERED, json!({ "filter": filter }))
             .await?;
-        Self::memories(answer)
+        let mut memories = Self::memories(answer)?;
+        // The hub answers with shared rows only; this host's machine corpus
+        // lives in the local store and travels with the host, never the link.
+        for memory in self.local.list_filtered(filter).await? {
+            if is_machine_row(&memory) {
+                memories.push(memory);
+            }
+        }
+        Ok(memories)
     }
 
     async fn primer_records(&self, limit: usize) -> Result<Vec<Memory>> {
@@ -516,7 +700,11 @@ impl MemoryStoreTrait for RoutedMemoryStore {
     }
 
     async fn record_savings_event(&self, event: &SavingsEvent) -> Result<()> {
-        self.local.record_savings_event(event).await
+        // The local row is the truth on this host; the mirror is best effort
+        // and never blocks the turn.
+        self.local.record_savings_event(event).await?;
+        self.push_mirror(MirrorRow::Savings(event.clone()));
+        Ok(())
     }
 
     async fn savings_events_rows(&self, session_id: Option<&str>) -> Result<Vec<SavingsEvent>> {
@@ -536,7 +724,11 @@ impl MemoryStoreTrait for RoutedMemoryStore {
     }
 
     async fn record_spend_event(&self, event: &SpendEvent) -> Result<()> {
-        self.local.record_spend_event(event).await
+        // The local row is the truth on this host; the mirror is best effort
+        // and never blocks the turn.
+        self.local.record_spend_event(event).await?;
+        self.push_mirror(MirrorRow::Spend(event.clone()));
+        Ok(())
     }
 
     async fn spend_rows_for_plan(&self, plan_id: &str) -> Result<Vec<SpendEvent>> {
@@ -698,7 +890,9 @@ impl MemoryHandler {
                     async {
                         let params: IdParams = decode(&params)?;
                         answer(store.get_memory(&params.id).await, |memory| {
-                            json!({ "memory": memory })
+                            // A machine-corpus row belongs to the hub's own
+                            // host: a node must not read it here.
+                            json!({ "memory": memory.filter(|row| !is_machine_row(row)) })
                         })
                     }
                     .await
@@ -707,7 +901,7 @@ impl MemoryHandler {
                     async {
                         let params: FilterParams = decode(&params)?;
                         answer(store.list_filtered(&params.filter).await, |memories| {
-                            json!({ "memories": memories })
+                            json!({ "memories": without_machine_rows(memories) })
                         })
                     }
                     .await
@@ -716,7 +910,7 @@ impl MemoryHandler {
                     async {
                         let params: TierParams = decode(&params)?;
                         answer(store.list_by_tier(params.tier).await, |memories| {
-                            json!({ "memories": memories })
+                            json!({ "memories": without_machine_rows(memories) })
                         })
                     }
                     .await
@@ -724,6 +918,9 @@ impl MemoryHandler {
                 MEM_COUNT_BY_TIER => {
                     async {
                         let params: TierParams = decode(&params)?;
+                        // Counts stay unfiltered on purpose: a tier total is a
+                        // store statistic, not a row readout, and the machine
+                        // corpus is a handful of records either way.
                         answer(store.count_by_tier(params.tier).await, |count| {
                             json!({ "count": count })
                         })
@@ -734,7 +931,7 @@ impl MemoryHandler {
                     async {
                         let params: LimitParams = decode(&params)?;
                         answer(store.primer_records(params.limit).await, |records| {
-                            json!({ "memories": records })
+                            json!({ "memories": without_machine_rows(records) })
                         })
                     }
                     .await
@@ -749,9 +946,28 @@ impl MemoryHandler {
                 MEM_TOP_RECALLED => {
                     async {
                         let params: LimitParams = decode(&params)?;
-                        answer(store.top_recalled(params.limit).await, |top| {
-                            json!({ "top": top })
-                        })
+                        Self::top_recalled(&store, params.limit).await
+                    }
+                    .await
+                }
+                MEM_MIRROR_ROWS => {
+                    async {
+                        let params: MirrorParams = decode(&params)?;
+                        if params.spend.len() + params.savings.len() > MIRROR_BATCH {
+                            return Err(RemoteError::bad_params(format!(
+                                "memory params: at most {MIRROR_BATCH} ledger rows per call"
+                            )));
+                        }
+                        for event in &params.spend {
+                            answer(store.record_spend_event(event).await, |()| json!({}))?;
+                        }
+                        for event in &params.savings {
+                            answer(store.record_savings_event(event).await, |()| json!({}))?;
+                        }
+                        Ok(json!({
+                            "spend": params.spend.len(),
+                            "savings": params.savings.len(),
+                        }))
                     }
                     .await
                 }
@@ -776,17 +992,69 @@ impl MemoryHandler {
         params: Value,
         peek: bool,
     ) -> std::result::Result<Value, RemoteError> {
-        let params: RecallParams = decode(&params)?;
+        let mut params: RecallParams = decode(&params)?;
+        // A node never sees the hub host's own machine corpus. Ask for headroom
+        // so dropping those rows cannot shorten the answer below the limit.
+        let limit = params.filter.limit;
+        if let Some(limit) = limit {
+            params.filter.limit = Some(limit.saturating_add(MACHINE_HEADROOM));
+        }
         let result = if peek {
             store.recall_peek(&params.query, &params.filter).await
         } else {
             store.recall(&params.query, &params.filter).await
         };
         match result {
-            Ok(hits) => Ok(json!({ "hits": hits })),
+            Ok(hits) => {
+                let mut hits: Vec<ScoredMemory> = hits
+                    .into_iter()
+                    .filter(|hit| !is_machine_row(&hit.memory))
+                    .collect();
+                if let Some(limit) = limit {
+                    hits.truncate(limit);
+                }
+                Ok(json!({ "hits": hits }))
+            }
             Err(error) => Err(RemoteError::new(CODE_MEMORY, error.to_string())),
         }
     }
+
+    /// `mem.top_recalled`: the store's most-recalled titles without the rows
+    /// indexed from the hub host's MACHINE corpus. The store answers titles,
+    /// so each one is resolved back to its row before the decision.
+    async fn top_recalled(
+        store: &Arc<dyn MemoryStoreTrait>,
+        limit: usize,
+    ) -> std::result::Result<Value, RemoteError> {
+        let top = store
+            .top_recalled(limit)
+            .await
+            .map_err(|error| RemoteError::new(CODE_MEMORY, error.to_string()))?;
+        let mut kept = Vec::with_capacity(top.len());
+        for (title, count) in top {
+            let rows = store
+                .list_filtered(&MemoryFilter {
+                    title_prefix: Some(title.clone()),
+                    ..MemoryFilter::default()
+                })
+                .await
+                .map_err(|error| RemoteError::new(CODE_MEMORY, error.to_string()))?;
+            if rows.iter().any(|row| row.title == title && is_machine_row(row)) {
+                continue;
+            }
+            kept.push((title, count));
+        }
+        Ok(json!({ "top": kept }))
+    }
+}
+
+/// Drop the rows indexed from the MACHINE knowledge corpus: they belong to the
+/// hub's own host, never to a routed session.
+fn without_machine_rows(memories: Vec<Memory>) -> Vec<Memory> {
+    memories
+        .into_iter()
+        .filter(|memory| !is_machine_row(memory))
+        .collect()
 }
 
 /// Decode `params`, answering a `bad_params` stream error when malformed.
@@ -861,6 +1129,15 @@ struct TierParams {
 #[derive(Debug, Deserialize)]
 struct LimitParams {
     limit: usize,
+}
+
+/// [`MEM_MIRROR_ROWS`]'s payload: the ledger rows a node owes the hub.
+#[derive(Debug, Default, Deserialize)]
+struct MirrorParams {
+    #[serde(default)]
+    spend: Vec<SpendEvent>,
+    #[serde(default)]
+    savings: Vec<SavingsEvent>,
 }
 
 /// Push a `mem.version` note on `link` whenever the shared store's version
@@ -1024,11 +1301,18 @@ mod tests {
         store: Arc<RoutedMemoryStore>,
         hub_store: Arc<MemoryStore>,
         service: Arc<dyn MemoryService>,
+        slot: Arc<LinkSlot>,
         pair: Pair,
         dirs: Vec<PathBuf>,
     }
 
     async fn fixture(name: &str) -> Fixture {
+        fixture_with_link(name, true).await
+    }
+
+    /// The same wiring, with the node's link left unpublished when
+    /// `publish_link` is false — the mirror test's "the hub is not there yet".
+    async fn fixture_with_link(name: &str, publish_link: bool) -> Fixture {
         let (local_dir, local) = open_store(&format!("{name}-local"));
         let (hub_dir, hub_store) = open_store(&format!("{name}-hub"));
         let slot = Arc::new(LinkSlot::new());
@@ -1042,11 +1326,14 @@ mod tests {
             Arc::new(HubLink { memory }),
         )
         .await;
-        publish(&slot, &pair.node);
+        if publish_link {
+            publish(&slot, &pair.node);
+        }
         Fixture {
             store,
             hub_store,
             service,
+            slot,
             pair,
             dirs: vec![local_dir, hub_dir],
         }
@@ -1084,6 +1371,22 @@ mod tests {
     async fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while !check() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait until the hub store holds `want` spend rows for `plan`.
+    async fn wait_for_hub_spend(hub: &MemoryStore, plan: &str, want: usize, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows = hub.spend_rows_for_plan(plan).await.expect("hub rows");
+            if rows.len() >= want {
+                return;
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "timed out waiting for {what}"
@@ -1340,5 +1643,211 @@ mod tests {
         fixture.store.refresh().await.expect("mem.config");
         assert_eq!(fixture.store.memory_search_config().decay_half_life_days, 42.0);
         watch.abort();
+    }
+
+    /// A MACHINE-corpus row as the knowledge indexer stamps it.
+    fn machine_memory(title: &str, content: &str) -> Memory {
+        let mut row = memory(MemoryTier::Semantic, title, content);
+        row.record_class = MemoryClass::Derived;
+        row.data = json!({ "source": crate::memory::indexer::MACHINE_SOURCE });
+        row
+    }
+
+    /// A ledger row as the node's spend recorder writes it.
+    fn spend(id: &str, plan: &str) -> SpendEvent {
+        SpendEvent {
+            id: id.to_string(),
+            session_id: Some("s1".into()),
+            turn_id: None,
+            agent_id: None,
+            plan_id: plan.into(),
+            step_index: None,
+            lane: None,
+            model: "worker-model".into(),
+            reason: "route".into(),
+            tokens_in: 10,
+            tokens_out: 2,
+            cached_tokens: None,
+            detail: None,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_rows_reach_the_hub_once() {
+        // The same row recorded and flushed twice (a retried flush after a lost
+        // answer) must leave ONE hub row: the id is the idempotency key.
+        let fixture = fixture("mirror-once").await;
+        let row = spend("11111111-1111-4111-8111-111111111111", "plan-mirror");
+        fixture.store.record_spend_event(&row).await.expect("node record");
+        fixture.store.flush_mirror();
+        fixture.store.record_spend_event(&row).await.expect("node record again");
+        fixture.store.flush_mirror();
+        wait_for_hub_spend(&fixture.hub_store, "plan-mirror", 1, "the mirrored spend row").await;
+        assert_eq!(
+            fixture
+                .hub_store
+                .spend_rows_for_plan("plan-mirror")
+                .await
+                .expect("hub rows")
+                .len(),
+            1,
+            "a re-sent ledger row must not duplicate on the hub"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .local()
+                .spend_rows_for_plan("plan-mirror")
+                .await
+                .expect("node rows")
+                .len(),
+            1,
+            "the node keeps its own single row"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_queue_waits_for_the_link() {
+        // No link published: the local write is the truth and the row waits in
+        // memory. Once the link is up the queued row reaches the hub.
+        let fixture = fixture_with_link("mirror-wait", false).await;
+        let row = spend("22222222-2222-4222-8222-222222222222", "plan-wait");
+        fixture.store.record_spend_event(&row).await.expect("node record");
+        assert_eq!(
+            fixture
+                .store
+                .local()
+                .spend_rows_for_plan("plan-wait")
+                .await
+                .expect("node rows")
+                .len(),
+            1,
+            "the local row lands without a link"
+        );
+        assert!(fixture
+            .hub_store
+            .spend_rows_for_plan("plan-wait")
+            .await
+            .expect("hub rows")
+            .is_empty());
+        assert_eq!(fixture.store.mirror.pending(), 1, "the row stays queued");
+        publish(&fixture.slot, &fixture.pair.node);
+        fixture.store.flush_mirror();
+        wait_for_hub_spend(&fixture.hub_store, "plan-wait", 1, "the queued spend row").await;
+        assert_eq!(fixture.store.mirror.pending(), 0, "the queue drained");
+        assert_eq!(fixture.store.mirror.pending(), 0, "the queue drained");
+    }
+
+    #[tokio::test]
+    async fn hub_recall_hides_machine_rows_from_nodes() {
+        let fixture = fixture("machine-hub").await;
+        let machine = machine_memory("machine fact", "alpha machine fact");
+        let machine_id = machine.id.clone();
+        fixture
+            .hub_store
+            .write(machine)
+            .await
+            .expect("hub machine write");
+        fixture
+            .hub_store
+            .write(memory(
+                MemoryTier::Semantic,
+                "shared fact",
+                "alpha shared fact",
+            ))
+            .await
+            .expect("hub shared write");
+
+        let filter = MemoryFilter::default();
+        let hits = fixture
+            .store
+            .recall("alpha", &filter)
+            .await
+            .expect("node recall");
+        assert!(
+            hits.iter().all(|hit| hit.memory.id != machine_id),
+            "a node never recalls the hub host's machine corpus"
+        );
+        assert!(hits.iter().any(|hit| hit.memory.title == "shared fact"));
+
+        // A limit must not be shortened by the dropped machine row either.
+        let limited = MemoryFilter {
+            limit: Some(1),
+            ..MemoryFilter::default()
+        };
+        let hits = fixture
+            .store
+            .recall("alpha", &limited)
+            .await
+            .expect("limited recall");
+        assert_eq!(hits.len(), 1, "the limit is honoured after the filter");
+        assert!(hits.iter().all(|hit| hit.memory.id != machine_id));
+
+        // Point lookups and listings answer null / drop the row too.
+        assert!(fixture
+            .store
+            .get_memory(&machine_id)
+            .await
+            .expect("node lookup")
+            .is_none());
+        let listed = fixture
+            .store
+            .list_filtered(&MemoryFilter::default())
+            .await
+            .expect("node list");
+        assert!(listed.iter().all(|row| row.id != machine_id));
+    }
+
+    #[tokio::test]
+    async fn node_recall_sees_its_own_machine_rows() {
+        // The node's own machine corpus is local and must survive the hub's
+        // shared-only answer — on the merged path AND on an explicit tier.
+        let fixture = fixture("machine-node").await;
+        let machine = machine_memory("node machine fact", "alpha node machine fact");
+        let machine_id = machine.id.clone();
+        fixture
+            .store
+            .local()
+            .write(machine)
+            .await
+            .expect("node machine write");
+        fixture
+            .hub_store
+            .write(memory(
+                MemoryTier::Semantic,
+                "shared fact",
+                "alpha shared fact",
+            ))
+            .await
+            .expect("hub shared write");
+
+        let hits = fixture
+            .store
+            .recall("alpha", &MemoryFilter::default())
+            .await
+            .expect("merged recall");
+        assert!(
+            hits.iter().any(|hit| hit.memory.id == machine_id),
+            "the node's own machine row is recalled"
+        );
+        assert!(hits.iter().any(|hit| hit.memory.title == "shared fact"));
+
+        let tiered = MemoryFilter {
+            tier: Some(MemoryTier::Semantic),
+            ..MemoryFilter::default()
+        };
+        let hits = fixture.store.recall("alpha", &tiered).await.expect("tiered recall");
+        assert!(
+            hits.iter().any(|hit| hit.memory.id == machine_id),
+            "an explicit tier keeps the node's machine row"
+        );
+
+        let listed = fixture
+            .store
+            .list_filtered(&MemoryFilter::default())
+            .await
+            .expect("node list");
+        assert!(listed.iter().any(|row| row.id == machine_id));
     }
 }

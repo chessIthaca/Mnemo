@@ -112,6 +112,10 @@ pub struct EngineBuilder {
     /// Whether the built brain starts the derived-memory-index file watcher
     /// (default `true`; see [`EngineBuilder::derived_index_watch`]).
     derived_index_watch: bool,
+    /// Whether typed knowledge records land in each agent's own root instead
+    /// of the factory-wide store (default `false`; see
+    /// [`EngineBuilder::worktree_knowledge`]).
+    worktree_knowledge: bool,
 }
 
 impl EngineBuilder {
@@ -126,6 +130,7 @@ impl EngineBuilder {
             code_embedder: crate::headless::CodeEmbedder::Auto,
             model_transport: None,
             derived_index_watch: true,
+            worktree_knowledge: false,
         }
     }
 
@@ -214,6 +219,15 @@ impl EngineBuilder {
         self
     }
 
+    /// Write typed knowledge records into each agent's own root
+    /// (`<worktree>/.coding/knowledge`) instead of the factory-wide store
+    /// (default `false`). A remote node turns it on so a worker's records
+    /// travel home with its branch bundle (plan 9a2f4b67 step 2).
+    pub fn worktree_knowledge(mut self, on: bool) -> Self {
+        self.worktree_knowledge = on;
+        self
+    }
+
     /// Build + start (identical to [`Engine::start`] plus the injections).
     pub async fn start(self) -> Result<Engine, EngineError> {
         // Job 6: the whole-brain seam is exclusive with the part seams —
@@ -247,6 +261,7 @@ impl EngineBuilder {
             NodeWiring {
                 model_transport: self.model_transport,
                 derived_index_watch: self.derived_index_watch,
+                worktree_knowledge: self.worktree_knowledge,
             },
         )
         .await
@@ -980,6 +995,8 @@ struct NodeWiring {
     model_transport: Option<Arc<dyn crate::provider::client_factory::ModelTransport>>,
     /// Whether the built brain starts the derived-memory-index file watcher.
     derived_index_watch: bool,
+    /// Whether typed knowledge records land in each agent's own root.
+    worktree_knowledge: bool,
 }
 
 /// The shared start body: the workspace gates, the config, the buses, the
@@ -997,6 +1014,7 @@ async fn start_inner(
     let NodeWiring {
         model_transport,
         derived_index_watch,
+        worktree_knowledge,
     } = node;
     // The workspace gates — row 9 + the §5.9.3 :664 require_git rule
     // (either the option or the workspace marker demands a repo).
@@ -1101,6 +1119,7 @@ async fn start_inner(
                     code_embedder,
                     model_transport: model_transport.clone(),
                     watch_derived_index: derived_index_watch,
+                    worktree_knowledge,
                 },
             )
             .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
@@ -1319,6 +1338,7 @@ mod tests {
                 code_embedder: crate::headless::CodeEmbedder::Auto,
                 model_transport: None,
                 watch_derived_index: true,
+                worktree_knowledge: false,
             },
         )
         .unwrap();

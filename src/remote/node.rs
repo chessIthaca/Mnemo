@@ -179,6 +179,14 @@ pub async fn run(
                 let connected_at = tokio::time::Instant::now();
                 state.observe_hub(link.peer_epoch());
                 state.slot.set(Some(link.clone()));
+                if let Some(routed) = state
+                    .routed
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone()
+                {
+                    routed.flush_mirror();
+                }
                 if !state.wait_engine_ready(CATALOG_WAIT).await {
                     eprintln!(
                         "mnemo node: the hub sent no model catalog within {}s",
@@ -511,6 +519,7 @@ async fn build_engine(state: &Arc<NodeState>, _config: Config) -> Result<Engine,
         )))
         .memory_store(routed)
         .derived_index_watch(false)
+        .worktree_knowledge(true)
         .code_embedder(CodeEmbedder::Off)
         .start()
         .await

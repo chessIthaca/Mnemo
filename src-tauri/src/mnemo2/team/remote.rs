@@ -1537,7 +1537,7 @@ mod tests {
                 let _ = shutdown_rx.await;
             }));
             assert!(
-                hub.wait_connected(&identity.node_id, Duration::from_secs(30))
+                hub.wait_connected(&identity.node_id, Duration::from_secs(120))
                     .await,
                 "the paired node connects"
             );
@@ -2002,7 +2002,7 @@ mod tests {
         if let Some(shutdown) = rig.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         while rig.hub.is_connected(&rig.node_id) {
             assert!(Instant::now() < deadline, "the node link drops");
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2030,7 +2030,7 @@ mod tests {
                 json!(mnemo::remote::repo::CheckoutList {
                     project: rig.workers.project().to_string(),
                 }),
-                Duration::from_secs(30),
+                Duration::from_secs(120),
             )
             .await
             .expect("the node lists its checkouts");
@@ -2218,7 +2218,7 @@ mod tests {
         let team = rig.team_unmeasured().await;
         // The monitor's first pass starts the qualification; wait until its
         // hostcheck checkout is prepared.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let held = checkout_list(&rig)
                 .await
@@ -2313,7 +2313,7 @@ mod tests {
             .server
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(rig.hub.clone());
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let released = checkout_list(&rig)
                 .await

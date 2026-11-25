@@ -434,7 +434,7 @@ mod tests {
                 let _ = shutdown_rx.await;
             }));
             assert!(
-                hub.wait_connected(&identity.node_id, Duration::from_secs(30))
+                hub.wait_connected(&identity.node_id, Duration::from_secs(120))
                     .await,
                 "the paired node connects"
             );

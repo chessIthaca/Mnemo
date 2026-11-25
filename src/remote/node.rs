@@ -69,6 +69,10 @@ pub const CATALOG_WAIT: Duration = Duration::from_secs(30);
 const BACKOFF_START: Duration = Duration::from_millis(500);
 /// The redial delay cap.
 const BACKOFF_CAP: Duration = Duration::from_secs(5);
+/// How long a link must stay up before its end resets the redial ladder. A
+/// link that dies sooner keeps the node backing off, so a peer that accepts
+/// and immediately drops cannot make the node spin.
+const STABLE_LINK: Duration = Duration::from_secs(10);
 
 /// What one node runtime needs: its home, the project it runs sessions in, and
 /// how long a call may wait for a dropped link.
@@ -172,7 +176,7 @@ pub async fn run(
         };
         match attempt {
             Ok(link) => {
-                backoff.reset();
+                let connected_at = tokio::time::Instant::now();
                 state.observe_hub(link.peer_epoch());
                 state.slot.set(Some(link.clone()));
                 if !state.wait_engine_ready(CATALOG_WAIT).await {
@@ -183,6 +187,14 @@ pub async fn run(
                     state.slot.set(None);
                     cancel_tx.send_replace(true);
                     drop(link);
+                    // A link that never became usable counts as a short one.
+                    tokio::select! {
+                        _ = &mut shutdown => {
+                            state.stop();
+                            break;
+                        }
+                        _ = tokio::time::sleep(backoff.next_delay()) => {}
+                    }
                     continue;
                 }
                 tokio::select! {
@@ -196,6 +208,20 @@ pub async fn run(
                         // The sessions keep running; the next dial resumes them.
                         state.slot.set(None);
                         cancel_tx.send_replace(true);
+                    }
+                }
+                if connected_at.elapsed() >= STABLE_LINK {
+                    // A link that carried real work resets the ladder.
+                    backoff.reset();
+                } else {
+                    // A link that died under the stability window must not
+                    // become a hot redial loop.
+                    tokio::select! {
+                        _ = &mut shutdown => {
+                            state.stop();
+                            break;
+                        }
+                        _ = tokio::time::sleep(backoff.next_delay()) => {}
                     }
                 }
             }
@@ -1281,11 +1307,20 @@ mod tests {
 
     // ── a byte-forwarding proxy the tests can cut ──────────────────────────
 
+    /// How long a slammed connection survives: long enough for the WebSocket
+    /// handshake and the catalog push, far under the node's stability window.
+    const SLAM_AFTER: Duration = Duration::from_millis(200);
+
     struct Cutter {
         addr: SocketAddr,
         target: Arc<StdMutex<SocketAddr>>,
         connections: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
         stop: watch::Sender<bool>,
+        /// Kill each forwarded connection shortly after it opens, simulating a
+        /// peer that accepts and immediately drops.
+        slam: Arc<std::sync::atomic::AtomicBool>,
+        /// How many client connections the proxy accepted (the redial count).
+        accepted: Arc<AtomicU64>,
     }
 
     impl Cutter {
@@ -1297,17 +1332,23 @@ mod tests {
             let target = Arc::new(StdMutex::new(target));
             let connections = Arc::new(StdMutex::new(Vec::new()));
             let (stop, mut stop_rx) = watch::channel(false);
+            let slam = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let accepted = Arc::new(AtomicU64::new(0));
             let targets = target.clone();
             let live = connections.clone();
+            let slams = slam.clone();
+            let accepts = accepted.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _ = stop_rx.wait_for(|ready| *ready) => return,
                         accepted = listener.accept() => {
                             let Ok((client, _)) = accepted else { continue };
+                            accepts.fetch_add(1, AtomicOrdering::SeqCst);
                             let target = *targets
                                 .lock()
                                 .unwrap_or_else(|poison| poison.into_inner());
+                            let slam = slams.load(AtomicOrdering::SeqCst);
                             let handle = tokio::spawn(async move {
                                 let Ok(server) = tokio::net::TcpStream::connect(target).await else {
                                     return;
@@ -1316,9 +1357,17 @@ mod tests {
                                 let (mut server_read, mut server_write) = server.into_split();
                                 let up = tokio::io::copy(&mut client_read, &mut server_write);
                                 let down = tokio::io::copy(&mut server_read, &mut client_write);
-                                tokio::select! {
-                                    _ = up => {}
-                                    _ = down => {}
+                                if slam {
+                                    tokio::select! {
+                                        _ = up => {}
+                                        _ = down => {}
+                                        _ = tokio::time::sleep(SLAM_AFTER) => {}
+                                    }
+                                } else {
+                                    tokio::select! {
+                                        _ = up => {}
+                                        _ = down => {}
+                                    }
                                 }
                             });
                             live.lock()
@@ -1333,6 +1382,8 @@ mod tests {
                 target,
                 connections,
                 stop,
+                slam,
+                accepted,
             }
         }
 
@@ -1356,6 +1407,16 @@ mod tests {
             {
                 handle.abort();
             }
+        }
+
+        /// Kill each forwarded connection after [`SLAM_AFTER`].
+        fn slam(&self) {
+            self.slam.store(true, AtomicOrdering::SeqCst);
+        }
+
+        /// How many client connections the proxy accepted.
+        fn accepted(&self) -> u64 {
+            self.accepted.load(AtomicOrdering::SeqCst)
         }
     }
 
@@ -2274,5 +2335,144 @@ mod tests {
         }
         found.sort();
         found
+    }
+    /// A node-side handler for a raw link the tests drive directly.
+    struct NoopHandler;
+
+    #[async_trait]
+    impl LinkHandler for NoopHandler {
+        async fn request(
+            &self,
+            _m: &str,
+            _p: Value,
+            _out: StreamTx,
+        ) -> Result<Value, RemoteError> {
+            Ok(Value::Null)
+        }
+
+        fn note(&self, _m: &str, _p: Value) {}
+    }
+
+    /// Pair a node and dial the hub directly (no `run` runtime in between).
+    async fn raw_node(server: &HubServer, tag: &str) -> (NodeIdentity, crate::remote::Link) {
+        let root = scratch(tag);
+        let home = root.join("node");
+        std::fs::create_dir_all(&home).expect("node home");
+        let code = server.pairing().issue_code(tag);
+        pair(&home, &server.local_addr().to_string(), &code.code, tag)
+            .await
+            .expect("pair");
+        let identity = NodeIdentity::load(&home).unwrap().expect("identity");
+        let link = dial(&identity, Arc::new(NoopHandler))
+            .await
+            .expect("the node dials");
+        (identity, link)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoked_live_node_is_cut() {
+        let hub = TestHub::start("revoked-live").await;
+        let (identity, link) = raw_node(&hub.server, "revoked live node").await;
+        assert!(
+            hub.server
+                .wait_connected(&identity.node_id, Duration::from_secs(10))
+                .await,
+            "the node should attach first"
+        );
+        // Revoke behind the live link's back: the next sweep must fail it even
+        // though the connection task still holds its own `Link` handle.
+        NodeRegistry::new(hub.state_dir.clone())
+            .revoke(&identity.node_id)
+            .expect("revoke");
+        tokio::time::timeout(Duration::from_secs(5), link.closed())
+            .await
+            .expect("a revoked node's live link must be cut");
+        let error = link
+            .call(
+                "llm.complete",
+                json!({ "model": { "endpoint": "hub", "model": "m" }, "messages": [] }),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect_err("the cut link must fail the next call");
+        assert_eq!(error.code, crate::remote::CODE_LINK_DOWN);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hub_shutdown_closes_node_links() {
+        let hub = TestHub::start("shutdown-links").await;
+        let (identity, link) = raw_node(&hub.server, "shutdown node").await;
+        assert!(
+            hub.server
+                .wait_connected(&identity.node_id, Duration::from_secs(10))
+                .await,
+            "the node should attach first"
+        );
+        let watcher = {
+            let link = link.clone();
+            tokio::spawn(async move { link.closed().await })
+        };
+        let TestHub { server, .. } = hub;
+        server.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), watcher)
+            .await
+            .expect("shutdown must close every live link")
+            .expect("the watcher task joins");
+        assert!(
+            link.call("session.list", json!({}), Duration::from_secs(1))
+                .await
+                .is_err(),
+            "a shut-down hub's link must be closed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instant_link_death_redials_with_backoff() {
+        let hub = TestHub::start("backoff").await;
+        let cutter = Cutter::start(hub.server.local_addr()).await;
+        let root = scratch("backoff-node");
+        let home = root.join("node");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let code = hub.server.pairing().issue_code("backoff node");
+        pair(
+            &home,
+            &hub.server.local_addr().to_string(),
+            &code.code,
+            "backoff node",
+        )
+        .await
+        .expect("pair");
+        // Point the stored identity at the slam proxy: every link it forwards
+        // dies after [`SLAM_AFTER`], far under the node's 10 s stability window.
+        let mut identity = NodeIdentity::load(&home).unwrap().expect("identity");
+        identity.hub = cutter.addr().to_string();
+        identity.save(&home).expect("save identity");
+        cutter.slam();
+        let (stop, mut rx) = watch::channel(false);
+        let cfg = NodeConfig {
+            home,
+            workspace,
+            outage_budget: Duration::from_secs(20),
+            index_codegraph: false,
+        };
+        let task = tokio::spawn(async move {
+            run(cfg, async move {
+                let _ = rx.wait_for(|ready| *ready).await;
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let attempts = cutter.accepted();
+        stop.send_replace(true);
+        let _ = task.await;
+        assert!(
+            attempts <= 8,
+            "a link that dies under the stability window must back off; saw {attempts} dials in 2 s"
+        );
+        assert!(
+            attempts >= 2,
+            "the node should still retry; saw {attempts} dials in 2 s"
+        );
     }
 }

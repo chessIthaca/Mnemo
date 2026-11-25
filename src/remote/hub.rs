@@ -83,6 +83,10 @@ pub const REVOKE_POLL: Duration = Duration::from_secs(1);
 /// arrived. The log is also swept whenever a node's link attaches.
 pub const CALL_SWEEP: Duration = Duration::from_secs(60);
 
+/// The pause before an event follow loop retries a link that just failed, so
+/// a dying link cannot make it spin. A live-map change wakes it sooner.
+pub const RETRY_PAUSE: Duration = Duration::from_millis(150);
+
 /// How the hub listens and where it keeps its paired-node registry and id.
 #[derive(Debug, Clone)]
 pub struct HubOptions {
@@ -225,6 +229,9 @@ struct HubState {
     llm: Arc<LlmHandler>,
     memory: Arc<MemoryHandler>,
     live: StdMutex<HashMap<String, LiveNode>>,
+    /// The per-connection tasks, so a shutdown aborts the ones parked on a
+    /// link instead of leaving them to notice the socket went away.
+    connections: StdMutex<Vec<JoinHandle<()>>>,
     changed: watch::Sender<u64>,
     shutdown: watch::Sender<bool>,
     generation: AtomicU64,
@@ -262,6 +269,7 @@ impl HubServer {
             llm: LlmHandler::new(adapter.clone()),
             memory: MemoryHandler::new(adapter),
             live: StdMutex::new(HashMap::new()),
+            connections: StdMutex::new(Vec::new()),
             changed,
             shutdown,
             generation: AtomicU64::new(0),
@@ -356,6 +364,9 @@ impl HubServer {
         {
             task.abort();
         }
+        // Close the links explicitly: a connection task holds its own `Link`
+        // clone while parked on `closed()`, so merely dropping the map's
+        // handle would never fail the link.
         let mut live = self
             .state
             .live
@@ -363,7 +374,17 @@ impl HubServer {
             .unwrap_or_else(|poison| poison.into_inner());
         for (_, node) in live.drain() {
             node.version_watch.abort();
-            drop(node.link);
+            node.link.close();
+        }
+        drop(live);
+        for task in self
+            .state
+            .connections
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .drain(..)
+        {
+            task.abort();
         }
     }
 }
@@ -587,12 +608,18 @@ async fn follow_events(
             Ok(Ok(opened)) => opened,
             Ok(Err(error)) => {
                 if error.code == CODE_LINK_DOWN || error.code == CODE_TIMEOUT {
+                    // The map may still hold a dying link; wait for the
+                    // change (or a short pause) instead of hot-spinning.
+                    pause_or_change(&state).await;
                     continue;
                 }
                 eprintln!("mnemo hub: engine.events on node {node_id} failed: {error}");
                 return;
             }
-            Err(_) => continue,
+            Err(_) => {
+                pause_or_change(&state).await;
+                continue;
+            }
         };
         while let Some(item) = items.next().await {
             let Ok(item) = item else { break };
@@ -620,6 +647,20 @@ async fn follow_events(
             }
         }
         // The stream ended with the link; wait for the next one and resume.
+        pause_or_change(&state).await;
+    }
+}
+
+/// Wait for the live-map to change, the hub to shut down, or [`RETRY_PAUSE`]
+/// — whichever comes first. Keeps a follow loop from spinning on a link that
+/// is already failing.
+async fn pause_or_change(state: &Arc<HubState>) {
+    let mut changes = state.changed.subscribe();
+    let mut shutdown = state.shutdown.subscribe();
+    tokio::select! {
+        _ = changes.changed() => {}
+        _ = shutdown.changed() => {}
+        _ = tokio::time::sleep(RETRY_PAUSE) => {}
     }
 }
 
@@ -686,12 +727,20 @@ async fn accept_loop(state: Arc<HubState>, listener: TcpListener) {
             }
             accepted = listener.accept() => {
                 let Ok((stream, _peer)) = accepted else { continue };
-                let state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = serve_connection(state, stream).await {
+                let connection_state = state.clone();
+                let task = tokio::spawn(async move {
+                    if let Err(error) = serve_connection(connection_state, stream).await {
                         eprintln!("mnemo hub: {error}");
                     }
                 });
+                let mut connections = state
+                    .connections
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                // Keep the list bounded over a long-lived hub: finished
+                // connections are only kept for the shutdown abort.
+                connections.retain(|task| !task.is_finished());
+                connections.push(task);
             }
         }
     }
@@ -785,10 +834,10 @@ fn attach(state: &Arc<HubState>, node_id: &str, link: Link) -> u64 {
         );
     if let Some(previous) = previous {
         // A second connection for the same node replaces the first: stop its
-        // watch and drop its handle, which fails that link once it was the
-        // last one.
+        // watch and close its link (the previous connection task holds its own
+        // handle, so dropping ours alone would not fail it).
         previous.version_watch.abort();
-        drop(previous.link);
+        previous.link.close();
     }
     let next = {
         let current = *state.changed.borrow();
@@ -867,7 +916,7 @@ fn sweep_revoked(state: &Arc<HubState>) {
     }
     for node in gone {
         node.version_watch.abort();
-        drop(node.link);
+        node.link.close();
     }
     let next = {
         let current = *state.changed.borrow();

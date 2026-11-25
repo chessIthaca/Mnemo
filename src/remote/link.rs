@@ -245,20 +245,47 @@ enum Outbound {
     Envelope(Envelope),
 }
 
+/// One inbound call's slot: reserved before the handler task is spawned, then
+/// upgraded to the running task's abort handle. The generation lets the
+/// handler's guard remove only its OWN reservation, never a later call's slot
+/// for the same (reused) id.
+enum InboundEntry {
+    /// The slot is held for a handler that is starting up.
+    Reserved { generation: u64 },
+    /// The handler task is running.
+    Running { generation: u64, task: AbortHandle },
+}
+
+impl InboundEntry {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Reserved { generation } | Self::Running { generation, .. } => *generation,
+        }
+    }
+}
+
 /// Frees one inbound call's slot when its handler task ends — including when
-/// the handler panics or the task is aborted by a `cancel`.
+/// the handler panics or the task is aborted — but only while the slot still
+/// belongs to this handler.
 struct InboundSlot {
     inner: Arc<LinkInner>,
     id: u64,
+    generation: u64,
 }
 
 impl Drop for InboundSlot {
     fn drop(&mut self) {
-        self.inner
+        let mut inbound = self
+            .inner
             .inbound
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(&self.id);
+            .unwrap_or_else(|poison| poison.into_inner());
+        if inbound
+            .get(&self.id)
+            .is_some_and(|entry| entry.generation() == self.generation)
+        {
+            inbound.remove(&self.id);
+        }
     }
 }
 
@@ -327,7 +354,10 @@ struct LinkInner {
     handler: Arc<dyn LinkHandler>,
     outbound: mpsc::Sender<Outbound>,
     pending: Mutex<HashMap<u64, Pending>>,
-    inbound: Mutex<HashMap<u64, AbortHandle>>,
+    inbound: Mutex<HashMap<u64, InboundEntry>>,
+    /// Mints the generation that guards each inbound slot against a stale
+    /// removal (a handler that finishes before its task handle is stored).
+    inbound_generation: AtomicU64,
     next_id: AtomicU64,
     /// Number of live [`Link`] handles; the link shuts down when the last one
     /// drops.
@@ -354,8 +384,10 @@ impl LinkInner {
         if self.failed.swap(true, Ordering::SeqCst) {
             return;
         }
-        let _ = self.closed.send(true);
-        let _ = self.shutdown.send(true);
+        // `send` drops the value when no receiver happens to exist; a later
+        // `closed()` subscriber must still observe the failed state.
+        let _ = self.closed.send_replace(true);
+        let _ = self.shutdown.send_replace(true);
         let pending: Vec<Pending> = {
             let mut pending = self
                 .pending
@@ -377,15 +409,17 @@ impl LinkInner {
                 }
             }
         }
-        let inbound: Vec<AbortHandle> = {
+        let inbound: Vec<InboundEntry> = {
             let mut inbound = self
                 .inbound
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            inbound.drain().map(|(_, handle)| handle).collect()
+            inbound.drain().map(|(_, entry)| entry).collect()
         };
-        for handle in inbound {
-            handle.abort();
+        for entry in inbound {
+            if let InboundEntry::Running { task, .. } = entry {
+                task.abort();
+            }
         }
     }
 }
@@ -414,6 +448,18 @@ impl Drop for Link {
 }
 
 impl Link {
+    /// Close the link now: every pending call and stream fails with
+    /// `link_down`, the inbound handlers are aborted, the socket tasks stop
+    /// and [`Link::closed`] resolves.
+    ///
+    /// Unlike dropping a handle this does not depend on how many other handles
+    /// exist, so a server can cut a revoked peer while a request handler still
+    /// holds its own clone.
+    pub fn close(&self) {
+        self.inner
+            .fail(RemoteError::link_down("the link was closed by this side"));
+    }
+
     /// Call `m` and wait for the answer, at most `timeout`. The timeout starts
     /// the moment the request is queued.
     pub async fn call(
@@ -1058,6 +1104,7 @@ where
         outbound,
         pending: Mutex::new(HashMap::new()),
         inbound: Mutex::new(HashMap::new()),
+        inbound_generation: AtomicU64::new(0),
         next_id: AtomicU64::new(1),
         refs: AtomicUsize::new(1),
         failed: AtomicBool::new(false),
@@ -1387,8 +1434,8 @@ async fn dispatch(inner: &Arc<LinkInner>, envelope: Envelope) {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .remove(&id);
-            if let Some(handle) = handle {
-                handle.abort();
+            if let Some(InboundEntry::Running { task, .. }) = handle {
+                task.abort();
             }
         }
         Envelope::Note { m, p } => inner.handler.note(&m, p),
@@ -1422,6 +1469,15 @@ async fn dispatch(inner: &Arc<LinkInner>, envelope: Envelope) {
             let handler = inner.handler.clone();
             let task_inner = inner.clone();
             let out = StreamTx::new(inner.clone(), id);
+            // Reserve the slot BEFORE spawning: a handler that finishes (or
+            // panics) immediately must not leave a stale entry behind when the
+            // task handle is stored afterwards.
+            let generation = inner.inbound_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            inner
+                .inbound
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(id, InboundEntry::Reserved { generation });
             let task = tokio::spawn(async move {
                 // Frees the inbound slot even when the handler panics: a
                 // panicking task never reaches its own cleanup line, and a
@@ -1430,15 +1486,27 @@ async fn dispatch(inner: &Arc<LinkInner>, envelope: Envelope) {
                 let _slot = InboundSlot {
                     inner: task_inner.clone(),
                     id,
+                    generation,
                 };
                 let result = handler.request(&m, p, out.clone()).await;
                 task_inner.finish_request(id, &out, result).await;
             });
-            inner
+            let mut inbound = inner
                 .inbound
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .insert(id, task.abort_handle());
+                .unwrap_or_else(|poison| poison.into_inner());
+            if inbound
+                .get(&id)
+                .is_some_and(|entry| entry.generation() == generation)
+            {
+                inbound.insert(
+                    id,
+                    InboundEntry::Running {
+                        generation,
+                        task: task.abort_handle(),
+                    },
+                );
+            }
         }
     }
 }
@@ -2417,7 +2485,10 @@ mod tests {
             send_frame(&mut ws, &key, 2, &Envelope::item(1, 1, json!({ "i": 1 }))).await;
             // Item 2 is missing.
             send_frame(&mut ws, &key, 3, &Envelope::item(1, 3, json!({ "i": 3 }))).await;
-            let _ = ws.next().await;
+            // Keep the socket open: the gap must fail the stream, not the
+            // link, and the peer dropping here would close it for another
+            // reason.
+            tokio::time::sleep(Duration::from_secs(1)).await;
         });
         let link = dial_on(node_io, &node.identity, Arc::new(TestHandler::new(&[])))
             .await
@@ -2498,5 +2569,98 @@ mod tests {
         );
         assert!(!error.message.contains("222"), "{}", error.message);
         hub.await.expect("hub task joins");
+    }
+
+    /// Read one MACed frame off a raw hub-side socket and parse its envelope.
+    async fn read_frame<W>(ws: &mut W) -> Envelope
+    where
+        W: Stream<Item = Result<Message, WsError>> + Unpin,
+    {
+        let message = ws.next().await.expect("a frame").expect("a healthy socket");
+        let text = message.to_text().expect("a text frame");
+        let mut parts = text.splitn(3, ' ');
+        let _seq = parts.next();
+        let _mac = parts.next();
+        let json = parts.next().expect("the frame JSON");
+        wire::parse_envelope(json).expect("a valid envelope")
+    }
+
+    /// A handler that always panics, to prove the inbound slot is freed.
+    struct PanicHandler;
+
+    #[async_trait]
+    impl LinkHandler for PanicHandler {
+        async fn request(&self, _m: &str, _p: Value, _out: StreamTx) -> Result<Value, RemoteError> {
+            panic!("this handler panics on purpose");
+        }
+
+        fn note(&self, _m: &str, _p: Value) {}
+    }
+
+    #[tokio::test]
+    async fn item_before_res_fails_link() {
+        let node = Node::new(NODE_ID, "duplex");
+        let token = node.token;
+        let (node_io, hub_io) = tokio::io::duplex(1 << 20);
+        let hub = tokio::spawn(async move {
+            let ws = raw_hub_ws(hub_io).await;
+            let (mut ws, key, _nonce) = raw_hub_handshake(ws, token).await;
+            // The node's streaming request opens a `StreamInit`; answer it
+            // with an item while the `res` is still missing.
+            let request = read_frame(&mut ws).await;
+            let Envelope::Req { id, .. } = request else {
+                panic!("expected a request, got {request:?}");
+            };
+            send_frame(&mut ws, &key, 1, &Envelope::item(id, 1, json!({ "early": true }))).await;
+            let _ = ws.next().await;
+        });
+        let link = dial_on(node_io, &node.identity, Arc::new(TestHandler::new(&["stream"])))
+            .await
+            .expect("link established");
+        let error = link
+            .call_stream("stream", json!({}))
+            .await
+            .err()
+            .expect("an item before the response is a protocol violation");
+        assert_eq!(error.code, CODE_LINK_DOWN);
+        assert!(
+            error.message.contains("before its response"),
+            "{}",
+            error.message
+        );
+        tokio::time::timeout(Duration::from_secs(2), link.closed())
+            .await
+            .expect("the link closes");
+        hub.await.expect("hub task joins");
+    }
+
+    #[tokio::test]
+    async fn panicking_handler_frees_inflight_slot() {
+        let (node_link, hub_link) = linked_pair(
+            Arc::new(TestHandler::new(&["echo"])),
+            Arc::new(PanicHandler),
+        )
+        .await;
+        let error = node_link
+            .call("boom", json!({}), Duration::from_millis(300))
+            .await
+            .expect_err("the panicking handler never answers");
+        assert_eq!(error.code, crate::remote::CODE_TIMEOUT);
+        assert!(
+            hub_link
+                .inner
+                .inbound
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .is_empty(),
+            "a panicking handler must free its inbound slot"
+        );
+        // A leaked slot would also break the next reuse of the id; prove the
+        // link still answers a normal call.
+        let answer = hub_link
+            .call("echo", json!({ "ping": 1 }), Duration::from_secs(5))
+            .await
+            .expect("the link still works");
+        assert_eq!(answer["echo"]["ping"], json!(1));
     }
 }

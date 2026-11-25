@@ -597,6 +597,16 @@ impl CallLog {
         }
     }
 
+    /// An empty log with a caller-supplied TTL (tests use a short one so the
+    /// sweep runs without waiting [`CALL_TTL`]).
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            calls: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), Arc<Call>>> {
         self.calls
             .lock()
@@ -1608,5 +1618,34 @@ mod tests {
             );
         }
         drop((pair, slot));
+    }
+    #[tokio::test]
+    async fn calllog_sweep_drops_unacked_ended_calls() {
+        let log = CallLog::with_ttl(Duration::from_millis(20));
+        let ended = Arc::new(Call::new());
+        {
+            let mut state = ended
+                .state
+                .try_lock()
+                .expect("a fresh call state is unlocked");
+            state.ended = true;
+            state.ended_at = Some(Instant::now());
+        }
+        ended.set_progress(Progress::Ended);
+        log.map()
+            .insert(("node".to_string(), "ended".to_string()), ended);
+        let running = Arc::new(Call::new());
+        log.map()
+            .insert(("node".to_string(), "running".to_string()), running);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        log.sweep();
+        assert!(
+            log.get("node", "ended").is_none(),
+            "an ended call whose ack never arrived is swept after the TTL"
+        );
+        assert!(
+            log.get("node", "running").is_some(),
+            "a running call survives the sweep"
+        );
     }
 }

@@ -3433,7 +3433,10 @@ dependencies = [
 name = "mnemo2-app"
 version = "2.9.0"
 dependencies = [
+ "async-trait",
  "dunce",
+ "futures",
+ "libc",
  "mnemo",
  "mnemo-app",
  "serde",
@@ -3445,6 +3448,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

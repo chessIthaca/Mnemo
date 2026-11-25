@@ -394,6 +394,8 @@ pub(super) fn counted_check(
     checkout: &Path,
     check_commands: &[String],
 ) -> Option<(String, String)> {
+    // A checkout that cannot be resolved counts nothing, whatever the cwd.
+    checkout.canonicalize().ok()?;
     counted_check_at(
         tool,
         args,
@@ -453,6 +455,9 @@ pub(super) fn counted_checks(
         return counted_check(tool, args, result, checkout, check_commands)
             .into_iter()
             .collect();
+    }
+    if checkout.canonicalize().is_err() {
+        return Vec::new();
     }
     counted_checks_at(
         tool,

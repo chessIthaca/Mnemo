@@ -2345,6 +2345,34 @@ $rest = $args[1..($args.Length-1)]
             .expect("the extension owns proof.prove")
             .expect_err("a path is not a checkout name");
         assert!(error.to_string().contains("is not a single path component"), "{error}");
+        // A mutation project key that tries to leave the work folder is refused,
+        // even for a checkout that exists (the checkout is read first).
+        std::fs::create_dir_all(
+            home.path()
+                .join(mnemo::remote::node::CHECKOUTS_DIR)
+                .join("0123456789ab-9"),
+        )
+        .expect("a node checkout folder");
+        let error = ProofNodeExtension
+            .request(
+                PROOF_MUTATE,
+                serde_json::json!({
+                    "checkout": "0123456789ab-9",
+                    "project": "../escape",
+                    "base": "0".repeat(40),
+                    "tip": "1".repeat(40),
+                    "cfg": {"command": "x", "missed": "x"},
+                    "worker_id": "abcd1234",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("the extension owns proof.mutate")
+            .expect_err("a path is not a project key");
+        assert_eq!(error.code, mnemo::remote::CODE_BAD_PARAMS);
+        assert!(error.to_string().contains("is not a single path component"), "{error}");
+        assert!(!home.path().join("work").join("escape").exists());
+        assert!(!home.path().join("escape").exists());
         assert!(
             ProofNodeExtension
                 .request("repo.list", request, &ctx)

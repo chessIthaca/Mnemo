@@ -125,6 +125,15 @@ fn dirty_error(worker_id: &str) -> String {
     )
 }
 
+/// Whether `error` is one of the dirty refusals a check run gives: the hub
+/// checkout of a local worker, or the node checkout of a remote one.
+fn is_dirty_refusal(error: &str, worker_id: &str) -> bool {
+    error == dirty_error(worker_id)
+        || error.starts_with(&format!(
+            "worker '{worker_id}' has uncommitted changes on host '"
+        ))
+}
+
 /// What a command that exited 0 but changed files is reported with.
 const CHANGED_FILES: &str = ", but it changed the checkout's files, so it does not count. Commit or discard the change, or fix the command.";
 
@@ -289,15 +298,27 @@ fn environmental_reason(result: &ToolResult, report: &RunReport) -> Option<Strin
         if !environmental_failure(exit, text) {
             return None;
         }
-        Some(
-            outcome
-                .failing
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or(outcome.headline.as_str())
-                .to_string(),
-        )
+        // The output opens with a stream marker (`[stderr]`); the reason is the
+        // line that says what is missing, else the first real line, and it
+        // always names the command.
+        let lines: Vec<&str> = outcome
+            .failing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("[std"))
+            .collect();
+        let line = lines
+            .iter()
+            .find(|line| environmental_failure(None, line))
+            .or_else(|| lines.first())
+            .copied()
+            .unwrap_or(outcome.headline.as_str());
+        let program = outcome.command.split_whitespace().next().unwrap_or("");
+        Some(if program.is_empty() || line.contains(program) {
+            line.to_string()
+        } else {
+            format!("{}: {line}", outcome.command)
+        })
     })
 }
 
@@ -971,7 +992,7 @@ impl TeamRuntime {
                     short(&tip)
                 )),
                 // A dirty checkout is the lead's to know: the review result says so.
-                Err(error) if error == dirty_error(&reviewed.id) => Some(error),
+                Err(error) if is_dirty_refusal(&error, &reviewed.id) => Some(error),
                 Err(error) => {
                     eprintln!("team: the missing checks of {} did not start: {error}", reviewed.id);
                     None
@@ -1276,5 +1297,90 @@ mod tests {
             tip,
             "the node checkout stayed at its tip"
         );
+    }
+
+    /// A remote worker whose node checkout is dirty: the review result carries
+    /// the refusal (naming host and files), not a silent skip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_reports_the_dirty_remote_refusal() {
+        let rig = remote_testkit::Rig::start().await;
+        let (mut record, remote, tip) = rig.worker_on_node("abcd1234", true).await;
+        write(
+            rig.root.path(),
+            ".coding/checks.toml",
+            "commands = [\"git --version\"]\n",
+        );
+        record.review = Some(crate::mnemo2::phase3::ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: None,
+            lane: None,
+        });
+        let team = rig.team().await;
+        team.records.lock().await.push(record.clone());
+        std::fs::write(
+            std::path::PathBuf::from(&remote.path).join("half-done.txt"),
+            "not committed\n",
+        )
+        .expect("dirty the node checkout");
+
+        let line = team
+            .start_missing_checks(&record)
+            .await
+            .expect("the refusal reaches the review result");
+        assert!(
+            line.contains("worker 'abcd1234' has uncommitted changes on host 'node-a'"),
+            "{line}"
+        );
+        assert!(line.contains("half-done.txt"), "{line}");
+        assert!(is_dirty_refusal(&line, "abcd1234"));
+        assert!(!is_dirty_refusal(&line, "other"));
+    }
+
+    /// A remote check run of a command the host lacks marks the host Failed,
+    /// with a reason that names the missing tool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_check_run_marks_the_host_failed_on_a_missing_command() {
+        let rig = remote_testkit::Rig::start().await;
+        let (record, _remote, _tip) = rig.worker_on_node("abcd1234", true).await;
+        write(
+            rig.root.path(),
+            ".coding/checks.toml",
+            "commands = [\"mnemo-no-such-tool --version\"]\n",
+        );
+        let team = rig.team().await;
+        team.records.lock().await.push(record.clone());
+        let mut signals = team.signals.subscribe();
+        team.run_checks_tool(Some("abcd1234"))
+            .await
+            .expect("start the remote check run");
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match signals.recv().await {
+                    Ok(BoardSignal::Notice { key, .. }) if key.starts_with("checks:abcd1234:") => {
+                        return;
+                    }
+                    Ok(_) => continue,
+                    Err(error) => panic!("the board signal channel closed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the check run posts its notice");
+
+        let commands = load_check_commands(rig.root.path());
+        let hash = checks_hash(&commands);
+        assert_eq!(
+            team.remote.qualification(&rig.node_id, &hash),
+            super::super::remote::Qualification::Failed
+        );
+        let reason = team
+            .remote
+            .host_states()
+            .get(&rig.node_id)
+            .and_then(|state| state.reason.clone())
+            .expect("a failed host carries a reason");
+        assert!(reason.contains("mnemo-no-such-tool"), "{reason}");
     }
 }

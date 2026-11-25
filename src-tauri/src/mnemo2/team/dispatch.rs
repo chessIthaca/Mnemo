@@ -22,6 +22,7 @@ use crate::mnemo2::phase3;
 
 use serde_json::{json, Value};
 
+use super::agent_watch::agent_refusal_retry_hint;
 use super::lead_tools::{team_tool_error, worker_status_view};
 use super::placement::{NodeChoice, Placement, PlacementRequest};
 use super::record::{
@@ -973,7 +974,9 @@ impl TeamRuntime {
                             let active = self.active_workers_for_slots().await;
                             let slots = self.persistence.slots.load(Ordering::SeqCst);
                             if active >= slots {
-                                return Err(format!("all {slots} worker slots are busy"));
+                                let text = format!("all {slots} worker slots are busy");
+                                self.fail_worker(&record.id, text.clone()).await;
+                                return Err(text);
                             }
                             // The fallback starts the worker on this computer,
                             // so an agent worker must pass the waiting-worker
@@ -986,7 +989,8 @@ impl TeamRuntime {
                                     self.agent_launch_refusal_for(None, false).await
                                 {
                                     let text = format!(
-                                        "{refusal}; retry with the same worker ID once the waiting worker is launched"
+                                        "{refusal}; {}",
+                                        agent_refusal_retry_hint(&refusal)
                                     );
                                     self.fail_worker(&record.id, text.clone()).await;
                                     return Err(text);
@@ -1199,7 +1203,8 @@ impl TeamRuntime {
 
     /// The Claude Code agent a re-dispatched step must run as, when its first
     /// dispatch failed before the agent started: no agent, no brief handed over,
-    /// `Failed`, and no live session. `None` for every other reuse, which keeps
+    /// `Dispatching`, `Failed` or `Interrupted` (the statuses the restart path
+    /// accepts), and no live session. `None` for every other reuse, which keeps
     /// the Mnemo restart path (audit finding on plan 5e64ccd5).
     async fn agent_retry_target(
         &self,
@@ -1210,7 +1215,10 @@ impl TeamRuntime {
     ) -> Option<ClaudeAgentDispatch> {
         if existing.claude_agent.is_some()
             || existing.brief_sent
-            || existing.status != WorkerStatus::Failed
+            || !matches!(
+                existing.status,
+                WorkerStatus::Dispatching | WorkerStatus::Failed | WorkerStatus::Interrupted
+            )
             || self.live.lock().await.contains_key(&existing.id)
         {
             return None;
@@ -1223,7 +1231,11 @@ impl TeamRuntime {
         }
         // A reused worker id skips routing: ask the tier the lead asked for, or
         // the one the record settled on.
-        self.claude_agent_rung(tier.or(existing.tier.as_deref()))
+        // "auto" asks for no tier in particular, like an absent one.
+        let tier = tier
+            .filter(|tier| *tier != "auto")
+            .or(existing.tier.as_deref());
+        self.claude_agent_rung(tier)
     }
 
     /// Take the agent path again for a re-dispatched step that never started:
@@ -1250,6 +1262,11 @@ impl TeamRuntime {
             .await?;
         match &placement {
             Placement::Node(choice) => {
+                // A worker on a host gets no WorktreeCreate launch, so only
+                // the agent cap applies.
+                if let Some(refusal) = self.agent_launch_refusal_for(None, true).await {
+                    return Err(refusal);
+                }
                 let base = existing.base_commit.clone().unwrap_or_default();
                 Box::pin(self.prepare_remote_checkout(
                     &mut existing,

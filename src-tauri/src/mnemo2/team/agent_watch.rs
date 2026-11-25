@@ -1454,6 +1454,17 @@ impl TeamRuntime {
     }
 }
 
+/// What the lead can do about an [`agent_launch_refusal_for`] refusal, for a
+/// dispatch that failed its worker over it: wait for the waiting worker's
+/// launch, or for a running agent worker to finish (the cap).
+pub(super) fn agent_refusal_retry_hint(refusal: &str) -> &'static str {
+    if refusal.contains("is waiting for its agent") {
+        "retry with the same worker ID once the waiting worker is launched"
+    } else {
+        "retry with the same worker ID when an agent worker finishes"
+    }
+}
+
 /// A handed-back worker `team_agent_started` may reclaim: Interrupted, with
 /// the hand-back still on record (no Mnemo model has run on it since).
 fn reclaimable(worker: &WorkerRecord) -> bool {

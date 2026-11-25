@@ -21165,6 +21165,140 @@ async fn dispatch_agent_fallback_respects_the_waiting_worker() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn agent_retry_after_busy_slots_stays_an_agent() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    // The node's checkout cannot be prepared and this computer has no free
+    // slot: the unpinned fallback refuses.
+    let blocked = block_node_checkout(&team, "busyslots01").await;
+    team.persistence
+        .slots
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let args = remote_agent_dispatch_args(&plan_id, "busyslots01");
+    let first = team
+        .handle_lead_host_tool_from("team_dispatch", args.clone(), MessageSender::ExternalLead)
+        .await;
+    assert!(!first.success, "the fallback must refuse: {}", first.output);
+    assert_eq!(first.output, "all 0 worker slots are busy");
+
+    // The refusal fails the record: it never stays Dispatching.
+    let failed = team.worker("busyslots01").await.expect("the failed record");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert_eq!(failed.error.as_deref(), Some("all 0 worker slots are busy"));
+    assert!(failed.claude_agent.is_none(), "the step never started");
+    assert!(!failed.brief_sent);
+
+    // The node is back: the retry takes the agent path again.
+    unblock_node_checkout(&blocked).await;
+    team.persistence
+        .slots
+        .store(8, std::sync::atomic::Ordering::SeqCst);
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(retry.success, "{}", retry.output);
+    let record = team.worker("busyslots01").await.expect("the retried record");
+    assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+    assert!(record.remote.is_some(), "the retry runs on the node");
+    assert!(team.live.lock().await.is_empty(), "no Mnemo session started");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_retry_with_auto_tier_stays_an_agent() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    let blocked = block_node_checkout(&team, "autotier01").await;
+    let mut args = remote_agent_dispatch_args(&plan_id, "autotier01");
+    args["host"] = serde_json::json!("node-a");
+    let first = team
+        .handle_lead_host_tool_from("team_dispatch", args.clone(), MessageSender::ExternalLead)
+        .await;
+    assert!(!first.success, "the first dispatch fails to prepare: {}", first.output);
+    let failed = team.worker("autotier01").await.expect("the failed record");
+    assert_eq!(failed.status, WorkerStatus::Failed);
+    assert!(failed.claude_agent.is_none());
+
+    // The retry asks for tier "auto": it means the tier the record settled on,
+    // so the step stays an agent worker.
+    unblock_node_checkout(&blocked).await;
+    args["tier"] = serde_json::json!("auto");
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(retry.success, "{}", retry.output);
+    let record = team.worker("autotier01").await.expect("the retried record");
+    assert_eq!(
+        record.claude_agent.as_deref(),
+        Some("opus"),
+        "an auto-tier retry stayed an agent worker"
+    );
+    assert!(record.remote.is_some());
+    assert!(team.live.lock().await.is_empty(), "no Mnemo session started");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_retry_on_node_respects_the_cap() {
+    let rig = Rig::start().await;
+    let (team, plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            serde_json::json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    let blocked = block_node_checkout(&team, "capretry01").await;
+    let mut args = remote_agent_dispatch_args(&plan_id, "capretry01");
+    args["host"] = serde_json::json!("node-a");
+    let first = team
+        .handle_lead_host_tool_from("team_dispatch", args.clone(), MessageSender::ExternalLead)
+        .await;
+    assert!(!first.success, "the first dispatch fails to prepare: {}", first.output);
+    unblock_node_checkout(&blocked).await;
+
+    // The cap is reached by running agent workers meanwhile.
+    let scratch = tempfile::tempdir().expect("scratch");
+    for index in 0..super::agent_watch::AGENT_WORKER_CAP {
+        let mut running = worker(scratch.path(), &format!("running{index:02}"));
+        running.claude_agent = Some("opus".into());
+        running.claude_agent_id = Some(format!("agent-{index}"));
+        running.status = WorkerStatus::Working;
+        running.brief_sent = true;
+        team.records.lock().await.push(running);
+    }
+    let refusal = team
+        .agent_launch_refusal_for(None, true)
+        .await
+        .expect("the cap refuses");
+    let retry = team
+        .handle_lead_host_tool_from("team_dispatch", args, MessageSender::ExternalLead)
+        .await;
+    assert!(!retry.success, "the retry must refuse: {}", retry.output);
+    assert!(retry.output.contains(&refusal), "{}", retry.output);
+    let record = team.worker("capretry01").await.expect("the record");
+    assert_eq!(record.status, WorkerStatus::Failed);
+    assert!(record.claude_agent.is_none());
+    assert!(record.remote.is_none(), "no node checkout was prepared");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pinned_agent_prepare_failure_retry_stays_an_agent() {
     let rig = Rig::start().await;
     let (team, plan_id, _plans) = remote_agent_team(&rig).await;

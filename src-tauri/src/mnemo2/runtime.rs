@@ -1167,8 +1167,11 @@ impl LeadRuntime {
         }
         // Stop answering for this project before the engine is released: the
         // hub belongs to the app instance, but its services must never serve a
-        // closed project.
-        crate::mnemo2::remote_hub::app_hub(&self.config_dir).unbind_project();
+        // closed project. The engine names the project, so a runtime that
+        // already handed the hub to a newer project leaves that binding alone.
+        if let Some(engine) = self.engine.lock().await.clone() {
+            crate::mnemo2::remote_hub::app_hub(&self.config_dir).unbind_project(&engine);
+        }
         // Stop the trace journal's background writer before the engine
         // drops: it polls the engine's shared trace log (plan c3ba2b58
         // step B).

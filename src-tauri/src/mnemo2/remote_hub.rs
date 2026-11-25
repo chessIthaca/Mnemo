@@ -178,10 +178,15 @@ impl AppHub {
         team.attach_hosts(hosts);
     }
 
-    /// Stop answering for the open project. The listener stays up: it belongs
-    /// to the app instance, not to the project that happened to open first.
-    pub fn unbind_project(&self) {
-        self.services.unbind();
+    /// Stop answering for the project behind `engine`. The listener stays up:
+    /// it belongs to the app instance, not to the project that happened to
+    /// open first.
+    ///
+    /// Only the runtime whose engine holds the binding may clear it: an older
+    /// runtime finishing its shutdown must not unbind the project that
+    /// replaced it.
+    pub fn unbind_project(&self, engine: &Arc<Engine>) {
+        self.services.unbind(engine);
     }
 
     /// Take the profile's exclusive hub claim.
@@ -339,9 +344,16 @@ impl AppHubServices {
         *self.binding.write().unwrap_or_else(|e| e.into_inner()) = Some((engine, config_dir));
     }
 
-    /// Answer nothing until a project is bound again.
-    fn unbind(&self) {
-        *self.binding.write().unwrap_or_else(|e| e.into_inner()) = None;
+    /// Answer nothing until a project is bound again — but only when the
+    /// binding still belongs to `engine`.
+    fn unbind(&self, engine: &Arc<Engine>) {
+        let mut binding = self.binding.write().unwrap_or_else(|e| e.into_inner());
+        let ours = binding
+            .as_ref()
+            .is_some_and(|(bound, _)| Weak::ptr_eq(bound, &Arc::downgrade(engine)));
+        if ours {
+            *binding = None;
+        }
     }
 
     /// The bound project's engine, if it is still alive.
@@ -461,6 +473,39 @@ mod tests {
             model: "test-model".to_string(),
             reasoning_effort: None,
         }
+    }
+
+    /// A started engine over `dir`: enough to be the hub's bound project in the
+    /// binding tests (no git, no memory, no code graph). The config names one
+    /// keyless `local` endpoint `endpoint_name` serving the default model, so
+    /// the engine's readiness gate passes and the catalog carries that name.
+    async fn test_engine(dir: &Path, endpoint_name: &str) -> Arc<Engine> {
+        std::fs::create_dir_all(dir).expect("engine dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_model = \"m\"\n",
+        )
+        .expect("test config");
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            format!(
+                "[[endpoint]]\nname = \"{endpoint_name}\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"m\"]\n"
+            ),
+        )
+        .expect("test endpoints");
+        Arc::new(
+            Engine::start(mnemo::headless::EngineOptions {
+                workspace: mnemo::workspace::Workspace::new(dir),
+                config_dir: Some(dir.to_path_buf()),
+                permissions: mnemo::agent::policy::PermissionPolicy::OverridePermissions,
+                memory: mnemo::headless::MemoryBackend::Disabled,
+                index_codegraph: false,
+                require_git: false,
+                auto_install_embedder: false,
+            })
+            .await
+            .expect("start the test engine"),
+        )
     }
 
     #[test]
@@ -607,12 +652,48 @@ mod tests {
         assert!(catalog.endpoints.is_empty());
         assert!(catalog.pricing.is_empty());
 
-        // Unbinding a bound project answers nothing again.
+        // A bound config dir is what a catalog read uses.
         let config = config_dir();
         services.bind(Weak::new(), config.path().to_path_buf());
-        assert!(services.config_dir().is_some());
-        services.unbind();
-        assert!(services.config_dir().is_none());
-        assert!(services.model_client(&unserved_model()).is_none());
+        assert_eq!(services.config_dir(), Some(config.path().to_path_buf()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unbinding_an_older_project_keeps_the_newer_binding() {
+        let config = config_dir();
+        let hub = Arc::new(AppHub::new(config.path()));
+        let older_dir = config.path().join("older");
+        let newer_dir = config.path().join("newer");
+        let older = test_engine(&older_dir, "older-project").await;
+        let newer = test_engine(&newer_dir, "newer-project").await;
+
+        // The newer project takes the hub's services while the older one is
+        // still shutting down.
+        hub.services.bind(Arc::downgrade(&older), older_dir.clone());
+        hub.services.bind(Arc::downgrade(&newer), newer_dir.clone());
+
+        hub.unbind_project(&older);
+
+        assert_eq!(
+            hub.services.config_dir(),
+            Some(newer_dir.clone()),
+            "closing the older project keeps the newer binding"
+        );
+        assert!(
+            hub.services
+                .catalog()
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.name == "newer-project"),
+            "the hub still answers with the newer project's catalog"
+        );
+
+        // The project that owns the binding still clears it.
+        hub.unbind_project(&newer);
+        assert!(
+            hub.services.config_dir().is_none(),
+            "closing the bound project unbinds the hub"
+        );
+        assert!(hub.services.model_client(&unserved_model()).is_none());
     }
 }

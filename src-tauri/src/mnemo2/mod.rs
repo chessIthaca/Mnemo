@@ -22,6 +22,10 @@ pub mod indexing;
 /// The real worker team runtime.
 pub mod team;
 
+/// The app's one worker hub: the listener paired nodes connect to, and the
+/// services (model clients, memory, catalog) it answers for the open project.
+pub mod remote_hub;
+
 /// The turn tag a team notice's first line carries, so a stale notice is
 /// dropped at delivery.
 pub(crate) mod notice_tag;

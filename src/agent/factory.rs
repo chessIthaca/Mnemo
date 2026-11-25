@@ -313,6 +313,11 @@ pub struct AgentLoopFactory {
     /// once at construction and shared by the memory tools + the finish
     /// capture. `None` when the plans dir implies no project root.
     knowledge: Option<Arc<KnowledgeStore>>,
+    /// Write typed knowledge records into the *agent root's* `.coding/knowledge`
+    /// instead of [`Self::knowledge`] (plan 9a2f4b67 step 2). The remote node
+    /// engine sets it so a worker's records land in its worktree and travel
+    /// home with the branch bundle; every other engine keeps the shared store.
+    worktree_knowledge: bool,
     /// The MACHINE knowledge corpus (`<config dir>/knowledge/`, plan
     /// d3336a8a step 8): the HOW/DECISION records shared by every project on
     /// the machine, indexed read-only into this project's store and written
@@ -509,6 +514,17 @@ impl AgentLoopFactory {
         self.machine_knowledge.as_ref()
     }
 
+    /// Write typed knowledge records into the built agent's own root
+    /// (`<project_root>/.coding/knowledge`) instead of the factory-wide store
+    /// (plan 9a2f4b67 step 2). The remote node engine sets this so a worker's
+    /// records land in its worktree and travel home with the branch bundle;
+    /// every other engine keeps the shared store (the default).
+    pub fn with_worktree_knowledge(mut self, on: bool) -> Self {
+        self.worktree_knowledge = on;
+        self
+    }
+
+
     /// Adopt an existing background-task register (the brain creates it
     /// before the factory, so its startup tasks are tracked too).
     pub fn with_background_tasks(
@@ -597,6 +613,9 @@ impl AgentLoopFactory {
                 .map(|p| p.join(knowledge::KNOWLEDGE_DIR_NAME))
                 .map(KnowledgeStore::new)
                 .map(Arc::new),
+            // Only the remote node engine switches this on
+            // (`with_worktree_knowledge`, plan 9a2f4b67 step 2).
+            worktree_knowledge: false,
             // No machine corpus at construction — the host wires it via
             // `with_machine_knowledge` once the config dir is known (plan
             // d3336a8a step 8). Until then `memory_write scope=machine` is
@@ -1978,8 +1997,17 @@ impl AgentLoopFactory {
             // The knowledge-file backing (typed records as files): typed
             // writes land in files (the truth) + the derived rows come from
             // reindexing. `None` (a plans dir that implies no root) keeps
-            // the historical DB-only behavior.
-            let knowledge = self.knowledge.clone();
+            // the historical DB-only behavior. A remote node engine
+            // (`worktree_knowledge`) writes into the built agent's own root
+            // instead, so the records travel with the worker's branch.
+            let knowledge = match (self.worktree_knowledge, root) {
+                (true, Some(root)) => Some(Arc::new(KnowledgeStore::new(
+                    root.project_root
+                        .join(".coding")
+                        .join(knowledge::KNOWLEDGE_DIR_NAME),
+                ))),
+                _ => self.knowledge.clone(),
+            };
             // The machine tier (plan d3336a8a step 8): every memory tool routes
             // a `[machine]` record's edit to the shared corpus and accepts
             // `memory_write scope=machine`. `None` until the host wires it.
@@ -4487,6 +4515,55 @@ mod tests {
         assert!(
             !dir.path().join("probe.txt").exists(),
             "the write must NOT land in the factory's project root"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_knowledge_writes_into_the_agent_root() {
+        // Plan 9a2f4b67 step 2: a remote node engine turns worktree knowledge
+        // on, so the worker's typed records land in ITS checkout and travel
+        // home with the branch bundle. Without the flag the factory-wide store
+        // keeps receiving them (the host behavior, unchanged).
+        let dir = tempdir().unwrap();
+        let factory = make_factory(dir.path()).with_worktree_knowledge(true);
+        let worktree = tempfile::tempdir().unwrap();
+        let worktree_root = worktree.path().canonicalize().unwrap();
+        let plans_dir = worktree_root.join("plans/agents/7");
+        let spec = AgentRootSpec {
+            sandbox: Sandbox::new(&worktree_root).unwrap(),
+            project_root: worktree_root.clone(),
+            codegraph: None,
+            check_commands: Vec::new(),
+        };
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(plans_dir.clone())));
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            Some(7),
+            Some(&spec),
+            &plans_dir,
+        );
+        let tool = registry
+            .iter()
+            .find(|t| t.name() == "memory_write")
+            .expect("memory_write registered");
+        let result = tool
+            .execute(serde_json::json!({
+                "tier": "semantic",
+                "title": "DECISION: probe record",
+                "content": "probe body",
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let wrote_in_worktree = worktree_root.join(".coding/knowledge/decision");
+        assert!(
+            std::fs::read_dir(&wrote_in_worktree)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false),
+            "the typed record must land in the agent's own .coding/knowledge"
+        );
+        assert!(
+            !dir.path().join(".coding/knowledge").exists(),
+            "the factory-wide store must not receive the worktree record"
         );
     }
 

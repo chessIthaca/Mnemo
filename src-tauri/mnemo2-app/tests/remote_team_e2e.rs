@@ -42,7 +42,8 @@ use mnemo::memory::indexer::MACHINE_SOURCE;
 use mnemo::memory::{Memory, MemoryClass, MemoryFilter, MemoryStoreTrait, MemoryTier};
 use mnemo::provider::trace::LlmRequestContext;
 use mnemo::provider::{
-    Capabilities, FinishReason, LlmClient, LlmEvent, Message, ProviderKind, ToolChoice, ToolSchema,
+    Capabilities, FinishReason, LlmClient, LlmEvent, Message, ProviderKind, Role, ToolChoice,
+    ToolSchema,
 };
 use mnemo::remote::catalog::ModelCatalog;
 use mnemo::remote::hub::{HubOptions, HubServer, HubServices, NodeHandle, RemoteSpawn};
@@ -818,6 +819,55 @@ async fn e2e_remote_worker_dispatch_check_review_merge() {
         assert!(
             !search_text.contains(MACHINE_TITLE),
             "a node session must never see the hub's machine knowledge: {search_text}"
+        );
+
+        // (8b) the hub record carries the conversation the node ran: the pump
+        // refreshes it from the node's post-turn snapshot, so a later resume —
+        // host "local" or on the node — starts from the real conversation.
+        let transcript = wait_for(
+            "the remote worker's transcript to reach the hub record",
+            Duration::from_secs(60),
+            || async {
+                let worker = team.worker(WORKER_ID).await.ok()?;
+                (!worker.transcript.messages.is_empty()).then(|| worker.transcript.clone())
+            },
+        )
+        .await;
+        // The opening system head carries the pinned task and the lead's brief
+        // verbatim: a resume rebuilds the head from the record, but the hub
+        // transcript must already hold the conversation it started from.
+        let opening = transcript
+            .messages
+            .iter()
+            .find(|message| message.role == Role::System)
+            .map(|message| message.content.as_text())
+            .expect("the worker's opening prompt reaches the hub record");
+        assert!(
+            opening.contains("Write remote.txt at the project root with the line"),
+            "the hub transcript keeps the lead's opening brief: {opening}"
+        );
+        let replies = transcript
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .collect::<Vec<_>>();
+        assert!(
+            !replies.is_empty(),
+            "the hub transcript keeps the worker's assistant turns: {:?}",
+            transcript
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            replies
+                .last()
+                .is_some_and(|message| message.content.as_text().contains("done")),
+            "the worker's closing answer reaches the hub record: {:?}",
+            replies
+                .last()
+                .map(|message| message.content.as_text())
         );
 
         // (9) the project's checks run on the node, at the worker tip.

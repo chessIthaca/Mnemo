@@ -551,7 +551,8 @@ fn spawn_forwarder(
 /// What a `session.*` call carries: the node's open sessions and its event
 /// sequence, or the session handler's answer.
 impl NodeState {
-    /// `node.status`: the node's identity, workspace and open sessions.
+    /// `node.status`: the node's identity, workspace, mirrored catalog
+    /// revision (`null` before the first catalog) and open sessions.
     async fn status(&self) -> Value {
         let sessions: Vec<Value> = {
             let open = self.sessions.lock().await;
@@ -561,9 +562,15 @@ impl NodeState {
                 })
                 .collect()
         };
+        let catalog_revision = self
+            .catalog
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
         json!({
             "node_id": self.identity.node_id,
             "version": env!("CARGO_PKG_VERSION"),
+            "catalog_revision": catalog_revision,
             "os": std::env::consts::OS,
             "workspace": self.cfg.workspace.to_string_lossy(),
             "hub": self.identity.hub,
@@ -2204,18 +2211,28 @@ mod tests {
         hub.services
             .push_script(vec![text("new catalog model"), finish_stop()]);
         hub.server.push_catalog();
-        let mut session = None;
+        // A spawn that pins a model the node's catalog does not know yet does
+        // not fail: the turn driver falls back to the default model. So wait
+        // until the node reports the new catalog revision before spawning.
+        let revision = hub.services.catalog().revision;
+        let mut applied = false;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while session.is_none() {
-            match handle.spawn_session(spawn_options("second/m2")).await {
-                Ok(id) => session = Some(id),
-                Err(_) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(status) = handle.status().await {
+                if status.get("catalog_revision").and_then(Value::as_str)
+                    == Some(revision.as_str())
+                {
+                    applied = true;
+                    break;
                 }
-                Err(error) => panic!("the new catalog never reached the node: {error}"),
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        let session = session.unwrap();
+        assert!(applied, "the new catalog revision never reached the node");
+        let session = handle
+            .spawn_session(spawn_options("second/m2"))
+            .await
+            .expect("spawn on the new endpoint");
         handle
             .send(
                 session,

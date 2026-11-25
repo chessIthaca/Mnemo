@@ -13,8 +13,10 @@
 //! worker runs locally exactly as it did before remote workers existed.
 //!
 //! A lead may pin a host: `"local"` keeps the worker here, a name (or node id)
-//! sends it there and fails loudly when that host cannot take it. A Claude
-//! Code agent worker always stays local in this phase.
+//! sends it there and fails loudly when that host cannot take it. A Claude Code
+//! agent worker may be placed on a node too (phase 4), but only when that node's
+//! record names the SSH connection the lead starts the session on; otherwise it
+//! stays local exactly as before.
 
 use serde_json::Value;
 
@@ -50,34 +52,36 @@ pub(super) struct NodeChoice {
     /// True when the lead named this host: a pinned host never falls back to
     /// the local computer.
     pub(super) pinned: bool,
+    /// The SSH connection this host's record links, when the placement is for a
+    /// Claude Code agent worker: the lead starts its session over that
+    /// connection, so a node without one never takes an agent worker.
+    pub(super) ssh: Option<String>,
 }
 
 /// What placement needs to know about one dispatch.
 pub(super) struct PlacementRequest<'a> {
     /// The lead's `host` argument, when it passed one.
     pub(super) pinned: Option<&'a str>,
-    /// A Claude Code agent worker always runs on this computer (phase 3).
+    /// A Claude Code agent worker runs as a session the lead starts over SSH on
+    /// a node whose record links a connection; this computer otherwise.
     pub(super) claude_agent: bool,
 }
 
 impl TeamRuntime {
     /// Choose the host for one new dispatch.
     ///
-    /// Order: a Claude Code agent stays local; an explicit host must be usable
-    /// or the dispatch fails; with no pin the qualified idle node with the most
-    /// free slots wins, ties by name, and this computer is the fallback.
+    /// Order: a pinned `"local"` is this computer; an explicit host must be
+    /// usable or the dispatch fails; with no pin the qualified idle node with
+    /// the most free slots wins, ties by name, and this computer is the
+    /// fallback. A Claude Code agent worker only takes a node whose record links
+    /// an SSH connection — the lead starts its session over that connection —
+    /// and stays local when no qualified node does.
     pub(super) async fn place_worker(
         &self,
         request: PlacementRequest<'_>,
     ) -> Result<Placement, String> {
-        if request.claude_agent {
-            return match request.pinned {
-                Some(host) if host != "local" => Err(
-                    "a Claude Code agent worker runs on this computer; omit host or pass host \"local\""
-                        .to_string(),
-                ),
-                _ => Ok(Placement::Local),
-            };
+        if request.pinned == Some("local") {
+            return Ok(Placement::Local);
         }
         let commands = spawn::load_check_commands(&self.workspace_root);
         let wants_windows = requires_windows(commands.as_slice());
@@ -97,6 +101,9 @@ impl TeamRuntime {
                 return Err(format!("host '{host}' is not connected"));
             }
             self.pinned_node_usable(&record, host, wants_windows).await?;
+            if request.claude_agent {
+                ssh_link_required(&record, host)?;
+            }
             return Ok(Placement::Node(choice(&record, true)));
         }
         let mut best: Option<(usize, NodeRecord)> = None;
@@ -110,6 +117,9 @@ impl TeamRuntime {
             }
         };
         for record in nodes {
+            if request.claude_agent && record.ssh.is_none() {
+                continue;
+            }
             if !server.is_connected(&record.node_id) {
                 continue;
             }
@@ -212,7 +222,19 @@ fn choice(record: &NodeRecord, pinned: bool) -> NodeChoice {
         name: record.name.clone(),
         os: record.os.clone(),
         pinned,
+        ssh: record.ssh.clone(),
     }
+}
+
+/// The refusal an agent worker's pinned host gets when its record links no SSH
+/// connection: the lead has no way to start the session there.
+fn ssh_link_required(record: &NodeRecord, host: &str) -> Result<(), String> {
+    if record.ssh.is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "host '{host}' has no SSH connection linked; link one with team_hosts action \"link\", or omit host"
+    ))
 }
 
 /// Whether a host on `os` can run this project's checks.
@@ -559,13 +581,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn placement_pinned_claude_agent_is_refused() {
-        let root = tempfile::tempdir().expect("root");
-        init_repo(root.path());
-        let state = tempfile::tempdir().expect("state");
-        let config = tempfile::tempdir().expect("config");
-        let _ = test_catalog(config.path());
-        let team = open_test_team(root.path(), state.path(), config.path()).await;
+    async fn placement_pinned_claude_agent_needs_ssh_link() {
+        let rig = Rig::start().await;
+        let team = rig.team_unmeasured().await;
 
         let refused = team
             .place_worker(PlacementRequest {
@@ -573,21 +591,88 @@ mod tests {
                 claude_agent: true,
             })
             .await
-            .expect_err("a Claude agent worker cannot be pinned to a node");
+            .expect_err("an agent worker's pinned host needs an SSH connection");
         assert_eq!(
             refused,
-            "a Claude Code agent worker runs on this computer; omit host or pass host \"local\""
+            "host 'node-a' has no SSH connection linked; link one with team_hosts action \"link\", or omit host"
         );
-        for pinned in [None, Some("local")] {
-            assert!(matches!(
+
+        rig.hub
+            .nodes()
+            .set_ssh(&rig.node_id, Some("studio-ssh"))
+            .expect("link the SSH connection");
+        match team
+            .place_worker(PlacementRequest {
+                pinned: Some("node-a"),
+                claude_agent: true,
+            })
+            .await
+            .expect("a pinned host with a linked connection takes an agent worker")
+        {
+            Placement::Node(choice) => {
+                assert!(choice.pinned);
+                assert_eq!(choice.node_id, rig.node_id);
+                assert_eq!(choice.ssh.as_deref(), Some("studio-ssh"));
+            }
+            Placement::Local => panic!("a linked pinned node takes the agent worker"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn placement_agent_tier_without_link_stays_local() {
+        let rig = Rig::start().await;
+        let team = rig.team_measured().await;
+
+        assert!(
+            matches!(
                 team.place_worker(PlacementRequest {
-                    pinned,
+                    pinned: None,
                     claude_agent: true,
                 })
                 .await
                 .expect("placement"),
                 Placement::Local
-            ));
+            ),
+            "an agent worker stays local while no qualified node links an SSH connection"
+        );
+        // The same idle qualified node still takes a Mnemo worker.
+        assert!(
+            matches!(
+                team.place_worker(PlacementRequest {
+                    pinned: None,
+                    claude_agent: false,
+                })
+                .await
+                .expect("placement"),
+                Placement::Node(_)
+            ),
+            "a Mnemo worker is placed as before"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn placement_agent_tier_prefers_linked_qualified_node() {
+        let rig = Rig::start().await;
+        let team = rig.team_measured().await;
+        rig.hub
+            .nodes()
+            .set_ssh(&rig.node_id, Some("studio-ssh"))
+            .expect("link the SSH connection");
+
+        match team
+            .place_worker(PlacementRequest {
+                pinned: None,
+                claude_agent: true,
+            })
+            .await
+            .expect("placement")
+        {
+            Placement::Node(choice) => {
+                assert!(!choice.pinned);
+                assert_eq!(choice.node_id, rig.node_id);
+                assert_eq!(choice.ssh.as_deref(), Some("studio-ssh"));
+            }
+            Placement::Local => panic!("a linked qualified node takes the agent worker"),
         }
     }
 

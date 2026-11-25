@@ -263,6 +263,7 @@ impl TeamRuntime {
             claude_agent_transcript: None,
             handed_back: None,
             launch_token: None,
+            claude_session: None,
             integrations: Vec::new(),
             integration_note: None,
             base_commit: Some(base_tip.clone()),
@@ -316,7 +317,15 @@ impl TeamRuntime {
         record.brief_sent = true;
         record.compacting = false;
         // The dispatch answer's launch prompt carries a fresh one-time token.
-        record.launch_token = Some(fresh_launch_token());
+        // A remote worker's session is started by the lead over SSH, which
+        // Mnemo's PreToolUse gate never sees: its prompt carries the worker
+        // marker instead and `team_agent_started` names the session.
+        record.launch_token = if record.remote.is_some() {
+            None
+        } else {
+            Some(fresh_launch_token())
+        };
+        record.claude_session = None;
         note_model(&mut record, &model);
         self.update_worker(&record.id, |worker| {
             worker.claude_agent = record.claude_agent.clone();
@@ -326,6 +335,7 @@ impl TeamRuntime {
             worker.brief_sent = true;
             worker.compacting = false;
             worker.launch_token = record.launch_token.clone();
+            worker.claude_session = None;
             note_model(worker, &model);
         })
         .await;

@@ -1554,10 +1554,11 @@ impl TeamRuntime {
     }
 
     /// Active workers for every slot gate: live local Mnemo sessions plus
-    /// session-free Claude Code agents in Working or Interrupted.
+    /// session-free local Claude Code agents in Working or Interrupted.
     ///
     /// A remote worker does not use a local pool slot: its host has its own
-    /// slots (`mnemo2-node run --slots`), so it is counted there, not here.
+    /// slots (`mnemo2-node run --slots`), so it is counted there, not here — a
+    /// remote agent worker's session-free record included (plan 5e64ccd5).
     pub(super) async fn active_workers_for_slots(&self) -> usize {
         let active_agents = self
             .records
@@ -1566,6 +1567,7 @@ impl TeamRuntime {
             .iter()
             .filter(|worker| {
                 worker.claude_agent.is_some()
+                    && worker.remote.is_none()
                     && matches!(
                         worker.status,
                         WorkerStatus::Working | WorkerStatus::Fixing | WorkerStatus::Interrupted

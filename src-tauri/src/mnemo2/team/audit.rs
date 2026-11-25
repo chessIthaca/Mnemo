@@ -417,6 +417,7 @@ impl TeamRuntime {
             claude_agent_transcript: None,
             handed_back: None,
             launch_token: None,
+            claude_session: None,
             integrations: Vec::new(),
             integration_note: None,
             base_commit: None,
@@ -448,7 +449,7 @@ impl TeamRuntime {
             // prepared at the audit's own base tip.
             reserved = Some((choice.node_id.clone(), record.branch.clone()));
             if let Err(error) =
-                Box::pin(self.prepare_remote_checkout(&mut record, choice, &base_tip, true)).await
+                Box::pin(self.prepare_remote_checkout(&mut record, choice, &base_tip, true, None)).await
             {
                 eprintln!(
                     "team: could not place audit {} on host '{}': {error}; running it locally",

@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex};
 
-use super::record::{RemoteCheckout, WorkerRecord};
+use super::record::{RemoteCheckout, WorkerRecord, WorkerStatus};
 use super::worker_session::{RemoteWorkerSession, SharedWorkerSession};
 
 /// How many node events one per-node demux buffers before a slow reader lags.
@@ -502,14 +502,18 @@ impl RemoteWorkers {
             .contains(&(node_id.to_string(), branch.to_string()))
     }
 
-    /// How many live workers run on `node_id`.
+    /// How many workers are running on `node_id`: its live sessions plus the
+    /// session-free Claude Code agent workers placed on it (plan 5e64ccd5). A
+    /// remote agent worker has no live session here, so its record counts until
+    /// it leaves Working, Fixing or Interrupted — otherwise the node would
+    /// advertise a free slot the session is already using.
     pub async fn busy_on(&self, node_id: &str) -> usize {
         // Never hold `records` and `live` together: the delivery path takes
         // `records` while it holds `live`. Copy the live ids, drop that lock,
         // then read the records.
         let live_ids: Vec<String> = self.live.lock().await.keys().cloned().collect();
         let records = self.records.lock().await;
-        live_ids
+        let live = live_ids
             .iter()
             .filter(|id| {
                 records.iter().any(|record| {
@@ -520,7 +524,23 @@ impl RemoteWorkers {
                             .is_some_and(|remote| remote.node_id == node_id)
                 })
             })
-            .count()
+            .count();
+        let agents = records
+            .iter()
+            .filter(|record| {
+                record.claude_agent.is_some()
+                    && !live_ids.contains(&record.id)
+                    && matches!(
+                        record.status,
+                        WorkerStatus::Working | WorkerStatus::Fixing | WorkerStatus::Interrupted
+                    )
+                    && record
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.node_id == node_id)
+            })
+            .count();
+        live + agents
     }
 
     /// How many pool slots `node` advertises, and its OS.
@@ -729,6 +749,7 @@ impl RemoteWorkers {
             path: answer.path,
             synced_tip: None,
             offline_since_ms: None,
+            ssh: None,
         })
     }
 
@@ -1750,6 +1771,7 @@ mod tests {
             path: "C:/node/checkouts/0123456789ab-1".to_string(),
             synced_tip: synced.map(str::to_string),
             offline_since_ms: None,
+            ssh: None,
         }
     }
 

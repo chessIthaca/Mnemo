@@ -1786,6 +1786,7 @@ pub(super) fn worker(root: &std::path::Path, id: &str) -> WorkerRecord {
         worktree: root
             .join(".worktrees")
             .join(format!("agent-{}", agent_short_id(id))),
+        remote: None,
         status: WorkerStatus::Completed,
         generation: 0,
         transcript: Arc::default(),

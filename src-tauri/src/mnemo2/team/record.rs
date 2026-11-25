@@ -209,6 +209,36 @@ pub struct ToolErrorNote {
     pub output: String,
 }
 
+/// Where a worker runs when it is not local: one checkout of one paired
+/// worker node (plan 9a2f4b67, phase 3).
+///
+/// The record keeps the node's stable identity (`node_id`) and display
+/// (`node_name`, `os`), the project key the hub sends with every repo call,
+/// the node checkout name and its path there, the last commit the hub copied
+/// into the worker's shadow checkout, and — while the node is away — the Unix
+/// millisecond the link was first seen down.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCheckout {
+    /// The paired node's 32-hex id.
+    pub node_id: String,
+    /// The node's operator-visible name.
+    pub node_name: String,
+    /// The node's operating system (`windows` or `macos`).
+    pub os: String,
+    /// The 12-hex project key both ends name the project by.
+    pub project: String,
+    /// The checkout name under the node's `<home>/checkouts/`.
+    pub checkout: String,
+    /// The checkout's path on the node.
+    pub path: String,
+    /// The node tip whose branch the hub last copied into the shadow.
+    #[serde(default)]
+    pub synced_tip: Option<String>,
+    /// When the node's link was first seen down, in Unix milliseconds.
+    #[serde(default)]
+    pub offline_since_ms: Option<u64>,
+}
+
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -239,6 +269,10 @@ pub struct WorkerRecord {
     pub branch: String,
     /// The linked worktree checkout.
     pub worktree: PathBuf,
+    /// Where the worker runs when it is not local. `None` is a local worker;
+    /// old ledgers written before remote workers load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteCheckout>,
     /// The real lifecycle state.
     pub status: WorkerStatus,
     /// The session generation within this worker (resume advances it).
@@ -663,6 +697,18 @@ impl WorkerRecord {
     /// status rule.
     pub(crate) fn waiting_on_user(&self) -> bool {
         self.status.waiting_on_user() && !audit_finished(self)
+    }
+
+    /// The host this worker runs on: `local`, or the paired node's name.
+    ///
+    /// Every user-facing place that tells a host apart (team_status, notices,
+    /// the review evidence) reads it here so an unnamed remote worker can never
+    /// look local.
+    pub fn host_label(&self) -> &str {
+        self.remote
+            .as_ref()
+            .map(|remote| remote.node_name.as_str())
+            .unwrap_or("local")
     }
 }
 

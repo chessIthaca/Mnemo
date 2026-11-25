@@ -368,6 +368,7 @@ impl TeamRuntime {
             model_id: None,
             branch: branch_created,
             worktree,
+            remote: None,
             status: WorkerStatus::Dispatching,
             generation: 0,
             transcript: Arc::default(),

@@ -11,7 +11,7 @@
 //! interaction, and event pump. It deliberately has no Tauri types so the
 //! worker lifecycle is testable against a scripted LLM.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -57,10 +57,15 @@ pub mod proof;
 mod proving;
 mod pump;
 mod record;
+// Public, like `proof`: the remote seam is the contract steps 5-7 build on, so
+// a step that adds it before the team calls every method does not trip the
+// dead-code lint.
+pub mod remote;
 mod review;
 mod routing;
 mod spawn;
-mod worker_session;
+// Public for the same reason: the worker-session seam is the team's contract.
+pub mod worker_session;
 
 use control::recover_worker;
 use deletion::schedule_trash_sweep;
@@ -71,6 +76,7 @@ use merge::{
 };
 use persistence::TeamPersistence;
 use pump::{close_worker_session, save_workers_now, save_workers_soon};
+use remote::{RemoteWorkers, ShadowSync};
 use worker_session::SharedWorkerSession;
 
 pub use agent_watch::{AgentGateView, AgentGateWorker};
@@ -88,9 +94,10 @@ pub use external_lead::{
     ExternalWait, ExternalWaitStatus, EXTERNAL_LEAD_IDLE_MS, EXTERNAL_LEAD_MEMORY_REMINDER,
 };
 pub use record::{
-    ChangeSource, HandedBack, InboxEntry, InboxKind, MessageSender, ToolErrorNote, WorkerCheck,
-    WorkerRecord, WorkerRouting, WorkerStatus,
+    ChangeSource, HandedBack, InboxEntry, InboxKind, MessageSender, RemoteCheckout, ToolErrorNote,
+    WorkerCheck, WorkerRecord, WorkerRouting, WorkerStatus,
 };
+pub use remote::{HostDirectory, PairOffer};
 
 /// The Tauri event channel emitted by the team runtime.
 pub const TEAM_EVENT_CHANNEL: &str = "mnemo2://team-event";
@@ -104,6 +111,12 @@ const EVENT_BUFFER: usize = 1024;
 
 /// The default number of concurrently live worker sessions.
 pub const DEFAULT_SLOTS: usize = 3;
+
+/// How often the host monitor re-reads the node links when no change woke it.
+const HOST_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the host monitor reconciles sessions, pools and refs with a node.
+const HOST_RECONCILE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A plan-board signal for the host: the UI refreshes on `Changed`, the lead
 /// is told about a `Notice`.
@@ -341,6 +354,11 @@ fn unix_ms() -> u64 {
     u64::try_from(phase3::now_ms()).unwrap_or(u64::MAX)
 }
 
+/// A commit sha as a person reads it: the first seven characters.
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
 /// A worker status as the short string the routing rows log (`working`,
 /// `stopped`, …) — the serde tag of [`WorkerStatus`].
 fn status_name(status: WorkerStatus) -> String {
@@ -424,6 +442,10 @@ pub struct TeamRuntime {
     /// missing mutation tools it named (decision 2026-11-19). In memory only.
     mutation_memory: Arc<std::sync::Mutex<proving::MutationMemory>>,
     signals: broadcast::Sender<BoardSignal>,
+    /// The remote-worker seam: host lookup, the per-node event demux, the git
+    /// bundle round trips, node-side checks and host suitability. With no
+    /// [`HostDirectory`] attached every worker is local.
+    remote: Arc<RemoteWorkers>,
     /// The external lead's attach flag, notice queue and activity clock.
     external: std::sync::Mutex<ExternalLead>,
     /// Wakes [`TeamRuntime::wait_external_notices`] on a push or a detach.
@@ -637,11 +659,22 @@ impl TeamRuntime {
             });
             Arc::new(RouteKnn::new(getter, routing_log_path.clone()))
         });
+        let workspace_root = options.workspace_root;
+        let records = Arc::new(Mutex::new(workers));
+        let live: Arc<Mutex<HashMap<String, LiveWorker>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Remoting is off until a host directory is attached: the seam exists,
+        // it just never reaches a node.
+        let remote = Arc::new(RemoteWorkers::new(
+            workspace_root.clone(),
+            options.state_dir.clone(),
+            records.clone(),
+            live.clone(),
+        ));
         let runtime = Self {
             engine: std::sync::RwLock::new(Some(options.engine)),
-            workspace_root: options.workspace_root,
-            records: Arc::new(Mutex::new(workers)),
-            live: Arc::new(Mutex::new(HashMap::new())),
+            workspace_root,
+            records,
+            live,
             messages: Arc::new(Mutex::new(Vec::new())),
             events,
             generation: Arc::new(AtomicU64::new(0)),
@@ -672,6 +705,7 @@ impl TeamRuntime {
             proofs: std::sync::RwLock::new(Arc::new(proving::RealProofs::new(config_dir.clone()))),
             mutation_memory: Arc::new(std::sync::Mutex::new(proving::MutationMemory::default())),
             signals,
+            remote,
             external: std::sync::Mutex::new(ExternalLead::away_since(unix_ms())),
             external_wake: tokio::sync::Notify::new(),
         };
@@ -724,6 +758,473 @@ impl TeamRuntime {
 
     fn notify_lead(&self, key: String, text: String) {
         let _ = self.signals.send(BoardSignal::Notice { key, text });
+    }
+
+    /// Attach the app's host directory: from here on a dispatch may place a
+    /// Mnemo-model worker on a paired node, and the host monitor runs.
+    ///
+    /// Remoting stays off until this is called with a directory that has a
+    /// running hub, so an app whose user never paired a node behaves exactly as
+    /// before.
+    pub fn attach_hosts(self: &Arc<Self>, hosts: Arc<dyn HostDirectory>) {
+        self.remote.attach(hosts.clone());
+        let team = Arc::downgrade(self);
+        tokio::spawn(async move {
+            // The app attaches its directory before the hub's listener exists
+            // (the first pairing starts it), so wait for a server rather than
+            // giving up.
+            let mut links: Option<tokio::sync::watch::Receiver<u64>> = None;
+            let mut last_reconcile = std::time::Instant::now();
+            loop {
+                // A dropped team ends the monitor, also while it is still
+                // waiting for the hub to appear.
+                if team.upgrade().is_none() {
+                    return;
+                }
+                if links.is_none() {
+                    let Some(server) = hosts.server() else {
+                        tokio::time::sleep(HOST_POLL).await;
+                        continue;
+                    };
+                    links = Some(server.link_changes());
+                    let Some(runtime) = team.upgrade() else {
+                        return;
+                    };
+                    runtime.reconcile_hosts().await;
+                    last_reconcile = std::time::Instant::now();
+                    continue;
+                }
+                let Some(link) = links.as_mut() else {
+                    continue;
+                };
+                tokio::select! {
+                    changed = link.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(HOST_POLL) => {}
+                }
+                let Some(runtime) = team.upgrade() else {
+                    return;
+                };
+                runtime.poll_hosts().await;
+                if last_reconcile.elapsed() >= HOST_RECONCILE {
+                    runtime.reconcile_hosts().await;
+                    last_reconcile = std::time::Instant::now();
+                }
+            }
+        });
+    }
+
+    /// Bring the hub shadow checkout of `worker_id` up to the worker's latest
+    /// tip. A local worker answers its worktree tip; remoting is not involved.
+    pub async fn sync_remote(&self, worker_id: &str) -> Result<ShadowSync, String> {
+        let record = {
+            let records = self.records.lock().await;
+            records
+                .iter()
+                .find(|worker| worker.id == worker_id)
+                .cloned()
+        }
+        .ok_or_else(|| format!("unknown worker '{worker_id}'"))?;
+        let sync = self.remote.sync_shadow(&record, true).await?;
+        if record.remote.is_some() {
+            if let Err(error) = self.persist().await {
+                eprintln!("team: could not save the synced tip of {worker_id}: {error}");
+            }
+        }
+        Ok(sync)
+    }
+
+    /// Notice a host going away, coming back, or staying away past the outage
+    /// budget. Runs on the host monitor; one pass never holds a team lock
+    /// across a link call.
+    async fn poll_hosts(&self) {
+        let Some(server) = self.remote.server() else {
+            return;
+        };
+        let connected: HashSet<String> = server.connected().into_iter().collect();
+        // One lock at a time: the delivery path holds `live` while it takes
+        // `records`, so nesting them here in the other order would deadlock.
+        let sessions: Vec<(String, SharedWorkerSession)> = {
+            let live = self.live.lock().await;
+            live.iter()
+                .map(|(id, worker)| (id.clone(), worker.session.clone()))
+                .collect()
+        };
+        let watching: Vec<(String, RemoteCheckout, SharedWorkerSession)> = {
+            let records = self.records.lock().await;
+            sessions
+                .into_iter()
+                .filter_map(|(id, session)| {
+                    let record = records.iter().find(|record| record.id == id)?;
+                    let remote = record.remote.clone()?;
+                    Some((id, remote, session))
+                })
+                .collect()
+        };
+        let budget_ms = u64::try_from(self.remote.outage_budget().as_millis()).unwrap_or(u64::MAX);
+        let now = unix_ms();
+        for (id, remote, session) in watching {
+            if !connected.contains(&remote.node_id) {
+                match remote.offline_since_ms {
+                    None => self.mark_host_offline(&id, &remote).await,
+                    Some(since) if now.saturating_sub(since) > budget_ms => {
+                        self.fail_lost_host(&id, &remote).await;
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+            if remote.offline_since_ms.is_none() {
+                continue;
+            }
+            let node = server.node(&remote.node_id);
+            match node.list_sessions().await {
+                Ok(sessions) if sessions.iter().any(|info| info.session == session.id()) => {
+                    self.mark_host_back(&id, &remote).await;
+                }
+                Ok(_) => self.mark_host_restarted(&id, &remote).await,
+                // A flapping link: the next pass decides.
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Mark a live remote worker's host as away and tell the lead.
+    async fn mark_host_offline(&self, worker_id: &str, remote: &RemoteCheckout) {
+        {
+            let mut records = self.records.lock().await;
+            let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
+                return;
+            };
+            let Some(state) = worker.remote.as_mut() else {
+                return;
+            };
+            if state.offline_since_ms.is_some() {
+                return;
+            }
+            state.offline_since_ms = Some(unix_ms());
+        }
+        if let Err(error) = self.persist().await {
+            eprintln!("team: could not save the lost host of {worker_id}: {error}");
+        }
+        let budget = self.remote.outage_budget().as_secs();
+        self.notify_lead(
+            format!("host-offline:{worker_id}"),
+            format!(
+                "Worker {worker_id} lost its host {}; it continues when the host is back (up to {budget} s).",
+                remote.node_name
+            ),
+        );
+    }
+
+    /// A host that came back within the outage budget: clear the mark and tell
+    /// the lead the worker continues there.
+    async fn mark_host_back(&self, worker_id: &str, remote: &RemoteCheckout) {
+        {
+            let mut records = self.records.lock().await;
+            let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
+                return;
+            };
+            let Some(state) = worker.remote.as_mut() else {
+                return;
+            };
+            if state.offline_since_ms.take().is_none() {
+                return;
+            }
+        }
+        if let Err(error) = self.persist().await {
+            eprintln!("team: could not save the returned host of {worker_id}: {error}");
+        }
+        self.notify_lead(
+            format!("host-back:{worker_id}"),
+            format!(
+                "Host {} is back; worker {worker_id} continues.",
+                remote.node_name
+            ),
+        );
+    }
+
+    /// A host that came back after its node process restarted: the session is
+    /// gone, and `team_resume` starts it there again.
+    async fn mark_host_restarted(&self, worker_id: &str, remote: &RemoteCheckout) {
+        {
+            let mut records = self.records.lock().await;
+            let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
+                return;
+            };
+            worker.status = WorkerStatus::Interrupted;
+            worker.error = Some(format!(
+                "host '{}' restarted; its session ended. team_resume continues it there.",
+                remote.node_name
+            ));
+            if let Some(state) = worker.remote.as_mut() {
+                state.offline_since_ms = None;
+            }
+        }
+        {
+            // The session is gone with the node process: end its pump and free
+            // the host slot now, as a lost host does.
+            let mut live = self.live.lock().await;
+            if let Some(worker) = live.remove(worker_id) {
+                worker.pump.abort();
+            }
+        }
+        if let Err(error) = self.persist().await {
+            eprintln!("team: could not save the restarted host of {worker_id}: {error}");
+        }
+        self.notify_lead(
+            format!("host-back:{worker_id}"),
+            format!(
+                "Host {} is back; worker {worker_id} continues.",
+                remote.node_name
+            ),
+        );
+        self.signal_board_changed();
+    }
+
+    /// A host that stayed away past the outage budget: the session there is
+    /// lost, and the worker fails with a resumable error naming the host.
+    async fn fail_lost_host(&self, worker_id: &str, remote: &RemoteCheckout) {
+        let message = {
+            let mut records = self.records.lock().await;
+            let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) else {
+                return;
+            };
+            let budget = self.remote.outage_budget().as_secs();
+            let name = &remote.node_name;
+            let base = worker
+                .base_commit
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("");
+            let from = match worker
+                .remote
+                .as_ref()
+                .and_then(|state| state.synced_tip.as_deref())
+            {
+                Some(tip) => format!(
+                    " from its last synced commit {}",
+                    short_sha(tip)
+                ),
+                None if !base.is_empty() => format!(
+                    " from its starting commit {} (nothing was synced from {name})",
+                    short_sha(base)
+                ),
+                None => String::new(),
+            };
+            let text = format!(
+                "host '{name}' has been offline for more than {budget} s; its session there is lost. team_resume continues worker '{worker_id}' on {name} once the host is back, or here with host \"local\"{from}."
+            );
+            worker.status = WorkerStatus::Failed;
+            worker.error = Some(text.clone());
+            text
+        };
+        {
+            let mut live = self.live.lock().await;
+            if let Some(worker) = live.remove(worker_id) {
+                worker.pump.abort();
+            }
+        }
+        if let Err(error) = self.persist().await {
+            eprintln!("team: could not save the failed worker {worker_id}: {error}");
+        }
+        self.notify_lead(
+            format!("host-lost:{worker_id}"),
+            format!(
+                "Host {} stayed away too long; worker {worker_id} failed. {message}",
+                remote.node_name
+            ),
+        );
+        self.signal_board_changed();
+    }
+
+    /// Re-align the node side with the hub: close sessions the hub does not
+    /// know, release pools no record holds, drop the refs of deleted workers,
+    /// and start a qualification on every connected node that has none.
+    async fn reconcile_hosts(&self) {
+        let Some(server) = self.remote.server() else {
+            return;
+        };
+        let project = self.remote.project().to_string();
+        let nodes = server.nodes().list().unwrap_or_default();
+        // One lock at a time (see `poll_hosts`): copy the live sessions, drop
+        // `live`, then read the records.
+        let live_ids: Vec<(String, mnemo::headless::SessionId)> = {
+            let live = self.live.lock().await;
+            live.iter()
+                .map(|(id, worker)| (id.clone(), worker.session.id()))
+                .collect()
+        };
+        let live_sessions: Vec<(String, mnemo::headless::SessionId)> = {
+            let records = self.records.lock().await;
+            live_ids
+                .into_iter()
+                .filter_map(|(id, session)| {
+                    let record = records.iter().find(|record| record.id == id)?;
+                    let remote = record.remote.as_ref()?;
+                    Some((remote.node_id.clone(), session))
+                })
+                .collect()
+        };
+        let previously_orphaned = self.remote.orphans();
+        let mut orphans_now: HashSet<(String, mnemo::headless::SessionId)> = HashSet::new();
+        for node_record in nodes
+            .iter()
+            .filter(|node| server.is_connected(&node.node_id))
+        {
+            let node = server.node(&node_record.node_id);
+            if let Ok(sessions) = node.list_sessions().await {
+                for info in sessions {
+                    let known = live_sessions
+                        .iter()
+                        .any(|(node_id, session)| node_id == &node_record.node_id && *session == info.session);
+                    if known {
+                        continue;
+                    }
+                    // A dispatch inserts its live entry only after the opening
+                    // prompt, so a session seen for the first time may still be
+                    // spawning: close it only when the previous pass saw it too.
+                    let key = (node_record.node_id.clone(), info.session);
+                    let seen_before = previously_orphaned.contains(&key);
+                    orphans_now.insert(key);
+                    if seen_before {
+                        let _ = node.close(info.session).await;
+                    }
+                }
+            }
+            let referenced: HashSet<String> = {
+                let records = self.records.lock().await;
+                records
+                    .iter()
+                    .filter_map(|record| {
+                        let remote = record.remote.as_ref()?;
+                        (remote.node_id == node_record.node_id).then(|| remote.checkout.clone())
+                    })
+                    .collect()
+            };
+            let qualifying = self.remote.qualifying_checkout(&node_record.node_id);
+            let listed = node
+                .call(
+                    mnemo::remote::repo::CHECKOUT_LIST,
+                    serde_json::json!(mnemo::remote::repo::CheckoutList {
+                        project: project.clone(),
+                    }),
+                    mnemo::remote::hub::CALL_TIMEOUT,
+                )
+                .await;
+            match listed {
+                Ok(value) => match serde_json::from_value::<
+                    mnemo::remote::repo::CheckoutListAnswer,
+                >(value)
+                {
+                    Ok(answer) => {
+                        for info in answer.checkouts {
+                            if referenced.contains(&info.checkout) {
+                                continue;
+                            }
+                            if qualifying.as_deref() == Some(info.checkout.as_str()) {
+                                continue;
+                            }
+                            // A detached pool is already released.
+                            let Some(branch) = info.branch.as_deref() else {
+                                continue;
+                            };
+                            if !branch.starts_with("wt/agent-") {
+                                continue;
+                            }
+                            // A qualification holds (or is about to hold) its
+                            // own hostcheck checkout: never release it under it.
+                            if self
+                                .remote
+                                .qualification_protects(&node_record.node_id, branch)
+                            {
+                                continue;
+                            }
+                            let released = node
+                                .call(
+                                    mnemo::remote::repo::CHECKOUT_RELEASE,
+                                    serde_json::json!(mnemo::remote::repo::CheckoutRelease {
+                                        checkout: info.checkout.clone(),
+                                    }),
+                                    mnemo::remote::hub::CALL_TIMEOUT,
+                                )
+                                .await;
+                            if let Err(error) = released {
+                                eprintln!(
+                                    "team: could not release checkout {} on host '{}': {error}",
+                                    info.checkout, node_record.name
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "team: bad checkout list from host '{}': {error}",
+                        node_record.name
+                    ),
+                },
+                Err(error) => eprintln!(
+                    "team: could not list checkouts on host '{}': {error}",
+                    node_record.name
+                ),
+            }
+        }
+        self.remote.replace_orphans(orphans_now);
+        self.drop_stale_remote_refs().await;
+        let commands = spawn::load_check_commands(&self.workspace_root);
+        let hash = remote::checks_hash(&commands);
+        for node_record in nodes
+            .iter()
+            .filter(|node| server.is_connected(&node.node_id))
+        {
+            if self.remote.qualification(&node_record.node_id, &hash)
+                == remote::Qualification::Pending
+            {
+                self.remote.qualify(&node_record.node_id);
+            }
+        }
+    }
+
+    /// Delete the `refs/mnemo/remote/<id>` refs of workers that no longer
+    /// exist.
+    async fn drop_stale_remote_refs(&self) {
+        let listing = match remote::git_value(
+            &self.workspace_root,
+            &["for-each-ref", "--format=%(refname)", "refs/mnemo/remote/"],
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(_) => return,
+        };
+        if listing.is_empty() {
+            return;
+        }
+        let known: HashSet<String> = self
+            .records
+            .lock()
+            .await
+            .iter()
+            .map(|record| record.id.clone())
+            .collect();
+        for reference in listing.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Some(id) = reference.strip_prefix("refs/mnemo/remote/") else {
+                continue;
+            };
+            if known.contains(id) {
+                continue;
+            }
+            if let Err(error) = remote::git_value(
+                &self.workspace_root,
+                &["update-ref", "-d", reference],
+            )
+            .await
+            {
+                eprintln!("team: could not drop {reference}: {error}");
+            }
+        }
     }
 
     /// Install a stub classifier for runtime integration tests.
@@ -945,8 +1446,11 @@ impl TeamRuntime {
         ledger::live_turns(&self.records.lock().await)
     }
 
-    /// Active workers for every slot gate: live Mnemo sessions plus
+    /// Active workers for every slot gate: live local Mnemo sessions plus
     /// session-free Claude Code agents in Working or Interrupted.
+    ///
+    /// A remote worker does not use a local pool slot: its host has its own
+    /// slots (`mnemo2-node run --slots`), so it is counted there, not here.
     pub(super) async fn active_workers_for_slots(&self) -> usize {
         let active_agents = self
             .records
@@ -961,7 +1465,21 @@ impl TeamRuntime {
                     )
             })
             .count();
-        self.live.lock().await.len() + active_agents
+        // One lock at a time: copy the live ids, drop `live`, then read the
+        // records (the delivery path nests them live-then-records).
+        let live_ids: Vec<String> = self.live.lock().await.keys().cloned().collect();
+        let local = {
+            let records = self.records.lock().await;
+            live_ids
+                .iter()
+                .filter(|id| {
+                    records
+                        .iter()
+                        .any(|worker| &worker.id == *id && worker.remote.is_none())
+                })
+                .count()
+        };
+        local + active_agents
     }
 
     /// Persist a new live-session cap without dropping active workers.

@@ -1355,7 +1355,7 @@ impl TeamRuntime {
 
     /// Share the lead's one plan board with the team and register the observer
     /// that tells working workers when the lead records something new.
-    pub(crate) fn attach_board(self: &Arc<Self>, board: Arc<PlanBoard>) {
+    pub fn attach_board(self: &Arc<Self>, board: Arc<PlanBoard>) {
         board.set_external_lead_attached(self.external_lead_attached());
         // The worker pumps resume a usage-limited worker through this handle;
         // a second attach finds it already set to this same runtime.

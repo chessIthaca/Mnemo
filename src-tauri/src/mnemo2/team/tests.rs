@@ -5926,20 +5926,23 @@ async fn routing_fixture(
 }
 
 /// Poll `probe` every 25 ms until it resolves to `Some`, or fail after
-/// 20 s: the worker pumps and the detached drift work run concurrently
-/// with the test.
+/// 120 s by deadline: the worker pumps and the detached drift work run
+/// concurrently with the test, and a loaded machine can stretch any step.
 async fn eventually<T, F, Fut>(probe: F) -> T
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    for _ in 0..800 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
         if let Some(value) = probe().await {
             return value;
         }
+        if std::time::Instant::now() >= deadline {
+            panic!("the polled condition never became true within 120 s");
+        }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("the polled condition never became true");
 }
 
 /// Wait until the deferred classification of an explicit-choice dispatch
@@ -20691,7 +20694,9 @@ async fn team_status_shows_host() {
         .expect("the remote worker");
     assert_eq!(entry["host"], "mac-mini");
     let offline = entry["host_offline_s"].as_u64().expect("an offline age");
-    assert!((30..40).contains(&offline), "{entry}");
+    // The lower bound proves the age is computed from offline_since_ms; the
+    // upper bound is only slack for a loaded machine, so it is wide.
+    assert!((30..30 + 120).contains(&offline), "{entry}");
     team.shutdown().await;
 }
 

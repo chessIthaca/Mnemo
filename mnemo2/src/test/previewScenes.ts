@@ -10,19 +10,21 @@
 import { mount as svelteMount, unmount } from "svelte";
 import App from "../App.svelte";
 import SettingsDialog from "../components/SettingsDialog.svelte";
+import WorkerHostsPage from "../components/WorkerHostsPage.svelte";
 import { seedBoardPreview } from "../lib/boardEngine";
 import { seedBacklogPreview, type BacklogItem, type BacklogTransport } from "../lib/backlog";
 import type { BoardPlan } from "../lib/boardState";
 import { app } from "../lib/store";
 import { seedGraphPreview, type GraphEdge, type GraphImpactSymbol, type GraphNode, type GraphStatus, type GraphSymbol, type GraphTransport } from "../lib/graph";
 import type { WorkerDeletionPreview } from "../lib/teamState";
+import type { WorkerHost as PairedHost, WorkerHostsTransport } from "../lib/workerHosts";
 import { seedPreviewSettings } from "./previewSettings";
 import { seedPreviewLaya } from "./previewLaya";
 import { seedPreviewSafety } from "./previewSafety";
 import { seedPreviewMcp } from "./previewMcp";
 import { seedPreviewAppearance } from "./previewAppearance";
 import type { ThemeChoice } from "../lib/theme";
-import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerThreadEntry } from "../lib/types";
+import type { AppState, LeadEntry, Worker, WorkerActivity, WorkerHost, WorkerThreadEntry } from "../lib/types";
 
 import { createLeadEntries, createWorkers, fixtureState } from "./fixtures";
 import { seedFilesPreview, type FileEntry } from "../lib/files";
@@ -2296,6 +2298,139 @@ function leadToolRows(): AppState {
   };
 }
 
+/** The one worker host the preview's remote workers run on. */
+const STUDIO = { name: "studio", os: "macos" };
+
+/**
+ * Mission control on two computers: two workers on the `studio` host (one of
+ * them while the host's link is away), a merged worker whose host went away
+ * after the merge (no away state, D6), and a worker on this computer. The away
+ * one is selected so the detail shows the host pill and its explanation.
+ */
+function remoteWorkers(): AppState {
+  const state = baseState();
+  const awaySinceMs = Date.now() - 95_000;
+  const placed = new Map<string, WorkerHost | null>([
+    ["sol", { ...STUDIO, offlineSinceMs: null, ssh: null }],
+    ["kai", { ...STUDIO, offlineSinceMs: awaySinceMs, ssh: null }],
+    ["ren", { ...STUDIO, offlineSinceMs: awaySinceMs, ssh: null }],
+    ["milo", null],
+  ]);
+  return {
+    ...state,
+    route: "team",
+    selectedWorkerId: "kai",
+    teamFilter: "all",
+    teamActive: 3,
+    teamSlots: 8,
+    workerPanelId: null,
+    workerDeletion: null,
+    workers: state.workers.map((worker) =>
+      placed.has(worker.id) ? { ...worker, host: placed.get(worker.id) ?? null } : worker,
+    ),
+  };
+}
+
+/** The hub address the sample pairing offer names (its port goes into the note). */
+const PREVIEW_HUB_ADDRESS = "192.168.1.20:47615";
+
+/** When the sample list's away host was last seen: two hours before the scene. */
+const OLD_LAPTOP_LAST_SEEN_MS = Date.now() - 2 * 60 * 60_000;
+
+/**
+ * The in-memory fake behind the `worker-hosts` scene: the real page mounted
+ * without the Tauri host, listing two paired computers. Linking, unlinking and
+ * revoking change the list in place, and pairing hands out the same offer shape
+ * the lead's `team_hosts pair` prints.
+ */
+export function previewWorkerHostsTransport(): WorkerHostsTransport {
+  const hosts: PairedHost[] = [
+    {
+      name: "studio",
+      node_id: "node-studio",
+      os: "macos",
+      connected: true,
+      slots: 2,
+      busy: 1,
+      catalog_ready: true,
+      checks: "passed",
+      last_seen_ms: Date.now(),
+      ssh: "studio-ssh",
+      claude_home: true,
+    },
+    {
+      name: "old-laptop",
+      node_id: "node-old-laptop",
+      os: "windows",
+      connected: false,
+      slots: null,
+      busy: null,
+      catalog_ready: null,
+      checks: "failed: cargo not found",
+      last_seen_ms: OLD_LAPTOP_LAST_SEEN_MS,
+      ssh: null,
+      claude_home: null,
+    },
+  ];
+  const find = (name: string): PairedHost => {
+    const host = hosts.find((candidate) => candidate.name === name);
+    if (!host) throw `There is no worker host named ${name}.`;
+    return host;
+  };
+  return {
+    list: async () => ({
+      hub: { listening: true, address: PREVIEW_HUB_ADDRESS },
+      hosts: hosts.map((host) => ({ ...host })),
+    }),
+    pair: async (name) => {
+      const code = "K7Q-4MZ";
+      const named = name?.trim() ? ` --name ${name.trim()}` : "";
+      const port = PREVIEW_HUB_ADDRESS.slice(PREVIEW_HUB_ADDRESS.lastIndexOf(":") + 1);
+      return {
+        code,
+        expires_in_s: 600,
+        hub: { listening: true, address: PREVIEW_HUB_ADDRESS },
+        commands: [
+          `mnemo2-node pair --hub ${PREVIEW_HUB_ADDRESS} --code ${code}${named}`,
+          "mnemo2-node run --workspace <an empty folder for Mnemo's work>",
+        ],
+        note: `Run both commands on the new host. This computer now accepts host connections on port ${port}; allow it if a firewall prompt appears.`,
+      };
+    },
+    revoke: async (name) => {
+      const host = find(name);
+      hosts.splice(hosts.indexOf(host), 1);
+      return { revoked: { name: host.name, node_id: host.node_id }, failed_workers: [] };
+    },
+    link: async (name, ssh) => {
+      const host = find(name);
+      host.ssh = ssh;
+      return { linked: { name: host.name, node_id: host.node_id, ssh } };
+    },
+    unlink: async (name) => {
+      const host = find(name);
+      const ssh = host.ssh;
+      host.ssh = null;
+      return { unlinked: { name: host.name, node_id: host.node_id, ssh } };
+    },
+  };
+}
+
+/**
+ * A full-height box for scenes that mount one settings page instead of the
+ * whole dialog: the pages are flex columns that fill the dialog body, so the
+ * preview gives them the dialog's canvas and height to render into.
+ */
+function pageFrame(target: HTMLElement): HTMLElement {
+  const frame = document.createElement("div");
+  frame.style.display = "flex";
+  frame.style.flexDirection = "column";
+  frame.style.height = "100%";
+  frame.style.background = "var(--surface)";
+  target.append(frame);
+  return frame;
+}
+
 /** Every scene the preview page renders, in index order. */
 export const previewScenes: PreviewScene[] = [
   {
@@ -2303,6 +2438,13 @@ export const previewScenes: PreviewScene[] = [
     title: "Mission control",
     description: "The team list with a live status row per running worker, and a selected worker whose thread has Markdown and tool rows.",
     build: missionControl,
+  },
+  {
+    name: "remote-workers",
+    title: "Remote workers",
+    description:
+      "The team list with worker hosts: a worker on the studio host, one whose host is away, a merged worker whose host went away after the merge (no away state), and a worker on this computer.",
+    build: remoteWorkers,
   },
   {
     name: "graph",
@@ -2482,6 +2624,28 @@ export const previewScenes: PreviewScene[] = [
       return () => {
         unmount(dialog);
         restoreSettings();
+      };
+    },
+  },
+  {
+    name: "worker-hosts",
+    title: "Settings: Worker hosts",
+    description:
+      "The settings dialog's Worker hosts page on its own: two paired computers (one connected and busy, one away whose checks failed), an SSH link on one of them, and the pairing offer with its code and the two mnemo2-node commands.",
+    // The dialog opens from component-local state, so the scene mounts the page
+    // directly against an in-memory fake of the worker_hosts_* commands: a
+    // browser has no Tauri host to ask, and linking, unlinking and revoking
+    // still work in the preview.
+    build: missionControl,
+    mount: (target) => {
+      const frame = pageFrame(target);
+      const page = svelteMount(WorkerHostsPage, {
+        target: frame,
+        props: { transport: previewWorkerHostsTransport() },
+      });
+      return () => {
+        unmount(page);
+        frame.remove();
       };
     },
   },

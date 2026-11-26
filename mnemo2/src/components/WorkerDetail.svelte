@@ -257,7 +257,7 @@
 
   {#if host && host.offlineSinceMs !== null && awaySeconds !== null}
     <p class="host-away" role="status">
-      <strong>{host.name}</strong> is unreachable since <ElapsedTime startedAtMs={host.offlineSinceMs} prefix="" title="Away time" />; {#if worker.runsAsAgent}its Claude Code session there may keep working.{:else}Mnemo continues the worker when it is back.{/if}
+      <strong>{host.name}</strong> has been unreachable for <ElapsedTime startedAtMs={host.offlineSinceMs} prefix="" title="Away time" />; {#if worker.runsAsAgent}its Claude Code session there may keep working.{:else}Mnemo continues the worker when it is back.{/if}
     </p>
   {/if}
 

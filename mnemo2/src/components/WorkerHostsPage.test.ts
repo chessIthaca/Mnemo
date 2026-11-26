@@ -62,7 +62,7 @@ describe("WorkerHostsPage", () => {
     expect(screen.getByText("connected")).toBeTruthy();
     expect(screen.getByText("checks passed")).toBeTruthy();
     expect(screen.getByText("1/4 busy")).toBeTruthy();
-    expect(screen.getByText(/signed in folder found/)).toBeTruthy();
+    expect(screen.getByText("Claude Code set up")).toBeTruthy();
   });
 
   it("shows the empty list text", async () => {

@@ -1,13 +1,16 @@
+import { fireEvent, screen, waitFor } from "@testing-library/svelte";
 import { describe, expect, it } from "vitest";
 import { createGraphTransport } from "../lib/graph";
 import { canMoveMain, createGitTransport } from "../lib/git";
 import type { AppState, LeadEntry, Worker, WorkerErrorEntry, WorkerModelSwitchEntry, WorkerThreadEntry } from "../lib/types";
 import { costPreviewInsights } from "../lib/cost";
 import { createMemoryTransport } from "../lib/memoryView";
+import { hostAway, hostBadgeTitle } from "../lib/workerHost";
 import {
   defaultPreviewScene,
   previewScene,
   previewScenes,
+  previewWorkerHostsTransport,
   type PreviewScene,
 } from "../test/previewScenes";
 
@@ -75,6 +78,7 @@ describe("preview scenes", () => {
     const scenes: PreviewScene[] = previewScenes;
     expect(scenes.map((scene) => scene.name)).toEqual([
       "mission-control",
+      "remote-workers",
       "graph",
       "files",
       "git",
@@ -87,6 +91,7 @@ describe("preview scenes", () => {
       "settings-mcp",
       "settings-appearance",
       "settings-project",
+      "worker-hosts",
       "mission-control-dark",
       "lead-chat-dark",
       "graph-dark",
@@ -278,5 +283,93 @@ describe("preview scenes", () => {
     expect(worker.activity?.phase).toBe("waiting");
     expect(worker.activity?.turnStartedAtMs).not.toBeNull();
     expect(worker.createdAtMs).toBeGreaterThan(0);
+  });
+
+  it("remote-workers shows a host badge, an away badge only while active, and no away state once merged", () => {
+    const state = build("remote-workers");
+    const workers = new Map(state.workers.map((worker) => [worker.id, worker]));
+
+    // The local worker keeps no host at all: the snapshot leaves `remote` out.
+    expect(workers.get("milo")?.host ?? null).toBeNull();
+
+    // A connected host: the badge names the computer and shows no away time.
+    const connected = workers.get("sol");
+    expect(connected?.host).toEqual({ name: "studio", os: "macos", offlineSinceMs: null, ssh: null });
+    expect(hostAway(connected!, Date.now())).toBeNull();
+
+    // The away host of an active worker: the badge reads "studio · away …".
+    const away = workers.get("kai");
+    expect(away?.status).toBe("working");
+    expect(away?.host?.name).toBe("studio");
+    expect(hostBadgeTitle(away!)).toBe("Runs on studio (macOS)");
+    const offlineSinceMs = away?.host?.offlineSinceMs ?? 0;
+    expect(offlineSinceMs).toBeGreaterThan(0);
+    expect(hostAway(away!, offlineSinceMs + 95_500)).toBe(95);
+    expect(hostAway(away!, Date.now())).toBeGreaterThanOrEqual(95);
+
+    // A merged worker keeps its host's offline mark but never shows an away
+    // state: the link loss no longer changes the worker (D6).
+    const merged = workers.get("ren");
+    expect(merged?.status).toBe("merged");
+    expect(merged?.host?.offlineSinceMs).not.toBeNull();
+    expect(hostAway(merged!, Date.now())).toBeNull();
+
+    // The away worker is selected, so the detail shows the host pill too.
+    expect(state.selectedWorkerId).toBe(away?.id);
+  });
+
+  it("worker-hosts mounts the real page against its in-memory hosts", async () => {
+    const scene = previewScene("worker-hosts");
+    if (!scene?.mount) throw new Error("the worker-hosts scene mounts the page");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const unmount = scene.mount(container);
+    try {
+      // The two paired computers, with the connected one's link, load and busy
+      // state and the away one's failed checks.
+      await waitFor(() => expect(screen.getByText("studio")).toBeTruthy());
+      expect(screen.getByText("old-laptop")).toBeTruthy();
+      expect(screen.getByText("Linked to studio-ssh")).toBeTruthy();
+      expect(screen.getByText("1/2 busy")).toBeTruthy();
+      expect(screen.getByText("checks failed: cargo not found")).toBeTruthy();
+      expect(screen.getByText(/away since 2 h ago/)).toBeTruthy();
+
+      // Pairing shows the code, the countdown and both node commands.
+      fireEvent.click(screen.getByRole("button", { name: "Get pairing code" }));
+      expect(await screen.findByText("K7Q-4MZ")).toBeTruthy();
+      expect(screen.getByText(/Expires in/)).toBeTruthy();
+      expect(screen.getByText("mnemo2-node pair --hub 192.168.1.20:47615 --code K7Q-4MZ")).toBeTruthy();
+      expect(
+        screen.getByText("mnemo2-node run --workspace <an empty folder for Mnemo's work>"),
+      ).toBeTruthy();
+    } finally {
+      unmount();
+      container.remove();
+    }
+  });
+
+  it("worker-hosts' fake transport pairs, links, unlinks and revokes in memory", async () => {
+    const transport = previewWorkerHostsTransport();
+    expect((await transport.list()).hosts.map((host) => host.name)).toEqual(["studio", "old-laptop"]);
+
+    // Linking is the user's standing approval; unlinking withdraws it.
+    await transport.link("old-laptop", "laptop-ssh");
+    expect((await transport.list()).hosts.find((host) => host.name === "old-laptop")?.ssh).toBe("laptop-ssh");
+    await transport.unlink("old-laptop");
+    expect((await transport.list()).hosts.find((host) => host.name === "old-laptop")?.ssh).toBeNull();
+
+    // A revoke drops the host from the list the page re-reads.
+    await transport.revoke("studio");
+    expect((await transport.list()).hosts.map((host) => host.name)).toEqual(["old-laptop"]);
+
+    // The offer keeps the lead tool's format, including an optional host name.
+    const offer = await transport.pair();
+    expect(offer).toMatchObject({ code: "K7Q-4MZ", expires_in_s: 600, hub: { listening: true, address: "192.168.1.20:47615" } });
+    expect(offer.commands).toEqual([
+      "mnemo2-node pair --hub 192.168.1.20:47615 --code K7Q-4MZ",
+      "mnemo2-node run --workspace <an empty folder for Mnemo's work>",
+    ]);
+    const named = await transport.pair(" new-mac ");
+    expect(named.commands[0]).toBe("mnemo2-node pair --hub 192.168.1.20:47615 --code K7Q-4MZ --name new-mac");
   });
 });

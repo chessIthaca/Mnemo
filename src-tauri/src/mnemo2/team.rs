@@ -1189,8 +1189,10 @@ impl TeamRuntime {
     /// know, release pools no record holds, drop the refs of deleted workers,
     /// and start a qualification on every connected node that has none.
     ///
-    /// A remote agent worker has no Mnemo session on its node, but its record
-    /// names its checkout, so that checkout counts as referenced and is kept.
+    /// A remote agent worker has no Mnemo session on its node, but a record
+    /// that still works (a non-empty `worktree`) names its checkout, so that
+    /// checkout counts as referenced and is kept. A merged or deleted worker
+    /// keeps `remote` for history and display but lets its checkout go.
     async fn reconcile_hosts(&self) {
         let Some(server) = self.remote.server() else {
             return;
@@ -1242,10 +1244,15 @@ impl TeamRuntime {
                     }
                 }
             }
+            // A record that no longer works keeps its `remote` for history and
+            // display but has an empty `worktree` (a merge or a deletion clears
+            // it): only a live record references its checkout, so a finished
+            // remote worker's checkout is released for the next dispatch.
             let referenced: HashSet<String> = {
                 let records = self.records.lock().await;
                 records
                     .iter()
+                    .filter(|record| !record.worktree.as_os_str().is_empty())
                     .filter_map(|record| {
                         let remote = record.remote.as_ref()?;
                         (remote.node_id == node_record.node_id).then(|| remote.checkout.clone())

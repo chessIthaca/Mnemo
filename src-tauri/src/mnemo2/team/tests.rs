@@ -22313,3 +22313,48 @@ async fn reused_dispatch_after_relink_names_the_live_connection() {
     );
     assert!(!again.output.contains("studio-ssh"), "{}", again.output);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconcile_releases_a_merged_remote_workers_checkout() {
+    let rig = Rig::start().await;
+    let team = rig.team().await;
+    let (mut record, remote, _tip) = rig.worker_on_node("releasem1", true).await;
+    // The worker merged: its local worktree is gone, its `remote` record stays
+    // for history and display. Its node checkout must be released so the next
+    // dispatch can use that pool.
+    record.status = WorkerStatus::Merged;
+    record.worktree = std::path::PathBuf::new();
+    team.records.lock().await.push(record);
+    team.persist().await.expect("persist the merged remote worker");
+
+    team.reconcile_hosts().await;
+
+    let listed: mnemo::remote::repo::CheckoutListAnswer = serde_json::from_value(
+        rig.call_node(
+            &remote,
+            mnemo::remote::repo::CHECKOUT_LIST,
+            json!(mnemo::remote::repo::CheckoutList {
+                project: remote.project.clone(),
+            }),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("the node lists its checkouts"),
+    )
+    .expect("checkout.list is JSON");
+    let info = listed
+        .checkouts
+        .into_iter()
+        .find(|info| info.checkout == remote.checkout)
+        .expect("the released checkout is still listed");
+    assert!(
+        info.branch.is_none(),
+        "the merged worker's checkout is detached: {info:?}"
+    );
+    let record = team.worker("releasem1").await.expect("the worker");
+    assert_eq!(record.status, WorkerStatus::Merged);
+    assert!(
+        record.remote.is_some(),
+        "the remote record stays for history and display"
+    );
+}

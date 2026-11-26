@@ -16,6 +16,8 @@
   import { canMerge, isAuditWorker } from "../lib/review";
   import { workerAgentPhaseText, workerStatusText, type TaskWorkflowStepId, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
+  import { hostAway, hostBadgeTitle } from "../lib/workerHost";
+  import ElapsedTime from "./ElapsedTime.svelte";
   import FindingsPanel from "./FindingsPanel.svelte";
   import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
@@ -59,6 +61,10 @@
     audit && (worker.reportDelivered === true || worker.status === "completed"),
   );
   const highRisk = $derived(worker.reviewRisk === "high");
+  /** The other computer this worker runs on; null when it runs on this one. */
+  const host = $derived(worker.host ?? null);
+  /** Seconds its host has been away, live only while the worker is active (D6). */
+  const awaySeconds = $derived(hostAway(worker, Date.now()));
   const models = $derived($app.leadRuntime.models);
   /** The model the worker was given: its spec, else the configured default. */
   const modelSpec = $derived(
@@ -172,6 +178,7 @@
             </span>
             {#if !modelChangeable && worker.reasoningEffort}<span class="effort-pill" title="Reasoning effort">effort: {worker.reasoningEffort}</span>{/if}
             {#if worker.tier}<span class="effort-pill" title="Model tier">tier: {worker.tier}</span>{/if}
+            {#if host}<span class="effort-pill host-pill" title={hostBadgeTitle(worker)}>host: {host.name}</span>{/if}
           </div>
           {#if planLabel}<p class="worker-plan">{planLabel}</p>{/if}
         </div>
@@ -247,6 +254,12 @@
       {/if}
     </nav>
   </header>
+
+  {#if host && host.offlineSinceMs !== null && awaySeconds !== null}
+    <p class="host-away" role="status">
+      <strong>{host.name}</strong> is unreachable since <ElapsedTime startedAtMs={host.offlineSinceMs} prefix="" title="Away time" />; {#if worker.runsAsAgent}its Claude Code session there may keep working.{:else}Mnemo continues the worker when it is back.{/if}
+    </p>
+  {/if}
 
   {#if worker.needsYou}
     <p class="worker-blocker" role="status">
@@ -377,6 +390,11 @@
   .detail-body.thread-tab { display: flex; flex: 1 0 320px; flex-direction: column; }
   .detail-body.thread-tab > :global(.thread-panel) { flex: 1 1 240px; min-height: 240px; }
   .worker-blocker { margin: 8px 0 0; padding: 7px 9px; border: 1px solid var(--warning-blocker-line); border-radius: 6px; background: var(--warning-soft); color: var(--ink-soft); font-size: var(--text-meta); line-height: 1.5; }
+  /* The host pill names the computer; the line under the header explains a
+     lost link while the worker is still active on that computer. */
+  .host-pill { white-space: nowrap; }
+  .host-away { margin: 8px 0 0; padding: 7px 9px; border: 1px solid var(--warning-blocker-line); border-radius: 6px; background: var(--warning-soft); color: var(--ink-soft); font-size: var(--text-meta); line-height: 1.5; }
+  .host-away :global(.elapsed-time) { color: var(--warning); font-variant-numeric: tabular-nums; }
   .checks-panel, .merge-panel { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
   .checks-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; color: var(--muted); font-size: var(--text-meta); letter-spacing: 0.08em; }
   .checks-heading code { overflow: hidden; font-family: var(--font-mono); font-size: var(--text-meta); letter-spacing: 0; text-overflow: ellipsis; white-space: nowrap; }

@@ -340,6 +340,19 @@ export interface WorkerAgent {
   stalled: boolean;
 }
 
+/**
+ * The other computer a worker runs on, from the team snapshot's `remote`:
+ * its display name and OS, the Unix millisecond its link was first seen down
+ * (null while it is connected), and the SSH connection a Claude Code agent
+ * worker's session starts on (null for a Mnemo worker).
+ */
+export interface WorkerHost {
+  name: string;
+  os: string;
+  offlineSinceMs: number | null;
+  ssh: string | null;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -367,6 +380,8 @@ export interface Worker {
   routing?: WorkerRouting | null;
   branch: string;
   worktree: string;
+  /** The other computer this worker runs on; null when it runs on this one. */
+  host?: WorkerHost | null;
   files: string[];
   tokens: number;
   cost: number | null;

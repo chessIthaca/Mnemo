@@ -182,3 +182,50 @@ describe("team sync transcript revisions", () => {
     expect(get(app).workers[0].messages[0]).toMatchObject({ body: "first message" });
   });
 });
+
+describe("team sync worker hosts", () => {
+  beforeEach(() => {
+    harness.team = null;
+    app.set(fixtureState());
+  });
+
+  it("maps a record's remote checkout onto the worker's host, and leaves a local worker without one", async () => {
+    const team = makeTeam();
+    team.setNext(
+      snapshotOf(
+        [
+          {
+            ...workerRecord("w1", ["first message"]),
+            remote: {
+              node_id: "a".repeat(32),
+              node_name: "studio",
+              os: "macos",
+              project: "0123456789ab",
+              checkout: "mnemo-w1",
+              path: "/Users/dev/Mnemo/checkouts/mnemo-w1",
+              synced_tip: "abc1234",
+              offline_since_ms: 1_787_400_050_000,
+              ssh: "studio-ssh",
+            },
+          },
+          workerRecord("w2", ["second message"]),
+        ],
+        { w1: 7, w2: 8 },
+      ),
+    );
+    harness.team = team.transport;
+
+    await actions.openProject("mnemo");
+
+    const { workers } = get(app);
+    // The name, OS, away mark and SSH link the row badge and the detail read.
+    expect(workers[0].host).toEqual({
+      name: "studio",
+      os: "macos",
+      offlineSinceMs: 1_787_400_050_000,
+      ssh: "studio-ssh",
+    });
+    // A worker on this computer carries no host at all: no badge, no away line.
+    expect(workers[1].host).toBeNull();
+  });
+});

@@ -701,21 +701,12 @@ async fn dispatch_routing_survives_a_real_worker_start() {
     // The deferred label lands on the record and survives the real
     // session start; `routed_by` resolved at dispatch time, so the
     // override is corpus-only and the record keeps "lead".
-    let routing = {
-        let mut routing = None;
-        for _ in 0..400 {
-            if let Ok(worker) = team.worker("routingworker").await {
-                if let Some(block) = worker.routing {
-                    if block.laya_tier.is_some() {
-                        routing = Some(block);
-                        break;
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        routing.expect("the deferred label landed")
-    };
+    let routing = wait_for_value("the deferred label to land", || async {
+        let worker = team.worker("routingworker").await.ok()?;
+        let block = worker.routing?;
+        block.laya_tier.is_some().then_some(block)
+    })
+    .await;
     assert_eq!(routing.laya_tier.as_deref(), Some("high"));
     assert_eq!(routing.routed_by, "lead");
     let status = team.handle_lead_host_tool("team_status", serde_json::json!({})).await;
@@ -764,17 +755,11 @@ async fn wait_for_worker_status(
     worker_id: &str,
     status: crate::mnemo2::team::WorkerStatus,
 ) -> crate::mnemo2::team::WorkerRecord {
-    // Generous budget: under the parallel test-suite load a spawned
-    // session's first provider request can take seconds to start.
-    for _ in 0..500 {
+    wait_for_value(&format!("the worker to reach {status:?}"), || async {
         let worker = team.worker(worker_id).await.expect("worker record");
-        if worker.status == status {
-            return worker;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let worker = team.worker(worker_id).await.expect("worker record");
-    panic!("worker did not reach {status:?}: {worker:?}");
+        (worker.status == status).then_some(worker)
+    })
+    .await
 }
 
 /// Poll until the worker's record carries the given observed model id
@@ -784,27 +769,17 @@ async fn wait_for_worker_model(
     worker_id: &str,
     model: &str,
 ) -> crate::mnemo2::team::WorkerRecord {
-    for _ in 0..250 {
+    wait_for_value(&format!("the worker to observe '{model}'"), || async {
         let worker = team.worker(worker_id).await.expect("worker record");
-        if worker.model_id.as_deref() == Some(model) {
-            return worker;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let worker = team.worker(worker_id).await.expect("worker record");
-    panic!("worker did not observe '{model}': {worker:?}");
+        (worker.model_id.as_deref() == Some(model)).then_some(worker)
+    })
+    .await
 }
 async fn wait_for_calls(llm: &Arc<ScriptedLlm>, expected: usize) {
-    for _ in 0..500 {
-        if llm.calls() >= expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "the provider only served {} of {expected} requests",
-        llm.calls()
-    );
+    wait_for(&format!("the provider to serve {expected} requests"), || async {
+        llm.calls() >= expected
+    })
+    .await;
 }
 
 /// How long a condition wait may take before the test calls it a hang.
@@ -814,6 +789,46 @@ async fn wait_for_calls(llm: &Arc<ScriptedLlm>, expected: usize) {
 /// transcript refresh can land seconds after its `Completed` status, and that
 /// is not a defect.
 const HANG_GUARD: Duration = Duration::from_secs(120);
+
+/// Poll `probe` every 20 ms until it holds.
+///
+/// Only [`HANG_GUARD`] bounds the wait, so a test fails when the condition
+/// never arrives and not when the machine is merely busy.
+async fn wait_for<F, Fut>(what: &str, mut probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + HANG_GUARD;
+    loop {
+        if probe().await {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after 120 s waiting for {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// [`wait_for`] for a probe that yields the value it observed, returning the
+/// first value it yields.
+async fn wait_for_value<T, F, Fut>(what: &str, mut probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = std::time::Instant::now() + HANG_GUARD;
+    loop {
+        if let Some(value) = probe().await {
+            return value;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after 120 s waiting for {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// Poll the team snapshot until `ready` holds, and return that snapshot.
 ///
@@ -861,16 +876,11 @@ async fn wait_for_ledger_row(
     model: &str,
     expected: (u64, u64, u64),
 ) {
-    for _ in 0..250 {
-        if ledger_usage_row(state_dir, model) == Some(expected) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "ledger row '{model}' never reached {expected:?}: {:?}",
-        ledger_usage_row(state_dir, model)
-    );
+    wait_for(
+        &format!("the ledger row '{model}' to reach {expected:?}"),
+        || async { ledger_usage_row(state_dir, model) == Some(expected) },
+    )
+    .await;
 }
 
 async fn next_event(rx: &mut broadcast::Receiver<LeadEvent>) -> LeadEvent {
@@ -898,27 +908,22 @@ async fn drain_turn(rx: &mut broadcast::Receiver<LeadEvent>) -> Vec<LeadEvent> {
 /// Poll until the lead reports idle again (a queued steer's follow-up
 /// turn can outlive the interrupt that flushed it).
 async fn wait_until_idle(runtime: &LeadRuntime) {
-    for _ in 0..500 {
-        if !runtime.snapshot().await.expect("snapshot").busy {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the lead never returned to idle");
+    wait_for("the lead to return to idle", || async {
+        !runtime.snapshot().await.expect("snapshot").busy
+    })
+    .await;
 }
 
 async fn wait_for_persisted(path: &Path) -> PersistedLead {
-    for _ in 0..100 {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(saved) = serde_json::from_slice::<PersistedLead>(&bytes) {
-                if !saved.transcript.messages.is_empty() {
-                    return saved;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the lead transcript was not persisted: {}", path.display());
+    wait_for_value(
+        &format!("the lead transcript to be persisted at {}", path.display()),
+        || async {
+            let bytes = std::fs::read(path).ok()?;
+            let saved = serde_json::from_slice::<PersistedLead>(&bytes).ok()?;
+            (!saved.transcript.messages.is_empty()).then_some(saved)
+        },
+    )
+    .await
 }
 
 #[tokio::test]
@@ -968,12 +973,10 @@ async fn memory_store_is_released_after_lead_runtime_shutdown() {
 
     // The agent tasks end on their next poll once their command channels
     // close, so give the runtime a bounded chance to run them.
-    for _ in 0..200 {
-        if store.upgrade().is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for("the memory store to be released after shutdown", || async {
+        store.upgrade().is_none()
+    })
+    .await;
     assert!(
         store.upgrade().is_none(),
         "the memory store outlived the lead runtime's shutdown and drop"
@@ -1256,24 +1259,19 @@ async fn a_reopened_lead_answers_a_new_prompt() {
             .expect("serialize the saved history"),
         "the restored history is retained"
     );
-    for _ in 0..100 {
-        if let Ok(bytes) = std::fs::read(state.path().join(LEAD_STATE_FILE)) {
-            if let Ok(saved) = serde_json::from_slice::<PersistedLead>(&bytes) {
-                if saved.transcript.messages.len() == restored_len + 2 {
-                    assert_eq!(
-                        serde_json::to_value(&saved.transcript.messages)
-                            .expect("serialize the persisted transcript"),
-                        serde_json::to_value(&snapshot.transcript.messages)
-                            .expect("serialize the live transcript")
-                    );
-                    second.shutdown().await;
-                    return;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the reopened lead did not persist its longer transcript");
+    let persisted = wait_for_value("the reopened lead to persist its longer transcript", || async {
+        let bytes = std::fs::read(state.path().join(LEAD_STATE_FILE)).ok()?;
+        let saved = serde_json::from_slice::<PersistedLead>(&bytes).ok()?;
+        (saved.transcript.messages.len() == restored_len + 2).then_some(saved)
+    })
+    .await;
+    assert_eq!(
+        serde_json::to_value(&persisted.transcript.messages)
+            .expect("serialize the persisted transcript"),
+        serde_json::to_value(&snapshot.transcript.messages)
+            .expect("serialize the live transcript")
+    );
+    second.shutdown().await;
 }
 
 #[tokio::test]
@@ -3183,12 +3181,10 @@ async fn larger_findings_route_to_the_tracked_worker_for_delta_review() {
         .dispatch("implement".into(), None)
         .await
         .expect("dispatch");
-    for _ in 0..100 {
-        if team.worker(&worker.id).await.expect("worker").status == WorkerStatus::Completed {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_for("the worker to finish its first turn", || async {
+        team.worker(&worker.id).await.expect("worker").status == WorkerStatus::Completed
+    })
+    .await;
     std::fs::create_dir_all(worker.worktree.join("src")).expect("source dir");
     std::fs::write(worker.worktree.join("src/lib.rs"), "pub fn old() {}\n").expect("source");
     run_git(&worker.worktree, &["add", "src/lib.rs"]);
@@ -3225,30 +3221,27 @@ async fn larger_findings_route_to_the_tracked_worker_for_delta_review() {
     assert_eq!(routed.inbox[0].kind, InboxKind::Fix);
     assert!(routed.inbox[0].text.starts_with("Fix review finding F-large:"));
     assert!(routed.inbox[0].at_ms > 0);
-    for _ in 0..100 {
-        if llm.calls() >= 2
+    wait_for("the tracked worker to receive and finish the fix brief", || async {
+        llm.calls() >= 2
             && team.worker(&worker.id).await.expect("worker").status == WorkerStatus::Completed
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await;
     assert_eq!(llm.calls(), 2, "the tracked worker received the fix brief");
-    let mut header_in_transcript = false;
-    for _ in 0..100 {
-        let fixed = team.worker(&worker.id).await.expect("fixed worker");
-        header_in_transcript = fixed.transcript.messages.iter().any(|message| {
-            message
-                .content
-                .as_text()
-                .starts_with("[From Mnemo2]\nFix review finding F-large:")
-        });
-        if header_in_transcript {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(header_in_transcript, "the Mnemo2 header reaches the transcript");
+    wait_for("the Mnemo2 header reaches the transcript", || async {
+        team.worker(&worker.id)
+            .await
+            .expect("fixed worker")
+            .transcript
+            .messages
+            .iter()
+            .any(|message| {
+                message
+                    .content
+                    .as_text()
+                    .starts_with("[From Mnemo2]\nFix review finding F-large:")
+            })
+    })
+    .await;
     std::fs::write(worker.worktree.join("src/lib.rs"), "pub fn new() {}\n")
         .expect("fixed source");
     run_git(&worker.worktree, &["add", "src/lib.rs"]);
@@ -3387,21 +3380,18 @@ async fn worker_inbox_persists_senders_before_a_busy_turn_ends() {
     // The steered turn end is not the worker's finished turn any more, so
     // wait for the accumulated steers to reach the transcript instead of a
     // status flip.
-    for _ in 0..100 {
+    wait_for("the steered messages to reach the worker transcript", || async {
         let record = team.worker(&worker.id).await.expect("worker transcript");
-        let all_delivered = expected.iter().all(|(_sender, _label, text, header)| {
+        expected.iter().all(|(_sender, _label, text, header)| {
             let delivered = format!("{header}\n{text}");
             record
                 .transcript
                 .messages
                 .iter()
                 .any(|message| message.content.as_text() == delivered)
-        });
-        if all_delivered {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        })
+    })
+    .await;
     let completed = team.worker(&worker.id).await.expect("completed transcript");
     for (_sender, _label, text, header) in expected {
         let delivered = format!("{header}\n{text}");
@@ -5165,15 +5155,10 @@ async fn worker_message_parent_round_trips_to_the_lead_inbox() {
         .dispatch("ask for the key".to_string(), None)
         .await
         .expect("the worker dispatches");
-    let mut delivered = None;
-    for _ in 0..100 {
-        if let Some(message) = team.messages().await.into_iter().next() {
-            delivered = Some(message);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let message = delivered.expect("the worker message reaches the lead inbox");
+    let message = wait_for_value("the worker message reaches the lead inbox", || async {
+        team.messages().await.into_iter().next()
+    })
+    .await;
     assert_eq!(message.worker_id, worker.id);
     assert_eq!(message.text, "need the API key");
     assert!(
@@ -5219,8 +5204,7 @@ async fn worker_events_stay_out_of_the_lead_stream_and_host_tools() {
         )
         .await
         .expect("worker dispatches");
-    let mut reported = None;
-    for _ in 0..150 {
+    let result = wait_for_value("the worker's message_parent call resolved", || async {
         let record = team.worker(&worker.id).await.expect("worker record");
         let result = record
             .transcript
@@ -5229,12 +5213,11 @@ async fn worker_events_stay_out_of_the_lead_stream_and_host_tools() {
             .find(|message| message.name.as_deref() == Some("message_parent"))
             .cloned();
         if result.is_some() && llm.calls() >= 3 && !lead.snapshot().await.expect("lead").busy {
-            reported = result;
-            break;
+            return result;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let result = reported.expect("the worker's message_parent call resolved");
+        None
+    })
+    .await;
     assert!(
         !result.tool_is_error,
         "the worker's own handler answers message_parent: {:?}",
@@ -5294,8 +5277,7 @@ async fn blocked_worker_notice_reaches_the_actual_lead_once() {
         )
         .await
         .expect("worker dispatches");
-    let mut notified = false;
-    for _ in 0..100 {
+    wait_for("the worker notice must drive one real lead turn", || async {
         let snapshot = lead.snapshot().await.expect("lead snapshot");
         let notices = snapshot
             .transcript
@@ -5306,13 +5288,9 @@ async fn blocked_worker_notice_reaches_the_actual_lead_once() {
                 text.starts_with(TEAM_NOTICE_PREFIX) && text.contains("need the API key")
             })
             .count();
-        if notices == 1 && !snapshot.busy && llm.calls() >= 3 {
-            notified = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(notified, "the worker notice must drive one real lead turn");
+        notices == 1 && !snapshot.busy && llm.calls() >= 3
+    })
+    .await;
     let snapshot = lead.snapshot().await.expect("notified lead snapshot");
     let notice = snapshot
         .transcript
@@ -5868,13 +5846,14 @@ async fn the_board_notice_reaches_the_actual_lead() {
     // Let any worker-finished notice turn settle before merging.
     let mut stable = 0;
     let mut last = usize::MAX;
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + HANG_GUARD;
+    while stable < 8 {
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after 120 s waiting for the lead to settle before the merge");
+        }
         let busy = lead.snapshot().await.expect("snapshot").busy;
         if !busy && llm.calls() == last {
             stable += 1;
-            if stable >= 8 {
-                break;
-            }
         } else {
             stable = 0;
         }
@@ -5883,10 +5862,9 @@ async fn the_board_notice_reaches_the_actual_lead() {
     }
     team.set_lead_busy(false);
     team.merge(&worker.id).await.expect("merge");
-    let mut seen = 0;
-    for _ in 0..150 {
+    let seen = wait_for_value("the lead to receive the board notice", || async {
         let snapshot = lead.snapshot().await.expect("snapshot");
-        seen = snapshot
+        let seen = snapshot
             .transcript
             .messages
             .iter()
@@ -5895,11 +5873,9 @@ async fn the_board_notice_reaches_the_actual_lead() {
                 text.starts_with(TEAM_NOTICE_PREFIX) && text.contains("step 1 is done")
             })
             .count();
-        if seen > 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        (seen > 0).then_some(seen)
+    })
+    .await;
     assert_eq!(seen, 1, "the lead received exactly one board notice");
 
     lead.shutdown().await;
@@ -6064,12 +6040,10 @@ async fn the_external_wait_says_how_it_ended() {
         let team = team.clone();
         tokio::spawn(async move { team.wait_external(Duration::from_secs(30)).await })
     };
-    for _ in 0..100 {
-        if team.external_waiter_alive() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for("the external waiter to block", || async {
+        team.external_waiter_alive()
+    })
+    .await;
     team.detach_external_lead();
     let outcome = tokio::time::timeout(Duration::from_secs(5), waiting)
         .await
@@ -6081,20 +6055,13 @@ async fn the_external_wait_says_how_it_ended() {
     lead.shutdown().await;
 }
 
-/// Wait until the lead's transcript has a message holding every needle.
+/// Whether the lead's transcript has a message holding every needle.
 async fn lead_transcript_has(lead: &LeadRuntime, needles: &[&str]) -> bool {
-    for _ in 0..250 {
-        let snapshot = lead.snapshot().await.expect("lead snapshot");
-        let seen = snapshot.transcript.messages.iter().any(|message| {
-            let text = message.content.as_text();
-            needles.iter().all(|needle| text.contains(needle))
-        });
-        if seen {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
+    let snapshot = lead.snapshot().await.expect("lead snapshot");
+    snapshot.transcript.messages.iter().any(|message| {
+        let text = message.content.as_text();
+        needles.iter().all(|needle| text.contains(needle))
+    })
 }
 
 #[tokio::test]
@@ -6111,10 +6078,10 @@ async fn releasing_the_external_lead_gives_its_unread_notices_to_the_in_app_lead
 
     assert!(lead.release_external_lead().await, "an external lead was attached");
     assert!(!team.external_lead_attached());
-    assert!(
-        lead_transcript_has(&lead, &["first-unread", "second-unread"]).await,
-        "one prompt carries both"
-    );
+    wait_for("one prompt carries both", || async {
+        lead_transcript_has(&lead, &["first-unread", "second-unread"]).await
+    })
+    .await;
     assert_eq!(llm.calls(), 1, "a single idle prompt, not one per notice");
     assert!(team.take_undelivered_notices().is_empty());
     assert!(
@@ -6161,10 +6128,10 @@ async fn notices_the_in_app_lead_cannot_take_stay_queued_for_later() {
     )
     .await;
     assert!(delivered);
-    assert!(
-        lead_transcript_has(&lead, &["parked-notice", "fresh-notice"]).await,
-        "parked notices go first, in the same message"
-    );
+    wait_for("parked notices go first, in the same message", || async {
+        lead_transcript_has(&lead, &["parked-notice", "fresh-notice"]).await
+    })
+    .await;
     assert!(team.take_undelivered_notices().is_empty());
 
     lead.shutdown().await;
@@ -6193,7 +6160,10 @@ async fn a_notice_arriving_after_a_detach_reaches_the_in_app_lead() {
         .await
     );
     assert!(team.peek_external_notices().is_empty(), "never queued for a lead that left");
-    assert!(lead_transcript_has(&lead, &["late-notice"]).await);
+    wait_for("the late notice to reach the lead transcript", || async {
+        lead_transcript_has(&lead, &["late-notice"]).await
+    })
+    .await;
 
     lead.shutdown().await;
 }
@@ -6229,12 +6199,10 @@ async fn waiting_for_external_notices_wakes_on_a_push_and_times_out_empty() {
         let team = team.clone();
         tokio::spawn(async move { team.wait_external_notices(Duration::from_secs(30)).await })
     };
-    for _ in 0..100 {
-        if team.external_waiter_alive() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for("the external waiter to block", || async {
+        team.external_waiter_alive()
+    })
+    .await;
     assert!(team.external_waiter_alive());
     team.push_external_notice("woken".into());
     let woken = tokio::time::timeout(Duration::from_secs(5), waiting)
@@ -6248,12 +6216,10 @@ async fn waiting_for_external_notices_wakes_on_a_push_and_times_out_empty() {
         let team = team.clone();
         tokio::spawn(async move { team.wait_external_notices(Duration::from_secs(30)).await })
     };
-    for _ in 0..100 {
-        if team.external_waiter_alive() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for("the external waiter to block", || async {
+        team.external_waiter_alive()
+    })
+    .await;
     team.detach_external_lead();
     let freed = tokio::time::timeout(Duration::from_secs(5), waiting)
         .await
@@ -6294,12 +6260,10 @@ async fn an_external_lead_idles_out_unless_a_waiter_is_blocked() {
         let team = team.clone();
         tokio::spawn(async move { team.wait_external_notices(Duration::from_secs(30)).await })
     };
-    for _ in 0..100 {
-        if team.external_waiter_alive() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for("the external waiter to block", || async {
+        team.external_waiter_alive()
+    })
+    .await;
     assert!(!team.external_idle_expired(now + minutes(120), idle));
     team.detach_external_lead();
     let _ = waiting.await;
@@ -6361,21 +6325,16 @@ async fn an_attached_external_lead_gets_worker_notices_instead_of_the_in_app_lea
         .dispatch_with_id("finish quietly".into(), None, Some("secondwk02".into()), None)
         .await
         .expect("second worker dispatches");
-    let mut delivered = false;
-    for _ in 0..200 {
+    wait_for("after the detach the in-app lead gets the notice", || async {
         let snapshot = lead.snapshot().await.expect("lead snapshot");
         let seen = snapshot.transcript.messages.iter().any(|message| {
             let text = message.content.as_text();
             text.starts_with(TEAM_NOTICE_PREFIX)
                 && text.contains(&format!("worker_id={}", second.id))
         });
-        if seen && !snapshot.busy && llm.calls() >= 3 {
-            delivered = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(delivered, "after the detach the in-app lead gets the notice");
+        seen && !snapshot.busy && llm.calls() >= 3
+    })
+    .await;
     assert!(team.drain_external_notices().is_empty());
 
     lead.shutdown().await;
@@ -6601,15 +6560,10 @@ async fn a_message_to_a_completed_worker_retracts_its_queued_notice() {
         .await
         .expect("worker dispatches");
     wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
-    let mut queued = false;
-    for _ in 0..250 {
-        if !team.peek_external_notices().is_empty() {
-            queued = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(queued, "the finished notice is queued and undrained");
+    wait_for("the finished notice is queued and undrained", || async {
+        !team.peek_external_notices().is_empty()
+    })
+    .await;
 
     team.message(&worker.id, "another look".into(), MessageSender::Lead)
         .await
@@ -6655,8 +6609,7 @@ async fn completed_worker_turn_sends_the_lead_one_review_notice() {
         )
         .await
         .expect("worker dispatches");
-    let mut notice = None;
-    for _ in 0..100 {
+    let notices = wait_for_value("the completed turn wakes the lead", || async {
         let snapshot = lead.snapshot().await.expect("lead snapshot");
         let notices: Vec<String> = snapshot
             .transcript
@@ -6667,13 +6620,9 @@ async fn completed_worker_turn_sends_the_lead_one_review_notice() {
                 text.starts_with(TEAM_NOTICE_PREFIX) && text.contains("finished its turn")
             })
             .collect();
-        if !notices.is_empty() && !snapshot.busy && llm.calls() >= 2 {
-            notice = Some(notices);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let notices = notice.expect("the completed turn wakes the lead");
+        (!notices.is_empty() && !snapshot.busy && llm.calls() >= 2).then_some(notices)
+    })
+    .await;
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
         notices[0].contains(&format!("worker_id={}", worker.id)),
@@ -6727,8 +6676,7 @@ async fn audit_completion_notice_asks_the_lead_to_adjudicate() {
         .expect("audit dispatches");
     wait_for_worker_status(&team, &audit.id, crate::mnemo2::team::WorkerStatus::Completed)
         .await;
-    let mut notified = false;
-    for _ in 0..100 {
+    wait_for("the audit completion must drive one real lead turn", || async {
         let snapshot = lead.snapshot().await.expect("lead snapshot");
         // An audit that ends with its findings as plain text delivers them as
         // a report too (bug 2026-11-16), so only the adjudication notice is
@@ -6746,13 +6694,9 @@ async fn audit_completion_notice_asks_the_lead_to_adjudicate() {
             .count();
         // The implementer's own finish also wakes the lead, so the
         // audit's notice is looked up by its worker, not counted alone.
-        if notices == 1 && !snapshot.busy && llm.calls() >= 4 {
-            notified = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(notified, "the audit completion must drive one real lead turn");
+        notices == 1 && !snapshot.busy && llm.calls() >= 4
+    })
+    .await;
     let snapshot = lead.snapshot().await.expect("notified lead snapshot");
     let notice = snapshot
         .transcript
@@ -6830,14 +6774,11 @@ async fn compact_resumes_one_stopped_worker_and_persists_the_real_outcome() {
         .dispatch("retain this work".into(), None)
         .await
         .expect("dispatch");
-    let mut worker = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
-    for _ in 0..100 {
-        worker = team.worker(&worker.id).await.expect("worker");
-        if worker.transcript.messages.len() >= 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let worker = wait_for_value("the completed transcript is saved before stopping", || async {
+        let record = team.worker(&worker.id).await.expect("worker");
+        (record.transcript.messages.len() >= 2).then_some(record)
+    })
+    .await;
     assert!(
         worker.transcript.messages.len() >= 2,
         "the completed transcript is saved before stopping"
@@ -6915,7 +6856,11 @@ async fn lead_compact_summarizes_history_and_reports_the_outcome() {
     let mut started_at = usize::MAX;
     let mut compacted_at = usize::MAX;
     let mut outcome = None;
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + HANG_GUARD;
+    while outcome.is_none() {
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after 120 s waiting for compaction to report its outcome");
+        }
         while let Ok(event) = events.try_recv() {
             sequence += 1;
             match &event.event.event {
@@ -7518,8 +7463,6 @@ async fn worker_reasoning_effort_is_validated_and_recorded() {
 
 #[tokio::test]
 async fn executor_advertises_and_executes_coding_tools() {
-    use crate::mnemo2::team::WorkerStatus;
-
     let root = tempfile::tempdir().expect("workspace");
     let config = tempfile::tempdir().expect("config");
     let state = tempfile::tempdir().expect("state");
@@ -7543,19 +7486,16 @@ async fn executor_advertises_and_executes_coding_tools() {
         .dispatch("write and commit a proof file".into(), None)
         .await
         .expect("dispatch");
-    let mut worker = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
-    for _ in 0..100 {
-        if worker
+    let worker = wait_for_value("the worker transcript to hold its git tool result", || async {
+        let record = team.worker(&worker.id).await.expect("worker");
+        record
             .transcript
             .messages
             .iter()
             .any(|message| message.name.as_deref() == Some("git"))
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        worker = team.worker(&worker.id).await.expect("worker");
-    }
+            .then_some(record)
+    })
+    .await;
     let advertised = llm.advertised_tools();
     let first = advertised.first().expect("worker request");
     for name in ["file_edit", "file_write", "shell", "git", "git_read"] {
@@ -8254,14 +8194,11 @@ async fn change_model_to_a_smaller_context_summarizes_without_failing_the_worker
     // The regression: the completed swap is informational. Poll until the
     // pump folded it (the badge the CompactStarted raised is cleared), then
     // assert the record never went Failed and carries no error.
-    let mut observed = team.worker("worker0001").await.expect("worker record");
-    for _ in 0..250 {
-        if !observed.compacting {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        observed = team.worker("worker0001").await.expect("worker record");
-    }
+    let observed = wait_for_value("the compacting badge to clear after the swap", || async {
+        let observed = team.worker("worker0001").await.expect("worker record");
+        (!observed.compacting).then_some(observed)
+    })
+    .await;
     assert!(
         !observed.compacting,
         "the compacting badge ended with the swap: status={:?} error={:?} compacting={} models={:?}",

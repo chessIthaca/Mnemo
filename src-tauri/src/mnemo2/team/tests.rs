@@ -20644,6 +20644,9 @@ async fn team_status_shows_host() {
     init_git(root.path());
     let local = reviewed_worker(root.path(), "00000001000000000001");
     let mut remote = reviewed_worker(root.path(), "00000001000000000002");
+    // Only an active worker's away host is reported (plan e8cb5112, step 2):
+    // a finished one keeps its host without an away age.
+    remote.status = WorkerStatus::NeedsYou;
     remote.remote = Some(super::record::RemoteCheckout {
         node_id: "a".repeat(32),
         node_name: "mac-mini".to_string(),
@@ -22464,4 +22467,225 @@ async fn hosts_action_unknown_action_errors() {
         error,
         "team_hosts requires 'action' to be list, pair, revoke, link, or unlink"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_after_relink_names_the_live_connection() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    let placed = dispatch_remote_session(&fixture, "rrelink01").await;
+    assert_eq!(
+        placed.remote.as_ref().and_then(|remote| remote.ssh.as_deref()),
+        Some("studio-ssh"),
+        "the record stores the connection its host was placed with"
+    );
+    // The user withdraws the approval from studio-ssh and gives it to another
+    // connection: the continue answer must name the live one.
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "office-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "rrelink01", "text": "Also cover the edge case."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let result: Value =
+        serde_json::from_str(answer.output.lines().next().expect("the JSON line")).expect("json");
+    assert_eq!(
+        result["result"]["continue_session"]["host"], "office-ssh",
+        "{result}"
+    );
+    let data = answer.data.as_ref().expect("the answer data");
+    assert_eq!(data["continue_session"]["host"], "office-ssh", "{data}");
+    assert!(!answer.output.contains("studio-ssh"), "{}", answer.output);
+    assert!(
+        !data.to_string().contains("studio-ssh"),
+        "the answer never names the withdrawn connection: {data}"
+    );
+
+    // Only the answer changed: the stored record still names the connection
+    // the worker was placed with.
+    let stored = team.worker("rrelink01").await.expect("the worker");
+    assert_eq!(
+        stored.remote.as_ref().and_then(|remote| remote.ssh.as_deref()),
+        Some("studio-ssh")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_after_unlink_explains_the_missing_link() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "runlinkc1").await;
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "runlinkc1", "text": "Also cover the edge case."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let result: Value =
+        serde_json::from_str(answer.output.lines().next().expect("the JSON line")).expect("json");
+    assert!(
+        result["result"]["continue_session"]["host"].is_null(),
+        "{result}"
+    );
+    let data = answer.data.as_ref().expect("the answer data");
+    assert!(data["continue_session"]["host"].is_null(), "{data}");
+    assert_eq!(data["continue_session"]["session"], "mnemo-runlinkc1", "{data}");
+    let explanation = super::control::unlinked_session_text("node-a");
+    assert!(answer.output.contains(&explanation), "{}", answer.output);
+
+    // The stored record keeps the connection its host was placed with.
+    let stored = team.worker("runlinkc1").await.expect("the worker");
+    assert_eq!(
+        stored.remote.as_ref().and_then(|remote| remote.ssh.as_deref()),
+        Some("studio-ssh")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merged_remote_worker_has_no_offline_mark() {
+    let rig = Rig::start().await;
+    let team = rig.team().await;
+    let (mut record, remote, tip) = rig.worker_on_node("mergedrm01", true).await;
+    record.status = WorkerStatus::InReview;
+    record.checks = vec![WorkerCheck {
+        name: "cargo test --workspace".into(),
+        status: "passed".into(),
+        detail: None,
+        tip: tip.clone(),
+    }];
+    record.review = Some(ReviewRecord {
+        summary: "reviewed".into(),
+        tip: tip.clone(),
+        reviewed_at_ms: 1,
+        evidence: Some(evidence()),
+        lane: None,
+    });
+    // The node link went down while the worker ran: its record carries the
+    // away mark the host monitor set.
+    assert!(remote.offline_since_ms.is_none());
+    if let Some(remote) = record.remote.as_mut() {
+        remote.offline_since_ms = Some(phase3::now_ms() as u64 - 30_000);
+    }
+    team.records.lock().await.push(record);
+    team.persist().await.expect("persist the remote worker");
+    let staged = team.worker("mergedrm01").await.expect("the staged worker");
+    assert!(
+        staged
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.offline_since_ms)
+            .is_some(),
+        "the away mark is stored before the merge"
+    );
+
+    let merged = team.merge("mergedrm01").await.expect("merge the remote worker");
+    assert_eq!(merged.status, WorkerStatus::Merged);
+    let remote = merged
+        .remote
+        .expect("the remote record stays for history and display");
+    assert_eq!(
+        remote.offline_since_ms, None,
+        "a merged worker's host is not away any more"
+    );
+    let stored = team.worker("mergedrm01").await.expect("the merged worker");
+    assert_eq!(
+        stored.remote.and_then(|remote| remote.offline_since_ms),
+        None
+    );
+}
+
+#[tokio::test]
+async fn team_status_hides_host_offline_for_finished_workers() {
+    let root = tempfile::tempdir().expect("workspace");
+    let state = tempfile::tempdir().expect("state");
+    init_git(root.path());
+    let mut finished = reviewed_worker(root.path(), "00000001000000000001");
+    finished.status = WorkerStatus::Completed;
+    let mut active = reviewed_worker(root.path(), "00000001000000000002");
+    active.status = WorkerStatus::Working;
+    let mut interrupted = reviewed_worker(root.path(), "00000001000000000003");
+    interrupted.status = WorkerStatus::Interrupted;
+    for worker in [&mut finished, &mut active, &mut interrupted] {
+        worker.remote = Some(super::record::RemoteCheckout {
+            node_id: "a".repeat(32),
+            node_name: "mac-mini".to_string(),
+            os: "macos".to_string(),
+            project: "0123456789ab".to_string(),
+            checkout: "pool-1".to_string(),
+            path: "/Users/mini/mnemo/checkouts/pool-1".to_string(),
+            synced_tip: None,
+            offline_since_ms: None,
+            ssh: None,
+        });
+    }
+    let team = open_test_team(
+        root.path(),
+        state.path(),
+        vec![finished, active, interrupted],
+    )
+    .await;
+    // The host monitor marked the host away while the workers ran: one has
+    // finished, one was working, one had its turn interrupted.
+    for id in [
+        "00000001000000000001",
+        "00000001000000000002",
+        "00000001000000000003",
+    ] {
+        team.update_worker(id, |worker| {
+            if let Some(remote) = worker.remote.as_mut() {
+                remote.offline_since_ms = Some(phase3::now_ms() as u64 - 30_000);
+            }
+        })
+        .await;
+    }
+
+    let answer = team_status_answer(&team, json!({})).await;
+    let entries = answer["result"].as_array().expect("a worker array");
+    let by_id = |id: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap_or_else(|| panic!("{id} listed: {answer}"))
+    };
+    assert_eq!(by_id("00000001000000000001")["host"], "mac-mini");
+    assert!(
+        by_id("00000001000000000001").get("host_offline_s").is_none(),
+        "a finished worker's host is not reported away: {answer}"
+    );
+    for id in ["00000001000000000002", "00000001000000000003"] {
+        let entry = by_id(id);
+        assert_eq!(entry["host"], "mac-mini", "{answer}");
+        let offline = entry["host_offline_s"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("an unfinished worker's host is away: {answer}"));
+        assert!(offline >= 30, "the mark I set has aged: {answer}");
+    }
+    // An interrupted worker keeps the away state: it decides whether the turn
+    // can be resumed on that host.
+    assert_eq!(
+        by_id("00000001000000000003")["status"], "interrupted",
+        "{answer}"
+    );
+    team.shutdown().await;
 }

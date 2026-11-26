@@ -1,6 +1,6 @@
 [package]
 name = "mnemo-app"
-version = "2.9.0"
+version = "2.10.0"
 autobins = false
 edition = "2021"
 description = "The Mnemo Tauri app shell"

@@ -209,6 +209,44 @@ pub struct ToolErrorNote {
     pub output: String,
 }
 
+/// Where a worker runs when it is not local: one checkout of one paired
+/// worker node (plan 9a2f4b67, phase 3).
+///
+/// The record keeps the node's stable identity (`node_id`) and display
+/// (`node_name`, `os`), the project key the hub sends with every repo call,
+/// the node checkout name and its path there, the last commit the hub copied
+/// into the worker's shadow checkout, and — while the node is away — the Unix
+/// millisecond the link was first seen down.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteCheckout {
+    /// The paired node's 32-hex id.
+    pub node_id: String,
+    /// The node's operator-visible name.
+    pub node_name: String,
+    /// The node's operating system (`windows` or `macos`).
+    pub os: String,
+    /// The 12-hex project key both ends name the project by.
+    pub project: String,
+    /// The checkout name under the node's `<home>/checkouts/`.
+    pub checkout: String,
+    /// The checkout's path on the node.
+    pub path: String,
+    /// The node tip whose branch the hub last copied into the shadow.
+    #[serde(default)]
+    pub synced_tip: Option<String>,
+    /// When the node's link was first seen down, in Unix milliseconds.
+    #[serde(default)]
+    pub offline_since_ms: Option<u64>,
+    /// The saved SSH connection the lead starts this agent worker's Claude
+    /// Code session on, as the desktop app's `list_start_targets` names it
+    /// (phase 4). Set at placement from the node record for a Claude-agent
+    /// worker only: a Mnemo worker has no session to start, so the field stays
+    /// `None` and [`prepare_checkout`](super::remote::RemoteWorkers::prepare_checkout)
+    /// never fills it.
+    #[serde(default)]
+    pub ssh: Option<String>,
+}
+
 /// One worker's durable record. It is the UI's truth and the recovery ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkerRecord {
@@ -239,6 +277,10 @@ pub struct WorkerRecord {
     pub branch: String,
     /// The linked worktree checkout.
     pub worktree: PathBuf,
+    /// Where the worker runs when it is not local. `None` is a local worker;
+    /// old ledgers written before remote workers load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteCheckout>,
     /// The real lifecycle state.
     pub status: WorkerStatus,
     /// The session generation within this worker (resume advances it).
@@ -413,6 +455,13 @@ pub struct WorkerRecord {
     /// prompt exactly once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_token: Option<String>,
+    /// The Claude Code session `team_agent_started` recorded for this worker:
+    /// the session the lead started over SSH on the worker's host (phase 4).
+    /// `None` for a local agent worker (whose agent the Agent tool launches
+    /// under the WorktreeCreate hook), for a Mnemo worker, and until the lead
+    /// reports the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session: Option<String>,
     /// The branches `team_integrate` merged into this worker's branch, in
     /// order (plan ca7f2177 decision 6).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -547,6 +596,47 @@ pub(super) fn agent_continue_prompt(record: &WorkerRecord, previous_model: &str)
     )
 }
 
+/// [`agent_prompt`] for a Claude Code agent worker whose session the lead
+/// starts over SSH on a paired host instead of here (phase 4).
+///
+/// The first line names the worker and its branch and is the marker the host's
+/// transcript watch finds the session by: a remote session carries no launch
+/// token, because Mnemo's PreToolUse gate only sees the lead's own agent
+/// launches. The body is [`agent_prompt`] with its checkout bullet pointed at
+/// the node checkout the session really works in.
+pub(super) fn remote_agent_prompt(record: &WorkerRecord) -> String {
+    let (path, node_name) = match record.remote.as_ref() {
+        Some(remote) => (remote.path.clone(), remote.node_name.clone()),
+        None => (record.worktree.to_string_lossy().into_owned(), String::new()),
+    };
+    let body = agent_prompt(record).replace(
+        "- You run in your own checkout of this project on branch ",
+        &format!("- This session runs in Mnemo's checkout {path} on host {node_name}, on branch "),
+    );
+    format!(
+        "Mnemo worker {} on branch {}: this Claude Code session runs on host {node_name}; Mnemo follows its transcript.\n\n{body}",
+        record.id, record.branch
+    )
+}
+
+/// How long a Claude Code session name may be.
+const SESSION_NAME_CHARS: usize = 24;
+
+/// The Claude Code session name for one worker's remote session (phase 4):
+/// `mnemo-` plus the worker id lowercased, stripped to `[a-z0-9-]`, and at most
+/// [`SESSION_NAME_CHARS`] characters in all.
+pub(super) fn session_name(worker_id: &str) -> String {
+    let mut name = String::from("mnemo-");
+    name.extend(
+        worker_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .map(|c| c.to_ascii_lowercase())
+            .take(SESSION_NAME_CHARS - "mnemo-".len()),
+    );
+    name
+}
+
 /// The refusal the tools that drive a Mnemo session give for a worker that
 /// runs as a Claude Code agent: its step lives on the lead's own agent, so
 /// Mnemo cannot message, resume, compact or route-fix it. `None` for an
@@ -663,6 +753,18 @@ impl WorkerRecord {
     /// status rule.
     pub(crate) fn waiting_on_user(&self) -> bool {
         self.status.waiting_on_user() && !audit_finished(self)
+    }
+
+    /// The host this worker runs on: `local`, or the paired node's name.
+    ///
+    /// Every user-facing place that tells a host apart (team_status, notices,
+    /// the review evidence) reads it here so an unnamed remote worker can never
+    /// look local.
+    pub fn host_label(&self) -> &str {
+        self.remote
+            .as_ref()
+            .map(|remote| remote.node_name.as_str())
+            .unwrap_or("local")
     }
 }
 

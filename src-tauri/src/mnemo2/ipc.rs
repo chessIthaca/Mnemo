@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri_plugin_notification::NotificationExt;
 use tauri::async_runtime::JoinHandle;
@@ -1005,6 +1006,64 @@ pub async fn team_snapshot(
         .await)
 }
 
+/// The paired worker hosts and the hub's state (the `team_hosts list` object).
+#[tauri::command]
+pub async fn worker_hosts_list(state: State<'_, Mnemo2State>) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("list", None, None)
+        .await
+}
+
+/// Offer a one-time pairing code for a new worker host.
+#[tauri::command]
+pub async fn worker_hosts_pair(
+    state: State<'_, Mnemo2State>,
+    name: Option<String>,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("pair", name.as_deref(), None)
+        .await
+}
+
+/// Revoke a worker host; its running workers fail and can be resumed.
+#[tauri::command]
+pub async fn worker_hosts_revoke(
+    state: State<'_, Mnemo2State>,
+    name: String,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("revoke", Some(&name), None)
+        .await
+}
+
+/// Tie a worker host to the saved SSH connection the lead starts Claude Code on.
+#[tauri::command]
+pub async fn worker_hosts_link(
+    state: State<'_, Mnemo2State>,
+    name: String,
+    ssh: String,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("link", Some(&name), Some(&ssh))
+        .await
+}
+
+/// Drop a worker host's SSH connection.
+#[tauri::command]
+pub async fn worker_hosts_unlink(
+    state: State<'_, Mnemo2State>,
+    name: String,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("unlink", Some(&name), None)
+        .await
+}
+
 /// Read the plan board: every plan with the workers on each step.
 #[tauri::command]
 pub async fn board_snapshot(state: State<'_, Mnemo2State>) -> Result<BoardSnapshot, String> {
@@ -1355,7 +1414,12 @@ pub async fn workbench_diff(
     worker_id: String,
 ) -> Result<DiffSnapshot, String> {
     let runtime = current(&state).await?;
-    let worker = current_team(&state).await?.worker(&worker_id).await?;
+    let team = current_team(&state).await?;
+    // A remote worker's commits reach its hub shadow checkout only when the
+    // hub pulls them: sync first so the tab shows the node's current work.
+    // An offline node leaves the last synced tip readable instead of failing.
+    let _ = team.sync_remote(&worker_id).await;
+    let worker = team.worker(&worker_id).await?;
     workbench::worker_diff(runtime.workspace_root(), &worker).await
 }
 

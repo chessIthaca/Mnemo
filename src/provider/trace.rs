@@ -297,7 +297,7 @@ impl TraceIdentity {
 /// Request-scoped context threaded from the call site into the trace
 /// record — the explicit, per-request attribution carrier (never a
 /// mutable "current label" on a shared provider, never a task-local).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmRequestContext {
     /// The attribution stamped at creation; `None` = unattributed (the
     /// legacy `complete` path).
@@ -2256,6 +2256,32 @@ mod tests {
 
     fn json_body() -> serde_json::Value {
         serde_json::json!({ "model": "test-model", "messages": [{ "role": "user", "content": "hi" }] })
+    }
+
+    /// A remote node relays its trace attribution alongside the model call, so
+    /// the hub keeps one cost/trace ledger — the context must survive JSON with
+    /// every attribution field intact.
+    #[test]
+    fn request_context_round_trips() {
+        let ctx = LlmRequestContext::attributed(TraceAttribution {
+            actor_kind: TraceActorKind::Worker,
+            agent_id: "7".to_string(),
+            session_id: "7".to_string(),
+            agent_name: "worker-1".to_string(),
+            worker_id: Some("w-1".to_string()),
+            plan_id: Some("abcdef12".to_string()),
+            plan_step: Some(3),
+            turn_id: Some("turn-9".to_string()),
+            purpose: TracePurpose::MemoryConsolidation,
+        });
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: LlmRequestContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attribution, ctx.attribution);
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        let empty = LlmRequestContext::unattributed();
+        let json = serde_json::to_string(&empty).unwrap();
+        let back: LlmRequestContext = serde_json::from_str(&json).unwrap();
+        assert!(back.attribution.is_none());
     }
 
     #[test]

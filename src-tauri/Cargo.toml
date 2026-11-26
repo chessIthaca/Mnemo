@@ -1,6 +1,6 @@
 [package]
 name = "mnemo-app"
-version = "2.9.0"
+version = "2.10.0"
 autobins = false
 edition = "2021"
 description = "The Mnemo Tauri app shell"
@@ -10,7 +10,7 @@ license = "MIT"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-mnemo = { path = "..", features = ["browser", "embeddings"] }
+mnemo = { path = "..", features = ["browser", "embeddings", "remote"] }
 tauri = { version = "2", features = ["unstable", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"

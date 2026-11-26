@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use mnemo::app::worktrees::{
     agent_short_id, current_branch, provision_agent_checkout, rollback_agent_checkout,
 };
-use mnemo::headless::{AgentSession, SessionCommand, SpawnOptions, Transcript};
+use mnemo::headless::{SessionCommand, SpawnOptions, Transcript};
 use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::{PermissionPolicy, route_question};
 
@@ -28,11 +28,12 @@ use super::dispatch::PlanRef;
 use super::guardrails::guardrails_for;
 use super::nudge::NUDGE_STRIKE_LIMIT;
 use super::record::{
-    fresh_launch_token, kickoff_message, note_model, session_model_spec, WorkerRecord,
-    WorkerStatus,
+    fresh_launch_token, kickoff_message, note_model, session_model_spec, RemoteCheckout,
+    WorkerRecord, WorkerStatus,
 };
 use super::routing::{logs_label, outcome_row, ClaudeAgentDispatch};
 use super::pump::pump_worker;
+use super::worker_session::{LocalWorkerSession, SharedWorkerSession};
 use super::{LiveWorker, TeamRuntime};
 
 /// The inputs one live worker session needs: where and on what it runs, its
@@ -55,6 +56,9 @@ pub(crate) struct WorkerSessionSpec {
     pub(crate) pinned_task: Option<String>,
     /// Exact commands measured and accepted for automatic worker checks.
     pub(crate) check_commands: Arc<Vec<String>>,
+    /// The node checkout the session runs in, when the worker was placed on a
+    /// paired host; `None` runs it on this computer.
+    pub(crate) remote: Option<RemoteCheckout>,
 }
 
 #[derive(Deserialize)]
@@ -208,6 +212,7 @@ impl TeamRuntime {
             reasoning_effort,
             branch,
             worktree,
+            remote: None,
             status: WorkerStatus::Dispatching,
             generation: 0,
             transcript: Arc::default(),
@@ -258,6 +263,7 @@ impl TeamRuntime {
             claude_agent_transcript: None,
             handed_back: None,
             launch_token: None,
+            claude_session: None,
             integrations: Vec::new(),
             integration_note: None,
             base_commit: Some(base_tip.clone()),
@@ -311,7 +317,15 @@ impl TeamRuntime {
         record.brief_sent = true;
         record.compacting = false;
         // The dispatch answer's launch prompt carries a fresh one-time token.
-        record.launch_token = Some(fresh_launch_token());
+        // A remote worker's session is started by the lead over SSH, which
+        // Mnemo's PreToolUse gate never sees: its prompt carries the worker
+        // marker instead and `team_agent_started` names the session.
+        record.launch_token = if record.remote.is_some() {
+            None
+        } else {
+            Some(fresh_launch_token())
+        };
+        record.claude_session = None;
         note_model(&mut record, &model);
         self.update_worker(&record.id, |worker| {
             worker.claude_agent = record.claude_agent.clone();
@@ -321,6 +335,7 @@ impl TeamRuntime {
             worker.brief_sent = true;
             worker.compacting = false;
             worker.launch_token = record.launch_token.clone();
+            worker.claude_session = None;
             note_model(worker, &model);
         })
         .await;
@@ -330,10 +345,16 @@ impl TeamRuntime {
 
 
     pub(super) async fn start_worker(&self, record: WorkerRecord) -> Result<WorkerRecord, String> {
-        let active = self.active_workers_for_slots().await;
-        let slots = self.persistence.slots.load(Ordering::SeqCst);
-        if active >= slots {
-            return Err(format!("all {slots} worker slots are busy"));
+        // A remote worker counts against its host's slots, not this
+        // computer's; the node-side spawn also re-checks them.
+        if let Some(remote) = record.remote.as_ref() {
+            Box::pin(self.start_remote_slot_gate(remote)).await?;
+        } else {
+            let active = self.active_workers_for_slots().await;
+            let slots = self.persistence.slots.load(Ordering::SeqCst);
+            if active >= slots {
+                return Err(format!("all {slots} worker slots are busy"));
+            }
         }
         let id = record.id.clone();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -364,6 +385,7 @@ impl TeamRuntime {
                         .unwrap_or_else(|| record.brief.clone()),
                 ),
                 check_commands: check_commands.clone(),
+                remote: record.remote.clone(),
             })
             .await
         {
@@ -376,7 +398,6 @@ impl TeamRuntime {
                 return Err(error);
             }
         };
-        let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(true));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
@@ -384,8 +405,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             id.clone(),
             generation,
-            self.engine()?,
-            session_id,
+            session.clone(),
             receiver,
             self.events.clone(),
             busy.clone(),
@@ -481,7 +501,7 @@ impl TeamRuntime {
     pub(crate) async fn spawn_worker_session(
         &self,
         spec: WorkerSessionSpec,
-    ) -> Result<AgentSession, String> {
+    ) -> Result<SharedWorkerSession, String> {
         let WorkerSessionSpec {
             model,
             reasoning_effort,
@@ -491,9 +511,42 @@ impl TeamRuntime {
             trace_identity,
             pinned_task,
             check_commands,
+            remote,
         } = spec;
+        if let Some(remote) = remote {
+            // The session lives in the node's checkout; the hub's shadow
+            // checkout is only a place to review and merge from.
+            return Box::pin(self.remote.spawn_session(
+                &remote,
+                SpawnOptions {
+                    name: Some(trace_identity.agent_name.clone()),
+                    model,
+                    reasoning_effort,
+                    worktree: None,
+                    check_commands: check_commands.as_ref().clone(),
+                    permissions: Some(PermissionPolicy::OverridePermissions),
+                    policy: None,
+                    resume,
+                    limits: None,
+                    host_tools: self.worker_host_tools(),
+                    external_policy: None,
+                    guardrails: Some(guardrails_for(&kind)),
+                    trace_identity: Some(trace_identity),
+                    pinned_task,
+                    skip_turn_routing: true,
+                },
+            ))
+            .await
+            .map_err(|err| {
+                format!(
+                    "could not spawn the worker session on host '{}': {err}",
+                    remote.node_name
+                )
+            });
+        }
         let name = trace_identity.agent_name.clone();
-        self.engine()?
+        let session = self
+            .engine()?
             .spawn(SpawnOptions {
                 name: Some(name),
                 model,
@@ -522,13 +575,37 @@ impl TeamRuntime {
                 skip_turn_routing: true,
             })
             .await
-            .map_err(|err| format!("could not spawn the worker session: {err}"))
+            .map_err(|err| format!("could not spawn the worker session: {err}"))?;
+        Ok(Arc::new(LocalWorkerSession::new(session)))
+    }
+
+    /// Refuse to start a worker whose host has no free slot, and push the
+    /// current model catalog before the session is spawned there.
+    async fn start_remote_slot_gate(&self, remote: &RemoteCheckout) -> Result<(), String> {
+        let server = self
+            .remote
+            .server()
+            .ok_or_else(|| format!("host '{}' is not connected", remote.node_name))?;
+        if !server.is_connected(&remote.node_id) {
+            return Err(format!("host '{}' is not connected", remote.node_name));
+        }
+        let record = self.remote.host(&remote.node_id)?;
+        let slots = self.remote.slots_of(&record).await;
+        if self.remote.busy_on(&remote.node_id).await >= slots {
+            return Err(format!(
+                "all {slots} slots on host '{}' are busy",
+                remote.node_name
+            ));
+        }
+        self.remote
+            .ensure_catalog(&server.node(&remote.node_id), &remote.node_name)
+            .await
     }
 
     /// Mark a worker failed after its session could not spawn or resume.
     /// Failed-and-stopped is a terminal status (design §4.7): the worker's
     /// `outcome` row is appended once the record persists.
-    async fn fail_worker(&self, worker_id: &str, error: String) {
+    pub(super) async fn fail_worker(&self, worker_id: &str, error: String) {
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Failed;
             worker.error = Some(error);

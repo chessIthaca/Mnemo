@@ -237,6 +237,13 @@ impl TeamRuntime {
         if self.worker_is_busy(worker_id).await {
             return Err("the worker must be idle before review".to_string());
         }
+        // A remote worker's commits live on its node: bring the hub shadow onto
+        // the node tip before anything reads it, so the reviewed tip, the lane
+        // and the diff all describe the commit the node holds. The host's link
+        // error is returned as it is: the review cannot proceed on a stale tip.
+        if worker.remote.is_some() {
+            self.sync_remote(worker_id).await?;
+        }
         let tip = self.worker_tip(&worker).await?;
         // The diff decides which evidence the review must carry: a light
         // change records the unanchored pass and the intent alone, and every

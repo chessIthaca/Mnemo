@@ -46,6 +46,10 @@ const WINDOWS_CFG_FILES: &[(&str, &str)] = &[
         "USERPROFILE vs HOME environment variables",
     ),
     (
+        "src-tauri/mnemo2-app/src/node/logfile.rs",
+        "stderr handle swap: SetStdHandle on Windows, dup2 on Unix",
+    ),
+    (
         "src-tauri/src/instance_marker.rs",
         "pid liveness via OpenProcess vs ps",
     ),

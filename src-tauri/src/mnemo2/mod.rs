@@ -22,6 +22,10 @@ pub mod indexing;
 /// The real worker team runtime.
 pub mod team;
 
+/// The app's one worker hub: the listener paired nodes connect to, and the
+/// services (model clients, memory, catalog) it answers for the open project.
+pub mod remote_hub;
+
 /// The turn tag a team notice's first line carries, so a stale notice is
 /// dropped at delivery.
 pub(crate) mod notice_tag;
@@ -771,6 +775,11 @@ pub fn run() {
             ipc::lead_answer,
             ipc::lead_close,
             ipc::team_snapshot,
+            ipc::worker_hosts_list,
+            ipc::worker_hosts_pair,
+            ipc::worker_hosts_revoke,
+            ipc::worker_hosts_link,
+            ipc::worker_hosts_unlink,
             ipc::board_snapshot,
             ipc::board_plan_document,
             backlog::backlog_items,

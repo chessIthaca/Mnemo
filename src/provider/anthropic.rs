@@ -466,7 +466,7 @@ impl AnthropicClient {
             match tc {
                 // Auto is the API default — omit the field entirely.
                 ToolChoice::Auto => {}
-                ToolChoice::Function(name) => {
+                ToolChoice::Function { name } => {
                     body["tool_choice"] = serde_json::json!({ "type": "tool", "name": name });
                 }
                 ToolChoice::Required => {
@@ -2508,7 +2508,9 @@ mod tests {
         assert!(mk(Some(ToolChoice::Auto)).get("tool_choice").is_none());
         // Function(name) → {"type":"tool","name":...}.
         assert_eq!(
-            mk(Some(ToolChoice::Function("read_file".into())))["tool_choice"],
+            mk(Some(ToolChoice::Function {
+                name: "read_file".into()
+            }))["tool_choice"],
             serde_json::json!({ "type": "tool", "name": "read_file" })
         );
         // Required → {"type":"any"}.

@@ -24,7 +24,7 @@ use crate::provider::anthropic::{AnthropicClient, AnthropicClientConfig};
 use crate::provider::openai::{OpenAiClient, OpenAiClientConfig};
 use crate::provider::trace::LlmRequestLog;
 use crate::provider::vision::{ImageDescriber, VisionClient};
-use crate::provider::{LlmClient, ProviderKind};
+use crate::provider::{Capabilities, LlmClient, ProviderKind};
 
 /// Resolve the API key for an endpoint: the stored key first, then the
 /// kind-appropriate environment variable, falling back to a placeholder
@@ -211,7 +211,8 @@ pub fn build_openai_client(
     ))
 }
 
-/// Build an [`LlmClient`] for a per-context model override ([`ModelRef`]).
+/// Build an [`LlmClient`] for a per-context model override ([`ModelRef`]),
+/// optionally through a [`ModelTransport`].
 ///
 /// Looks up the referenced endpoint in `config` (returning `None` when it
 /// doesn't exist — a dangling reference is dropped so the caller falls back to
@@ -227,13 +228,24 @@ pub fn build_openai_client(
 ///
 /// Used by the agent loop at turn time to build a throwaway provider for a
 /// resolved per-context override. `trace` wires capture into the shared
-/// [`LlmRequestLog`] (pass `None` to disable).
-pub fn build_provider_for(
+/// [`LlmRequestLog`] (pass `None` to disable). A `transport` replaces the
+/// HTTP client build entirely (the remote-node seam); it is asked first, and
+/// an absent client falls back to the config path.
+///
+/// [`build_provider_for`] is this function with no transport — the local-only
+/// form every host call site keeps using.
+pub fn build_provider_via(
     config: &Config,
     model: &ModelRef,
     trace: Option<Arc<LlmRequestLog>>,
     run_dir: Option<std::path::PathBuf>,
+    transport: Option<&Arc<dyn ModelTransport>>,
 ) -> Option<Arc<dyn LlmClient>> {
+    if let Some(transport) = transport {
+        if let Some(client) = transport.client_for(config, model) {
+            return Some(client);
+        }
+    }
     let endpoint = config.endpoint(&model.endpoint)?;
     Some(build_client(
         config,
@@ -246,7 +258,90 @@ pub fn build_provider_for(
     ))
 }
 
-/// The reasoning effort for a per-context model build: the context's
+/// [`build_provider_via`] without a transport: build the client from the
+/// local endpoint config (the form every host call site uses).
+pub fn build_provider_for(
+    config: &Config,
+    model: &ModelRef,
+    trace: Option<Arc<LlmRequestLog>>,
+    run_dir: Option<std::path::PathBuf>,
+) -> Option<Arc<dyn LlmClient>> {
+    build_provider_via(config, model, trace, run_dir, None)
+}
+
+/// Where a provider client for a per-request model reference comes from.
+///
+/// The one seam that lets a **remote worker node** run with no API keys of
+/// its own: every model call resolves through this transport instead of the
+/// HTTP client build, so the hub — which holds the keys, the `[models]`
+/// tiers and the endpoints — can serve the request. It is deliberately
+/// consulted BEFORE [`build_client`] and never through
+/// [`crate::headless::EngineBuilder::provider`]: the injected-provider path
+/// drops spawn model pins (`has_injected_provider` makes the spawn model
+/// `None`), while a transport is asked for the exact [`ModelRef`] the
+/// resolver was handed, effort resolution included in the ref.
+pub trait ModelTransport: Send + Sync {
+    /// A client for `model`, or `None` when the transport cannot serve it
+    /// (the caller then falls back to the local config path). The ref is
+    /// passed **before** effort normalisation, so a transport can resolve
+    /// the tier/model per request itself.
+    fn client_for(&self, config: &Config, model: &ModelRef) -> Option<Arc<dyn LlmClient>>;
+}
+
+/// A client that answers every request with a non-retryable error.
+///
+/// The startup provider of a transport-backed brain when the transport has no
+/// client for the resolved default model — a remote node whose hub catalog
+/// carries no default model yet. It keeps the brain wireable (agents,
+/// sessions, the memory store and the tool surface all exist) while making
+/// the missing model an explicit, non-retryable error on the first call
+/// instead of a panic or a silent fallback to an unconfigured HTTP endpoint.
+pub struct UnavailableClient {
+    model: String,
+    reason: String,
+    capabilities: Capabilities,
+}
+
+impl UnavailableClient {
+    /// A client that fails every request for `model` with `reason`.
+    pub fn new(model: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            capabilities: Capabilities {
+                max_context: 0,
+                max_output_tokens: 0,
+                ..Capabilities::openai()
+            },
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for UnavailableClient {
+    fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Local
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    async fn complete(
+        &self,
+        _messages: &[crate::provider::Message],
+        _tools: &[crate::provider::ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<futures::stream::BoxStream<'_, crate::provider::LlmEvent>> {
+        Err(crate::error::Error::Provider(self.reason.clone()))
+    }
+}
+
+/// The effort the per-context model build uses: the context's
 /// `ModelRef::reasoning_effort` override when set (normalized through the
 /// same gate / allow-list clamp / "off" wire encoding as configured
 /// values), else the model's own default chain.

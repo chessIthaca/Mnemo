@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 use mnemo::app::plan_board::BoardStatus;
 use mnemo::headless::SessionId;
 
-use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
 use crate::mnemo2::ledger;
 use crate::mnemo2::notice_tag::{NoticeState, TurnTag};
 use crate::mnemo2::runtime::{finished_notice, TEAM_NOTICE_PREFIX};
@@ -353,6 +352,12 @@ impl TeamRuntime {
     /// is left alone: its transcript may still be written. Does nothing while
     /// an external lead is attached or the grace has not passed. Returns the
     /// ids handed back.
+    ///
+    /// A worker on a host goes back only when it never got a session (plan
+    /// 5e64ccd5): no session reported (`claude_session`), none found
+    /// (`claude_agent_id`), and the host's latest `claude.watch` answered and
+    /// found none. Its SSH session may otherwise still be writing, so a stalled
+    /// remote worker is never handed back.
     pub(super) async fn hand_back_agent_workers(&self) -> Result<Vec<String>, String> {
         let _guard = self.merge_lock.lock().await;
         if self.external_lead_attached() || !self.hand_back_grace_passed_now() {
@@ -375,6 +380,12 @@ impl TeamRuntime {
             if !agent_watch::hand_back_due(&worker, view.as_ref()) {
                 continue;
             }
+            if worker.remote.is_some() {
+                if self.remote_never_started(&worker) {
+                    due.push(worker);
+                }
+                continue;
+            }
             if agent_watch::waits_for_agent(&worker) && self.register_launched_agent(&worker).await {
                 continue;
             }
@@ -394,6 +405,7 @@ impl TeamRuntime {
                 };
                 if worker.claude_agent.is_none()
                     || worker.claude_agent_id != seen.claude_agent_id
+                    || worker.claude_session != seen.claude_session
                     || worker.status != seen.status
                 {
                     continue;
@@ -404,7 +416,7 @@ impl TeamRuntime {
         }
         let mut notices = Vec::new();
         for worker in &handed {
-            let dirty = agent_watch::checkout_dirty(&worker.worktree).await;
+            let dirty = self.worker_checkout_dirty(worker).await;
             notices.push(agent_watch::handed_back_notice(worker, dirty));
         }
         let handed: Vec<String> = handed.into_iter().map(|worker| worker.id).collect();
@@ -432,6 +444,18 @@ impl TeamRuntime {
         saved.map(|()| handed)
     }
 
+    /// Whether a remote agent worker never got a Claude Code session: none
+    /// reported, none found, and its host's latest `claude.watch` answered
+    /// without one.
+    fn remote_never_started(&self, worker: &WorkerRecord) -> bool {
+        agent_watch::waits_for_agent(worker)
+            && worker.claude_session.is_none()
+            && self
+                .agent_watch
+                .remote_seen(&worker.id)
+                .is_some_and(|seen| !seen.failed && seen.session.is_none())
+    }
+
     /// Before an agent worker that awaits its launch is handed back, look
     /// for the agent the lead did launch for it (plan ee73bd2f decision 2)
     /// and register it as `team_agent_started` would. Returns whether one
@@ -439,15 +463,7 @@ impl TeamRuntime {
     async fn register_launched_agent(&self, worker: &WorkerRecord) -> bool {
         // Newer than the dispatch, or than the last reroute onto the agent
         // tier when the worker moved there later.
-        let since_ms = worker
-            .reroutes
-            .iter()
-            .filter_map(|row| match row {
-                DispatchRoutingRow::LeadReroute { ts, .. }
-                | DispatchRoutingRow::UserReroute { ts, .. } => Some(u128::from(*ts)),
-                _ => None,
-            })
-            .fold(worker.created_at_ms, u128::max);
+        let since_ms = agent_watch::agent_since_ms(worker);
         let taken: Vec<String> = self
             .records
             .lock()
@@ -770,11 +786,16 @@ impl TeamRuntime {
     /// so a lead's `team_agent_done` that got there first is not doubled.
     /// Returns whether it finished the worker.
     pub(super) async fn auto_finish_agent(&self, run: &FinishedRun) -> Result<bool, String> {
-        // Read before the lock: the transcript can be long.
+        // Read before the lock: the transcript can be long. A remote
+        // worker's host already read it.
         let report = run
-            .transcript
-            .as_deref()
-            .and_then(|path| agent_log::last_assistant_text_of(std::path::Path::new(path)))
+            .report
+            .clone()
+            .or_else(|| {
+                run.transcript
+                    .as_deref()
+                    .and_then(|path| agent_log::last_assistant_text_of(std::path::Path::new(path)))
+            })
             .unwrap_or_else(|| NO_FINAL_MESSAGE.to_string());
         let _guard = self.merge_lock.lock().await;
         let Ok(record) = self.worker(&run.worker_id).await else {
@@ -793,6 +814,16 @@ impl TeamRuntime {
         // Marked before the merge lock is released, so a team_agent_done
         // waiting on it finds the run finished.
         self.agent_watch.mark_auto_finished(&worker);
+        // A worker on a host: its shadow copy catches up with the node tip
+        // before the lead reads the notice and checks it. Best-effort.
+        if worker.remote.is_some() {
+            if let Err(error) = self.sync_remote(&worker.id).await {
+                eprintln!(
+                    "team: could not sync {} from its host after its session ended: {error}",
+                    worker.id
+                );
+            }
+        }
         self.push_agent_done_notice(&worker, false, true);
         Ok(true)
     }

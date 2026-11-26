@@ -3170,6 +3170,48 @@ async fn spend_events_round_trip_by_plan() {
 }
 
 #[tokio::test]
+async fn spend_insert_is_idempotent() {
+    // A remote worker's ledger rows are mirrored to the hub over the link
+    // (plan 9a2f4b67 step 2): a flush that is retried after a lost answer
+    // re-sends the SAME row id, and the second insert must be a no-op rather
+    // than a UNIQUE-constraint failure. Same for the savings ledger.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let spend = SpendEvent {
+        id: "0b6f0f4a-0000-4000-8000-000000000001".into(),
+        session_id: Some("s1".into()),
+        turn_id: None,
+        agent_id: None,
+        plan_id: "plan-mirror".into(),
+        step_index: None,
+        lane: None,
+        model: "worker-model".into(),
+        reason: "route".into(),
+        tokens_in: 10,
+        tokens_out: 2,
+        cached_tokens: None,
+        detail: None,
+        created_at: 1_700_000_000,
+    };
+    let savings = SavingsEvent {
+        id: "0b6f0f4a-0000-4000-8000-000000000002".into(),
+        session_id: Some("s1".into()),
+        kind: "outline".into(),
+        detail: None,
+        tokens_before: 1_000,
+        tokens_after: 100,
+        tokens_saved: 900,
+        measured: true,
+        created_at: 1_700_000_000,
+    };
+    for _ in 0..2 {
+        store.record_spend_event(&spend).await.unwrap();
+        store.record_savings_event(&savings).await.unwrap();
+    }
+    assert_eq!(store.spend_rows_for_plan("plan-mirror").await.unwrap().len(), 1);
+    assert_eq!(store.savings_events_rows(Some("s1")).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
     // Backlog 652ae094: the Dashboard's read path — the ledger aggregated
     // per-kind (biggest saver first), per UTC day (oldest first), the bounded
@@ -4667,4 +4709,45 @@ fn cosine_pool_ranks_5000_rows_under_200ms_in_debug() {
         fastest < std::time::Duration::from_millis(200),
         "the 5,000-row cosine pass took {fastest:?} (best of 5) (debug budget 200 ms; release target 20 ms)"
     );
+}
+
+/// The link carries a recall's filter one way and the scored result the other
+/// way, so both shapes must survive JSON — and an omitted filter field must
+/// keep the exclusion DEFAULTS (`true`), never deserialize to `false`.
+#[test]
+fn memory_filter_and_scored_memory_round_trip() {
+    let filter = MemoryFilter::default()
+        .tier(MemoryTier::Semantic)
+        .limit(7);
+    let json = serde_json::to_string(&filter).unwrap();
+    let back: MemoryFilter = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.tier, Some(MemoryTier::Semantic));
+    assert_eq!(back.limit, Some(7));
+    assert!(back.exclude_working);
+    assert!(back.exclude_superseded);
+    assert!(back.exclude_quarantined);
+
+    // A minimal payload (a link caller naming only a limit) keeps the defaults.
+    let sparse: MemoryFilter = serde_json::from_str(r#"{"limit":3}"#).unwrap();
+    assert_eq!(sparse.limit, Some(3));
+    assert_eq!(sparse.tier, None);
+    assert!(sparse.exclude_working, "exclude_working must default to true");
+    assert!(
+        sparse.exclude_superseded,
+        "exclude_superseded must default to true"
+    );
+    assert!(
+        sparse.exclude_quarantined,
+        "exclude_quarantined must default to true"
+    );
+
+    let scored = ScoredMemory {
+        memory: Memory::new(MemoryTier::Semantic, "title", "body", 1000),
+        score: 0.75,
+    };
+    let json = serde_json::to_string(&scored).unwrap();
+    let back: ScoredMemory = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.memory.id, scored.memory.id);
+    assert_eq!(back.memory.title, "title");
+    assert!((back.score - 0.75).abs() < f64::EPSILON);
 }

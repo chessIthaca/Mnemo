@@ -79,6 +79,19 @@ A Mnemo worker can move onto an agent tier mid-step. While you lead, `team_resum
 
 Passing `model` always means a Mnemo worker: `team_dispatch` starts one on it, and `team_resume` switches a Mnemo worker to it. When Mnemo2's own lead leads, the tier runs on its models as usual.
 
+### Agent tiers on a worker host
+
+When a host is linked to an SSH connection (`team_hosts` action `link`, with the connection name from `list_start_targets`), an agent-tier worker may run there. An answer that carries a `claude_session` block instead of `claude_agent` (from `team_dispatch`, `team_resume`, or an escalation onto an agent tier) means: start that session. The user can also pair, link and revoke hosts in Settings → Worker hosts. Linking the host was the user's approval for Claude workers on that connection, so do not ask again:
+
+1. Call `start_session` with every field of the block unchanged (`target` "ssh", `host`, `cwd`, `use_worktree` false, `context` "fresh", `initiation` "user_asked", `name`, `title`, `model`, `effort`, `background`, `prompt`, `wake_when_done` true).
+2. Call `team_agent_started` with the `worker_id` and the session id `start_session` returned.
+
+If the desktop app refuses the start or asks to confirm it, pass that question to the user. If the session does not start, `team_resume` with `host` "local" moves the worker to this computer and answers with a `claude_agent` block.
+
+Mnemo follows the session's transcript on the host: `team_status` shows its host, phase and activity, and Mnemo finishes the worker when the session ends its turn. The session's end note also reaches you; if Mnemo has not finished the worker by then, call `team_agent_done`. To continue such a worker (`team_message`, `team_route_fix`), send `continue_session.message` with `SendMessage` to `continue_session.session`.
+
+Never start `claude` on the host yourself, and never pass credentials. If the host is revoked, stop its session (with `SendMessage`, or in the app) before you resume the worker on this computer.
+
 ## Briefs
 
 The worker automatically receives the plan (title, goal, context, decisions, interfaces, acceptance scenarios, step list) and the full text of its step. The design belongs in the step text, written as a spec as the `mnemo-plan` skill describes, because the brief is not saved in the plan: a later worker on the same step never sees it. If you notice while writing a brief that the step lacks signatures, rules or test names, add them to the plan first, with `plan_update` `add_steps` or `decision`. Your `brief` then carries only what is specific to this dispatch:

@@ -374,6 +374,20 @@ impl TeamRuntime {
             )
             .await?;
         }
+        // A remote worker's commits live on its node: bring the hub shadow onto
+        // the node tip before the clean check, the tip read and the merge, so all
+        // three see the commit the node holds. Uncommitted changes on the node
+        // mean the merge would carry less than the worker has, so they refuse it.
+        if worker.remote.is_some() {
+            let sync = self.sync_remote(worker_id).await?;
+            if !sync.dirty.is_empty() {
+                return Err(super::proving::dirty_remote_error(
+                    worker_id,
+                    worker.host_label(),
+                    &sync.dirty,
+                ));
+            }
+        }
         phase3::require_clean(&worker.worktree, "worker").await?;
         let tip = phase3::tip(&worker.worktree).await?;
         if pool {
@@ -487,6 +501,13 @@ impl TeamRuntime {
             worker.status = WorkerStatus::Merged;
             worker.merge = Some(record);
             worker.error = None;
+            // A merged worker is finished: its host is no longer away from a
+            // turn that would resume, so the away mark goes with the merge.
+            // The rest of the remote record stays for history and display
+            // (plan e8cb5112, step 2).
+            if let Some(remote) = worker.remote.as_mut() {
+                remote.offline_since_ms = None;
+            }
         })
         .await;
         self.persist().await?;
@@ -926,5 +947,39 @@ impl TeamRuntime {
             format!("board:untick:{}:{}", worker.id, now_key()),
             format!("{text}\nUse plan_show for the plan's current state."),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mnemo2::team::check_run::remote_testkit;
+
+    /// A remote worker whose node checkout has uncommitted changes is refused
+    /// before the merge reads anything: the merge would carry less than the
+    /// worker has, and the refusal names the host and the files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_refuses_dirty_remote_worker() {
+        let rig = remote_testkit::Rig::start().await;
+        let (record, remote, _tip) = rig.worker_on_node("abcd1234", true).await;
+        let team = rig.team().await;
+        team.records.lock().await.push(record.clone());
+
+        // The worker keeps editing its node checkout and does not commit.
+        std::fs::write(
+            std::path::PathBuf::from(&remote.path).join("half-done.txt"),
+            "not committed\n",
+        )
+        .expect("dirty the node checkout");
+
+        let error = team
+            .merge_as("abcd1234", true)
+            .await
+            .expect_err("a dirty node checkout refuses the merge");
+        assert!(
+            error.contains("worker 'abcd1234' has uncommitted changes on host 'node-a'"),
+            "{error}"
+        );
+        assert!(error.contains("half-done.txt"), "{error}");
+        assert!(error.contains("ask it to commit them"), "{error}");
     }
 }

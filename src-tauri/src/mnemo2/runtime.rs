@@ -355,6 +355,11 @@ impl CatalogHandles {
         if let Some(team) = team {
             team.set_catalog(models, tiers_of(&self.config_dir), pricing_of(&self.config_dir)?);
         }
+        // A new endpoint/tier set must reach a paired node before its next
+        // dispatch: the hub pushes the new catalog revision down every link.
+        if let Some(server) = crate::mnemo2::remote_hub::app_hub(&self.config_dir).server() {
+            server.push_catalog();
+        }
         Ok(())
     }
 }
@@ -471,7 +476,7 @@ impl LeadRuntime {
             .for_engine(&engine);
         let classifier = setup.classifier_slot();
         let team = TeamRuntime::open(TeamRuntimeOptions {
-            engine,
+            engine: engine.clone(),
             workspace_root: runtime.workspace_root.clone(),
             state_dir: runtime.state_dir.clone(),
             config_dir: runtime.config_dir.clone(),
@@ -488,7 +493,15 @@ impl LeadRuntime {
         if let Some(board) = runtime.board_handle() {
             team.attach_board(board);
         }
-        *runtime.team.lock().await = Some(team);
+        *runtime.team.lock().await = Some(Arc::clone(&team));
+        // The app's one worker hub: serve this project's models, memory and
+        // catalog to a paired node. With no node paired this starts no
+        // listener, so remoting stays off until the operator pairs one.
+        crate::mnemo2::remote_hub::app_hub(&runtime.config_dir).bind_project(
+            &engine,
+            &team,
+            &runtime.config_dir,
+        );
         // Live settings: a hand edit of `~/.mnemo/*.toml` (or another
         // instance's save) reloads this engine through the same live-apply a
         // Settings save uses. Best effort — a watcher that cannot start leaves
@@ -1151,6 +1164,13 @@ impl LeadRuntime {
         self.indexing.stop().await;
         if let Some(team) = self.team.lock().await.take() {
             team.shutdown().await;
+        }
+        // Stop answering for this project before the engine is released: the
+        // hub belongs to the app instance, but its services must never serve a
+        // closed project. The engine names the project, so a runtime that
+        // already handed the hub to a newer project leaves that binding alone.
+        if let Some(engine) = self.engine.lock().await.clone() {
+            crate::mnemo2::remote_hub::app_hub(&self.config_dir).unbind_project(&engine);
         }
         // Stop the trace journal's background writer before the engine
         // drops: it polls the engine's shared trace log (plan c3ba2b58

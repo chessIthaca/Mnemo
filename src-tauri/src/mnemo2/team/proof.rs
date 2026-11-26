@@ -29,9 +29,13 @@ use std::time::Duration;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use serde::Deserialize;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use mnemo::machine_slots::{HeavySlots, SlotGuard};
+use mnemo::remote::node::{checkout_path, NodeCallCtx, NodeExtension};
+use mnemo::remote::RemoteError;
 
 #[cfg(windows)]
 use mnemo::process_tree::KillOnCloseJob;
@@ -58,6 +62,21 @@ const CARGO_REGRESSION_COMMAND: &str = "cargo test --workspace -- {name}";
 /// cargo prints `test <name> ... ok` for a test that ran.
 const CARGO_REGRESSION_RAN: &str = "{name} ... ";
 
+/// The hub→node method that runs the regression red check.
+pub const PROOF_PROVE: &str = "proof.prove";
+
+/// The hub→node method that runs the mutation check.
+pub const PROOF_MUTATE: &str = "proof.mutate";
+
+/// How long the hub waits for a node's regression check. The run itself is
+/// limited to [`REGRESSION_LIMIT`] and may wait for one of the node's heavy
+/// slots first, so the hub allows it a full afternoon.
+pub const PROOF_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// How long the hub waits for a node's mutation run, which builds and tests
+/// every mutant.
+pub const MUTATE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The proof configuration read from a project's `.coding/checks.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProofConfig {
@@ -68,7 +87,7 @@ pub struct ProofConfig {
 }
 
 /// The `[regression]` table: how to run one regression test by name.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RegressionCfg {
     /// The command that runs one test; `{name}` is the plan's regression test.
     pub command: String,
@@ -77,7 +96,7 @@ pub struct RegressionCfg {
 }
 
 /// The `[mutation]` table: how to run the project's mutation tool.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MutationCfg {
     /// The command; `{diff}` is a unified diff file, `{out}` an output folder.
     pub command: String,
@@ -332,7 +351,8 @@ pub fn source_hunks_patch(diff: &str, tip_file: &dyn Fn(&str) -> Option<String>)
 }
 
 /// What a red check proved.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum RedOutcome {
     /// The regression test failed once the change's source hunks were gone.
     Red {
@@ -970,7 +990,7 @@ pub async fn prove_regression(
 }
 
 /// One mutant no test caught.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Mutant {
     /// Repository-relative path, or empty when the line did not parse.
     pub file: String,
@@ -1146,6 +1166,159 @@ pub async fn run_mutation(
         ));
     }
     Ok(parse_missed(&missed))
+}
+
+/// `proof.prove`: the hub asks a node to run the regression red check in one
+/// of its checkouts.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ProveNodeRequest {
+    /// The checkout name under the node's `checkouts/`.
+    pub checkout: String,
+    /// The base commit the change sits on.
+    pub base: String,
+    /// The commit being proved.
+    pub tip: String,
+    /// How to run one regression test by name.
+    pub cfg: RegressionCfg,
+    /// The plan's regression test.
+    pub test: String,
+}
+
+/// `proof.mutate`: the hub asks a node to run the mutation check over a
+/// change.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MutateNodeRequest {
+    /// The checkout name under the node's `checkouts/`.
+    pub checkout: String,
+    /// The 12-hex project key: names the node's work folder for the run.
+    pub project: String,
+    /// The base commit the change sits on.
+    pub base: String,
+    /// The commit being proved.
+    pub tip: String,
+    /// How to run the project's mutation tool.
+    pub cfg: MutationCfg,
+    /// The worker the run belongs to.
+    pub worker_id: String,
+}
+
+/// The node's proof surface: the two proof runs the hub asks for, executed in
+/// the node's own checkout with the node's own heavy slots.
+///
+/// A node binary installs it through [`mnemo::remote::node::NodeConfig`]'s
+/// `extension` field. A method this extension does not know is left to the
+/// node runtime (`None`).
+///
+/// A proof interrupted on a node (Mnemo2 closing, the node process dying)
+/// leaves that node checkout reverse-applied, with no hub-side marker to
+/// repair it: the node's next `checkout.prepare` resets the checkout onto its
+/// branch tip, which is the only state a later run accepts.
+pub struct ProofNodeExtension;
+
+#[async_trait]
+impl NodeExtension for ProofNodeExtension {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        ctx: &NodeCallCtx,
+    ) -> Option<Result<Value, RemoteError>> {
+        match method {
+            PROOF_PROVE => Some(prove_on_node(params, ctx).await),
+            PROOF_MUTATE => Some(mutate_on_node(params, ctx).await),
+            _ => None,
+        }
+    }
+}
+
+/// The node's heavy slots as its own config sees them; `None` when the config
+/// cannot be read, so the proof runs unslotted rather than failing.
+fn node_slots(ctx: &NodeCallCtx) -> Option<HeavySlots> {
+    let config = mnemo::config::Config::load(&ctx.config_dir).ok()?;
+    Some(HeavySlots::new(
+        mnemo::machine_slots::default_dir(&ctx.config_dir),
+        config.general.general.machine.heavy_commands,
+    ))
+}
+
+/// The node's work root for one project's mutation runs. The project key is a
+/// path component, never a path.
+fn node_work_root(ctx: &NodeCallCtx, project: &str) -> Result<PathBuf, RemoteError> {
+    let mut components = Path::new(project).components();
+    let single = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !single {
+        return Err(RemoteError::bad_params(format!(
+            "project {project:?} is not a single path component"
+        )));
+    }
+    Ok(ctx.home.join("work").join(project))
+}
+
+/// Run the hub's `proof.prove` request and return its outcome.
+async fn prove_on_node(params: Value, ctx: &NodeCallCtx) -> Result<Value, RemoteError> {
+    let request: ProveNodeRequest = serde_json::from_value(params)
+        .map_err(|error| RemoteError::bad_params(format!("proof.prove: {error}")))?;
+    let checkout = checkout_path(&ctx.home, &request.checkout)?;
+    let outcome = prove_regression(
+        checkout,
+        request.base,
+        request.tip,
+        request.cfg,
+        request.test,
+        node_slots(ctx).as_ref(),
+    )
+    .await
+    .map_err(|error| RemoteError::new(mnemo::remote::CODE_INTERNAL, error))?;
+    serde_json::to_value(outcome).map_err(|error| {
+        RemoteError::new(
+            mnemo::remote::CODE_INTERNAL,
+            format!("proof.prove: {error}"),
+        )
+    })
+}
+
+/// Run the hub's `proof.mutate` request and return the mutants no test caught.
+async fn mutate_on_node(params: Value, ctx: &NodeCallCtx) -> Result<Value, RemoteError> {
+    let request: MutateNodeRequest = serde_json::from_value(params)
+        .map_err(|error| RemoteError::bad_params(format!("proof.mutate: {error}")))?;
+    let checkout = checkout_path(&ctx.home, &request.checkout)?;
+    let main_root = node_work_root(ctx, &request.project)?;
+    let create = main_root.clone();
+    tokio::task::spawn_blocking(move || std::fs::create_dir_all(&create))
+        .await
+        .map_err(|error| {
+            RemoteError::new(
+                mnemo::remote::CODE_INTERNAL,
+                format!("proof.mutate: could not create the work folder: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            RemoteError::new(
+                mnemo::remote::CODE_INTERNAL,
+                format!(
+                    "proof.mutate: could not create {}: {error}",
+                    main_root.display()
+                ),
+            )
+        })?;
+    let mutants = run_mutation(
+        main_root,
+        checkout,
+        request.base,
+        request.tip,
+        request.cfg,
+        request.worker_id,
+        node_slots(ctx).as_ref(),
+    )
+    .await
+    .map_err(|error| RemoteError::new(mnemo::remote::CODE_INTERNAL, error))?;
+    serde_json::to_value(mutants).map_err(|error| {
+        RemoteError::new(
+            mnemo::remote::CODE_INTERNAL,
+            format!("proof.mutate: {error}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -2090,5 +2263,122 @@ $rest = $args[1..($args.Length-1)]
         std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("cargo");
         std::fs::write(root.join(".coding/checks.toml"), "commands = [oops\n").expect("checks");
         assert_eq!(load_proof_config(root), ProofConfig::default());
+    }
+
+    /// The node's proof answers travel as JSON: every outcome and every mutant
+    /// survives the hub→node→hub trip unchanged.
+    #[test]
+    fn red_outcome_round_trips_serde() {
+        for outcome in [
+            RedOutcome::Red {
+                output: "FAILED demo::regression".to_string(),
+            },
+            RedOutcome::NotRed {
+                output: "test result: ok".to_string(),
+            },
+            RedOutcome::Inconclusive {
+                reason: "the test did not run".to_string(),
+            },
+        ] {
+            let value = serde_json::to_value(&outcome).expect("encode the outcome");
+            assert!(
+                value.get("outcome").and_then(Value::as_str).is_some(),
+                "the outcome is tagged: {value}"
+            );
+            assert_eq!(
+                serde_json::from_value::<RedOutcome>(value).expect("decode the outcome"),
+                outcome
+            );
+        }
+        let mutant = Mutant {
+            file: "src/a.rs".to_string(),
+            line: 7,
+            text: "replace + with -".to_string(),
+        };
+        let value = serde_json::to_value(&mutant).expect("encode a mutant");
+        assert_eq!(
+            serde_json::from_value::<Mutant>(value).expect("decode a mutant"),
+            mutant
+        );
+    }
+
+    /// The node's proof surface refuses a checkout name it cannot resolve, and
+    /// leaves a method it does not own to the node runtime.
+    #[tokio::test]
+    async fn proof_extension_rejects_unknown_checkout() {
+        let home = tempfile::tempdir().expect("node home");
+        let ctx = NodeCallCtx {
+            home: home.path().to_path_buf(),
+            config_dir: home.path().to_path_buf(),
+        };
+        let request = serde_json::json!({
+            "checkout": "0123456789ab-9",
+            "base": "0".repeat(40),
+            "tip": "1".repeat(40),
+            "cfg": {"command": "cargo test -- {name}", "ran": "{name} ... "},
+            "test": "demo::regression",
+        });
+        let error = ProofNodeExtension
+            .request(PROOF_PROVE, request.clone(), &ctx)
+            .await
+            .expect("the extension owns proof.prove")
+            .expect_err("an unknown checkout is refused");
+        assert!(
+            error.to_string().contains("does not exist on this node"),
+            "{error}"
+        );
+        assert_eq!(error.code, mnemo::remote::CODE_BAD_PARAMS);
+        // A name that tries to leave the checkouts folder is refused too.
+        let error = ProofNodeExtension
+            .request(
+                PROOF_PROVE,
+                serde_json::json!({
+                    "checkout": "../escape",
+                    "base": "0".repeat(40),
+                    "tip": "1".repeat(40),
+                    "cfg": {"command": "x", "ran": "x"},
+                    "test": "x",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("the extension owns proof.prove")
+            .expect_err("a path is not a checkout name");
+        assert!(error.to_string().contains("is not a single path component"), "{error}");
+        // A mutation project key that tries to leave the work folder is refused,
+        // even for a checkout that exists (the checkout is read first).
+        std::fs::create_dir_all(
+            home.path()
+                .join(mnemo::remote::node::CHECKOUTS_DIR)
+                .join("0123456789ab-9"),
+        )
+        .expect("a node checkout folder");
+        let error = ProofNodeExtension
+            .request(
+                PROOF_MUTATE,
+                serde_json::json!({
+                    "checkout": "0123456789ab-9",
+                    "project": "../escape",
+                    "base": "0".repeat(40),
+                    "tip": "1".repeat(40),
+                    "cfg": {"command": "x", "missed": "x"},
+                    "worker_id": "abcd1234",
+                }),
+                &ctx,
+            )
+            .await
+            .expect("the extension owns proof.mutate")
+            .expect_err("a path is not a project key");
+        assert_eq!(error.code, mnemo::remote::CODE_BAD_PARAMS);
+        assert!(error.to_string().contains("is not a single path component"), "{error}");
+        assert!(!home.path().join("work").join("escape").exists());
+        assert!(!home.path().join("escape").exists());
+        assert!(
+            ProofNodeExtension
+                .request("repo.list", request, &ctx)
+                .await
+                .is_none(),
+            "a repo method is not the proof surface"
+        );
     }
 }

@@ -1609,11 +1609,21 @@ fn tool_list(target: &Target) -> Vec<Value> {
             if spec.name == "team_resume" {
                 external_team_resume(&mut spec.description, &mut spec.parameters);
             }
-            json!({
+            let mut tool = json!({
                 "name": spec.name,
                 "description": spec.description,
                 "inputSchema": spec.parameters,
-            })
+            });
+            // The external lead's own permission system gates MCP tools; a
+            // tool that needs approval says so with the MCP hints, so a
+            // client that auto-allows read-only tools never treats it as one.
+            if spec.safety == mnemo::tool::SafetyLevel::NeedsApproval {
+                tool["annotations"] = json!({
+                    "readOnlyHint": false,
+                    "destructiveHint": true,
+                });
+            }
+            tool
         })
         .collect();
     let engine_tools = target
@@ -2892,6 +2902,29 @@ mod tests {
         // The engine's tools hold its memory store and code graph: release
         // them before the shutdown removes the project folder.
         drop(engine_tools);
+        fixture.shutdown().await;
+    }
+
+    /// A tool that needs approval carries the MCP hints that say so (only
+    /// `team_hosts` does); every other tool lists no annotations.
+    #[tokio::test]
+    async fn a_tool_that_needs_approval_lists_its_hints() {
+        let fixture = Fixture::new(true, true, ServerOptions::default()).await;
+        let (_, reply) = fixture
+            .rpc(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+            .await;
+        let tools = reply["result"]["tools"].as_array().expect("tools");
+        let hosts = tools
+            .iter()
+            .find(|tool| tool["name"] == "team_hosts")
+            .expect("team_hosts is listed");
+        assert_eq!(hosts["annotations"]["readOnlyHint"], false);
+        assert_eq!(hosts["annotations"]["destructiveHint"], true);
+        let status = tools
+            .iter()
+            .find(|tool| tool["name"] == "team_status")
+            .expect("team_status is listed");
+        assert!(status.get("annotations").is_none(), "{status}");
         fixture.shutdown().await;
     }
 

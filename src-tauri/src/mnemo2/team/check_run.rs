@@ -33,12 +33,17 @@ use crate::mnemo2::usage::ProjectUsage;
 
 use super::dispatch::BoxFuture;
 use super::persistence::TeamPersistence;
-use super::pump::counted_checks;
+use super::pump::{counted_checks_at, CheckoutRoot};
 use super::pump::save_workers;
-use super::record::{WorkerCheck, WorkerRecord, WorkerStatus};
+use super::record::{RemoteCheckout, WorkerCheck, WorkerRecord, WorkerStatus};
+use super::remote::{checks_hash, environmental_failure, RemoteWorkers};
 use super::review::CheckRecorder;
 use super::spawn::load_check_commands;
 use super::{now_key, BoardSignal, TeamRuntime};
+
+#[cfg(test)]
+#[path = "remote_testkit.rs"]
+pub(super) mod remote_testkit;
 
 /// The in-progress key of a run in the lead checkout (no worker owns it).
 const LEAD_KEY: &str = "@lead";
@@ -118,6 +123,15 @@ fn dirty_error(worker_id: &str) -> String {
     format!(
         "{worker_id}'s checkout has uncommitted changes; Mnemo checks only a committed tip. Commit or discard them first."
     )
+}
+
+/// Whether `error` is one of the dirty refusals a check run gives: the hub
+/// checkout of a local worker, or the node checkout of a remote one.
+fn is_dirty_refusal(error: &str, worker_id: &str) -> bool {
+    error == dirty_error(worker_id)
+        || error.starts_with(&format!(
+            "worker '{worker_id}' has uncommitted changes on host '"
+        ))
 }
 
 /// What a command that exited 0 but changed files is reported with.
@@ -259,6 +273,55 @@ impl RunReport {
     }
 }
 
+/// The first environmental failure among the failing outcomes, when one of them
+/// names a shell or tool the host does not have.
+///
+/// This is what disqualifies a host for this project (`note_check`); a red test
+/// at the lead's tip is the project's fault, not the host's, and stays a plain
+/// failure.
+fn environmental_reason(result: &ToolResult, report: &RunReport) -> Option<String> {
+    let entries = result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("checks"))
+        .and_then(Value::as_array)?;
+    report.outcomes.iter().filter(|outcome| !outcome.passed).find_map(|outcome| {
+        let entry = entries.iter().find(|entry| {
+            entry.get("command").and_then(Value::as_str) == Some(outcome.command.as_str())
+        })?;
+        let exit = entry.get("exit_code").and_then(Value::as_i64);
+        let text = if outcome.failing.is_empty() {
+            outcome.headline.as_str()
+        } else {
+            outcome.failing.as_str()
+        };
+        if !environmental_failure(exit, text) {
+            return None;
+        }
+        // The output opens with a stream marker (`[stderr]`); the reason is the
+        // line that says what is missing, else the first real line, and it
+        // always names the command.
+        let lines: Vec<&str> = outcome
+            .failing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("[std"))
+            .collect();
+        let line = lines
+            .iter()
+            .find(|line| environmental_failure(None, line))
+            .or_else(|| lines.first())
+            .copied()
+            .unwrap_or(outcome.headline.as_str());
+        let program = outcome.command.split_whitespace().next().unwrap_or("");
+        Some(if program.is_empty() || line.contains(program) {
+            line.to_string()
+        } else {
+            format!("{}: {line}", outcome.command)
+        })
+    })
+}
+
 /// Run every command with the `run_checks` tool in `checkout`.
 ///
 /// `lead` marks the lead checkout's run: there a tree change confined to the
@@ -382,6 +445,21 @@ fn build_report(
     args: &Value,
     result: &ToolResult,
 ) -> Result<RunReport, String> {
+    build_report_at(
+        &CheckoutRoot::Local(checkout),
+        commands,
+        args,
+        result,
+    )
+}
+
+/// [`build_report`] against a hub or node checkout.
+fn build_report_at(
+    checkout: &CheckoutRoot<'_>,
+    commands: &[String],
+    args: &Value,
+    result: &ToolResult,
+) -> Result<RunReport, String> {
     let Some(entries) = result
         .data
         .as_ref()
@@ -392,7 +470,7 @@ fn build_report(
     };
     // The pump's own counting rule decides what passed: exit 0, an allowed
     // command, run from the checkout, files unchanged.
-    let counted = counted_checks("run_checks", args, result, checkout, commands);
+    let counted = counted_checks_at("run_checks", args, result, checkout, commands);
     let run: Vec<String> = entries
         .iter()
         .filter_map(|entry| entry.get("command").and_then(Value::as_str))
@@ -466,6 +544,8 @@ struct CheckCtx {
     save_lock: Arc<Mutex<()>>,
     persistence: TeamPersistence,
     signals: broadcast::Sender<BoardSignal>,
+    /// The remote-worker seam: the node check run and the host measurement.
+    remote: Arc<RemoteWorkers>,
     /// Tests only: this run panics at its start.
     #[cfg(test)]
     inject_panic: bool,
@@ -580,6 +660,140 @@ impl CheckCtx {
         self.notice(format!("checks:{worker_id}:{}", now_key()), text);
     }
 
+    /// The same run for a remote worker: the commands run in its node checkout,
+    /// at the node's tip, and the hub shadow is refreshed onto that tip so the
+    /// review, diff and merge read it locally.
+    async fn run_worker_remote(
+        &self,
+        worker_id: &str,
+        remote: RemoteCheckout,
+        tip: String,
+        commands: Vec<String>,
+        guard: CheckRunGuard,
+    ) {
+        #[cfg(test)]
+        if self.inject_panic {
+            panic!("injected check run panic");
+        }
+        let header = format!("worker_id={worker_id}");
+        let host = remote.node_name.clone();
+        let text = match self.remote.run_checks(&remote, &commands, &tip).await {
+            Err(error) => format!(
+                "{header}\nMnemo could not run the checks for {worker_id} on host {host}: {error}"
+            ),
+            Ok(answer) => match build_report_at(
+                &CheckoutRoot::Remote(&remote.path),
+                &commands,
+                &json!({}),
+                &answer.result,
+            ) {
+                Err(error) => format!(
+                    "{header}\nMnemo could not run the checks for {worker_id} on host {host}: {error}"
+                ),
+                Ok(report) => {
+                    // The run measured the host, whatever the worker's tip does
+                    // next: a shell or tool the host lacks disqualifies it; a red
+                    // test does not.
+                    self.remote.note_check(
+                        &remote.node_id,
+                        &checks_hash(&commands),
+                        report.outcomes.iter().any(|outcome| outcome.passed),
+                        environmental_reason(&answer.result, &report),
+                    );
+                    if answer.tip_before != tip || answer.tip_after != tip {
+                        format!(
+                            "{header}\nMnemo ran the checks for {worker_id} on host {host} but its tip moved from {} to {} while they ran, so nothing was recorded. Run team_run_checks again.",
+                            short(&answer.tip_before),
+                            short(&answer.tip_after)
+                        )
+                    } else {
+                        let recorder = CheckRecorder::new(
+                            &self.records,
+                            &self.usage,
+                            &self.save_lock,
+                            &self.persistence,
+                        );
+                        let mut problem = None;
+                        for outcome in &report.outcomes {
+                            let check = WorkerCheck {
+                                name: outcome.command.clone(),
+                                status: if outcome.passed { "passed" } else { "failed" }.to_string(),
+                                detail: Some(outcome.detail()),
+                                tip: tip.clone(),
+                            };
+                            if let Err(error) = recorder.record_at_tip(worker_id, check).await {
+                                problem = Some(error);
+                                break;
+                            }
+                        }
+                        if problem.is_none() {
+                            problem = save_workers(
+                                &self.records,
+                                &self.usage,
+                                &self.save_lock,
+                                &self.persistence,
+                            )
+                            .await
+                            .err();
+                        }
+                        // The shadow must hold the tip those checks measured:
+                        // review, diff and merge read it, not the node.
+                        let record = {
+                            let records = self.records.lock().await;
+                            records
+                                .iter()
+                                .find(|worker| worker.id == worker_id)
+                                .cloned()
+                        };
+                        if let Some(record) = record {
+                            match self.remote.sync_shadow(&record, true).await {
+                                Ok(_) => {
+                                    // Persist the tip the shadow now holds: the
+                                    // offline message and the next sync read it.
+                                    if let Err(error) = save_workers(
+                                        &self.records,
+                                        &self.usage,
+                                        &self.save_lock,
+                                        &self.persistence,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "team: could not save the synced tip of {worker_id}: {error}"
+                                        );
+                                    }
+                                }
+                                Err(error) => eprintln!(
+                                    "team: could not sync the shadow of {worker_id} onto the tip its checks measured: {error}"
+                                ),
+                            }
+                        }
+                        let next = match (&problem, report.all_passed()) {
+                            (Some(error), _) => {
+                                format!("The results could not be recorded: {error}")
+                            }
+                            (None, true) => "Merge it with team_merge.".to_string(),
+                            (None, false) => "Route the failures with team_route_fix.".to_string(),
+                        };
+                        Self::notice_text(
+                            Some(&header),
+                            &format!(
+                                "Mnemo ran the checks for {worker_id} at {} on host {host}",
+                                short(&tip)
+                            ),
+                            &report,
+                            &next,
+                        )
+                    }
+                }
+            },
+        };
+        // The claim goes before the notice, so the lead's next call is not
+        // refused for a run that already ended.
+        drop(guard);
+        self.notice(format!("checks:{worker_id}:{}", now_key()), text);
+    }
+
     /// The same run in the lead checkout; nothing is recorded.
     async fn run_lead(&self, tip: String, branch: String, commands: Vec<String>, guard: CheckRunGuard) {
         let outcomes = run_all(&self.workspace_root, &commands, &self.config_dir, true).await;
@@ -622,6 +836,7 @@ impl TeamRuntime {
             save_lock: self.save_lock.clone(),
             persistence: self.persistence.clone(),
             signals: self.signals.clone(),
+            remote: self.remote.clone(),
             #[cfg(test)]
             inject_panic: self
                 .check_runs
@@ -696,6 +911,36 @@ impl TeamRuntime {
             let Some(guard) = self.check_runs.claim(worker_id) else {
                 return Err(check_run_error(worker_id));
             };
+            if let Some(remote) = worker.remote.clone() {
+                // A remote worker's checkout lives on its node: take the
+                // authoritative tip from the node and refuse a node tree the
+                // worker still edits. The hub shadow follows that tip.
+                let sync = self.sync_remote(worker_id).await?;
+                if !sync.dirty.is_empty() {
+                    return Err(super::proving::dirty_remote_error(
+                        worker_id,
+                        worker.host_label(),
+                        &sync.dirty,
+                    ));
+                }
+                let tip = sync.tip;
+                let ctx = self.check_ctx();
+                let id = worker_id.to_string();
+                let started = short(&tip).to_string();
+                let signals = ctx.signals.clone();
+                let host = remote.node_name.clone();
+                let stopped = format!(
+                    "worker_id={worker_id}\nMnemo's check run for {worker_id} on host {host} stopped unexpectedly; nothing was recorded. Run team_run_checks again."
+                );
+                let run = tokio::spawn(async move {
+                    ctx.run_worker_remote(&id, remote, tip, commands, guard)
+                        .await
+                });
+                supervise(signals, worker_id.to_string(), stopped, run);
+                return Ok(format!(
+                    "Mnemo is running the checks for {worker_id} at {started} on host {host}; a notice follows and records each command on that tip."
+                ));
+            }
             if phase3::require_clean(&worker.worktree, "worker").await.is_err() {
                 return Err(dirty_error(worker_id));
             }
@@ -747,7 +992,7 @@ impl TeamRuntime {
                     short(&tip)
                 )),
                 // A dirty checkout is the lead's to know: the review result says so.
-                Err(error) if error == dirty_error(&reviewed.id) => Some(error),
+                Err(error) if is_dirty_refusal(&error, &reviewed.id) => Some(error),
                 Err(error) => {
                     eprintln!("team: the missing checks of {} did not start: {error}", reviewed.id);
                     None
@@ -979,5 +1224,163 @@ mod tests {
             missing: Vec::new(),
         };
         assert!(!empty.all_passed(), "an empty list is never a pass");
+    }
+
+    /// A remote worker's checks run on its node, are recorded at the NODE's tip,
+    /// and leave the hub shadow on that same tip — the checkout review, diff and
+    /// merge read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_check_run_records_at_node_tip() {
+        let rig = remote_testkit::Rig::start().await;
+        let (record, remote, tip) = rig.worker_on_node("abcd1234", true).await;
+        // A command every host has, so the test measures the run and not the
+        // node's toolchain.
+        write(
+            rig.root.path(),
+            ".coding/checks.toml",
+            "commands = [\"git --version\"]\n",
+        );
+        let team = rig.team().await;
+        team.records.lock().await.push(record.clone());
+        // The notice is posted after the checks are recorded AND the shadow is
+        // synced onto the tip they measured; wait for it so the node outlives
+        // the whole run.
+        let mut signals = team.signals.subscribe();
+
+        let started = team
+            .run_checks_tool(Some("abcd1234"))
+            .await
+            .expect("start the remote check run");
+        assert!(started.contains("on host node-a"), "{started}");
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match signals.recv().await {
+                    Ok(BoardSignal::Notice { key, text })
+                        if key.starts_with("checks:abcd1234:") =>
+                    {
+                        return text;
+                    }
+                    Ok(_) => continue,
+                    Err(error) => panic!("the board signal channel closed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the check run posts its notice");
+        assert!(notice.contains("on host node-a"), "{notice}");
+        assert!(!notice.contains("could not"), "{notice}");
+
+        let checks = team
+            .records
+            .lock()
+            .await
+            .iter()
+            .find(|record| record.id == "abcd1234")
+            .map(|record| record.checks.clone())
+            .expect("the worker record");
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].name, "git --version");
+        assert_eq!(checks[0].status, "passed");
+        assert_eq!(checks[0].tip, tip, "recorded at the node's tip");
+
+        let shadow = record.worktree.clone();
+        assert_eq!(
+            phase3::tip(&shadow).await.expect("the shadow tip"),
+            tip,
+            "the hub shadow holds the tip the checks measured"
+        );
+        let node_checkout = std::path::PathBuf::from(&remote.path);
+        assert_eq!(
+            super::super::remote::git_value(&node_checkout, &["rev-parse", "HEAD"])
+                .await
+                .expect("the node tip"),
+            tip,
+            "the node checkout stayed at its tip"
+        );
+    }
+
+    /// A remote worker whose node checkout is dirty: the review result carries
+    /// the refusal (naming host and files), not a silent skip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_reports_the_dirty_remote_refusal() {
+        let rig = remote_testkit::Rig::start().await;
+        let (mut record, remote, tip) = rig.worker_on_node("abcd1234", true).await;
+        write(
+            rig.root.path(),
+            ".coding/checks.toml",
+            "commands = [\"git --version\"]\n",
+        );
+        record.review = Some(crate::mnemo2::phase3::ReviewRecord {
+            summary: "reviewed".into(),
+            tip,
+            reviewed_at_ms: 1,
+            evidence: None,
+            lane: None,
+        });
+        let team = rig.team().await;
+        team.records.lock().await.push(record.clone());
+        std::fs::write(
+            std::path::PathBuf::from(&remote.path).join("half-done.txt"),
+            "not committed\n",
+        )
+        .expect("dirty the node checkout");
+
+        let line = team
+            .start_missing_checks(&record)
+            .await
+            .expect("the refusal reaches the review result");
+        assert!(
+            line.contains("worker 'abcd1234' has uncommitted changes on host 'node-a'"),
+            "{line}"
+        );
+        assert!(line.contains("half-done.txt"), "{line}");
+        assert!(is_dirty_refusal(&line, "abcd1234"));
+        assert!(!is_dirty_refusal(&line, "other"));
+    }
+
+    /// A remote check run of a command the host lacks marks the host Failed,
+    /// with a reason that names the missing tool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_check_run_marks_the_host_failed_on_a_missing_command() {
+        let rig = remote_testkit::Rig::start().await;
+        let (record, _remote, _tip) = rig.worker_on_node("abcd1234", true).await;
+        write(
+            rig.root.path(),
+            ".coding/checks.toml",
+            "commands = [\"mnemo-no-such-tool --version\"]\n",
+        );
+        let team = rig.team().await;
+        team.records.lock().await.push(record.clone());
+        let mut signals = team.signals.subscribe();
+        team.run_checks_tool(Some("abcd1234"))
+            .await
+            .expect("start the remote check run");
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match signals.recv().await {
+                    Ok(BoardSignal::Notice { key, .. }) if key.starts_with("checks:abcd1234:") => {
+                        return;
+                    }
+                    Ok(_) => continue,
+                    Err(error) => panic!("the board signal channel closed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("the check run posts its notice");
+
+        let commands = load_check_commands(rig.root.path());
+        let hash = checks_hash(&commands);
+        assert_eq!(
+            team.remote.qualification(&rig.node_id, &hash),
+            super::super::remote::Qualification::Failed
+        );
+        let reason = team
+            .remote
+            .host_states()
+            .get(&rig.node_id)
+            .and_then(|state| state.reason.clone())
+            .expect("a failed host carries a reason");
+        assert!(reason.contains("mnemo-no-such-tool"), "{reason}");
     }
 }

@@ -105,6 +105,17 @@ pub struct EngineBuilder {
     brain: Option<Arc<Brain>>,
     /// Whether the built brain arms the code-search embedder.
     code_embedder: crate::headless::CodeEmbedder,
+    /// The remote-node seam: route every provider through this transport
+    /// instead of the local endpoint config. Exclusive with `.provider` and
+    /// `.brain` (see [`EngineBuilder::model_transport`]).
+    model_transport: Option<Arc<dyn crate::provider::client_factory::ModelTransport>>,
+    /// Whether the built brain starts the derived-memory-index file watcher
+    /// (default `true`; see [`EngineBuilder::derived_index_watch`]).
+    derived_index_watch: bool,
+    /// Whether typed knowledge records land in each agent's own root instead
+    /// of the factory-wide store (default `false`; see
+    /// [`EngineBuilder::worktree_knowledge`]).
+    worktree_knowledge: bool,
 }
 
 impl EngineBuilder {
@@ -117,6 +128,9 @@ impl EngineBuilder {
             shared: None,
             brain: None,
             code_embedder: crate::headless::CodeEmbedder::Auto,
+            model_transport: None,
+            derived_index_watch: true,
+            worktree_knowledge: false,
         }
     }
 
@@ -178,6 +192,42 @@ impl EngineBuilder {
         self
     }
 
+    /// Route every model call through `transport` — the **remote worker
+    /// node** seam. With a transport the brain's startup provider comes from
+    /// the transport (or an explicit non-retryable "model not found" client,
+    /// with no vision client), the resolver builds every turn's provider
+    /// through it, and the config-readiness gate is skipped: a node has no
+    /// `keys.toml` of its own, the hub holds the keys.
+    ///
+    /// Exclusive with [`EngineBuilder::provider`] and [`EngineBuilder::brain`]
+    /// — a transport replaces the client build rather than injecting one
+    /// client, and the injected-provider path (`has_injected_provider`) is
+    /// exactly what drops spawn model pins. `start` refuses the combination.
+    pub fn model_transport(
+        mut self,
+        transport: Arc<dyn crate::provider::client_factory::ModelTransport>,
+    ) -> Self {
+        self.model_transport = Some(transport);
+        self
+    }
+
+    /// Whether the built brain starts the derived-memory-index OS file watcher
+    /// (default `true`). A remote node turns it off: the hub owns the shared
+    /// index and already watches its own `.coding/`.
+    pub fn derived_index_watch(mut self, on: bool) -> Self {
+        self.derived_index_watch = on;
+        self
+    }
+
+    /// Write typed knowledge records into each agent's own root
+    /// (`<worktree>/.coding/knowledge`) instead of the factory-wide store
+    /// (default `false`). A remote node turns it on so a worker's records
+    /// travel home with its branch bundle (plan 9a2f4b67 step 2).
+    pub fn worktree_knowledge(mut self, on: bool) -> Self {
+        self.worktree_knowledge = on;
+        self
+    }
+
     /// Build + start (identical to [`Engine::start`] plus the injections).
     pub async fn start(self) -> Result<Engine, EngineError> {
         // Job 6: the whole-brain seam is exclusive with the part seams —
@@ -192,6 +242,15 @@ impl EngineBuilder {
                 "brain injection is exclusive with provider/memory_store/shared_resources — the injected brain carries its own transport, store, and resources"
             ));
         }
+        // The model transport is exclusive with the single-client seams: it
+        // replaces the client build for EVERY request (so a spawn's model pin
+        // still resolves), while `.provider` injects one client and disables
+        // pins, and `.brain` brings its own wiring.
+        if self.model_transport.is_some() && (self.provider.is_some() || self.brain.is_some()) {
+            return Err(EngineError::start_failed(
+                "model_transport is exclusive with provider/brain — a transport replaces the client build instead of injecting one client",
+            ));
+        }
         start_inner(
             self.opts,
             self.provider,
@@ -199,6 +258,11 @@ impl EngineBuilder {
             self.shared,
             self.brain,
             self.code_embedder,
+            NodeWiring {
+                model_transport: self.model_transport,
+                derived_index_watch: self.derived_index_watch,
+                worktree_knowledge: self.worktree_knowledge,
+            },
         )
         .await
     }
@@ -602,6 +666,53 @@ impl Engine {
         self.bus.lock().expect("session bus lock poisoned").clone()
     }
 
+    /// Subscribe to the engine's session bus — every live session's
+    /// [`SessionEvent`], the same stream [`AgentSession::events`] hands a
+    /// single session.
+    ///
+    /// `None` after [`Engine::shutdown`]: the sender is dropped there, so a
+    /// late subscriber has nothing to listen to (the same §7 row 15 rule the
+    /// per-session receivers observe as `Closed`). A remote worker node uses
+    /// this to forward the whole engine's event stream over the link while it
+    /// drives sessions by id.
+    pub fn events(&self) -> Option<EventReceiver<SessionEvent>> {
+        self.session_bus().map(|tx| EventReceiver {
+            rx: tx.subscribe(),
+        })
+    }
+
+    /// Push a reloaded config into the per-context model resolver — the
+    /// remote-node form of a Settings save. The resolver reads `[models]` per
+    /// request, so the change lands on the next request; the transport (when
+    /// one is set) is kept and the provider cache is cleared.
+    ///
+    /// A no-op on the config the brain holds (host callers go through
+    /// `Brain::model_resolver` themselves for that); this is the engine-owned
+    /// handle the node's link drives.
+    pub fn set_model_config(&self, config: crate::config::Config) {
+        self.brain.model_resolver.set_config(config);
+    }
+
+    /// The client that will serve `model` — resolved through the same
+    /// per-request path the turn driver uses (transport first, then the local
+    /// endpoint config), and cached afterwards. `None` when nothing can serve
+    /// the ref (a dangling endpoint on a host with no transport).
+    ///
+    /// The remote node asks this for a model switch: the client it returns is
+    /// the one `set_model` would install, so the node can prove the switch
+    /// went through the link's transport.
+    pub fn model_client(
+        &self,
+        model: &crate::config::ModelRef,
+    ) -> Option<Arc<dyn LlmClient>> {
+        crate::model_resolver::ModelResolver::build_turn_provider(
+            &*self.brain.model_resolver,
+            model,
+            1.0,
+        )
+        .map(|(client, _)| client)
+    }
+
     /// The engine's host-event bus (§5.3 :300).
     ///
     /// Unlike the session bus (§7 row 15), this one closes on engine *drop*,
@@ -874,6 +985,20 @@ impl Engine {
     }
 }
 
+/// The remote-node wiring a caller hands [`EngineBuilder`]: the model
+/// transport that replaces the HTTP client build, and the derived-index
+/// watcher switch. Bundled so the shared start body keeps a readable
+/// signature (and clippy's argument-count lint) as the seams grow.
+struct NodeWiring {
+    /// `Some` = every model call resolves through this transport (the
+    /// hub-proxied client); `None` = today's local endpoint wiring.
+    model_transport: Option<Arc<dyn crate::provider::client_factory::ModelTransport>>,
+    /// Whether the built brain starts the derived-memory-index file watcher.
+    derived_index_watch: bool,
+    /// Whether typed knowledge records land in each agent's own root.
+    worktree_knowledge: bool,
+}
+
 /// The shared start body: the workspace gates, the config, the buses, the
 /// brain (built, or the whole-brain injection — job 6), the host core,
 /// the pump.
@@ -884,7 +1009,13 @@ async fn start_inner(
     shared: Option<Arc<crate::host::brain::SharedResources>>,
     injected_brain: Option<Arc<Brain>>,
     code_embedder: crate::headless::CodeEmbedder,
+    node: NodeWiring,
 ) -> Result<Engine, EngineError> {
+    let NodeWiring {
+        model_transport,
+        derived_index_watch,
+        worktree_knowledge,
+    } = node;
     // The workspace gates — row 9 + the §5.9.3 :664 require_git rule
     // (either the option or the workspace marker demands a repo).
     if !opts.workspace.root.is_dir() {
@@ -918,7 +1049,7 @@ async fn start_inner(
     // load-bearing for it. Job 6 (§5.9.10): an injected BRAIN skips the
     // gate for the same reason — its factory carries the host app's
     // transport.
-    if provider.is_none() && injected_brain.is_none() {
+    if provider.is_none() && injected_brain.is_none() && model_transport.is_none() {
         let status =
             crate::headless::setup::Setup::status_from_config(&config_dir, &config, None);
         if !status.ready_to_run {
@@ -986,6 +1117,9 @@ async fn start_inner(
                     injected_store,
                     shared,
                     code_embedder,
+                    model_transport: model_transport.clone(),
+                    watch_derived_index: derived_index_watch,
+                    worktree_knowledge,
                 },
             )
             .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
@@ -1202,6 +1336,9 @@ mod tests {
                 injected_store: None,
                 shared: None,
                 code_embedder: crate::headless::CodeEmbedder::Auto,
+                model_transport: None,
+                watch_derived_index: true,
+                worktree_knowledge: false,
             },
         )
         .unwrap();
@@ -1410,5 +1547,290 @@ mod tests {
         );
         engine.shutdown().await.unwrap();
     }
+
+    /// A stub model client a [`RecordingTransport`] hands out: one text turn,
+    /// no HTTP. `model()` echoes the ref it was built for, so a live model
+    /// switch reports the target model id.
+    struct TransportEcho {
+        model: String,
+        caps: Capabilities,
+    }
+
+    #[async_trait]
+    impl LlmClient for TransportEcho {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            &self.model
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<ToolChoice>,
+        ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                LlmEvent::TextDelta {
+                    text: "ok".to_string(),
+                },
+                LlmEvent::Finish {
+                    reason: crate::provider::FinishReason::Stop,
+                },
+            ])))
+        }
+    }
+
+    /// The node-side transport: records every [`crate::config::ModelRef`] it is
+    /// asked for and serves each one with a [`TransportEcho`] stub.
+    struct RecordingTransport {
+        seen: std::sync::Mutex<Vec<crate::config::ModelRef>>,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<crate::config::ModelRef> {
+            self.seen.lock().expect("seen lock").clone()
+        }
+    }
+
+    impl crate::provider::client_factory::ModelTransport for RecordingTransport {
+        fn client_for(
+            &self,
+            _config: &Config,
+            model: &crate::config::ModelRef,
+        ) -> Option<Arc<dyn LlmClient>> {
+            self.seen.lock().expect("seen lock").push(model.clone());
+            Some(Arc::new(TransportEcho {
+                model: model.model.clone(),
+                caps: Capabilities::openai(),
+            }))
+        }
+    }
+
+    /// A config dir with an endpoint + default model but NO `keys.toml` — an
+    /// unready config for a host, which a transport-backed node must accept.
+    fn write_keyless_config(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"test-model\"]\n",
+        )
+        .unwrap();
+    }
+
+    /// A transport-backed engine over a KEYLESS config: the exact wiring a
+    /// remote worker node uses (no `keys.toml`, no local endpoint key).
+    async fn transport_engine(
+        ws: &std::path::Path,
+        cfg: &std::path::Path,
+        transport: Arc<RecordingTransport>,
+    ) -> Engine {
+        EngineBuilder::new(opts(ws, cfg))
+            .model_transport(transport)
+            .start()
+            .await
+            .expect("a transport-backed engine starts without keys.toml")
+    }
+
+    /// The step that must not break: a spawn's model pin still reaches the
+    /// transport. `.provider` would have nulled it (`has_injected_provider`),
+    /// so a transport-backed spawn must keep `Some(ModelRef)` and resolve THAT
+    /// ref — endpoint and model id intact — on the turn.
+    #[tokio::test]
+    async fn engine_with_transport_keeps_spawn_model_pin() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_keyless_config(cfg.path());
+        let transport = RecordingTransport::new();
+        let engine = transport_engine(ws.path(), cfg.path(), transport.clone()).await;
+        let session = engine
+            .spawn(SpawnOptions {
+                model: Some("ep/pinned".to_string()),
+                ..SpawnOptions::default()
+            })
+            .await
+            .expect("the transport serves the pinned model");
+        session
+            .run_to_completion("hi")
+            .await
+            .expect("the transport's turn completes");
+        let seen = transport.seen();
+        assert!(
+            seen.iter().any(|m| m.endpoint == "ep" && m.model == "pinned"),
+            "the spawn model pin must reach the transport, got {seen:?}"
+        );
+        engine.shutdown().await.unwrap();
+        engine.shutdown().await.unwrap();
+    }
+
+    /// The readiness gate (missing `keys.toml`/default model) is a HOST gate: a
+    /// node holds no keys, the hub does. Without a transport the same keyless
+    /// config refuses to start; with one it starts and serves a turn.
+    #[tokio::test]
+    async fn engine_with_transport_skips_readiness_gate() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_keyless_config(cfg.path());
+        // (let-else, not unwrap_err: Engine is not Debug.)
+        let Err(err) = EngineBuilder::new(opts(ws.path(), cfg.path())).start().await else {
+            panic!("a keyless config must refuse to start a host engine");
+        };
+        assert_eq!(err.code(), "not_configured");
+        assert!(
+            !cfg.path().join("keys.toml").exists(),
+            "there is no key file on this machine"
+        );
+
+        let transport = RecordingTransport::new();
+        let engine = transport_engine(ws.path(), cfg.path(), transport).await;
+        let session = engine
+            .spawn(SpawnOptions::default())
+            .await
+            .expect("the transport serves the default model");
+        session
+            .run_to_completion("hi")
+            .await
+            .expect("the transport's turn completes");
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A live model switch (the node's `set_model`) resolves its provider
+    /// through the transport — that is how a worker's picker change is served
+    /// by the hub's model catalog.
+    #[tokio::test]
+    async fn set_model_goes_through_transport() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_keyless_config(cfg.path());
+        let transport = RecordingTransport::new();
+        let engine = transport_engine(ws.path(), cfg.path(), transport.clone()).await;
+        let session = engine.spawn(SpawnOptions::default()).await.unwrap();
+        let switch = session
+            .set_model("ep/switched", None)
+            .await
+            .expect("the transport serves the switched model");
+        assert_eq!(
+            switch,
+            crate::headless::session::ModelSwitch::NextRequest {
+                model: "switched".to_string()
+            }
+        );
+        let seen = transport.seen();
+        assert!(
+            seen.iter()
+                .any(|m| m.endpoint == "ep" && m.model == "switched"),
+            "the switch must resolve through the transport, got {seen:?}"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A transport-backed brain builds NO vision client, even with
+    /// `[general.vision_model]` configured: a node has no vision endpoint (and
+    /// vision tools are a later phase). The host wiring is unchanged.
+    #[tokio::test]
+    async fn transport_engine_has_no_vision_client() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_keyless_config(cfg.path());
+        // A vision model pointed at the same (existing) endpoint: a HOST build
+        // would configure vision from this.
+        let mut config_text = std::fs::read_to_string(cfg.path().join("config.toml")).unwrap();
+        config_text.push_str(
+            "\n[general.vision_model]\nendpoint = \"test\"\nmodel = \"test-model\"\n",
+        );
+        std::fs::write(cfg.path().join("config.toml"), config_text).unwrap();
+        let transport = RecordingTransport::new();
+        let engine = transport_engine(ws.path(), cfg.path(), transport).await;
+        assert!(
+            !engine.brain().factory.vision_slot().is_configured(),
+            "a transport-backed brain must not build a vision client"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    /// `derived_index_watch(false)` starts no file watcher: a node's `.coding/`
+    /// is fed by the hub's bundles, and the hub already watches the one shared
+    /// index. The default (a host) still starts one.
+    #[tokio::test]
+    async fn derived_index_watch_off_starts_no_watcher() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        std::fs::create_dir_all(ws.path().join(".coding")).unwrap();
+        let engine = EngineBuilder::new(opts(ws.path(), cfg.path()))
+            .derived_index_watch(false)
+            .start()
+            .await
+            .unwrap();
+        assert!(
+            engine.brain()._memory_watcher.is_none(),
+            "watch off must start no derived-index watcher"
+        );
+        engine.shutdown().await.unwrap();
+
+        let engine = EngineBuilder::new(opts(ws.path(), cfg.path())).start().await.unwrap();
+        assert!(
+            engine.brain()._memory_watcher.is_some(),
+            "the default (host) wiring watches the derived index"
+        );
+        engine.shutdown().await.unwrap();
+    }
+
+    /// A transport replaces the client build for every request; injecting ONE
+    /// client (`.provider`) or a whole brain alongside it is ambiguous wiring,
+    /// so `start` refuses — the same rule the brain seam already enforced.
+    #[tokio::test]
+    async fn transport_and_provider_are_exclusive() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        // (let-else, not unwrap_err: Engine is not Debug.)
+        let Err(err) = EngineBuilder::new(opts(ws.path(), cfg.path()))
+            .model_transport(RecordingTransport::new())
+            .provider(Arc::new(NeverProvider {
+                caps: Capabilities::openai(),
+            }))
+            .start()
+            .await
+        else {
+            panic!("transport + provider is ambiguous wiring — start must refuse");
+        };
+        assert_eq!(err.code(), "start_failed");
+        assert!(err.to_string().contains("exclusive"));
+
+        let brain = shared_brain(ws.path(), cfg.path());
+        let Err(err) = EngineBuilder::new(opts(ws.path(), cfg.path()))
+            .model_transport(RecordingTransport::new())
+            .brain(brain)
+            .start()
+            .await
+        else {
+            panic!("transport + brain is ambiguous wiring — start must refuse");
+        };
+        assert_eq!(err.code(), "start_failed");
+        assert!(err.to_string().contains("exclusive"));
+    }
+
+
+
+
+
+
+
+
 }
 

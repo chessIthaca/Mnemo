@@ -4301,10 +4301,10 @@
     },
     {
       "id": "c8a1a6f5",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795591164117,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1795593218602,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-c8a1a6f5-20261125-075338.md",
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
@@ -4312,14 +4312,297 @@
     },
     {
       "id": "a040713f",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1795591259825,
+      "closed_at_ms": 1795608217223,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-a040713f-20261125-120337.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Phase 2 adds a new node runtime and protocol; it changes no specified behaviour of existing capabilities. Spec deltas for a new remote-workers capability are added when the implementation steps are recorded."
+    },
+    {
+      "id": "9a2f4b67",
+      "status": "closed",
+      "created_at_ms": 1795612328402,
+      "closed_at_ms": 1795640257400,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-9a2f4b67-20261125-205737.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Workers are placed on a host after the tier is chosen",
+              "text": "After the tier is chosen, dispatch SHALL place a Mnemo-model worker on a connected paired worker node that has a free slot and whose operating system can run the project's checks, and SHALL run it locally otherwise. A lead-supplied host MUST win over automatic placement. Claude-agent-tier workers MUST stay local.",
+              "scenarios": [
+                {
+                  "name": "No node connected",
+                  "when": [
+                    "the lead dispatches a Mnemo-model worker",
+                    "no worker node is connected"
+                  ],
+                  "then": [
+                    "the worker runs locally exactly as before"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Idle suitable node",
+                  "when": [
+                    "the lead dispatches a Mnemo-model worker without a host",
+                    "a connected node has a free slot and passed the project's checks"
+                  ],
+                  "then": [
+                    "the worker runs on that node",
+                    "team_status shows the node as the worker's host"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Lead pins local",
+                  "when": [
+                    "the lead dispatches with host \"local\""
+                  ],
+                  "then": [
+                    "the worker runs locally even when a node is idle"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Step 1 is a no-code research step that only reads the governed files. The placement behaviour change is carried by the dispatch-routing delta attached here; external-lead, tier-ladder and worker-brief requirements are unchanged (remote workers keep the same lead attach flow, tier ladder and brief contents). Any further delta is added with plan_update when the implementation steps are recorded."
+    },
+    {
+      "id": "5e64ccd5",
+      "status": "closed",
+      "created_at_ms": 1795641364905,
+      "closed_at_ms": 1795657806412,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-5e64ccd5-20261126-015006.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [],
+          "modified": [
+            {
+              "requirement": "Workers are placed on a host after the tier is chosen",
+              "text": "After the tier is chosen, dispatch SHALL place a Mnemo-model worker on a connected paired worker node that has a free slot and whose operating system can run the project's checks, and SHALL run it locally otherwise. A lead-supplied host MUST win over automatic placement. A Claude-agent-tier worker MAY be placed on such a node only when the node also has a linked SSH connection on which the lead can start a Claude Code session; otherwise it MUST stay local. Mnemo MUST NOT start the Claude Code session itself.",
+              "scenarios": [
+                {
+                  "name": "No node connected",
+                  "when": [
+                    "the lead dispatches a Mnemo-model worker",
+                    "no worker node is connected"
+                  ],
+                  "then": [
+                    "the worker runs locally exactly as before"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Idle suitable node",
+                  "when": [
+                    "the lead dispatches a Mnemo-model worker without a host",
+                    "a connected node has a free slot and passed the project's checks"
+                  ],
+                  "then": [
+                    "the worker runs on that node",
+                    "team_status shows the node as the worker's host"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Lead pins local",
+                  "when": [
+                    "the lead dispatches with host \"local\""
+                  ],
+                  "then": [
+                    "the worker runs locally even when a node is idle"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Agent tier without an SSH link",
+                  "when": [
+                    "the lead dispatches an agent-tier worker",
+                    "no qualified node has a linked SSH connection"
+                  ],
+                  "then": [
+                    "the worker stays local and the dispatch answer is the existing claude_agent block"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Agent tier on a linked host",
+                  "when": [
+                    "the lead dispatches an agent-tier worker without a host",
+                    "a qualified node with a free slot has a linked SSH connection"
+                  ],
+                  "then": [
+                    "the worker is placed on that node",
+                    "the dispatch answer tells the lead to start a Claude Code session on that SSH connection in the worker's node checkout"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "removed": [],
+          "renamed": []
+        },
+        {
+          "capability": "external-lead",
+          "added": [
+            {
+              "requirement": "A remote Claude-agent worker's session is started by the lead",
+              "text": "The dispatch answer for an agent-tier worker placed on a host SHALL carry a claude_session block naming the SSH connection, the node checkout and the prompt. Mnemo MUST NOT start the session or launch claude itself. Mnemo SHALL follow the session through the host node and finish the worker when the session ends its turn, and team_agent_done SHALL remain authoritative.",
+              "scenarios": [
+                {
+                  "name": "Remote agent dispatch",
+                  "when": [
+                    "the lead dispatches an agent-tier worker that is placed on a linked host"
+                  ],
+                  "then": [
+                    "the answer carries a claude_session block with target \"ssh\", the SSH connection, the node checkout path and the prompt",
+                    "the answer carries no claude_agent block and no launch token"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Session ends its turn",
+                  "when": [
+                    "the remote session's transcript on the host ends its turn"
+                  ],
+                  "then": [
+                    "Mnemo finishes the worker with the session's last answer as the report"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Step 1 is research only; the dispatch-routing change is carried by the attached delta. external-lead, tier-ladder and worker-brief requirement changes, if any, are added with plan_update when the implementation steps are recorded."
+    },
+    {
+      "id": "e8cb5112",
+      "status": "closed",
+      "created_at_ms": 1795683699889,
+      "closed_at_ms": 1795705485446,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-e8cb5112-20261126-150445.md",
+      "abandon_reason": null,
+      "spec_deltas": [
+        {
+          "capability": "dispatch-routing",
+          "added": [
+            {
+              "requirement": "Host state is reported from the live link and only for active workers",
+              "text": "A continue answer (team_message or team_route_fix to a remote Claude Code agent worker) SHALL name the host's currently linked SSH connection, never a connection stored on the worker record that has since been unlinked or replaced. With no linked connection it SHALL name none and explain how to proceed. A worker's host-away time (host_offline_s) SHALL be reported only while the worker is active, and a merge SHALL clear the worker's host-away mark.",
+              "scenarios": [
+                {
+                  "name": "Continue after a relink",
+                  "when": [
+                    "a remote Claude worker was placed with SSH connection A",
+                    "the host is unlinked and linked to connection B",
+                    "the lead sends team_message to the worker"
+                  ],
+                  "then": [
+                    "continue_session.host is B",
+                    "the stored worker record still names A"
+                  ],
+                  "and": []
+                },
+                {
+                  "name": "Finished worker on an away host",
+                  "when": [
+                    "a worker's host went away and the worker then merged or finished"
+                  ],
+                  "then": [
+                    "team_status shows no host_offline_s for that worker"
+                  ],
+                  "and": []
+                }
+              ]
+            }
+          ],
+          "modified": [],
+          "removed": [],
+          "renamed": []
+        }
+      ],
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "external-lead, tier-ladder and worker-brief are untouched: step 1 only moves team_hosts' body into a shared function with byte-identical tool output; the dispatch-routing delta covers the step 2 behaviour change."
+    },
+    {
+      "id": "707ad97e",
+      "status": "closed",
+      "created_at_ms": 1795689068794,
+      "closed_at_ms": 1795696247309,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-707ad97e-20261126-123047.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only timing fix; product behavior is unchanged."
+    },
+    {
+      "id": "eafd1fee",
+      "status": "closed",
+      "created_at_ms": 1795689275221,
+      "closed_at_ms": 1795696275448,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-eafd1fee-20261126-123115.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Timeout tuning for existing node calls; no specified behavior changes."
+    },
+    {
+      "id": "f96d40f3",
+      "status": "closed",
+      "created_at_ms": 1795693064347,
+      "closed_at_ms": 1795696306901,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-f96d40f3-20261126-123146.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only wait changes; product behavior unchanged."
+    },
+    {
+      "id": "bb7b3cbe",
+      "status": "closed",
+      "created_at_ms": 1795702451992,
+      "closed_at_ms": 1795704511818,
+      "report_path": "D:\\Mnemo\\.coding\\reviews\\team-bb7b3cbe-20261126-144831.md",
+      "abandon_reason": null,
+      "schema": "spec-driven@1",
+      "sections": {},
+      "no_spec_impact": "Test-only timing changes."
+    },
+    {
+      "id": "35e36a51",
+      "status": "open",
+      "created_at_ms": 1795705872535,
       "closed_at_ms": null,
       "report_path": null,
       "abandon_reason": null,
       "schema": "spec-driven@1",
       "sections": {},
-      "no_spec_impact": "Phase 2 adds a new node runtime and protocol; it changes no specified behaviour of existing capabilities. Spec deltas for a new remote-workers capability are added when the implementation steps are recorded."
+      "no_spec_impact": "Release housekeeping: version bump and CHANGELOG; no specified behaviour changes."
     }
   ]
 }

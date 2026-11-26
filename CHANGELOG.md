@@ -7,6 +7,27 @@ gets GitHub release notes; the installers are built by
 `.github/workflows/build.yml` when a `v*` tag is pushed (release steps:
 `.coding/knowledge/how/2026-11-12-cut-a-mnemo-release-with-the-security-and-depend.md`).
 
+## [2.10.0] — 2026-11-26
+
+Worker hosts, so Mnemo workers (and Claude Code workers) run on a second Windows or Mac computer.
+
+### Added
+- Worker hosts: pair another Windows or Mac computer with `mnemo2-node` and the hub places workers there, so their builds and checks run on that machine. Code travels as git bundles, model calls and shared memory stay on the hub, and the host needs no API keys.
+- **Settings → Worker hosts**: pair a host with a one-time code, link it to an SSH connection, unlink and revoke. Each host shows its operating system, connection state, check result and busy slots.
+- Claude Code workers on a linked host: the lead starts the session over the desktop app's SSH connection to the host. Linking a host is your approval, and Mnemo never launches `claude` itself.
+- Every worker shows its host: a badge such as `studio` in the worker list and `host: studio` in its detail, with an away state and time while the host is unreachable.
+- When a host goes away, Mnemo workers continue if it returns within the outage budget, Claude Code sessions keep working, and `team_resume` continues workers after a failure or a host restart.
+- A host keeps one to eight warm checkouts per project (`--slots`, default 2).
+- The `mnemo2-node` binary ships in the Windows installer and the Mac app bundle, and `docs/WORKER-HOSTS.md` walks through installing and pairing a host.
+
+### Changed
+- Git-heavy hub-to-host calls (bundle upload, checkout and fetch) wait up to 180 seconds, so a large repository or a busy host no longer fails with a timeout.
+- A merged worker's checkout on its host is released automatically, a reused dispatch names the host's live SSH connection, and a finished worker drops its away state.
+- Development check runs bind only loopback, so they raise no firewall prompt.
+
+### Fixed
+- A host trims only idle checkouts and never one a worker is still using.
+
 ## [2.9.0] — 2026-11-25
 
 Claude Code agent workers start without a permission prompt and are handed back more patiently, and Mnemo2 shuts down cleanly.

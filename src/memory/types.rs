@@ -396,7 +396,14 @@ pub struct ProceduralData {
 }
 
 /// A filter for memory recall.
-#[derive(Debug, Clone)]
+///
+/// Serialisable so a remote worker node can relay a recall call's filter to
+/// the hub, which answers against the one shared store. Every field is
+/// optional on the wire (`#[serde(default)]`): an omitted field takes
+/// [`MemoryFilter::default`]'s value, so the exclusion defaults stay
+/// `true` for a link payload that only names a tier or a limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MemoryFilter {
     pub tier: Option<MemoryTier>,
     pub limit: Option<usize>,

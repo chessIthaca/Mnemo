@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use super::agent_watch;
 use super::deletion::{CheckoutKind, validated_checkout, worker_checkout};
-use super::dispatch::claude_agent_block;
+use super::dispatch::{claude_agent_block, claude_session_block};
 use super::{
     LiveWorker, RECOVERED_WORKTREE_CLEANUP_ERROR, TeamRuntime, WorkerSessionSpec,
     cleanup_agent_worktree, merge_conflicts_only, merge_record_from_git, now_key, status_name,
@@ -39,7 +39,8 @@ use super::spawn::load_check_commands;
 use super::record::{
     ChangeSource, InboxEntry, InboxKind, MessageSender, WorkerRecord, WorkerStatus, append_inbox,
     agent_continue_prompt, agent_resume_refusal, agent_worker_refusal, audit_finished, audit_finished_error,
-    fresh_launch_token, kickoff_message, note_model, session_model_spec, with_launch_token,
+    agent_prompt, fresh_launch_token, kickoff_message, note_model, remote_agent_prompt,
+    session_model_spec, with_launch_token,
 };
 use super::routing::{
     NUDGE_LADDER, final_tier, logs_label, logs_routing, next_tier_above, outcome_row,
@@ -49,12 +50,26 @@ use super::routing::{
 /// The refusal of a resume while Mnemo2 shuts the team down.
 const CLOSING_RESUME_ERROR: &str = "Mnemo2 is closing; the worker cannot be resumed now";
 
+/// What the lead chose for a resume onto a tier: the tier or model, the
+/// effort, whether a handed-back worker's dirty checkout may be taken over, and
+/// where the worker continues (`"local"` or nothing).
+pub(super) struct ResumeChoice<'a> {
+    pub(super) tier: Option<&'a str>,
+    pub(super) model: Option<String>,
+    pub(super) reasoning_effort: Option<String>,
+    pub(super) keep_changes: bool,
+    pub(super) host: Option<&'a str>,
+}
+
 /// What a resume onto a tier did: the worker, and the `claude_agent` block
 /// when the move handed its step to the external lead's Claude Code agent
-/// (plan e52e0be1 decision 5) instead of switching its model.
+/// (plan e52e0be1 decision 5) instead of switching its model — or, for a
+/// worker on a host, the `claude_session` block the lead starts its session
+/// over SSH with (plan 5e64ccd5).
 pub(super) struct TierResume {
     pub(super) worker: WorkerRecord,
     pub(super) claude_agent: Option<Value>,
+    pub(super) claude_session: Option<Value>,
 }
 
 impl TierResume {
@@ -62,8 +77,27 @@ impl TierResume {
         Self {
             worker,
             claude_agent: None,
+            claude_session: None,
         }
     }
+}
+
+/// The answer in place of a `claude_session` block for a worker whose host is
+/// no longer linked to an SSH connection: unlinking withdrew the user's
+/// approval to start Claude workers there (plan 5e64ccd5 decision D1).
+pub(super) fn unlinked_session_text(node: &str) -> String {
+    format!(
+        "host '{node}' is no longer linked to an SSH connection; team_resume with host \"local\" moves the worker here, or link the host again"
+    )
+}
+
+/// The refusal of a Claude Code hand-off for a worker on a host whose SSH
+/// connection is not linked (plan 5e64ccd5): Mnemo cannot name where the lead
+/// starts its session.
+fn no_ssh_link_error(node: &str) -> String {
+    format!(
+        "host '{node}' has no SSH connection linked; team_resume with host \"local\" first or link the host with team_hosts"
+    )
 }
 
 impl TeamRuntime {
@@ -542,16 +576,17 @@ impl TeamRuntime {
     /// Reattach a stopped/interrupted worker from its saved transcript. The
     /// session comes back idle; the lead then sends it a message.
     pub async fn resume(&self, worker_id: &str) -> Result<WorkerRecord, String> {
-        self.resume_keeping(worker_id, false).await
+        self.resume_keeping_on(worker_id, false, None).await
     }
 
-    /// [`Self::resume`]; `keep_changes` (only the external lead's
-    /// `team_resume` passes it) lets the Mnemo model take over a handed-back
-    /// worker's dirty checkout (plan ee73bd2f decision 3).
-    pub(super) async fn resume_keeping(
+    /// [`Self::resume`] with `team_resume`'s `keep_changes` and optional
+    /// `host`: `"local"` continues a worker from another host on this
+    /// computer, from the hub's shadow checkout (plan 9a2f4b67, step 5).
+    pub(super) async fn resume_keeping_on(
         &self,
         worker_id: &str,
         keep_changes: bool,
+        host: Option<&str>,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         self.proving_guard(worker_id)?;
@@ -560,7 +595,110 @@ impl TeamRuntime {
         if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
-        self.resume_session(worker_id, keep_changes).await
+        // Only a worker that can be resumed at all moves to this computer.
+        Box::pin(self.rehome_local(worker_id, host)).await?;
+        Box::pin(self.resume_session(worker_id, keep_changes)).await
+    }
+
+    /// Re-prepare a remote worker's node checkout (keeping anything the node
+    /// still has) from the last synced tip and return the record that names
+    /// it; a local record comes back as it is.
+    async fn rehome_remote_checkout(
+        &self,
+        worker_id: &str,
+        record: WorkerRecord,
+    ) -> Result<WorkerRecord, String> {
+        let Some(remote) = record.remote.clone() else {
+            return Ok(record);
+        };
+        let server = self
+            .remote
+            .server()
+            .ok_or_else(|| format!("host '{}' is not connected", remote.node_name))?;
+        if self.remote.host(&remote.node_id).is_err() {
+            return Err(format!(
+                "host '{}' is no longer paired; pass host \"local\" to continue worker '{worker_id}' here",
+                remote.node_name
+            ));
+        }
+        if !server.is_connected(&remote.node_id) {
+            return Err(format!(
+                "host '{}' is not connected; resume worker '{worker_id}' when it is back, or pass host \"local\" to continue here",
+                remote.node_name
+            ));
+        }
+        let base = remote
+            .synced_tip
+            .clone()
+            .or_else(|| record.base_commit.clone())
+            .unwrap_or_default();
+        let mut refreshed = self
+            .remote
+            .prepare_checkout(&remote.node_id, &record.branch, &base, true)
+            .await?;
+        refreshed.synced_tip = remote.synced_tip.clone();
+        self.update_worker(worker_id, |worker| {
+            worker.remote = Some(refreshed.clone());
+        })
+        .await;
+        self.persist().await?;
+        self.worker(worker_id).await
+    }
+
+    /// Apply `team_resume`'s `host` to a remote worker: only `"local"` is
+    /// accepted, and it moves the worker back here from its last synced commit.
+    ///
+    /// The sync is best-effort: when the host is offline the shadow checkout
+    /// stays at its last state, which is still the best copy this computer has.
+    async fn rehome_local(&self, worker_id: &str, host: Option<&str>) -> Result<(), String> {
+        let Some(host) = host else {
+            return Ok(());
+        };
+        if host != "local" {
+            return Err("team_resume's host only takes \"local\"".to_string());
+        }
+        let record = self.worker(worker_id).await?;
+        let Some(remote) = record.remote.as_ref() else {
+            return Ok(());
+        };
+        // A session still running on the host owns the node checkout: moving
+        // the record here under it would split the worker in two.
+        if self.live.lock().await.contains_key(worker_id) {
+            return Err(format!(
+                "worker '{worker_id}' is still running on host '{}'; stop it first, then resume it with host \"local\"",
+                remote.node_name
+            ));
+        }
+        // A worker the resume refuses anyway stays where it is, so the
+        // refusal reads the same and nothing moved.
+        if matches!(
+            record.status,
+            WorkerStatus::Cancelled | WorkerStatus::Merged | WorkerStatus::Merging
+        ) || audit_finished(&record)
+            || !record.worktree.is_dir()
+        {
+            return Ok(());
+        }
+        // The worker will run on this computer, so it needs one of this
+        // computer's slots: asked before it moves, so a refusal leaves the
+        // record on its host.
+        let active = self.active_workers_for_slots().await;
+        let slots = self.persistence.slots.load(Ordering::SeqCst);
+        if active >= slots {
+            return Err(format!("all {slots} worker slots are busy"));
+        }
+        let _ = self.sync_remote(worker_id).await;
+        // After the sync, which records the tip it copied.
+        let moved = self.worker(worker_id).await?.remote;
+        self.update_worker(worker_id, |worker| worker.remote = None)
+            .await;
+        if let Err(error) = self.persist().await {
+            // The saved state still names the host: so must the record.
+            self.update_worker(worker_id, |worker| worker.remote = moved)
+                .await;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Refuse a Mnemo session on a handed-back worker whose checkout has
@@ -577,7 +715,7 @@ impl TeamRuntime {
         if record.handed_back.is_none() || keep_changes {
             return Ok(());
         }
-        if !agent_watch::checkout_dirty(&record.worktree).await {
+        if !self.worker_checkout_dirty(record).await {
             return Ok(());
         }
         let refusal = agent_watch::handed_back_dirty_refusal(record);
@@ -603,12 +741,16 @@ impl TeamRuntime {
     pub(super) async fn resume_on_tier(
         &self,
         worker_id: &str,
-        tier: Option<&str>,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
         source: ChangeSource,
-        keep_changes: bool,
+        choice: ResumeChoice<'_>,
     ) -> Result<TierResume, String> {
+        let ResumeChoice {
+            tier,
+            model,
+            reasoning_effort,
+            keep_changes,
+            host,
+        } = choice;
         let pinned = model.is_some();
         let model = self.lead_model_choice(tier, model);
         let _guard = self.merge_lock.lock().await;
@@ -618,21 +760,60 @@ impl TeamRuntime {
         if let Some(refusal) = agent_resume_refusal(&self.worker(worker_id).await?) {
             return Err(refusal);
         }
+        // Only a worker that can be resumed at all moves to this computer, and
+        // it moves before a hand-off, so `host: "local"` hands it to the lead's
+        // own agent here.
+        Box::pin(self.rehome_local(worker_id, host)).await?;
         if let (false, Some(tier)) = (pinned, tier) {
-            if let Some(handed) = self.hand_to_agent_locked(worker_id, tier, source).await? {
+            // Boxed: this resume path already runs on a deep future.
+            if let Some(handed) =
+                Box::pin(self.hand_to_agent_locked(worker_id, tier, source)).await?
+            {
                 return Ok(handed);
             }
         }
-        self.resume_on_tier_locked_keeping(
+        Box::pin(self.resume_on_tier_locked_keeping(
             worker_id,
             tier,
             model?,
             reasoning_effort,
             source,
             keep_changes,
-        )
+        ))
         .await
         .map(TierResume::switched)
+    }
+
+    /// The SSH connection a hand-off of a worker on a host starts its Claude
+    /// Code session on: only the one linked to its host right now, since the
+    /// link is the user's standing approval and an unlink withdraws it (the
+    /// checkout's `ssh` is a display copy and never consulted). `Ok(None)` for
+    /// a local worker; an error when the host has none.
+    fn handoff_ssh(&self, record: &WorkerRecord) -> Result<Option<String>, String> {
+        let Some(remote) = record.remote.as_ref() else {
+            return Ok(None);
+        };
+        self.live_ssh_link(&remote.node_id)
+            .map(Some)
+            .ok_or_else(|| no_ssh_link_error(&remote.node_name))
+    }
+
+    /// The SSH connection the host `node_id` is linked to right now, if any.
+    pub(super) fn live_ssh_link(&self, node_id: &str) -> Option<String> {
+        self.remote.host(node_id).ok().and_then(|node| node.ssh)
+    }
+
+    /// Why the step of `record` cannot be handed to a Claude Code agent now,
+    /// for the automatic paths (escalation, usage limit), which then switch
+    /// its model instead: a worker on a host without a linked SSH connection,
+    /// the agent cap, or — for a local worker — another agent worker waiting
+    /// for its launch.
+    pub(super) async fn agent_handoff_blocked(&self, record: &WorkerRecord) -> Option<String> {
+        if let Err(error) = self.handoff_ssh(record) {
+            return Some(error);
+        }
+        self.agent_launch_refusal_for(Some(&record.id), record.remote.is_some())
+            .await
     }
 
     /// The Claude Code agent `tier` hands a worker to, with the tier's agent
@@ -661,6 +842,11 @@ impl TeamRuntime {
     /// the previous worker stopped. `Ok(None)` when the move is no hand-off
     /// ([`Self::agent_handoff_target`]), so the caller switches models as
     /// before. The caller holds the merge lock; closing is re-checked here.
+    ///
+    /// A worker on a host (plan 5e64ccd5) gets no launch token: its record
+    /// takes the host's linked SSH connection and the answer is the
+    /// `claude_session` block the lead starts its session with there. Without
+    /// a linked connection the hand-off is refused before anything changes.
     pub(super) async fn hand_to_agent_locked(
         &self,
         worker_id: &str,
@@ -674,7 +860,12 @@ impl TeamRuntime {
         let Some((agent, effort)) = self.agent_handoff_target(&record, tier) else {
             return Ok(None);
         };
-        if let Some(refusal) = self.agent_launch_refusal(Some(worker_id)).await {
+        let ssh = self.handoff_ssh(&record)?;
+        let remote = record.remote.is_some();
+        if let Some(refusal) = self
+            .agent_launch_refusal_for(Some(worker_id), remote)
+            .await
+        {
             return Err(refusal);
         }
         let previous = session_model_spec(&record).to_string();
@@ -701,8 +892,14 @@ impl TeamRuntime {
             worker.error = None;
             // An agent runs it again: a hand-back on record is over.
             worker.handed_back = None;
-            // The new launch prompt carries a fresh one-time token.
-            worker.launch_token = Some(fresh_launch_token());
+            // The new launch prompt carries a fresh one-time token; a session
+            // on a host takes the host's SSH connection instead.
+            if let Some(checkout) = worker.remote.as_mut() {
+                checkout.ssh = ssh.clone();
+                worker.launch_token = None;
+            } else {
+                worker.launch_token = Some(fresh_launch_token());
+            }
             worker.reroutes.push(row.clone());
             if let Some(routing) = worker.routing.as_mut() {
                 routing.nudged = None;
@@ -712,6 +909,19 @@ impl TeamRuntime {
         self.persist().await?;
         self.append_reroute_row(&row, source, None);
         let worker = self.worker(worker_id).await?;
+        if remote {
+            let mut block = claude_session_block(&worker)
+                .ok_or_else(|| format!("worker '{worker_id}' has no Claude Code session"))?;
+            // The continue prompt's tail after the remote prompt.
+            let full = agent_continue_prompt(&worker, &previous);
+            let tail = full.strip_prefix(&agent_prompt(&worker)).unwrap_or_default();
+            block["prompt"] = json!(format!("{}{tail}", remote_agent_prompt(&worker)));
+            return Ok(Some(TierResume {
+                worker,
+                claude_agent: None,
+                claude_session: Some(block),
+            }));
+        }
         let mut block = claude_agent_block(&worker)
             .ok_or_else(|| format!("worker '{worker_id}' has no Claude Code agent"))?;
         block["prompt"] = json!(with_launch_token(
@@ -721,7 +931,58 @@ impl TeamRuntime {
         Ok(Some(TierResume {
             worker,
             claude_agent: Some(block),
+            claude_session: None,
         }))
+    }
+
+    /// `team_resume` with host `"local"` on an agent worker placed on a host
+    /// (plan 5e64ccd5): while it has no Claude Code session there, move it to
+    /// this computer from its last synced commit and answer the local
+    /// `claude_agent` block, with a fresh launch token, the lead launches its
+    /// Agent with. Refused while a session is registered or found on the host
+    /// (it may still be writing the node checkout), and while another local
+    /// agent worker waits for its launch.
+    pub(super) async fn relocate_agent_local(&self, worker_id: &str) -> Result<TierResume, String> {
+        let _guard = self.merge_lock.lock().await;
+        if self.persistence.closed.load(Ordering::SeqCst) {
+            return Err(CLOSING_RESUME_ERROR.to_string());
+        }
+        self.proving_guard(worker_id)?;
+        let record = self.worker(worker_id).await?;
+        let Some(remote) = record.remote.as_ref() else {
+            return Err(format!("worker '{worker_id}' already runs on this computer"));
+        };
+        if record.claude_agent_id.is_some() || record.claude_session.is_some() {
+            return Err(format!(
+                "worker '{worker_id}' has a Claude Code session on host '{}'; stop it, mark the run with team_agent_done, then resume with host \"local\".",
+                remote.node_name
+            ));
+        }
+        if !agent_watch::waits_for_agent(&record) {
+            return Err(agent_resume_refusal(&record).unwrap_or_else(|| {
+                format!("worker '{worker_id}' does not wait for a Claude Code session")
+            }));
+        }
+        if let Some(refusal) = self.agent_launch_refusal(Some(worker_id)).await {
+            return Err(refusal);
+        }
+        Box::pin(self.rehome_local(worker_id, Some("local"))).await?;
+        if self.worker(worker_id).await?.remote.is_some() {
+            return Err(format!(
+                "worker '{worker_id}' could not move to this computer: its checkout here is missing"
+            ));
+        }
+        self.agent_watch.forget(worker_id);
+        self.issue_launch_token(worker_id).await?;
+        let worker = self.worker(worker_id).await?;
+        let block = claude_agent_block(&worker)
+            .ok_or_else(|| format!("worker '{worker_id}' has no Claude Code agent"))?;
+        let _ = self.signals.send(super::BoardSignal::Changed);
+        Ok(TierResume {
+            worker,
+            claude_agent: Some(block),
+            claude_session: None,
+        })
     }
 
     /// Tell the external lead that Mnemo moved a worker onto a tier that runs
@@ -730,6 +991,31 @@ impl TeamRuntime {
     /// the cause has more to say.
     pub(super) fn notify_agent_handoff(&self, handed: &TierResume, lead_in: Option<&str>) {
         let worker = &handed.worker;
+        if let (Some(block), Some(remote)) = (&handed.claude_session, worker.remote.as_ref()) {
+            let opening = lead_in.map(|text| format!("{text}\n")).unwrap_or_default();
+            // The block is only handed on while the host is still linked.
+            if self.live_ssh_link(&remote.node_id).is_none() {
+                self.notify_lead(
+                    format!("agent-handoff:{}:{}", worker.id, worker.generation),
+                    format!(
+                        "{opening}Worker {id} moved to a Claude Code agent tier: {text}.",
+                        id = worker.id,
+                        text = unlinked_session_text(&remote.node_name),
+                    ),
+                );
+                return;
+            }
+            self.notify_lead(
+                format!("agent-handoff:{}:{}", worker.id, worker.generation),
+                format!(
+                    "{opening}Worker {id} moves to a Claude Code session on host {node}; start it over SSH connection '{ssh}' with the claude_session block from its last answer.\n{block}",
+                    id = worker.id,
+                    node = remote.node_name,
+                    ssh = remote.ssh.as_deref().unwrap_or_default(),
+                ),
+            );
+            return;
+        }
         let tier = worker.tier.as_deref().unwrap_or("its tier");
         let block = handed
             .claude_agent
@@ -790,7 +1076,7 @@ impl TeamRuntime {
     }
 
     pub(super) async fn resume_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
-        self.resume_session(worker_id, false).await
+        Box::pin(self.resume_session(worker_id, false)).await
     }
 
     /// [`Self::resume_inner`]; `keep_changes` lets the Mnemo model take over
@@ -844,12 +1130,16 @@ impl TeamRuntime {
                 "worker '{worker_id}' is already running; team_message it to continue"
             ));
         }
-        let active = self.active_workers_for_slots().await;
-        let slots = self.persistence.slots.load(Ordering::SeqCst);
-        if active >= slots {
-            return Err(format!("all {slots} worker slots are busy"));
-        }
+        // A remote worker counts against its host's slots, not this
+        // computer's; the host is gated again below.
         let record = self.worker(worker_id).await?;
+        if record.remote.is_none() {
+            let active = self.active_workers_for_slots().await;
+            let slots = self.persistence.slots.load(Ordering::SeqCst);
+            if active >= slots {
+                return Err(format!("all {slots} worker slots are busy"));
+            }
+        }
         if record.status == WorkerStatus::Cancelled {
             return Err(
                 "a cleaned worker cannot be resumed; review its retained branch".to_string(),
@@ -869,6 +1159,10 @@ impl TeamRuntime {
         }
         self.handed_back_takeover_refusal(&record, keep_changes)
             .await?;
+        // A remote worker's session lives in its node checkout: re-prepare it
+        // (keeping anything the node still has) from the last synced tip before
+        // spawning there.
+        let record = Box::pin(self.rehome_remote_checkout(worker_id, record)).await?;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let check_commands = load_check_commands(&self.workspace_root);
         let session = self
@@ -886,9 +1180,9 @@ impl TeamRuntime {
                         .unwrap_or_else(|| record.brief.clone()),
                 ),
                 check_commands: check_commands.clone(),
+                remote: record.remote.clone(),
             })
             .await?;
-        let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(false));
         let receiver = session.events();
         let strikes = Arc::new(Mutex::new(route_question::Strikes::new(NUDGE_STRIKE_LIMIT)));
@@ -896,8 +1190,7 @@ impl TeamRuntime {
         let pump = tokio::spawn(pump_worker(
             worker_id.to_string(),
             generation,
-            self.engine()?,
-            session_id,
+            session.clone(),
             receiver,
             self.events.clone(),
             busy.clone(),
@@ -1031,6 +1324,23 @@ impl TeamRuntime {
             return Err(audit_finished_error(worker_id));
         }
         self.validate_model(&model, &reasoning_effort)?;
+        // A remote session can only switch to a model its node's catalog knows
+        // (the node refuses an unknown model instead of defaulting); push the
+        // hub's catalog and wait until the node applied it.
+        if let Some(remote) = record.remote.as_ref() {
+            let server = self
+                .remote
+                .server()
+                .ok_or_else(|| format!("host '{}' is not connected", remote.node_name))?;
+            if !server.is_connected(&remote.node_id) {
+                return Err(format!("host '{}' is not connected", remote.node_name));
+            }
+            Box::pin(
+                self.remote
+                    .ensure_catalog(&server.node(&remote.node_id), &remote.node_name),
+            )
+            .await?;
+        }
         // Decided before anything changes, so a refused worker keeps its
         // model and stays Interrupted.
         self.handed_back_takeover_refusal(&record, keep_changes)
@@ -1151,7 +1461,7 @@ impl TeamRuntime {
             return self.start_worker(record).await;
         }
         // The takeover was decided above.
-        self.resume_session(worker_id, true).await
+        Box::pin(self.resume_session(worker_id, true)).await
     }
 
     /// Compact a quiescent worker. Blocked or stopped sessions are resumed once.

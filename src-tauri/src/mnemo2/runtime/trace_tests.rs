@@ -166,6 +166,7 @@ async fn worker_calls_carry_worker_plan_and_step() {
             trace_identity: worker_identity("Trace worker"),
             pinned_task: None,
             check_commands: std::sync::Arc::new(Vec::new()),
+            remote: None,
         })
         .await
         .expect("spawn the worker session");

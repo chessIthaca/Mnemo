@@ -3343,10 +3343,11 @@ dependencies = [
 
 [[package]]
 name = "mnemo"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "async-tungstenite",
  "base64 0.23.1",
  "chromiumoxide",
  "clap",
@@ -3355,6 +3356,7 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
+ "hmac",
  "image",
  "libc",
  "notify",
@@ -3395,7 +3397,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-app"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3429,9 +3431,12 @@ dependencies = [
 
 [[package]]
 name = "mnemo2-app"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
+ "async-trait",
  "dunce",
+ "futures",
+ "libc",
  "mnemo",
  "mnemo-app",
  "serde",
@@ -3443,6 +3448,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

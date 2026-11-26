@@ -282,6 +282,12 @@ pub struct ConfigModelResolver {
     /// slots and the shared 429 cooldown under it. `None` = no machine limits
     /// (tests, callers without a config dir).
     run_dir: Option<std::path::PathBuf>,
+    /// The remote-node seam: when set, every built provider comes from this
+    /// [`ModelTransport`](crate::provider::client_factory::ModelTransport)
+    /// (the hub-proxied model client) instead of the local endpoint config.
+    /// `set_config` keeps it — a config reload on a node must not silently
+    /// drop the link's model path — while still clearing the provider cache.
+    transport: Option<Arc<dyn crate::provider::client_factory::ModelTransport>>,
 }
 
 impl ConfigModelResolver {
@@ -297,7 +303,19 @@ impl ConfigModelResolver {
             trace,
             cache: RwLock::new(HashMap::new()),
             run_dir: None,
+            transport: None,
         }
+    }
+
+    /// Route every provider this resolver builds through `transport` — the
+    /// remote worker node's hub-proxied model client. Builder form: a host
+    /// without a link keeps building from the local endpoint config.
+    pub fn with_transport(
+        mut self,
+        transport: Option<Arc<dyn crate::provider::client_factory::ModelTransport>>,
+    ) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Point every provider this resolver builds at the machine-wide run
@@ -510,11 +528,12 @@ impl ModelResolver for ConfigModelResolver {
             }
         }
         // Cache miss — build the provider + cache it for future turns.
-        let provider = crate::provider::client_factory::build_provider_for(
+        let provider = crate::provider::client_factory::build_provider_via(
             &config,
             model,
             Some(self.trace.clone()),
             self.run_dir.clone(),
+            self.transport.as_ref(),
         )?;
         let max_context = provider.capabilities().max_context;
         let cm = ContextManager::new(max_context, fill_rate)
@@ -1659,6 +1678,90 @@ mod tests {
         );
         assert_eq!(infos[1].endpoint, "deepseek");
         assert_eq!(infos[1].models, vec!["deepseek-v4-flash".to_string()]);
+    }
+
+    /// A transport that hands out one shared stub client and records every
+    /// `ModelRef` it is asked for.
+    struct RecordingTransport {
+        client: Arc<dyn crate::provider::LlmClient>,
+        seen: std::sync::Mutex<Vec<ModelRef>>,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                client: Arc::new(crate::provider::client_factory::UnavailableClient::new(
+                    "stub",
+                    "stub transport client",
+                )),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<ModelRef> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::provider::client_factory::ModelTransport for RecordingTransport {
+        fn client_for(
+            &self,
+            _config: &Config,
+            model: &ModelRef,
+        ) -> Option<Arc<dyn crate::provider::LlmClient>> {
+            self.seen.lock().unwrap().push(model.clone());
+            Some(self.client.clone())
+        }
+    }
+
+    /// The remote-node seam: with a transport the resolver never builds from
+    /// the local endpoint config (which has no key here) — it asks the
+    /// transport, and the provider cache still collapses repeated builds.
+    #[test]
+    fn resolver_uses_transport_and_caches() {
+        let transport = RecordingTransport::new();
+        let r = resolver(config_with_endpoints(ModelsConfig::default()))
+            .with_transport(Some(transport.clone()));
+        let model = ModelRef {
+            endpoint: "openai".into(),
+            model: "o3".into(),
+            reasoning_effort: Some("low".into()),
+        };
+        let (p1, _) = r.build_turn_provider(&model, 0.5).expect("transport build");
+        assert!(
+            Arc::ptr_eq(&p1, &transport.client),
+            "the resolver must return the transport's client"
+        );
+        let (p2, _) = r.build_turn_provider(&model, 0.5).expect("cached build");
+        assert!(
+            Arc::ptr_eq(&p1, &p2),
+            "the provider cache must still collapse repeated builds"
+        );
+        let seen = transport.seen();
+        assert_eq!(seen.len(), 1, "the cache must prevent a second transport call");
+        assert_eq!(seen[0], model, "the transport sees the exact ModelRef");
+        // A different effort is a different cache key, so the transport is asked
+        // again. It also proves the ref reaches the transport BEFORE effort
+        // normalisation (the override is still `low`, not the endpoint default).
+        let other = ModelRef {
+            reasoning_effort: Some("high".into()),
+            ..model.clone()
+        };
+        let _ = r.build_turn_provider(&other, 0.5).expect("second build");
+        assert_eq!(transport.seen().len(), 2);
+        assert_eq!(transport.seen()[1], other);
+
+        // set_config keeps the transport (a node's config reload must not drop
+        // its model path) but still clears the cache — proven by the transport
+        // being asked a third time for the same ref.
+        r.set_config(config_with_endpoints(ModelsConfig::default()));
+        let _ = r.build_turn_provider(&model, 0.5).expect("rebuild");
+        assert_eq!(
+            transport.seen().len(),
+            3,
+            "set_config clears the cache but keeps the transport wired"
+        );
+        assert_eq!(transport.seen()[2], model);
     }
 
     #[test]

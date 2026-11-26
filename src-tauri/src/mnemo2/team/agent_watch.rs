@@ -17,6 +17,11 @@
 //! after its last complete line, so a long transcript is never parsed twice.
 //! Malformed lines are skipped. Nothing outside `~/.claude/projects` and the
 //! file the lead named is ever read.
+//!
+//! A worker placed on a paired host runs as a Claude Code session the lead
+//! started there over SSH (plan 5e64ccd5). Its transcript lives on the host,
+//! so each pass asks the host (`claude.watch`) instead and keeps the answer
+//! ([`RemoteSeen`]); the same finish and stall rules then apply to it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,16 +33,20 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use mnemo::app::worktrees::is_link_or_junction;
+use mnemo::provider::Role;
 
+use crate::mnemo2::dispatch_routing::DispatchRoutingRow;
 use crate::mnemo2::phase3;
 use crate::mnemo2::runtime::TEAM_NOTICE_PREFIX;
 
+use super::claude_node::{ClaudeWatch, ClaudeWatchAnswer, CLAUDE_WATCH};
 use super::dispatch::BoxFuture;
 use super::pump::save_workers;
 use super::record::{
     append_inbox, fresh_launch_token, HandedBack, InboxEntry, InboxKind, MessageSender,
     WorkerRecord, WorkerStatus,
 };
+use super::remote::RemoteWorkers;
 use super::{BoardSignal, TeamRuntime};
 
 /// How long a transcript may stay unchanged before the agent counts as
@@ -74,8 +83,12 @@ impl AgentView {
 }
 
 /// The reading state of one registered agent.
+///
+/// The counters and the turn state are read by the node's Claude session watch
+/// too ([`super::claude_node`]), which follows a transcript without a
+/// registration.
 #[derive(Default)]
-struct Observed {
+pub(super) struct Observed {
     /// The agent id this state belongs to; a new registration starts over.
     agent_id: String,
     /// The file the counters were read from.
@@ -91,8 +104,17 @@ struct Observed {
     /// Length and hash of the file's first bytes when last read: a changed
     /// hash means the file was replaced.
     fingerprint: Option<(u64, u64)>,
-    tool_calls: u64,
-    tokens: u64,
+    /// Tool calls the transcript's assistant records carried.
+    pub(super) tool_calls: u64,
+    /// Tokens the transcript's assistant records reported.
+    pub(super) tokens: u64,
+    /// Who spoke last in the transcript: the turn's last word.
+    pub(super) last_role: Option<Role>,
+    /// The latest non-null `stop_reason` among the current turn's assistant
+    /// records.
+    pub(super) last_stop: Option<String>,
+    /// Whether the latest assistant record ended by asking for a tool.
+    pub(super) last_tool_use: bool,
     /// When Mnemo first saw this registration: the silence clock when
     /// neither a transcript nor the record says anything.
     registered_ms: u128,
@@ -130,8 +152,37 @@ pub(super) struct FinishedRun {
     /// The worker's turn count when the finish was seen: with the worker and
     /// the agent, the run's key.
     pub(super) turns: u32,
-    /// The agent's transcript, for its last message.
+    /// The agent's transcript, for its last message; `None` for a remote
+    /// worker, whose transcript lives on its host.
     pub(super) transcript: Option<String>,
+    /// The run's report as the host already read it (a remote worker's last
+    /// assistant text); preferred over reading `transcript`.
+    pub(super) report: Option<String>,
+}
+
+/// What the latest `claude.watch` answer said about a remote agent worker's
+/// Claude Code session on its host (plan 5e64ccd5): the facts [`look`] builds
+/// the worker's [`AgentView`] from, without touching the hub's filesystem.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct RemoteSeen {
+    /// The session (transcript file stem) the host found, if any.
+    pub(super) session: Option<String>,
+    /// The transcript's path on the host.
+    pub(super) transcript: Option<String>,
+    /// The transcript's length in bytes.
+    pub(super) size: u64,
+    /// When the transcript last changed, in the host's Unix milliseconds.
+    pub(super) last_activity_ms: Option<u64>,
+    pub(super) tool_calls: u64,
+    pub(super) tokens: u64,
+    /// Whether the session's last word ended an assistant turn.
+    pub(super) turn_ended: bool,
+    /// The ended turn's last assistant text: the run's report.
+    pub(super) last_text: Option<String>,
+    /// The latest call failed (the facts above are from an earlier answer):
+    /// the hub cannot tell whether a session exists, so it is no reason to
+    /// hand the worker back.
+    pub(super) failed: bool,
 }
 
 /// The report of an agent that ended without a final message.
@@ -143,6 +194,12 @@ struct Inner {
     states: HashMap<String, Observed>,
     /// The agent runs Mnemo finished itself, by worker id.
     auto_finished: HashMap<String, AutoFinished>,
+    /// What each remote agent worker's host last said about its session, by
+    /// worker id.
+    remote_seen: HashMap<String, RemoteSeen>,
+    /// A pass recorded a remote session on a worker record: the runtime saves
+    /// the records after the pass.
+    discovered: bool,
     /// Tests only: run a watcher pass right after a continuation or fix
     /// round put its worker back to work, and keep the runs it found.
     #[cfg(test)]
@@ -172,9 +229,21 @@ impl AgentWatch {
     }
 
     /// Forget a worker's reading state (a new registration, or the worker
-    /// is gone).
+    /// is gone), the host's last answer about it included.
     pub(super) fn forget(&self, worker_id: &str) {
-        self.lock().states.remove(worker_id);
+        let mut inner = self.lock();
+        inner.states.remove(worker_id);
+        inner.remote_seen.remove(worker_id);
+    }
+
+    /// What the host last said about a remote agent worker's session.
+    pub(super) fn remote_seen(&self, worker_id: &str) -> Option<RemoteSeen> {
+        self.lock().remote_seen.get(worker_id).cloned()
+    }
+
+    /// Whether a pass recorded a remote session since the last call.
+    fn take_discovered(&self) -> bool {
+        std::mem::take(&mut self.lock().discovered)
     }
 
     /// Remember that Mnemo finished `worker`'s agent run itself; `worker` is
@@ -226,11 +295,20 @@ impl AgentWatch {
         let Some(agent_id) = worker.claude_agent_id.clone() else {
             return;
         };
-        let len = worker
-            .claude_agent_transcript
-            .as_deref()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map_or(0, |meta| meta.len());
+        // A remote worker's transcript lives on its host: the floor is the
+        // length the host last reported, never a hub path's.
+        let local_len = || {
+            worker
+                .claude_agent_transcript
+                .as_deref()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map_or(0, |meta| meta.len())
+        };
+        let len = if worker.remote.is_some() {
+            self.lock().remote_seen.get(&worker.id).map_or(0, |seen| seen.size)
+        } else {
+            local_len()
+        };
         let mut inner = self.lock();
         let observed = inner.states.entry(worker.id.clone()).or_default();
         if observed.agent_id != agent_id {
@@ -425,6 +503,8 @@ fn epoch_ms(time: std::time::SystemTime) -> u128 {
 /// Count one transcript line into `observed`; anything malformed adds
 /// nothing.
 fn read_line(observed: &mut Observed, line: &[u8]) {
+    // A CRLF line ends in `\r`, which JSON treats as whitespace like `\n`.
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     let Ok(value) = serde_json::from_slice::<Value>(line) else {
         return;
     };
@@ -433,8 +513,42 @@ fn read_line(observed: &mut Observed, line: &[u8]) {
     };
     let assistant = message.get("role").and_then(Value::as_str) == Some("assistant")
         || value.get("type").and_then(Value::as_str) == Some("assistant");
+    let user = message.get("role").and_then(Value::as_str) == Some("user")
+        || value.get("type").and_then(Value::as_str) == Some("user");
+    if user && !assistant {
+        // A real user turn — not Claude Code's own bookkeeping and not a record
+        // that only carries tool results — is the turn's last word: whatever
+        // ended the previous turn no longer speaks for this one.
+        let text = user_message_text(message);
+        let only_results = message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                !blocks.is_empty()
+                    && blocks.iter().all(|block| {
+                        block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+            });
+        if !only_results && !meta_user_entry(&value, &text) {
+            observed.last_role = Some(Role::User);
+            observed.last_stop = None;
+        }
+        return;
+    }
     if !assistant {
         return;
+    }
+    observed.last_role = Some(Role::Assistant);
+    observed.last_tool_use = message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        });
+    if let Some(stop) = message.get("stop_reason").and_then(Value::as_str) {
+        observed.last_stop = Some(stop.to_string());
     }
     if let Some(blocks) = message.get("content").and_then(Value::as_array) {
         let calls = blocks
@@ -486,6 +600,9 @@ impl Observed {
         self.offset = 0;
         self.tool_calls = 0;
         self.tokens = 0;
+        self.last_role = None;
+        self.last_stop = None;
+        self.last_tool_use = false;
         self.tail.clear();
         self.skipping = false;
         self.fingerprint = None;
@@ -529,7 +646,7 @@ impl Observed {
 
 /// Read what the file gained since the last look: only new bytes, in
 /// chunks, and only complete lines are parsed.
-fn read_new(observed: &mut Observed, path: &Path, length: u64) {
+pub(super) fn read_new(observed: &mut Observed, path: &Path, length: u64) {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
         return;
@@ -587,6 +704,9 @@ pub(super) struct Looked {
 /// worker has no registered agent.
 pub(super) fn look(watch: &AgentWatch, worker: &WorkerRecord, now: u128) -> Option<Looked> {
     let agent_id = worker.claude_agent_id.clone()?;
+    if worker.remote.is_some() {
+        return Some(look_remote(watch, worker, agent_id, now));
+    }
     // The recorded file, or a fresh search when it is missing or gone.
     let root = watch.projects_root();
     let recorded = worker
@@ -651,6 +771,69 @@ pub(super) fn look(watch: &AgentWatch, worker: &WorkerRecord, now: u128) -> Opti
     })
 }
 
+/// [`look`] for a remote agent worker: its view comes from the host's last
+/// `claude.watch` answer ([`RemoteSeen`]), never from the hub's filesystem. The
+/// finish and stall rules are the local ones, except that a worker whose host
+/// is away never counts as stalled (it is offline, not silent).
+fn look_remote(watch: &AgentWatch, worker: &WorkerRecord, agent_id: String, now: u128) -> Looked {
+    let mut inner = watch.lock();
+    let seen = inner.remote_seen.get(&worker.id).cloned().unwrap_or_default();
+    let observed = inner.states.entry(worker.id.clone()).or_default();
+    if observed.agent_id != agent_id {
+        *observed = Observed {
+            agent_id: agent_id.clone(),
+            registered_ms: now,
+            ..Observed::default()
+        };
+    }
+    observed.offset = seen.size;
+    observed.tool_calls = seen.tool_calls;
+    observed.tokens = seen.tokens;
+    let last_activity = seen.last_activity_ms.map(u128::from);
+    let finished = seen.turn_ended;
+    let last = match last_activity {
+        Some(written) => written.max(observed.run_start_ms),
+        None if worker.last_activity_ms > 0 => worker.last_activity_ms.max(observed.run_start_ms),
+        None => observed.registered_ms.max(observed.run_start_ms),
+    };
+    let running = matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing);
+    let offline = worker
+        .remote
+        .as_ref()
+        .is_some_and(|remote| remote.offline_since_ms.is_some());
+    let stalled = running && !finished && !offline && now.saturating_sub(last) >= STALL_MS;
+    Looked {
+        view: AgentView {
+            id: agent_id,
+            transcript: seen
+                .transcript
+                .clone()
+                .or_else(|| worker.claude_agent_transcript.clone()),
+            last_activity_ms: last_activity,
+            tool_calls: seen.tool_calls,
+            tokens: seen.tokens,
+            finished,
+            stalled,
+        },
+        found: None,
+    }
+}
+
+/// When an agent worker's agent can have started: its dispatch, or the last
+/// reroute onto the agent tier when it moved there later. A transcript written
+/// before it is not this worker's.
+pub(super) fn agent_since_ms(worker: &WorkerRecord) -> u128 {
+    worker
+        .reroutes
+        .iter()
+        .filter_map(|row| match row {
+            DispatchRoutingRow::LeadReroute { ts, .. }
+            | DispatchRoutingRow::UserReroute { ts, .. } => Some(u128::from(*ts)),
+            _ => None,
+        })
+        .fold(worker.created_at_ms, u128::max)
+}
+
 impl TeamRuntime {
     /// One look at a worker's registered agent, remembering a transcript
     /// path found late and the agent's last activity on the record.
@@ -683,13 +866,15 @@ impl TeamRuntime {
             let records = self.records.clone();
             let signals = self.signals.clone();
             let watch = self.agent_watch.clone();
+            let remote = self.remote.clone();
             // The runtime, to finish a worker whose agent ended; set once the
             // runtime holds its own Arc (`attach_board`).
             let limits = self.usage_limits.clone();
             inner.task = Some(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(WATCH_INTERVAL).await;
-                    let (keep, finished, _stalled) = tick(&records, &signals, &watch).await;
+                    let (keep, finished, _stalled) =
+                        tick(&records, &signals, &watch, &remote).await;
                     match limits.team() {
                         Some(team) => team.after_agent_watch(&finished).await,
                         None => {
@@ -726,7 +911,8 @@ impl TeamRuntime {
         if self.agent_watch.lock().probe.is_none() {
             return;
         }
-        let (_, finished, _) = tick(&self.records, &self.signals, &self.agent_watch).await;
+        let (_, finished, _) =
+            tick(&self.records, &self.signals, &self.agent_watch, &self.remote).await;
         if let Some(probe) = self.agent_watch.lock().probe.as_mut() {
             probe.extend(finished);
         }
@@ -735,7 +921,16 @@ impl TeamRuntime {
     /// One pass of the watcher. Tests call it instead of waiting a minute.
     #[cfg(test)]
     pub(super) async fn agent_watch_tick(&self) {
-        let (_, finished, _) = tick(&self.records, &self.signals, &self.agent_watch).await;
+        self.watch_agents_now().await;
+    }
+
+    /// One watcher pass now: ask every remote agent worker's host about its
+    /// session, look at every registered agent, send the notices that are due,
+    /// finish the runs that ended and run the hand-back check, as the watcher
+    /// task does each minute. The end-to-end test drives the watch with it.
+    pub async fn watch_agents_now(&self) {
+        let (_, finished, _) =
+            tick(&self.records, &self.signals, &self.agent_watch, &self.remote).await;
         self.after_agent_watch(&finished).await;
     }
 
@@ -745,6 +940,14 @@ impl TeamRuntime {
     /// once the lead has been away for the grace period (plan ee73bd2f
     /// decision 1), so a stall alone hands nothing back.
     async fn after_agent_watch(&self, finished: &[FinishedRun]) {
+        // A session the pass found for a remote worker is saved, so a restart
+        // keeps following it (no lock is held here).
+        if self.agent_watch.take_discovered() {
+            if let Err(error) = self.persist().await {
+                eprintln!("team: could not save a remote session the watcher found: {error}");
+                self.agent_watch.lock().discovered = true;
+            }
+        }
         for run in finished {
             self.finish_agent_run(run).await;
         }
@@ -771,9 +974,10 @@ impl TeamRuntime {
 
 /// A registered agent worker whose agent still owes the lead something.
 fn watched(worker: &WorkerRecord) -> bool {
-    worker.claude_agent.is_some()
+    (worker.claude_agent.is_some()
         && worker.claude_agent_id.is_some()
-        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing)
+        && matches!(worker.status, WorkerStatus::Working | WorkerStatus::Fixing))
+        || (runs_as_agent(worker) && worker.remote.is_some())
 }
 
 /// An agent worker at work, its agent registered or still awaited: the
@@ -816,7 +1020,11 @@ async fn tick(
     records: &Arc<Mutex<Vec<WorkerRecord>>>,
     signals: &broadcast::Sender<BoardSignal>,
     watch: &AgentWatch,
+    remote: &Arc<RemoteWorkers>,
 ) -> (bool, Vec<FinishedRun>, bool) {
+    // Boxed: the link calls make a large future, and the run-start probe
+    // awaits a pass deep inside the resume and message paths.
+    Box::pin(watch_remote(records, signals, watch, remote)).await;
     let workers: Vec<WorkerRecord> = records
         .lock()
         .await
@@ -847,6 +1055,17 @@ async fn tick(
         let mut notice = None;
         {
             let mut inner = watch.lock();
+            // A remote worker's host already read the report.
+            let remote_report = worker
+                .remote
+                .is_some()
+                .then(|| {
+                    inner
+                        .remote_seen
+                        .get(&worker.id)
+                        .and_then(|seen| seen.last_text.clone())
+                })
+                .flatten();
             let Some(observed) = inner.states.get_mut(&worker.id) else {
                 continue;
             };
@@ -859,11 +1078,19 @@ async fn tick(
                 let grown = observed.run_floor.is_none_or(|floor| observed.offset > floor);
                 if new_run && grown {
                     observed.handled_turns = Some(worker.turns);
+                    // A remote worker's transcript path is the host's, never
+                    // read here.
+                    let (transcript, report) = if worker.remote.is_some() {
+                        (None, remote_report)
+                    } else {
+                        (view.transcript.clone(), None)
+                    };
                     finished.push(FinishedRun {
                         worker_id: worker.id.clone(),
                         agent_id: view.id.clone(),
                         turns: worker.turns,
-                        transcript: view.transcript.clone(),
+                        transcript,
+                        report,
                     });
                 }
             } else if view.stalled {
@@ -890,6 +1117,120 @@ async fn tick(
         }
     }
     (true, finished, any_stalled)
+}
+
+/// Ask every remote agent worker's host about its Claude Code session
+/// (`claude.watch`) and keep the answer for [`look`]. The first session found
+/// for a worker that has none becomes its agent (`claude_agent_id`, with the
+/// host's transcript path). A failed call keeps the earlier answer, marked
+/// failed; a worker whose host is away is not asked. The link is never called
+/// while the watch's mutex or the records lock is held.
+async fn watch_remote(
+    records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    signals: &broadcast::Sender<BoardSignal>,
+    watch: &AgentWatch,
+    remote: &Arc<RemoteWorkers>,
+) {
+    let workers: Vec<WorkerRecord> = records
+        .lock()
+        .await
+        .iter()
+        .filter(|worker| runs_as_agent(worker) && worker.remote.is_some())
+        .cloned()
+        .collect();
+    for worker in workers {
+        let Some(checkout) = worker.remote.clone() else {
+            continue;
+        };
+        if checkout.offline_since_ms.is_some() {
+            continue;
+        }
+        let request = ClaudeWatch {
+            checkout: checkout.checkout.clone(),
+            worker_id: worker.id.clone(),
+            branch: worker.branch.clone(),
+            since_ms: u64::try_from(agent_since_ms(&worker)).unwrap_or(u64::MAX),
+            session: worker.claude_agent_id.clone(),
+        };
+        let params = serde_json::to_value(&request).unwrap_or(Value::Null);
+        let answer = remote
+            .call_node(&checkout, CLAUDE_WATCH, params, mnemo::remote::hub::CALL_TIMEOUT)
+            .await
+            .and_then(|value| {
+                serde_json::from_value::<ClaudeWatchAnswer>(value)
+                    .map_err(|error| format!("{CLAUDE_WATCH}: {error}"))
+            });
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(error) => {
+                eprintln!(
+                    "team: could not ask host '{}' about {}'s Claude Code session: {error}",
+                    checkout.node_name, worker.id
+                );
+                watch
+                    .lock()
+                    .remote_seen
+                    .entry(worker.id.clone())
+                    .or_default()
+                    .failed = true;
+                continue;
+            }
+        };
+        // Applied only while the record is still the one asked about: a new
+        // session registered meanwhile starts over.
+        let mut discovered = false;
+        let current = {
+            let mut records = records.lock().await;
+            match records.iter_mut().find(|record| record.id == worker.id) {
+                Some(record)
+                    if record.claude_session == worker.claude_session
+                        && record.remote.is_some()
+                        && runs_as_agent(record) =>
+                {
+                    match (&record.claude_agent_id, &answer.session) {
+                        (None, Some(session)) if worker.claude_agent_id.is_none() => {
+                            record.claude_agent_id = Some(session.clone());
+                            record.claude_agent_transcript = answer.transcript.clone();
+                            discovered = true;
+                            true
+                        }
+                        (known, _) => *known == worker.claude_agent_id,
+                    }
+                }
+                _ => false,
+            }
+        };
+        if !current {
+            continue;
+        }
+        let mut inner = watch.lock();
+        inner.discovered |= discovered;
+        inner.remote_seen.insert(
+            worker.id.clone(),
+            RemoteSeen {
+                session: answer.session.clone(),
+                transcript: answer.transcript.clone(),
+                size: answer.size,
+                last_activity_ms: answer.last_activity_ms,
+                tool_calls: answer.tool_calls,
+                tokens: answer.tokens,
+                turn_ended: answer.turn_ended,
+                last_text: answer.last_text.clone(),
+                failed: false,
+            },
+        );
+        drop(inner);
+        if discovered && answer.matches > 1 {
+            let id = &worker.id;
+            let _ = signals.send(BoardSignal::Notice {
+                key: format!("remote-sessions:{id}:{}", phase3::now_ms()),
+                text: format!(
+                    "worker_id={id}\nMore than one Claude Code session on host {} names {id}; Mnemo follows the newest.",
+                    checkout.node_name
+                ),
+            });
+        }
+    }
 }
 
 /// Makes every progress notice key unique, so two notes in one millisecond
@@ -931,6 +1272,14 @@ pub(super) fn waits_for_agent(worker: &WorkerRecord) -> bool {
     runs_as_agent(worker)
         && worker.claude_agent_id.is_none()
         && !worker.worktree.as_os_str().is_empty()
+}
+
+/// A waiting agent worker whose agent the WorktreeCreate hook can still hand a
+/// checkout to: a local one. A remote agent worker's session is started on its
+/// host, where no hook runs and no launch token exists, so it never blocks the
+/// next local launch (phase 4).
+pub(super) fn waits_for_local_agent(worker: &WorkerRecord) -> bool {
+    waits_for_agent(worker) && worker.remote.is_none()
 }
 
 /// The phase of a Claude Code agent worker that `team_status` and the
@@ -1016,6 +1365,36 @@ pub(super) async fn checkout_dirty(worktree: &Path) -> bool {
     }
 }
 
+impl TeamRuntime {
+    /// Whether a worker's checkout has uncommitted changes: [`checkout_dirty`]
+    /// for a local worker; for a worker on a host, the node checkout's own
+    /// `git status` (`repo.tip`'s dirty list). A host that cannot answer counts
+    /// as dirty, which only ever refuses a takeover.
+    ///
+    /// Boxed: the resume paths that ask this already run on deep futures.
+    pub(super) fn worker_checkout_dirty<'a>(&'a self, worker: &'a WorkerRecord) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            match worker.remote.as_ref() {
+                Some(remote) => match self.remote.node_tip(remote).await {
+                    Ok(tip) => !tip.dirty.is_empty(),
+                    Err(_) => true,
+                },
+                None => checkout_dirty(&worker.worktree).await,
+            }
+        })
+    }
+}
+
+/// Where a worker's checkout is, as the hand-back notices name it: the hub
+/// checkout, or for a worker on a host the node checkout and the host (whose
+/// own `git status` the dirty flag comes from).
+fn checkout_label(worker: &WorkerRecord) -> String {
+    match worker.remote.as_ref() {
+        Some(remote) => format!("{} on host {}", remote.path, remote.node_name),
+        None => worker.worktree.display().to_string(),
+    }
+}
+
 /// The ways to continue a handed-back worker, as the notices name them.
 fn handed_back_recovery(worker_id: &str) -> String {
     format!(
@@ -1034,7 +1413,7 @@ pub(super) fn handed_back_notice(worker: &WorkerRecord, dirty: bool) -> String {
     };
     format!(
         "{TEAM_NOTICE_PREFIX} worker_id={id}\n{id} was handed back from Claude Code: {HANDED_BACK_REASON}\nIts checkout {checkout} {changes}.\n{recovery}",
-        checkout = worker.worktree.display(),
+        checkout = checkout_label(worker),
         recovery = handed_back_recovery(id),
     )
 }
@@ -1046,7 +1425,7 @@ pub(super) fn handed_back_dirty_refusal(worker: &WorkerRecord) -> String {
     let id = &worker.id;
     format!(
         "worker_id={id}\n{id} was handed back from Claude Code and its checkout {checkout} has uncommitted changes, which its Claude Code agent may still be writing: Mnemo does not start a Mnemo model there, so {id} stays interrupted.\n{recovery}",
-        checkout = worker.worktree.display(),
+        checkout = checkout_label(worker),
         recovery = handed_back_recovery(id),
     )
 }
@@ -1065,7 +1444,7 @@ pub(super) struct Launched {
 const FIRST_MESSAGE_BYTES: u64 = 1024 * 1024;
 
 /// Whether `path` exists and is no link or junction.
-fn plain_entry(path: &Path) -> bool {
+pub(super) fn plain_entry(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| !is_link_or_junction(&meta))
 }
 
@@ -1102,7 +1481,7 @@ fn meta_user_entry(value: &Value, text: &str) -> bool {
 /// The text of a transcript's first real user message (its prompt), skipping
 /// meta and caveat entries ([`meta_user_entry`]), read from at most
 /// [`FIRST_MESSAGE_BYTES`].
-fn first_user_text(path: &Path) -> Option<String> {
+pub(super) fn first_user_text(path: &Path) -> Option<String> {
     use std::io::{BufRead, Read};
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file.take(FIRST_MESSAGE_BYTES));
@@ -1135,7 +1514,7 @@ fn first_user_text(path: &Path) -> Option<String> {
 /// branch name. Only this phrase counts (plan ee73bd2f, step 1 audit): a
 /// brief routinely names other workers' checkouts and branches ("never
 /// touch …"), which must not match.
-fn prompt_names_branch(text: &str, branch: &str) -> bool {
+pub(super) fn prompt_names_branch(text: &str, branch: &str) -> bool {
     let branch = branch.trim();
     if branch.is_empty() {
         return false;
@@ -1288,7 +1667,7 @@ impl TeamRuntime {
         AgentGateView {
             waiting: records
                 .iter()
-                .find(|worker| waits_for_agent(worker))
+                .find(|worker| waits_for_local_agent(worker))
                 .map(gate_worker),
             running: records
                 .iter()
@@ -1350,18 +1729,39 @@ impl TeamRuntime {
     /// isolated launch could be handed the wrong checkout, or
     /// [`AGENT_WORKER_CAP`] agent workers already run. `except` is the worker
     /// being started or moved, which never counts against itself.
+    ///
+    /// A local start checks the waiting worker too; [`agent_launch_refusal_for`]
+    /// says why a remote start does not.
     pub(super) async fn agent_launch_refusal(&self, except: Option<&str>) -> Option<String> {
+        self.agent_launch_refusal_for(except, false).await
+    }
+
+    /// [`agent_launch_refusal`] for a worker starting on a host: no
+    /// WorktreeCreate hook runs there, so a waiting local agent worker cannot
+    /// be handed the remote session's checkout, and only the cap applies.
+    /// Remote agent workers count against the cap like local ones.
+    ///
+    /// [`agent_refusal_retry_hint`] tells the two refusals apart by the phrase
+    /// "is waiting for its agent" in the waiting refusal: keep it in that text
+    /// (and out of the cap text) when either changes.
+    pub(super) async fn agent_launch_refusal_for(
+        &self,
+        except: Option<&str>,
+        remote: bool,
+    ) -> Option<String> {
         let records = self.records.lock().await;
         let others = || {
             records
                 .iter()
                 .filter(move |worker| Some(worker.id.as_str()) != except)
         };
-        if let Some(waiting) = others().find(|worker| waits_for_agent(worker)) {
-            return Some(format!(
-                "{} is waiting for its agent: launch it (Agent with isolation \"worktree\") before dispatching another agent step.",
-                waiting.id
-            ));
+        if !remote {
+            if let Some(waiting) = others().find(|worker| waits_for_local_agent(worker)) {
+                return Some(format!(
+                    "{} is waiting for its agent: launch it (Agent with isolation \"worktree\") before dispatching another agent step.",
+                    waiting.id
+                ));
+            }
         }
         let running: Vec<&str> = others()
             .filter(|worker| runs_as_agent(worker))
@@ -1373,6 +1773,19 @@ impl TeamRuntime {
                 running.join(", ")
             )
         })
+    }
+}
+
+/// What the lead can do about an [`agent_launch_refusal_for`] refusal, for a
+/// dispatch that failed its worker over it: wait for the waiting worker's
+/// launch, or for a running agent worker to finish (the cap). It tells them
+/// apart by the literal "is waiting for its agent", which only the waiting
+/// refusal contains.
+pub(super) fn agent_refusal_retry_hint(refusal: &str) -> &'static str {
+    if refusal.contains("is waiting for its agent") {
+        "retry with the same worker ID once the waiting worker is launched"
+    } else {
+        "retry with the same worker ID when an agent worker finishes"
     }
 }
 
@@ -1430,6 +1843,11 @@ impl TeamRuntime {
             agent_worker_in_work(&worker, "team_agent_started")?;
             None
         };
+        if worker.remote.is_some() {
+            return self
+                .remote_session_started(worker_id, agent_id, reclaim_guard)
+                .await;
+        }
         let search = find_transcript(&self.agent_watch, agent_id, transcript_path);
         let transcript = search.path;
         let mut restored = false;
@@ -1493,6 +1911,84 @@ impl TeamRuntime {
         Ok((worker, text))
     }
 
+    /// [`Self::agent_started`] for a worker on a host (plan 5e64ccd5): the id is
+    /// the Claude Code session the lead started there over SSH, kept in
+    /// `claude_session` as the handle the lead continues it by. The transcript
+    /// is the host's to find: the watcher sets `claude_agent_id` and its path
+    /// from `claude.watch`. A session other than the one on record starts the
+    /// following over. `reclaim_guard` is the merge lock a reclaim holds.
+    async fn remote_session_started(
+        &self,
+        worker_id: &str,
+        session: &str,
+        reclaim_guard: Option<tokio::sync::MutexGuard<'_, ()>>,
+    ) -> Result<(WorkerRecord, String), String> {
+        let mut restored = false;
+        let mut replaced = false;
+        let node = {
+            let mut records = self.records.lock().await;
+            let Some(record) = records.iter_mut().find(|record| record.id == worker_id) else {
+                return Err(format!("unknown worker '{worker_id}'"));
+            };
+            if reclaim_guard.is_some() {
+                // Re-checked under the lock: a Mnemo session may have started.
+                if !reclaimable(record) {
+                    agent_worker_in_work(record, "team_agent_started")?;
+                }
+                if let Some(handed) = record.handed_back.take() {
+                    record.claude_agent = Some(handed.claude_agent);
+                    record.claude_agent_effort = handed.claude_agent_effort;
+                    record.status = handed.status;
+                    record.error = None;
+                    restored = true;
+                }
+            }
+            if record
+                .claude_session
+                .as_deref()
+                .is_some_and(|known| known != session)
+            {
+                // Another session: its transcript is found afresh.
+                record.claude_agent_id = None;
+                record.claude_agent_transcript = None;
+                replaced = true;
+            }
+            record.claude_session = Some(session.to_string());
+            record.last_activity_ms = record.last_activity_ms.max(phase3::now_ms());
+            record
+                .remote
+                .as_ref()
+                .map(|remote| remote.node_name.clone())
+                .unwrap_or_default()
+        };
+        if replaced {
+            self.agent_watch.forget(worker_id);
+        }
+        save_workers(
+            &self.records,
+            &self.usage,
+            &self.save_lock,
+            &self.persistence,
+        )
+        .await?;
+        self.ensure_agent_watch().await;
+        let text = if restored {
+            format!(
+                "Restored {worker_id} as a Claude Code agent worker and registered session {session}; Mnemo follows its transcript on host {node}."
+            )
+        } else {
+            format!(
+                "Registered Claude Code session {session} for {worker_id}; Mnemo follows its transcript on host {node}."
+            )
+        };
+        drop(reclaim_guard);
+        if restored {
+            let _ = self.signals.send(BoardSignal::Changed);
+        }
+        let worker = self.worker(worker_id).await?;
+        Ok((worker, text))
+    }
+
     /// The worktree Claude Code's WorktreeCreate hook hands an agent launched
     /// with isolation "worktree" (plan 4d920eec decision 3): the pool
     /// checkout of the one agent worker that waits for its agent (Working or
@@ -1523,7 +2019,7 @@ impl TeamRuntime {
             .lock()
             .await
             .iter()
-            .filter(|worker| waits_for_agent(worker))
+            .filter(|worker| waits_for_local_agent(worker))
             .map(|worker| worker.id.clone())
             .collect();
         let worker_id = match waiting.as_slice() {

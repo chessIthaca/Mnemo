@@ -35,6 +35,11 @@ pub mod openspec;
 pub mod process_tree;
 pub mod project;
 pub mod provider;
+/// The hub↔node link (plan a040713f, phase 2): pairing, the authenticated
+/// multiplexed WebSocket, and its wire format. Gated by the `remote`
+/// feature, which implies `headless`.
+#[cfg(feature = "remote")]
+pub mod remote;
 pub mod runtime;
 pub mod safety_rules;
 pub mod shell_path;

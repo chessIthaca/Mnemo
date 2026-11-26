@@ -25,7 +25,9 @@ use super::agent_watch;
 use super::claude_node::{ClaudeStatusAnswer, CLAUDE_STATUS};
 use super::control::ResumeChoice;
 use super::findings_ledger;
-use super::record::{with_launch_token, ChangeSource, MessageSender, RemoteCheckout, WorkerRecord};
+use super::record::{
+    session_name, with_launch_token, ChangeSource, MessageSender, RemoteCheckout, WorkerRecord,
+};
 use super::remote::{checks_hash, HostDirectory, Qualification};
 use super::routing::tier_ids;
 use super::spawn;
@@ -276,7 +278,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_agent_started".to_string(),
-                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent. On a worker Mnemo handed back to its own models while you were away, and no Mnemo model has run on since, it restores the worker as an agent worker with your agent registered.".to_string(),
+                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent. On a worker Mnemo handed back to its own models while you were away, and no Mnemo model has run on since, it restores the worker as an agent worker with your agent registered. For a worker on a host, agent_id is the session id start_session returned, transcript_path is ignored, and Mnemo follows the session's transcript on the host.".to_string(),
                 parameters: json!({"type":"object","properties":{
                     "worker_id":{"type":"string","description":"The agent worker the agent runs."},
                     "agent_id":{"type":"string","description":"The id of the Claude Code agent (the Agent tool's agent id)."},
@@ -733,7 +735,14 @@ impl TeamRuntime {
                     host,
                 )
                 .await;
-            return dispatch_result(
+            // A worker on a host whose link was withdrawn since it was placed
+            // (a reused or retried dispatch) gets no session block.
+            let mut result = result;
+            let unlinked = result
+                .as_mut()
+                .ok()
+                .and_then(|(worker, _, _)| self.withhold_unlinked_session(worker));
+            let mut answer = dispatch_result(
                 result,
                 "team_dispatch",
                 mode,
@@ -741,6 +750,10 @@ impl TeamRuntime {
                 explicit_model,
                 warnings,
             );
+            if let Some(text) = unlinked {
+                answer.output = format!("{}\n{text}", answer.output);
+            }
+            return answer;
         }
         if name == "team_audit_dispatch" {
             let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
@@ -944,6 +957,9 @@ impl TeamRuntime {
         // A team_resume that handed the step to the lead's Claude Code agent
         // (plan e52e0be1 decision 5) answers with the block to launch.
         let mut handoff_block: Option<Value> = None;
+        // The same for a worker on a host: the `claude_session` block the
+        // lead starts its session with over SSH (plan 5e64ccd5).
+        let mut session_block: Option<Value> = None;
         let result = match name {
             "team_message" => match args.get("text").and_then(Value::as_str) {
                 Some(text) => self.message(worker_id, text.to_string(), sender).await,
@@ -962,44 +978,13 @@ impl TeamRuntime {
                 }
             }
             "team_resume" => {
-                let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
-                let model = args.get("model").and_then(Value::as_str).map(str::to_string);
-                let reasoning_effort = args
-                    .get("reasoning_effort")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                // Only the external lead may let a Mnemo model take over a
-                // handed-back worker's dirty checkout (plan ee73bd2f
-                // decision 3); the in-app lead's tool has no such switch.
-                let keep_changes = sender == MessageSender::ExternalLead
-                    && args
-                        .get("keep_changes")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                let host = args
-                    .get("host")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|host| !host.is_empty());
-                if tier.is_none() && model.is_none() && reasoning_effort.is_none() {
-                    Box::pin(self.resume_keeping_on(worker_id, keep_changes, host)).await
-                } else {
-                    Box::pin(self.resume_on_tier(
-                        worker_id,
-                        ChangeSource::Lead,
-                        ResumeChoice {
-                            tier: tier.as_deref(),
-                            model,
-                            reasoning_effort,
-                            keep_changes,
-                            host,
-                        },
-                    ))
-                    .await
-                    .map(|resumed| {
+                match Box::pin(self.team_resume_tool(worker_id, &args, sender)).await {
+                    Ok(resumed) => {
                         handoff_block = resumed.claude_agent;
-                        resumed.worker
-                    })
+                        session_block = resumed.claude_session;
+                        Ok(resumed.worker)
+                    }
+                    Err(error) => Err(error),
                 }
             }
             "team_compact" => self.compact(worker_id).await,
@@ -1084,22 +1069,24 @@ impl TeamRuntime {
             _ => Err(format!("unknown team host tool '{name}'")),
         };
         let reviewed = result.as_ref().ok().cloned();
-        let mut answer = match (result, handoff_block) {
-            (Ok(worker), Some(block)) => agent_handoff_answer(&worker, block),
-            (Ok(worker), None)
+        let mut answer = match (result, handoff_block, session_block) {
+            (Ok(worker), Some(block), _) => agent_handoff_answer(&worker, block),
+            (Ok(worker), None, Some(block)) => session_handoff_answer(&worker, block),
+            (Ok(worker), None, None)
                 if worker.claude_agent.is_some()
                     && matches!(name, "team_message" | "team_route_fix") =>
             {
                 // No registered agent: the lead launches a new one with this
-                // message, which carries a fresh one-time launch token.
-                let token = if worker.claude_agent_id.is_none() {
+                // message, which carries a fresh one-time launch token. A
+                // session on a host never gets one.
+                let token = if worker.claude_agent_id.is_none() && worker.remote.is_none() {
                     self.issue_launch_token(&worker.id).await.ok()
                 } else {
                     None
                 };
                 continue_agent_answer(&worker, name, token.as_deref())
             }
-            (result, _) => worker_result(result, name),
+            (result, _, _) => worker_result(result, name),
         };
         if let (true, Some(missing)) = (answer.success, stale) {
             answer.output = format!("{}\n{}", answer.output, stale_base_line(missing));
@@ -1134,6 +1121,89 @@ impl TeamRuntime {
             }
         }
         answer
+    }
+
+    /// Point a dispatch answer's copy of an agent worker on a host at the SSH
+    /// connection its host is linked to now: a host linked to another
+    /// connection since placement names that one; a host whose link is gone
+    /// gets its copy's connection cleared, so the answer carries no
+    /// `claude_session` block, and the line that says so is returned. The
+    /// stored record is unchanged.
+    fn withhold_unlinked_session(&self, worker: &mut WorkerRecord) -> Option<String> {
+        worker.claude_agent.as_ref()?;
+        let remote = worker.remote.as_mut()?;
+        remote.ssh.as_ref()?;
+        match self.live_ssh_link(&remote.node_id) {
+            Some(live) => {
+                remote.ssh = Some(live);
+                None
+            }
+            None => {
+                remote.ssh = None;
+                Some(super::control::unlinked_session_text(&remote.node_name))
+            }
+        }
+    }
+
+    /// `team_resume`: resume the worker where it ran, on another tier, or —
+    /// with `host: "local"` — here. An agent worker on a host moves here
+    /// unchanged, to be launched as the lead's own agent (plan 5e64ccd5).
+    /// Kept out of the tool dispatcher, whose future is already deep.
+    async fn team_resume_tool(
+        &self,
+        worker_id: &str,
+        args: &Value,
+        sender: MessageSender,
+    ) -> Result<super::control::TierResume, String> {
+        let tier = args.get("tier").and_then(Value::as_str).map(str::to_string);
+        let model = args.get("model").and_then(Value::as_str).map(str::to_string);
+        let reasoning_effort = args
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // Only the external lead may let a Mnemo model take over a
+        // handed-back worker's dirty checkout (plan ee73bd2f decision 3); the
+        // in-app lead's tool has no such switch.
+        let keep_changes = sender == MessageSender::ExternalLead
+            && args
+                .get("keep_changes")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let host = args
+            .get("host")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|host| !host.is_empty());
+        let remote_agent = host == Some("local")
+            && self.worker(worker_id).await.is_ok_and(|worker| {
+                worker.remote.is_some() && agent_watch::runs_as_agent(&worker)
+            });
+        if remote_agent {
+            if tier.is_some() || model.is_some() || reasoning_effort.is_some() {
+                return Err("team_resume with host \"local\" moves the worker here unchanged; resume it here first, then change its tier.".to_string());
+            }
+            return Box::pin(self.relocate_agent_local(worker_id)).await;
+        }
+        if tier.is_none() && model.is_none() && reasoning_effort.is_none() {
+            let worker = Box::pin(self.resume_keeping_on(worker_id, keep_changes, host)).await?;
+            return Ok(super::control::TierResume {
+                worker,
+                claude_agent: None,
+                claude_session: None,
+            });
+        }
+        Box::pin(self.resume_on_tier(
+            worker_id,
+            ChangeSource::Lead,
+            ResumeChoice {
+                tier: tier.as_deref(),
+                model,
+                reasoning_effort,
+                keep_changes,
+                host,
+            },
+        ))
+        .await
     }
 
     /// The status views `team_status` answers, each with its `stale_base`
@@ -1543,17 +1613,70 @@ fn agent_handoff_answer(worker: &WorkerRecord, block: Value) -> ToolResult {
     ToolResult::success(output).with_data(json!({"worker": data, "claude_agent": block}))
 }
 
+/// The `team_resume` answer when the move handed the step of a worker on a host
+/// to a Claude Code session there (plan 5e64ccd5): the worker entry beside the
+/// `claude_session` block, in the result and in `data`, with the instruction
+/// the dispatch of such a worker gives.
+fn session_handoff_answer(worker: &WorkerRecord, block: Value) -> ToolResult {
+    let mut reported = worker_status_view(worker, false);
+    without_transcripts(&mut reported);
+    let output = serde_json::to_string(&json!({
+        "action": "team_resume",
+        "result": {"worker": reported, "claude_session": block},
+    }))
+    .unwrap_or_else(|_| "team_resume".to_string());
+    let node = block["node"].as_str().unwrap_or_default();
+    let ssh = block["host"].as_str().unwrap_or_default();
+    let output = format!(
+        "{output}\n{id} moves to host {node} as a Claude Code session over SSH connection '{ssh}'. The user approved Claude workers on '{ssh}' by linking it: call start_session with the claude_session block's fields unchanged (target \"ssh\", host, cwd, use_worktree false, context \"fresh\", initiation \"user_asked\", name, title, model, effort, background, prompt, wake_when_done true), then call team_agent_started with worker_id and the session id start_session returned. Mnemo follows the session's transcript on the host and finishes the worker when the session ends its turn.",
+        id = worker.id
+    );
+    let data = serde_json::to_value(worker).unwrap_or(Value::Null);
+    ToolResult::success(output).with_data(json!({"worker": data, "claude_session": block}))
+}
+
 /// The `team_message` or `team_route_fix` answer for a worker that runs as a
 /// Claude Code agent (plan ca7f2177 decision 5): Mnemo recorded the message
 /// or the fix round, and the lead passes the text on to its agent. The
 /// `continue_agent` block `{agent_id, worktree, message}` is in the result
 /// and in `data`; the text says how to continue, with the message below it.
+///
+/// A worker on a host (plan 5e64ccd5) continues in its Claude Code session
+/// there: the `continue_session` block `{session, host, message}` names the
+/// session (the one `team_agent_started` recorded, else the session name its
+/// start used) and the SSH connection, and never carries a launch token.
 fn continue_agent_answer(worker: &WorkerRecord, action: &str, token: Option<&str>) -> ToolResult {
     let message = worker
         .inbox
         .last()
         .map(|entry| entry.text.clone())
         .unwrap_or_default();
+    if let Some(remote) = worker.remote.as_ref() {
+        let session = worker
+            .claude_session
+            .clone()
+            .unwrap_or_else(|| session_name(&worker.id));
+        let block = json!({
+            "session": session,
+            "host": remote.ssh,
+            "message": message,
+        });
+        let mut reported = worker_status_view(worker, false);
+        without_transcripts(&mut reported);
+        let output = serde_json::to_string(&json!({
+            "action": action,
+            "result": {"worker": reported, "continue_session": block},
+        }))
+        .unwrap_or_else(|_| action.to_string());
+        let how = format!(
+            "Continue {id}'s Claude Code session on host {node} with SendMessage to {session}, sending the message below; Mnemo finishes the worker when the session ends its turn.",
+            id = worker.id,
+            node = remote.node_name,
+        );
+        let data = serde_json::to_value(worker).unwrap_or(Value::Null);
+        return ToolResult::success(format!("{output}\n{how}\n\n{message}"))
+            .with_data(json!({"worker": data, "continue_session": block}));
+    }
     // A message for a new agent carries the launch token on its first line.
     let message = with_launch_token(message, token);
     let block = json!({

@@ -17748,6 +17748,7 @@ async fn a_lead_team_agent_done_before_the_watcher_leaves_nothing_to_finish() {
         agent_id: "a1b2c3".into(),
         turns: 0,
         transcript: Some(transcript.to_string_lossy().into_owned()),
+        report: None,
     };
     team.agent_done("agentWatch15", "the lead's report".into(), false)
         .await
@@ -21551,4 +21552,764 @@ async fn pinned_agent_prepare_failure_retry_stays_an_agent() {
         team.live.lock().await.is_empty(),
         "no Mnemo session started for an agent tier"
     );
+}
+
+// --- Remote agent workers: follow, finish, continue and hand back (plan
+// 5e64ccd5 step 5) ---------------------------------------------------------
+
+/// A rig whose node serves the Claude session watch over its own projects
+/// folder, its team with node-a linked to the SSH connection `studio-ssh`, and
+/// remote agent workers dispatched there with [`dispatch_remote_session`].
+struct RemoteSessionRig {
+    team: std::sync::Arc<TeamRuntime>,
+    plan_id: String,
+    projects: tempfile::TempDir,
+    _plans: tempfile::TempDir,
+    _rig: Rig,
+}
+
+async fn remote_session_rig() -> RemoteSessionRig {
+    use super::claude_node::{ClaudeNodeExtension, MnemoNodeExtension};
+
+    let projects = tempfile::tempdir().expect("the node's projects folder");
+    let extension = std::sync::Arc::new(MnemoNodeExtension {
+        claude: ClaudeNodeExtension::with_projects_root(projects.path().to_path_buf()),
+    });
+    let rig = Rig::start_with_extension(extension).await;
+    let (team, plan_id, plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+    RemoteSessionRig {
+        team,
+        plan_id,
+        projects,
+        _plans: plans,
+        _rig: rig,
+    }
+}
+
+/// Dispatch one agent-tier worker onto node-a; returns its record.
+async fn dispatch_remote_session(fixture: &RemoteSessionRig, worker_id: &str) -> WorkerRecord {
+    let answer = fixture
+        .team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&fixture.plan_id, worker_id),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let record = fixture.team.worker(worker_id).await.expect("the worker record");
+    assert!(record.remote.is_some(), "the worker runs on the host");
+    assert!(record.claude_agent.is_some(), "the worker runs as a Claude Code agent");
+    record
+}
+
+/// The node transcript of `session` for `worker`, in the projects folder
+/// Claude Code names after the worker's node checkout.
+fn remote_session_path(fixture: &RemoteSessionRig, worker: &WorkerRecord, session: &str) -> std::path::PathBuf {
+    let checkout = &worker.remote.as_ref().expect("a remote worker").path;
+    let slug: String = checkout
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let folder = fixture.projects.path().join(slug);
+    std::fs::create_dir_all(&folder).expect("the session folder");
+    folder.join(format!("{session}.jsonl"))
+}
+
+/// The session's prompt record: the marker the node finds the worker by.
+fn remote_prompt_record(worker: &WorkerRecord) -> String {
+    json!({"type": "user", "message": {"role": "user", "content": format!(
+        "Mnemo worker {} on branch {}: this Claude Code session runs on host node-a; Mnemo follows its transcript.\n\nDo the step.",
+        worker.id, worker.branch
+    )}})
+    .to_string()
+}
+
+fn remote_text_record(text: &str) -> String {
+    json!({"type": "assistant", "message": {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+    }})
+    .to_string()
+}
+
+fn remote_tool_record() -> String {
+    json!({"type": "assistant", "message": {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 40, "output_tokens": 2},
+    }})
+    .to_string()
+}
+
+fn remote_user_record(text: &str) -> String {
+    json!({"type": "user", "message": {"role": "user", "content": text}}).to_string()
+}
+
+/// Write `lines` as a whole transcript.
+fn write_remote_session(path: &std::path::Path, lines: &[String]) {
+    let mut body = lines.join("\n");
+    body.push('\n');
+    std::fs::write(path, body).expect("the session transcript");
+}
+
+/// Back-date a transcript's last write by `by`.
+fn age_remote_session(path: &std::path::Path, by: std::time::Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open the transcript")
+        .set_modified(std::time::SystemTime::now() - by)
+        .expect("set the transcript's time");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_session_is_discovered_and_registered() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    let worker = dispatch_remote_session(&fixture, "rwatch01").await;
+    // Dispatched a while ago: an older session of the worker is still its.
+    team.update_worker("rwatch01", |record| {
+        record.created_at_ms = record.created_at_ms.saturating_sub(60_000)
+    })
+    .await;
+    let older = remote_session_path(&fixture, &worker, "session-older");
+    write_remote_session(&older, &[remote_prompt_record(&worker), remote_tool_record()]);
+    age_remote_session(&older, std::time::Duration::from_secs(10));
+    let newer = remote_session_path(&fixture, &worker, "session-newer");
+    write_remote_session(&newer, &[remote_prompt_record(&worker), remote_tool_record()]);
+    let mut notices = team.subscribe_board();
+
+    team.watch_agents_now().await;
+
+    let record = team.worker("rwatch01").await.expect("the worker");
+    assert_eq!(record.claude_agent_id.as_deref(), Some("session-newer"));
+    assert!(
+        record
+            .claude_agent_transcript
+            .as_deref()
+            .is_some_and(|path| path.ends_with("session-newer.jsonl")),
+        "the host's transcript path is recorded: {:?}",
+        record.claude_agent_transcript
+    );
+    assert_eq!(record.status, WorkerStatus::Working);
+    assert!(record.claude_session.is_none(), "the lead has not reported a session");
+    let sent = count_notices(&mut notices, "More than one Claude Code session");
+    assert_eq!(
+        sent,
+        vec!["worker_id=rwatch01\nMore than one Claude Code session on host node-a names rwatch01; Mnemo follows the newest.".to_string()]
+    );
+    let agent = status_agent(team, "rwatch01").await;
+    assert_eq!(agent["id"], "session-newer");
+    assert_eq!(agent["tool_calls"], 1);
+    assert_eq!(agent["tokens"], 42);
+    assert_eq!(agent["finished"], false);
+
+    // A later pass names the session: no second notice.
+    team.watch_agents_now().await;
+    assert!(count_notices(&mut notices, "More than one Claude Code session").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_turn_end_finishes_with_last_text() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    let worker = dispatch_remote_session(&fixture, "rfinish01").await;
+    let path = remote_session_path(&fixture, &worker, "session-done");
+    write_remote_session(
+        &path,
+        &[
+            remote_prompt_record(&worker),
+            remote_tool_record(),
+            remote_text_record("Done on the host: commit abc123."),
+        ],
+    );
+    team.drain_external_notices();
+
+    team.watch_agents_now().await;
+
+    let record = team.worker("rfinish01").await.expect("the worker");
+    assert_eq!(record.status, WorkerStatus::Completed);
+    assert_eq!(record.report.as_deref(), Some("Done on the host: commit abc123."));
+    assert_eq!(record.turns, 1);
+    let notices = team.drain_external_notices();
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice.contains("Done on the host: commit abc123.")),
+        "the finished notice quotes the session's last text: {notices:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_stall_notice_after_silence() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    let worker = dispatch_remote_session(&fixture, "rstall01").await;
+    // The session's last word is a tool call: it never counts as ended, so
+    // silence is a stall (the pinned clock is the back-dated transcript).
+    let path = remote_session_path(&fixture, &worker, "session-stall");
+    write_remote_session(&path, &[remote_prompt_record(&worker), remote_tool_record()]);
+    let mut notices = team.subscribe_board();
+    team.watch_agents_now().await;
+    assert!(count_notices(&mut notices, "has written nothing").is_empty());
+    assert_eq!(status_agent(team, "rstall01").await["stalled"], false);
+
+    age_remote_session(&path, std::time::Duration::from_secs(11 * 60));
+    team.watch_agents_now().await;
+    team.watch_agents_now().await;
+    let sent = count_notices(&mut notices, "has written nothing");
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].contains("rstall01's Claude Code agent has written nothing for 11 minutes"),
+        "{}",
+        sent[0]
+    );
+    assert_eq!(status_agent(team, "rstall01").await["stalled"], true);
+
+    // A host that is away is offline, not silent.
+    team.update_worker("rstall01", |record| {
+        if let Some(remote) = record.remote.as_mut() {
+            remote.offline_since_ms = Some(unix_ms());
+        }
+    })
+    .await;
+    assert_eq!(status_agent(team, "rstall01").await["stalled"], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_continue_block_names_session() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "rcontinue01").await;
+
+    // Before the lead reports the session, the block names the session name
+    // its start used.
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "rcontinue01", "text": "Also cover the edge case."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let block = &answer.data.as_ref().expect("the answer data")["continue_session"];
+    assert_eq!(block["session"], "mnemo-rcontinue01");
+    assert_eq!(block["host"], "studio-ssh");
+    assert_eq!(block["message"], "Also cover the edge case.");
+
+    let started = team
+        .handle_lead_host_tool_from(
+            "team_agent_started",
+            json!({"worker_id": "rcontinue01", "agent_id": "local_sess42"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(started.success, "{}", started.output);
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "rcontinue01", "text": "Run the tests again."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    let data = answer.data.as_ref().expect("the answer data");
+    assert!(data["continue_agent"].is_null(), "no local continue block: {data}");
+    let block = &data["continue_session"];
+    assert_eq!(block["session"], "local_sess42");
+    assert_eq!(block["host"], "studio-ssh");
+    assert_eq!(block["message"], "Run the tests again.");
+    let result: Value =
+        serde_json::from_str(answer.output.lines().next().expect("the JSON line")).expect("json");
+    assert_eq!(result["result"]["continue_session"], *block);
+    assert!(
+        answer.output.contains("Continue rcontinue01's Claude Code session on host node-a with SendMessage to local_sess42, sending the message below; Mnemo finishes the worker when the session ends its turn."),
+        "{}",
+        answer.output
+    );
+    assert!(!answer.output.contains("launch token"), "{}", answer.output);
+    let record = team.worker("rcontinue01").await.expect("the worker");
+    assert!(record.launch_token.is_none(), "a remote session never gets a launch token");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_team_agent_started_records_session_handle() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    let worker = dispatch_remote_session(&fixture, "rstarted01").await;
+
+    let bad = team
+        .handle_lead_host_tool_from(
+            "team_agent_started",
+            json!({"worker_id": "rstarted01", "agent_id": "not a session!"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!bad.success);
+    assert!(bad.output.contains("team_agent_started requires the agent's id"), "{}", bad.output);
+
+    let started = team
+        .handle_lead_host_tool_from(
+            "team_agent_started",
+            json!({"worker_id": "rstarted01", "agent_id": "sess-a"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(started.success, "{}", started.output);
+    assert_eq!(
+        started.output,
+        "Registered Claude Code session sess-a for rstarted01; Mnemo follows its transcript on host node-a."
+    );
+    let record = team.worker("rstarted01").await.expect("the worker");
+    assert_eq!(record.claude_session.as_deref(), Some("sess-a"));
+    assert!(record.claude_agent_id.is_none(), "the watcher finds the transcript");
+    assert!(record.claude_agent_transcript.is_none());
+
+    // The watcher finds the session's transcript on the host.
+    let path = remote_session_path(&fixture, &worker, "transcript-a");
+    write_remote_session(&path, &[remote_prompt_record(&worker), remote_tool_record()]);
+    team.watch_agents_now().await;
+    let record = team.worker("rstarted01").await.expect("the worker");
+    assert_eq!(record.claude_agent_id.as_deref(), Some("transcript-a"));
+    assert_eq!(record.claude_session.as_deref(), Some("sess-a"));
+
+    // The same session again changes nothing.
+    let again = team
+        .handle_lead_host_tool_from(
+            "team_agent_started",
+            json!({"worker_id": "rstarted01", "agent_id": "sess-a"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(again.success, "{}", again.output);
+    assert_eq!(
+        team.worker("rstarted01").await.expect("the worker").claude_agent_id.as_deref(),
+        Some("transcript-a")
+    );
+
+    // Another session starts the following over.
+    let other = team
+        .handle_lead_host_tool_from(
+            "team_agent_started",
+            json!({"worker_id": "rstarted01", "agent_id": "sess-b"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(other.success, "{}", other.output);
+    let record = team.worker("rstarted01").await.expect("the worker");
+    assert_eq!(record.claude_session.as_deref(), Some("sess-b"));
+    assert!(record.claude_agent_id.is_none());
+    assert!(record.claude_agent_transcript.is_none());
+    assert!(team.agent_watch.remote_seen("rstarted01").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_continue_does_not_finish_on_the_old_turn_end() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    let worker = dispatch_remote_session(&fixture, "rturnid01").await;
+    let path = remote_session_path(&fixture, &worker, "session-turns");
+    let mut lines = vec![remote_prompt_record(&worker), remote_text_record("First run done.")];
+    write_remote_session(&path, &lines);
+    team.watch_agents_now().await;
+    let record = team.worker("rturnid01").await.expect("the worker");
+    assert_eq!(record.status, WorkerStatus::Completed);
+    assert_eq!(record.report.as_deref(), Some("First run done."));
+
+    // The lead continues the session; the host still reports the old turn end
+    // until the lead's message lands.
+    let answer = team
+        .handle_lead_host_tool_from(
+            "team_message",
+            json!({"worker_id": "rturnid01", "text": "Fix the review finding."}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(answer.success, "{}", answer.output);
+    assert_eq!(
+        team.worker("rturnid01").await.expect("the worker").status,
+        WorkerStatus::Working
+    );
+    team.watch_agents_now().await;
+    let record = team.worker("rturnid01").await.expect("the worker");
+    assert_eq!(
+        record.status,
+        WorkerStatus::Working,
+        "the previous turn's end is not this run's"
+    );
+    assert_eq!(record.turns, 1);
+
+    // The continued turn ends.
+    lines.push(remote_user_record("Fix the review finding."));
+    lines.push(remote_text_record("Second run done."));
+    write_remote_session(&path, &lines);
+    team.watch_agents_now().await;
+    let record = team.worker("rturnid01").await.expect("the worker");
+    assert_eq!(record.status, WorkerStatus::Completed);
+    assert_eq!(record.report.as_deref(), Some("Second run done."));
+    assert_eq!(record.turns, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_hand_back_checks_node_dirty() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    let never = dispatch_remote_session(&fixture, "rhandone").await;
+    dispatch_remote_session(&fixture, "rhandtwo").await;
+    // rhand02's session was started and reported, but not found yet.
+    let started = team
+        .handle_lead_host_tool_from(
+            "team_agent_started",
+            json!({"worker_id": "rhandtwo", "agent_id": "sess-running"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(started.success, "{}", started.output);
+    // The node checkout holds uncommitted work; the hub's shadow does not.
+    let node_checkout = std::path::PathBuf::from(&never.remote.as_ref().expect("remote").path);
+    std::fs::write(node_checkout.join("left-behind.txt"), "uncommitted\n").expect("write");
+    assert!(team.worker_checkout_dirty(&never).await);
+    assert!(!super::agent_watch::checkout_dirty(&never.worktree).await, "the shadow is clean");
+
+    set_hand_back_grace(team, 0);
+    assert!(team.detach_external_lead());
+    // Before the host answered, nothing goes back.
+    assert!(team.hand_back_agent_workers().await.expect("no error").is_empty());
+
+    team.watch_agents_now().await;
+
+    let handed = team.worker("rhandone").await.expect("the worker");
+    assert_eq!(handed.status, WorkerStatus::Interrupted);
+    assert!(handed.claude_agent.is_none());
+    assert!(handed.remote.is_some(), "the record still names its host");
+    let notices = handed_back_notices(team, "rhandone");
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("has uncommitted changes"), "{}", notices[0]);
+    let named = format!("Its checkout {} on host node-a has", node_checkout.display());
+    assert!(notices[0].contains(&named), "{}", notices[0]);
+
+    let kept = team.worker("rhandtwo").await.expect("the worker");
+    assert_eq!(kept.status, WorkerStatus::Working, "a reported session may be writing");
+    assert_eq!(kept.claude_agent.as_deref(), Some("opus"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_agent_resume_local_gives_claude_agent_block() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "rlocal01").await;
+    dispatch_remote_session(&fixture, "rlocal02").await;
+
+    // A registered session may still write the node checkout.
+    let started = team
+        .handle_lead_host_tool_from(
+            "team_agent_started",
+            json!({"worker_id": "rlocal02", "agent_id": "sess-busy"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(started.success, "{}", started.output);
+    let refused = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "rlocal02", "host": "local"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!refused.success);
+    assert_eq!(
+        refused.output,
+        "worker 'rlocal02' has a Claude Code session on host 'node-a'; stop it, mark the run with team_agent_done, then resume with host \"local\"."
+    );
+
+    // A tier with host "local" is refused: the move keeps the worker as it is.
+    let refused = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "rlocal01", "host": "local", "tier": "high"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!refused.success);
+    assert_eq!(
+        refused.output,
+        "team_resume with host \"local\" moves the worker here unchanged; resume it here first, then change its tier."
+    );
+    assert!(team.worker("rlocal01").await.expect("the worker").remote.is_some());
+
+    let moved = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "rlocal01", "host": "local"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(moved.success, "{}", moved.output);
+    let record = team.worker("rlocal01").await.expect("the worker");
+    assert!(record.remote.is_none(), "the worker runs here now");
+    assert_eq!(record.status, WorkerStatus::Working);
+    assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+    let token = record.launch_token.clone().expect("a fresh launch token");
+    let block = &moved.data.as_ref().expect("the answer data")["claude_agent"];
+    assert_eq!(block["isolation"], "worktree");
+    assert_eq!(block["branch"], record.branch);
+    let prompt = block["prompt"].as_str().expect("the prompt");
+    assert!(prompt.starts_with("Mnemo launch token: "), "{prompt}");
+    assert!(prompt.contains(&token), "{prompt}");
+    assert!(super::agent_watch::waits_for_local_agent(&record));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_handoff_without_ssh_link_is_refused() {
+    let rig = Rig::start().await;
+    let (team, _plan_id, _plans) = remote_agent_team(&rig).await;
+    let (mut record, _remote, _tip) = rig.worker_on_node("rhandoff01", false).await;
+    record.status = WorkerStatus::Interrupted;
+    record.model = Some("test/scripted-average".into());
+    record.tier = Some("medium".into());
+    team.records.lock().await.push(record);
+    team.persist().await.expect("persist the remote worker");
+
+    let refused = {
+        let _guard = team.merge_lock.lock().await;
+        team.hand_to_agent_locked("rhandoff01", "high", ChangeSource::Lead)
+            .await
+            .err()
+            .expect("the hand-off is refused")
+    };
+    assert_eq!(
+        refused,
+        "host 'node-a' has no SSH connection linked; team_resume with host \"local\" first or link the host with team_hosts"
+    );
+    let record = team.worker("rhandoff01").await.expect("the worker");
+    assert!(record.claude_agent.is_none(), "nothing changed");
+    assert!(record.launch_token.is_none());
+    assert_eq!(record.status, WorkerStatus::Interrupted);
+    assert!(record.remote.as_ref().is_some_and(|remote| remote.ssh.is_none()));
+    let blocked = team.agent_handoff_blocked(&record).await;
+    assert_eq!(blocked.as_deref(), Some(refused.as_str()), "escalation folds onto a model");
+
+    // Linked, the hand-off answers the session block with the host's
+    // connection and no launch token.
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+    let handed = {
+        let _guard = team.merge_lock.lock().await;
+        team.hand_to_agent_locked("rhandoff01", "high", ChangeSource::Lead)
+            .await
+            .expect("no error")
+            .expect("a hand-off")
+    };
+    assert!(handed.claude_agent.is_none());
+    let block = handed.claude_session.as_ref().expect("the session block");
+    assert_eq!(block["host"], "studio-ssh");
+    let prompt = block["prompt"].as_str().expect("the prompt");
+    assert!(prompt.starts_with("Mnemo worker rhandoff01 on branch "), "{prompt}");
+    assert!(prompt.contains("already worked on this step in this checkout"), "{prompt}");
+    let record = team.worker("rhandoff01").await.expect("the worker");
+    assert_eq!(record.claude_agent.as_deref(), Some("opus"));
+    assert!(record.launch_token.is_none());
+    assert_eq!(
+        record.remote.as_ref().and_then(|remote| remote.ssh.as_deref()),
+        Some("studio-ssh")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_refusal_retry_hint_covers_both_refusals() {
+    let rig = Rig::start().await;
+    let team = rig.team().await;
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut waiting = worker(scratch.path(), "hintwait01");
+    waiting.claude_agent = Some("opus".into());
+    waiting.status = WorkerStatus::Working;
+    team.records.lock().await.push(waiting);
+    let waiting_refusal = team
+        .agent_launch_refusal_for(None, false)
+        .await
+        .expect("the waiting worker refuses a local launch");
+    assert_eq!(
+        super::agent_watch::agent_refusal_retry_hint(&waiting_refusal),
+        "retry with the same worker ID once the waiting worker is launched"
+    );
+    for index in 0..super::agent_watch::AGENT_WORKER_CAP {
+        let mut running = worker(scratch.path(), &format!("hintrun{index:02}"));
+        running.claude_agent = Some("opus".into());
+        running.claude_agent_id = Some(format!("agent-{index}"));
+        running.status = WorkerStatus::Working;
+        team.records.lock().await.push(running);
+    }
+    // A remote start skips the waiting check: the cap refuses it.
+    let cap_refusal = team
+        .agent_launch_refusal_for(None, true)
+        .await
+        .expect("the cap refuses");
+    assert_eq!(
+        super::agent_watch::agent_refusal_retry_hint(&cap_refusal),
+        "retry with the same worker ID when an agent worker finishes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handoff_after_unlink_is_refused() {
+    let rig = Rig::start().await;
+    let (team, _plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+    // The checkout still carries the connection it was placed with.
+    let (mut record, _remote, _tip) = rig.worker_on_node("unlinkho1", false).await;
+    record.status = WorkerStatus::Interrupted;
+    record.model = Some("test/scripted-average".into());
+    record.tier = Some("medium".into());
+    if let Some(remote) = record.remote.as_mut() {
+        remote.ssh = Some("studio-ssh".into());
+    }
+    team.records.lock().await.push(record);
+    team.persist().await.expect("persist the remote worker");
+    // The user withdraws the approval.
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+
+    let refused = {
+        let _guard = team.merge_lock.lock().await;
+        team.hand_to_agent_locked("unlinkho1", "high", ChangeSource::Lead)
+            .await
+            .err()
+            .expect("the hand-off is refused")
+    };
+    assert_eq!(
+        refused,
+        "host 'node-a' has no SSH connection linked; team_resume with host \"local\" first or link the host with team_hosts"
+    );
+    let record = team.worker("unlinkho1").await.expect("the worker");
+    assert!(record.claude_agent.is_none(), "nothing changed");
+    assert!(record.launch_token.is_none());
+    assert_eq!(record.status, WorkerStatus::Interrupted);
+    assert!(team.agent_handoff_blocked(&record).await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reused_dispatch_after_unlink_gives_no_session_block() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "reuseunl1").await;
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+
+    let again = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&fixture.plan_id, "reuseunl1"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(again.success, "{}", again.output);
+    let answer: Value =
+        serde_json::from_str(again.output.lines().next().expect("the JSON line")).expect("json");
+    assert_eq!(answer["result"]["reused"], true, "{answer}");
+    assert!(answer["result"].get("claude_session").is_none(), "{answer}");
+    assert!(answer["result"]["claude_agent"].is_null(), "{answer}");
+    let data = again.data.as_ref().expect("the answer data");
+    assert!(data.get("claude_session").is_none(), "{data}");
+    assert!(!again.output.contains("call start_session"), "{}", again.output);
+    assert!(
+        again.output.contains("host 'node-a' is no longer linked to an SSH connection; team_resume with host \"local\" moves the worker here, or link the host again"),
+        "{}",
+        again.output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relocate_local_refuses_while_another_local_agent_waits() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "relocwt01").await;
+    // A local agent worker waits for its launch: the one WorktreeCreate hook
+    // could not tell two waiting checkouts apart.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut waiting = worker(scratch.path(), "waitlocal1");
+    waiting.claude_agent = Some("opus".into());
+    waiting.status = WorkerStatus::Working;
+    team.records.lock().await.push(waiting);
+    let expected = team
+        .agent_launch_refusal_for(Some("relocwt01"), false)
+        .await
+        .expect("the waiting worker refuses a local launch");
+
+    let refused = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "relocwt01", "host": "local"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!refused.success);
+    assert_eq!(refused.output, expected);
+    let record = team.worker("relocwt01").await.expect("the worker");
+    assert!(record.remote.is_some(), "the worker stays on its host");
+    assert!(record.launch_token.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reused_dispatch_after_relink_names_the_live_connection() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "relinkre1").await;
+    // The user moves the approval from studio-ssh to another connection.
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+    let relinked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "office-ssh"}),
+        )
+        .await;
+    assert!(relinked.success, "{}", relinked.output);
+
+    let again = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&fixture.plan_id, "relinkre1"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(again.success, "{}", again.output);
+    let answer: Value =
+        serde_json::from_str(again.output.lines().next().expect("the JSON line")).expect("json");
+    assert_eq!(answer["result"]["reused"], true, "{answer}");
+    assert_eq!(answer["result"]["claude_session"]["host"], "office-ssh", "{answer}");
+    let data = again.data.as_ref().expect("the answer data");
+    assert_eq!(data["claude_session"]["host"], "office-ssh", "{data}");
+    assert!(
+        again.output.contains("over SSH connection 'office-ssh'"),
+        "{}",
+        again.output
+    );
+    assert!(!again.output.contains("studio-ssh"), "{}", again.output);
 }

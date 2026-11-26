@@ -11,6 +11,7 @@
   import { createSettingsTransport, emptyTiers, type EndpointDetailDto, type TiersDto } from "../lib/settingsEngine";
   import { errorText } from "../lib/settingsState";
   import { createSpecsTransport } from "../lib/specsSettings";
+  import { createWorkerHostsTransport } from "../lib/workerHosts";
   import { provideUnsavedRegistry } from "../lib/unsavedEdits";
   import AboutPage from "./AboutPage.svelte";
   import AppearancePage from "./AppearancePage.svelte";
@@ -26,6 +27,7 @@
   import Sheet from "./Sheet.svelte";
   import SpecsPage from "./SpecsPage.svelte";
   import TiersPage from "./TiersPage.svelte";
+  import WorkerHostsPage from "./WorkerHostsPage.svelte";
 
   type Page =
     | "project"
@@ -35,6 +37,7 @@
     | "models"
     | "savings"
     | "machine"
+    | "hosts"
     | "safety"
     | "mcp"
     | "claude"
@@ -56,6 +59,7 @@
         { id: "models", label: "Models" },
         { id: "savings", label: "Savings" },
         { id: "machine", label: "Machine" },
+        { id: "hosts", label: "Worker hosts" },
         { id: "safety", label: "Safety" },
         { id: "mcp", label: "MCP" },
         { id: "claude", label: "Claude Code" },
@@ -150,6 +154,7 @@
   const claudeTransport = $derived(open ? createClaudeCodeTransport() : null);
   const appearanceTransport = $derived(open ? createAppearanceTransport() : null);
   const specsTransport = $derived(open ? createSpecsTransport() : null);
+  const hostsTransport = $derived(open ? createWorkerHostsTransport() : null);
   // About talks to the shell directly, so it is ready whether or not the
   // settings load succeeded — unlike the pages above it never gates on `open`.
   const aboutTransport = createAboutTransport();
@@ -249,6 +254,12 @@
             <ClaudeCodePage transport={claudeTransport} />
           {:else}
             <p class="settings-empty">Claude Code setup is available in the desktop app.</p>
+          {/if}
+        {:else if page === "hosts"}
+          {#if hostsTransport}
+            <WorkerHostsPage transport={hostsTransport} />
+          {:else}
+            <p class="settings-empty">Worker hosts are available in the desktop app.</p>
           {/if}
         {:else if page === "appearance"}
           {#if appearanceTransport}

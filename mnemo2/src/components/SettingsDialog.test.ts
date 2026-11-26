@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   safetyTransport: null as unknown,
   mcpTransport: null as unknown,
   claudeTransport: null as unknown,
+  hostsTransport: null as unknown,
   specsTransport: null as unknown,
   aboutTransport: null as unknown,
 }));
@@ -48,6 +49,11 @@ vi.mock("../lib/mcpSettings", async (importOriginal) => {
 vi.mock("../lib/claudeCode", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/claudeCode")>();
   return { ...original, createClaudeCodeTransport: () => mocks.claudeTransport };
+});
+
+vi.mock("../lib/workerHosts", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../lib/workerHosts")>();
+  return { ...original, createWorkerHostsTransport: () => mocks.hostsTransport };
 });
 
 vi.mock("../lib/specsSettings", async (importOriginal) => {
@@ -244,6 +250,7 @@ describe("SettingsDialog", () => {
     mocks.safetyTransport = null;
     mocks.mcpTransport = null;
     mocks.claudeTransport = null;
+    mocks.hostsTransport = null;
     mocks.specsTransport = null;
     mocks.aboutTransport = null;
     app.set(fixtureState());
@@ -635,6 +642,22 @@ describe("SettingsDialog", () => {
     const connect = screen.getByRole("button", { name: "Connect Claude Code" }) as HTMLButtonElement;
     expect(connect.disabled).toBe(false);
   });
+  it("opens the Worker hosts page from the rail", async () => {
+    makeTransport();
+    mocks.hostsTransport = {
+      list: vi.fn(async () => ({ hub: { listening: true, address: "127.0.0.1:1" }, hosts: [] })),
+      pair: vi.fn(),
+      revoke: vi.fn(),
+      link: vi.fn(),
+      unlink: vi.fn(),
+    };
+    await openDialog();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Worker hosts" }));
+
+    expect(await screen.findByRole("region", { name: "Worker hosts" })).toBeTruthy();
+    expect(await screen.findByText("No worker hosts yet.")).toBeTruthy();
+  });
 });
 
 /**
@@ -649,6 +672,7 @@ describe("unsaved edits", () => {
     mocks.safetyTransport = null;
     mocks.mcpTransport = null;
     mocks.claudeTransport = null;
+    mocks.hostsTransport = null;
     mocks.specsTransport = null;
     mocks.aboutTransport = null;
     app.set(fixtureState());

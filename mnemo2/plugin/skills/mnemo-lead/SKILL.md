@@ -81,7 +81,7 @@ Passing `model` always means a Mnemo worker: `team_dispatch` starts one on it, a
 
 ### Agent tiers on a worker host
 
-When a host is linked to an SSH connection (`team_hosts` action `link`, with the connection name from `list_start_targets`), an agent-tier worker may run there. An answer that carries a `claude_session` block instead of `claude_agent` (from `team_dispatch`, `team_resume`, or an escalation onto an agent tier) means: start that session. Linking the host was the user's approval for Claude workers on that connection, so do not ask again:
+When a host is linked to an SSH connection (`team_hosts` action `link`, with the connection name from `list_start_targets`), an agent-tier worker may run there. An answer that carries a `claude_session` block instead of `claude_agent` (from `team_dispatch`, `team_resume`, or an escalation onto an agent tier) means: start that session. The user can also pair, link and revoke hosts in Settings → Worker hosts. Linking the host was the user's approval for Claude workers on that connection, so do not ask again:
 
 1. Call `start_session` with every field of the block unchanged (`target` "ssh", `host`, `cwd`, `use_worktree` false, `context` "fresh", `initiation` "user_asked", `name`, `title`, `model`, `effort`, `background`, `prompt`, `wake_when_done` true).
 2. Call `team_agent_started` with the `worker_id` and the session id `start_session` returned.

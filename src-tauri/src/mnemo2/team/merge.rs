@@ -501,6 +501,13 @@ impl TeamRuntime {
             worker.status = WorkerStatus::Merged;
             worker.merge = Some(record);
             worker.error = None;
+            // A merged worker is finished: its host is no longer away from a
+            // turn that would resume, so the away mark goes with the merge.
+            // The rest of the remote record stays for history and display
+            // (plan e8cb5112, step 2).
+            if let Some(remote) = worker.remote.as_mut() {
+                remote.offline_since_ms = None;
+            }
         })
         .await;
         self.persist().await?;

@@ -356,13 +356,30 @@ impl TeamRuntime {
         name: Option<&str>,
         ssh: Option<&str>,
     ) -> ToolResult {
+        match self.hosts_action(action, name, ssh).await {
+            Ok(value) => {
+                ToolResult::success(serde_json::to_string_pretty(&value).unwrap_or_default())
+            }
+            Err(error) => ToolResult::error(error),
+        }
+    }
+
+    /// The one implementation behind the `team_hosts` tool and the app's
+    /// worker-host commands: run `action` and return its JSON object, or the
+    /// error text.
+    pub async fn hosts_action(
+        &self,
+        action: &str,
+        name: Option<&str>,
+        ssh: Option<&str>,
+    ) -> Result<Value, String> {
         let Some(hosts) = self
             .hosts
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
         else {
-            return ToolResult::error("worker hosts are not available in this window");
+            return Err("worker hosts are not available in this window".to_string());
         };
         match action {
             "list" => self.team_hosts_list(&hosts).await,
@@ -370,8 +387,9 @@ impl TeamRuntime {
             "revoke" => self.team_hosts_revoke(&hosts, name).await,
             "link" => self.team_hosts_link(name, ssh),
             "unlink" => self.team_hosts_unlink(name),
-            _ => ToolResult::error(
-                "team_hosts requires 'action' to be list, pair, revoke, link, or unlink",
+            _ => Err(
+                "team_hosts requires 'action' to be list, pair, revoke, link, or unlink"
+                    .to_string(),
             ),
         }
     }
@@ -392,51 +410,46 @@ impl TeamRuntime {
 
     /// `team_hosts link`: tie a host to the saved SSH connection the lead
     /// starts Claude Code sessions on.
-    fn team_hosts_link(&self, name: Option<&str>, ssh: Option<&str>) -> ToolResult {
+    fn team_hosts_link(&self, name: Option<&str>, ssh: Option<&str>) -> Result<Value, String> {
         let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
-            return ToolResult::error("team_hosts link requires 'name' (the host's name or id)");
+            return Err("team_hosts link requires 'name' (the host's name or id)".to_string());
         };
         if !valid_host_name(name) {
-            return ToolResult::error(HOST_NAME_REFUSAL);
+            return Err(HOST_NAME_REFUSAL.to_string());
         }
         let Some(ssh) = ssh
             .map(str::trim)
             .filter(|ssh| (1..=100).contains(&ssh.chars().count()))
             .filter(|ssh| !ssh.chars().any(char::is_control))
         else {
-            return ToolResult::error(
-                "team_hosts link requires 'ssh': the SSH connection's name (1-100 characters)",
+            return Err(
+                "team_hosts link requires 'ssh': the SSH connection's name (1-100 characters)"
+                    .to_string(),
             );
         };
         match self.set_host_ssh(name, Some(ssh)) {
-            Ok(record) => ToolResult::success(
-                serde_json::to_string_pretty(&json!({
+            Ok(record) => Ok(json!({
                     "action": "team_hosts",
                     "linked": {"name": record.name, "node_id": record.node_id, "ssh": record.ssh},
-                }))
-                .unwrap_or_default(),
-            ),
-            Err(error) => ToolResult::error(format!("could not link host '{name}': {error}")),
+                })),
+            Err(error) => Err(format!("could not link host '{name}': {error}")),
         }
     }
 
     /// `team_hosts unlink`: drop a host's SSH connection.
-    fn team_hosts_unlink(&self, name: Option<&str>) -> ToolResult {
+    fn team_hosts_unlink(&self, name: Option<&str>) -> Result<Value, String> {
         let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
-            return ToolResult::error("team_hosts unlink requires 'name' (the host's name or id)");
+            return Err("team_hosts unlink requires 'name' (the host's name or id)".to_string());
         };
         if !valid_host_name(name) {
-            return ToolResult::error(HOST_NAME_REFUSAL);
+            return Err(HOST_NAME_REFUSAL.to_string());
         }
         match self.set_host_ssh(name, None) {
-            Ok(record) => ToolResult::success(
-                serde_json::to_string_pretty(&json!({
+            Ok(record) => Ok(json!({
                     "action": "team_hosts",
                     "unlinked": {"name": record.name, "node_id": record.node_id, "ssh": record.ssh},
-                }))
-                .unwrap_or_default(),
-            ),
-            Err(error) => ToolResult::error(format!("could not unlink host '{name}': {error}")),
+                })),
+            Err(error) => Err(format!("could not unlink host '{name}': {error}")),
         }
     }
 
@@ -445,16 +458,13 @@ impl TeamRuntime {
     ///
     /// `slots`, `busy`, and `catalog_ready` need a live status call, so they
     /// are `null` while the host is disconnected.
-    async fn team_hosts_list(&self, hosts: &Arc<dyn HostDirectory>) -> ToolResult {
+    async fn team_hosts_list(&self, hosts: &Arc<dyn HostDirectory>) -> Result<Value, String> {
         let Some(server) = hosts.server() else {
-            return ToolResult::success(
-                serde_json::to_string_pretty(&json!({
+            return Ok(json!({
                     "action": "team_hosts",
                     "hub": {"listening": false, "address": null},
                     "hosts": [],
-                }))
-                .unwrap_or_default(),
-            );
+                }));
         };
         let commands = spawn::load_check_commands(&self.workspace_root);
         let checks = checks_hash(commands.as_slice());
@@ -520,14 +530,11 @@ impl TeamRuntime {
             }
             listed.push(entry);
         }
-        ToolResult::success(
-            serde_json::to_string_pretty(&json!({
+        Ok(json!({
                 "action": "team_hosts",
                 "hub": {"listening": true, "address": hosts.address()},
                 "hosts": listed,
             }))
-            .unwrap_or_default(),
-        )
     }
 
     /// `team_hosts pair`: a one-time code and the two commands to run on the
@@ -536,17 +543,17 @@ impl TeamRuntime {
         &self,
         hosts: &Arc<dyn HostDirectory>,
         name: Option<&str>,
-    ) -> ToolResult {
+    ) -> Result<Value, String> {
         let name = name.map(str::trim).filter(|name| !name.is_empty());
         if let Some(name) = name {
             if !valid_host_name(name) {
-                return ToolResult::error(HOST_NAME_REFUSAL);
+                return Err(HOST_NAME_REFUSAL.to_string());
             }
         }
         let offer = match hosts.pair(name).await {
             Ok(offer) => offer,
             Err(error) => {
-                return ToolResult::error(format!("could not offer a pairing code: {error}"))
+                return Err(format!("could not offer a pairing code: {error}"))
             }
         };
         let port = offer
@@ -561,8 +568,7 @@ impl TeamRuntime {
             .expires_ms
             .saturating_sub(u64::try_from(phase3::now_ms()).unwrap_or(u64::MAX))
             / 1000;
-        ToolResult::success(
-            serde_json::to_string_pretty(&json!({
+        Ok(json!({
                 "action": "team_hosts",
                 "code": offer.code,
                 "expires_in_s": expires_in_s,
@@ -578,8 +584,6 @@ impl TeamRuntime {
                     "Run both commands on the new host. This computer now accepts host connections on port {port}; allow it if a firewall prompt appears."
                 ),
             }))
-            .unwrap_or_default(),
-        )
     }
 
     /// `team_hosts revoke`: drop a host and fail its running workers with the
@@ -588,28 +592,25 @@ impl TeamRuntime {
         &self,
         hosts: &Arc<dyn HostDirectory>,
         name: Option<&str>,
-    ) -> ToolResult {
+    ) -> Result<Value, String> {
         let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
-            return ToolResult::error("team_hosts revoke requires 'name' (the host's name or id)");
+            return Err("team_hosts revoke requires 'name' (the host's name or id)".to_string());
         };
         if !valid_host_name(name) {
-            return ToolResult::error(HOST_NAME_REFUSAL);
+            return Err(HOST_NAME_REFUSAL.to_string());
         }
         let record = match hosts.revoke(name).await {
             Ok(record) => record,
             Err(error) => {
-                return ToolResult::error(format!("could not revoke host '{name}': {error}"))
+                return Err(format!("could not revoke host '{name}': {error}"))
             }
         };
         let failed_workers = self.fail_revoked_host(&record.node_id, &record.name).await;
-        ToolResult::success(
-            serde_json::to_string_pretty(&json!({
+        Ok(json!({
                 "action": "team_hosts",
                 "revoked": {"name": record.name, "node_id": record.node_id},
                 "failed_workers": failed_workers,
             }))
-            .unwrap_or_default(),
-        )
     }
 
     /// The worker's host tools: report back to the lead, and re-read the plan.

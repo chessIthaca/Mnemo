@@ -95,13 +95,14 @@ jobs:
           }
           exit $LASTEXITCODE
         working-directory: src-tauri/mnemo2-app
-      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp and
-      # the shared models host mnemo-models included; fail if that ever
-      # stops (review finding ciMissesModelsBin).
-      - name: Check the installers carry mnemo2-mcp and mnemo-models
+      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp,
+      # the shared models host mnemo-models and the worker host daemon
+      # mnemo2-node included; fail if that ever stops (review finding
+      # ciMissesModelsBin).
+      - name: Check the installers carry mnemo2-mcp, mnemo-models and mnemo2-node
         shell: pwsh
         run: |
-          foreach ($binary in 'mnemo2-mcp.exe', 'mnemo-models.exe') {
+          foreach ($binary in 'mnemo2-mcp.exe', 'mnemo-models.exe', 'mnemo2-node.exe') {
             $hits = Get-ChildItem target/release -Recurse -Include installer.nsi,main.wxs | Select-String -SimpleMatch $binary
             $files = $hits | ForEach-Object { Split-Path $_.Path -Leaf } | Sort-Object -Unique
             if (-not ($files -contains 'installer.nsi' -and $files -contains 'main.wxs')) {
@@ -265,13 +266,15 @@ jobs:
             npx tauri build --target aarch64-apple-darwin --features auto-update
           fi
         working-directory: src-tauri/mnemo2-app
-      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp and
-      # the shared models host mnemo-models included; fail if that ever
-      # stops (review finding ciMissesModelsBin).
-      - name: Check the app bundle carries mnemo2-mcp and mnemo-models
+      # Tauri bundles every [[bin]] of src-tauri/mnemo2-app, mnemo2-mcp,
+      # the shared models host mnemo-models and the worker host daemon
+      # mnemo2-node included; fail if that ever stops (review finding
+      # ciMissesModelsBin).
+      - name: Check the app bundle carries mnemo2-mcp, mnemo-models and mnemo2-node
         run: |
           test -x target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app/Contents/MacOS/mnemo2-mcp
           test -x target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app/Contents/MacOS/mnemo-models
+          test -x target/aarch64-apple-darwin/release/bundle/macos/Mnemo2.app/Contents/MacOS/mnemo2-node
       # upload-artifact@v4 does not preserve file permissions (the Mach-O
       # exec bit) or symlinks, so a raw .app would not launch after download
       # (review F2). ditto preserves both — zip the .app and upload the zip

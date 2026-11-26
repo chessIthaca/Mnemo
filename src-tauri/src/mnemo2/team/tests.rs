@@ -21811,6 +21811,8 @@ async fn remote_agent_hand_back_checks_node_dirty() {
     let notices = handed_back_notices(team, "rhandone");
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("has uncommitted changes"), "{}", notices[0]);
+    let named = format!("Its checkout {} on host node-a has", node_checkout.display());
+    assert!(notices[0].contains(&named), "{}", notices[0]);
 
     let kept = team.worker("rhandtwo").await.expect("the worker");
     assert_eq!(kept.status, WorkerStatus::Working, "a reported session may be writing");
@@ -21977,4 +21979,113 @@ async fn agent_refusal_retry_hint_covers_both_refusals() {
         super::agent_watch::agent_refusal_retry_hint(&cap_refusal),
         "retry with the same worker ID when an agent worker finishes"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handoff_after_unlink_is_refused() {
+    let rig = Rig::start().await;
+    let (team, _plan_id, _plans) = remote_agent_team(&rig).await;
+    let linked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "studio-ssh"}),
+        )
+        .await;
+    assert!(linked.success, "{}", linked.output);
+    // The checkout still carries the connection it was placed with.
+    let (mut record, _remote, _tip) = rig.worker_on_node("unlinkho1", false).await;
+    record.status = WorkerStatus::Interrupted;
+    record.model = Some("test/scripted-average".into());
+    record.tier = Some("medium".into());
+    if let Some(remote) = record.remote.as_mut() {
+        remote.ssh = Some("studio-ssh".into());
+    }
+    team.records.lock().await.push(record);
+    team.persist().await.expect("persist the remote worker");
+    // The user withdraws the approval.
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+
+    let refused = {
+        let _guard = team.merge_lock.lock().await;
+        team.hand_to_agent_locked("unlinkho1", "high", ChangeSource::Lead)
+            .await
+            .err()
+            .expect("the hand-off is refused")
+    };
+    assert_eq!(
+        refused,
+        "host 'node-a' has no SSH connection linked; team_resume with host \"local\" first or link the host with team_hosts"
+    );
+    let record = team.worker("unlinkho1").await.expect("the worker");
+    assert!(record.claude_agent.is_none(), "nothing changed");
+    assert!(record.launch_token.is_none());
+    assert_eq!(record.status, WorkerStatus::Interrupted);
+    assert!(team.agent_handoff_blocked(&record).await.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reused_dispatch_after_unlink_gives_no_session_block() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "reuseunl1").await;
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+
+    let again = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&fixture.plan_id, "reuseunl1"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(again.success, "{}", again.output);
+    let answer: Value =
+        serde_json::from_str(again.output.lines().next().expect("the JSON line")).expect("json");
+    assert_eq!(answer["result"]["reused"], true, "{answer}");
+    assert!(answer["result"].get("claude_session").is_none(), "{answer}");
+    assert!(answer["result"]["claude_agent"].is_null(), "{answer}");
+    let data = again.data.as_ref().expect("the answer data");
+    assert!(data.get("claude_session").is_none(), "{data}");
+    assert!(!again.output.contains("call start_session"), "{}", again.output);
+    assert!(
+        again.output.contains("host 'node-a' is no longer linked to an SSH connection; team_resume with host \"local\" moves the worker here, or link the host again"),
+        "{}",
+        again.output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relocate_local_refuses_while_another_local_agent_waits() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "relocwt01").await;
+    // A local agent worker waits for its launch: the one WorktreeCreate hook
+    // could not tell two waiting checkouts apart.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut waiting = worker(scratch.path(), "waitlocal1");
+    waiting.claude_agent = Some("opus".into());
+    waiting.status = WorkerStatus::Working;
+    team.records.lock().await.push(waiting);
+    let expected = team
+        .agent_launch_refusal_for(Some("relocwt01"), false)
+        .await
+        .expect("the waiting worker refuses a local launch");
+
+    let refused = team
+        .handle_lead_host_tool_from(
+            "team_resume",
+            json!({"worker_id": "relocwt01", "host": "local"}),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(!refused.success);
+    assert_eq!(refused.output, expected);
+    let record = team.worker("relocwt01").await.expect("the worker");
+    assert!(record.remote.is_some(), "the worker stays on its host");
+    assert!(record.launch_token.is_none());
 }

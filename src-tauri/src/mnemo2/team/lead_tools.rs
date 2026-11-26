@@ -278,7 +278,7 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_agent_started".to_string(),
-                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent. On a worker Mnemo handed back to its own models while you were away, and no Mnemo model has run on since, it restores the worker as an agent worker with your agent registered.".to_string(),
+                description: "Register the Claude Code agent you launched for an agent worker, right after launching it, so Mnemo follows its transcript: team_status then shows the agent's last activity, tool calls, tokens and whether it stalled or finished, and you get a notice when it goes silent for ten minutes or ends. Pass the agent's id; pass transcript_path when you know the agent's transcript file, otherwise Mnemo looks for ~/.claude/projects/*/*/subagents/agent-<agent_id>.jsonl (and keeps looking if it is not there yet). Only for a Working or Fixing agent worker; register again when you continue the step with a new agent. On a worker Mnemo handed back to its own models while you were away, and no Mnemo model has run on since, it restores the worker as an agent worker with your agent registered. For a worker on a host, agent_id is the session id start_session returned, transcript_path is ignored, and Mnemo follows the session's transcript on the host.".to_string(),
                 parameters: json!({"type":"object","properties":{
                     "worker_id":{"type":"string","description":"The agent worker the agent runs."},
                     "agent_id":{"type":"string","description":"The id of the Claude Code agent (the Agent tool's agent id)."},
@@ -735,7 +735,14 @@ impl TeamRuntime {
                     host,
                 )
                 .await;
-            return dispatch_result(
+            // A worker on a host whose link was withdrawn since it was placed
+            // (a reused or retried dispatch) gets no session block.
+            let mut result = result;
+            let unlinked = result
+                .as_mut()
+                .ok()
+                .and_then(|(worker, _, _)| self.withhold_unlinked_session(worker));
+            let mut answer = dispatch_result(
                 result,
                 "team_dispatch",
                 mode,
@@ -743,6 +750,10 @@ impl TeamRuntime {
                 explicit_model,
                 warnings,
             );
+            if let Some(text) = unlinked {
+                answer.output = format!("{}\n{text}", answer.output);
+            }
+            return answer;
         }
         if name == "team_audit_dispatch" {
             let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
@@ -1110,6 +1121,20 @@ impl TeamRuntime {
             }
         }
         answer
+    }
+
+    /// For a dispatch answer's copy of an agent worker on a host whose SSH
+    /// link is gone now: clear the copy's display connection, so the answer
+    /// carries no `claude_session` block, and return the line that says so.
+    /// The stored record is unchanged.
+    fn withhold_unlinked_session(&self, worker: &mut WorkerRecord) -> Option<String> {
+        worker.claude_agent.as_ref()?;
+        let remote = worker.remote.as_mut()?;
+        if remote.ssh.is_none() || self.live_ssh_link(&remote.node_id).is_some() {
+            return None;
+        }
+        remote.ssh = None;
+        Some(super::control::unlinked_session_text(&remote.node_name))
     }
 
     /// `team_resume`: resume the worker where it ran, on another tier, or —

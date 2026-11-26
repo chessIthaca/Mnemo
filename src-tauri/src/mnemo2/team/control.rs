@@ -82,6 +82,15 @@ impl TierResume {
     }
 }
 
+/// The answer in place of a `claude_session` block for a worker whose host is
+/// no longer linked to an SSH connection: unlinking withdrew the user's
+/// approval to start Claude workers there (plan 5e64ccd5 decision D1).
+pub(super) fn unlinked_session_text(node: &str) -> String {
+    format!(
+        "host '{node}' is no longer linked to an SSH connection; team_resume with host \"local\" moves the worker here, or link the host again"
+    )
+}
+
 /// The refusal of a Claude Code hand-off for a worker on a host whose SSH
 /// connection is not linked (plan 5e64ccd5): Mnemo cannot name where the lead
 /// starts its session.
@@ -776,23 +785,22 @@ impl TeamRuntime {
     }
 
     /// The SSH connection a hand-off of a worker on a host starts its Claude
-    /// Code session on: the one on its checkout, else the one linked to its
-    /// host. `Ok(None)` for a local worker; an error when the host has none.
+    /// Code session on: only the one linked to its host right now, since the
+    /// link is the user's standing approval and an unlink withdraws it (the
+    /// checkout's `ssh` is a display copy and never consulted). `Ok(None)` for
+    /// a local worker; an error when the host has none.
     fn handoff_ssh(&self, record: &WorkerRecord) -> Result<Option<String>, String> {
         let Some(remote) = record.remote.as_ref() else {
             return Ok(None);
         };
-        remote
-            .ssh
-            .clone()
-            .or_else(|| {
-                self.remote
-                    .host(&remote.node_id)
-                    .ok()
-                    .and_then(|node| node.ssh)
-            })
+        self.live_ssh_link(&remote.node_id)
             .map(Some)
             .ok_or_else(|| no_ssh_link_error(&remote.node_name))
+    }
+
+    /// The SSH connection the host `node_id` is linked to right now, if any.
+    pub(super) fn live_ssh_link(&self, node_id: &str) -> Option<String> {
+        self.remote.host(node_id).ok().and_then(|node| node.ssh)
     }
 
     /// Why the step of `record` cannot be handed to a Claude Code agent now,
@@ -985,6 +993,18 @@ impl TeamRuntime {
         let worker = &handed.worker;
         if let (Some(block), Some(remote)) = (&handed.claude_session, worker.remote.as_ref()) {
             let opening = lead_in.map(|text| format!("{text}\n")).unwrap_or_default();
+            // The block is only handed on while the host is still linked.
+            if self.live_ssh_link(&remote.node_id).is_none() {
+                self.notify_lead(
+                    format!("agent-handoff:{}:{}", worker.id, worker.generation),
+                    format!(
+                        "{opening}Worker {id} moved to a Claude Code agent tier: {text}.",
+                        id = worker.id,
+                        text = unlinked_session_text(&remote.node_name),
+                    ),
+                );
+                return;
+            }
             self.notify_lead(
                 format!("agent-handoff:{}:{}", worker.id, worker.generation),
                 format!(

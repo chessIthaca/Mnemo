@@ -179,8 +179,6 @@ pub(super) struct RemoteSeen {
     pub(super) turn_ended: bool,
     /// The ended turn's last assistant text: the run's report.
     pub(super) last_text: Option<String>,
-    /// When the hub got this answer.
-    pub(super) at_ms: u128,
     /// The latest call failed (the facts above are from an earlier answer):
     /// the hub cannot tell whether a session exists, so it is no reason to
     /// hand the worker back.
@@ -199,6 +197,9 @@ struct Inner {
     /// What each remote agent worker's host last said about its session, by
     /// worker id.
     remote_seen: HashMap<String, RemoteSeen>,
+    /// A pass recorded a remote session on a worker record: the runtime saves
+    /// the records after the pass.
+    discovered: bool,
     /// Tests only: run a watcher pass right after a continuation or fix
     /// round put its worker back to work, and keep the runs it found.
     #[cfg(test)]
@@ -238,6 +239,11 @@ impl AgentWatch {
     /// What the host last said about a remote agent worker's session.
     pub(super) fn remote_seen(&self, worker_id: &str) -> Option<RemoteSeen> {
         self.lock().remote_seen.get(worker_id).cloned()
+    }
+
+    /// Whether a pass recorded a remote session since the last call.
+    fn take_discovered(&self) -> bool {
+        std::mem::take(&mut self.lock().discovered)
     }
 
     /// Remember that Mnemo finished `worker`'s agent run itself; `worker` is
@@ -934,6 +940,14 @@ impl TeamRuntime {
     /// once the lead has been away for the grace period (plan ee73bd2f
     /// decision 1), so a stall alone hands nothing back.
     async fn after_agent_watch(&self, finished: &[FinishedRun]) {
+        // A session the pass found for a remote worker is saved, so a restart
+        // keeps following it (no lock is held here).
+        if self.agent_watch.take_discovered() {
+            if let Err(error) = self.persist().await {
+                eprintln!("team: could not save a remote session the watcher found: {error}");
+                self.agent_watch.lock().discovered = true;
+            }
+        }
         for run in finished {
             self.finish_agent_run(run).await;
         }
@@ -1189,7 +1203,9 @@ async fn watch_remote(
         if !current {
             continue;
         }
-        watch.lock().remote_seen.insert(
+        let mut inner = watch.lock();
+        inner.discovered |= discovered;
+        inner.remote_seen.insert(
             worker.id.clone(),
             RemoteSeen {
                 session: answer.session.clone(),
@@ -1200,10 +1216,10 @@ async fn watch_remote(
                 tokens: answer.tokens,
                 turn_ended: answer.turn_ended,
                 last_text: answer.last_text.clone(),
-                at_ms: phase3::now_ms(),
                 failed: false,
             },
         );
+        drop(inner);
         if discovered && answer.matches > 1 {
             let id = &worker.id;
             let _ = signals.send(BoardSignal::Notice {
@@ -1369,6 +1385,16 @@ impl TeamRuntime {
     }
 }
 
+/// Where a worker's checkout is, as the hand-back notices name it: the hub
+/// checkout, or for a worker on a host the node checkout and the host (whose
+/// own `git status` the dirty flag comes from).
+fn checkout_label(worker: &WorkerRecord) -> String {
+    match worker.remote.as_ref() {
+        Some(remote) => format!("{} on host {}", remote.path, remote.node_name),
+        None => worker.worktree.display().to_string(),
+    }
+}
+
 /// The ways to continue a handed-back worker, as the notices name them.
 fn handed_back_recovery(worker_id: &str) -> String {
     format!(
@@ -1387,7 +1413,7 @@ pub(super) fn handed_back_notice(worker: &WorkerRecord, dirty: bool) -> String {
     };
     format!(
         "{TEAM_NOTICE_PREFIX} worker_id={id}\n{id} was handed back from Claude Code: {HANDED_BACK_REASON}\nIts checkout {checkout} {changes}.\n{recovery}",
-        checkout = worker.worktree.display(),
+        checkout = checkout_label(worker),
         recovery = handed_back_recovery(id),
     )
 }
@@ -1399,7 +1425,7 @@ pub(super) fn handed_back_dirty_refusal(worker: &WorkerRecord) -> String {
     let id = &worker.id;
     format!(
         "worker_id={id}\n{id} was handed back from Claude Code and its checkout {checkout} has uncommitted changes, which its Claude Code agent may still be writing: Mnemo does not start a Mnemo model there, so {id} stays interrupted.\n{recovery}",
-        checkout = worker.worktree.display(),
+        checkout = checkout_label(worker),
         recovery = handed_back_recovery(id),
     )
 }
@@ -1752,7 +1778,9 @@ impl TeamRuntime {
 
 /// What the lead can do about an [`agent_launch_refusal_for`] refusal, for a
 /// dispatch that failed its worker over it: wait for the waiting worker's
-/// launch, or for a running agent worker to finish (the cap).
+/// launch, or for a running agent worker to finish (the cap). It tells them
+/// apart by the literal "is waiting for its agent", which only the waiting
+/// refusal contains.
 pub(super) fn agent_refusal_retry_hint(refusal: &str) -> &'static str {
     if refusal.contains("is waiting for its agent") {
         "retry with the same worker ID once the waiting worker is launched"

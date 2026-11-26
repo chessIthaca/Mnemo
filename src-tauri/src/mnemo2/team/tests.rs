@@ -22089,3 +22089,43 @@ async fn relocate_local_refuses_while_another_local_agent_waits() {
     assert!(record.remote.is_some(), "the worker stays on its host");
     assert!(record.launch_token.is_none());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reused_dispatch_after_relink_names_the_live_connection() {
+    let fixture = remote_session_rig().await;
+    let team = &fixture.team;
+    dispatch_remote_session(&fixture, "relinkre1").await;
+    // The user moves the approval from studio-ssh to another connection.
+    let unlinked = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "unlink", "name": "node-a"}))
+        .await;
+    assert!(unlinked.success, "{}", unlinked.output);
+    let relinked = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "office-ssh"}),
+        )
+        .await;
+    assert!(relinked.success, "{}", relinked.output);
+
+    let again = team
+        .handle_lead_host_tool_from(
+            "team_dispatch",
+            remote_agent_dispatch_args(&fixture.plan_id, "relinkre1"),
+            MessageSender::ExternalLead,
+        )
+        .await;
+    assert!(again.success, "{}", again.output);
+    let answer: Value =
+        serde_json::from_str(again.output.lines().next().expect("the JSON line")).expect("json");
+    assert_eq!(answer["result"]["reused"], true, "{answer}");
+    assert_eq!(answer["result"]["claude_session"]["host"], "office-ssh", "{answer}");
+    let data = again.data.as_ref().expect("the answer data");
+    assert_eq!(data["claude_session"]["host"], "office-ssh", "{data}");
+    assert!(
+        again.output.contains("over SSH connection 'office-ssh'"),
+        "{}",
+        again.output
+    );
+    assert!(!again.output.contains("studio-ssh"), "{}", again.output);
+}

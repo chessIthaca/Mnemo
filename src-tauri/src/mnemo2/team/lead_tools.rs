@@ -1123,18 +1123,26 @@ impl TeamRuntime {
         answer
     }
 
-    /// For a dispatch answer's copy of an agent worker on a host whose SSH
-    /// link is gone now: clear the copy's display connection, so the answer
-    /// carries no `claude_session` block, and return the line that says so.
-    /// The stored record is unchanged.
+    /// Point a dispatch answer's copy of an agent worker on a host at the SSH
+    /// connection its host is linked to now: a host linked to another
+    /// connection since placement names that one; a host whose link is gone
+    /// gets its copy's connection cleared, so the answer carries no
+    /// `claude_session` block, and the line that says so is returned. The
+    /// stored record is unchanged.
     fn withhold_unlinked_session(&self, worker: &mut WorkerRecord) -> Option<String> {
         worker.claude_agent.as_ref()?;
         let remote = worker.remote.as_mut()?;
-        if remote.ssh.is_none() || self.live_ssh_link(&remote.node_id).is_some() {
-            return None;
+        remote.ssh.as_ref()?;
+        match self.live_ssh_link(&remote.node_id) {
+            Some(live) => {
+                remote.ssh = Some(live);
+                None
+            }
+            None => {
+                remote.ssh = None;
+                Some(super::control::unlinked_session_text(&remote.node_name))
+            }
         }
-        remote.ssh = None;
-        Some(super::control::unlinked_session_text(&remote.node_name))
     }
 
     /// `team_resume`: resume the worker where it ran, on another tier, or —

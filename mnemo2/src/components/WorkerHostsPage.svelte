@@ -166,7 +166,10 @@
                 {/if}
                 <span class="meta tone-{checksLabel(host.checks).tone}">{checksLabel(host.checks).text}</span>
                 {#if host.claude_home !== null}
-                  <span class="meta">Claude Code: {host.claude_home ? "signed in folder found" : "signed in folder not found"}</span>
+                  <span
+                    class="meta"
+                    title="Whether this host has a Claude Code folder; sign in to Claude Code there once to use Claude workers on it."
+                  >{host.claude_home ? "Claude Code set up" : "Claude Code not set up yet"}</span>
                 {/if}
               </div>
 

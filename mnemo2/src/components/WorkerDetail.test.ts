@@ -417,7 +417,7 @@ describe("WorkerDetail host", () => {
 
     const line = container.querySelector<HTMLElement>(".host-away");
     expect(line?.textContent?.replace(/\s+/g, " ").trim()).toMatch(
-      /^studio is unreachable since \d+:\d{2}; Mnemo continues the worker when it is back\.$/,
+      /^studio has been unreachable for \d+:\d{2}; Mnemo continues the worker when it is back\.$/,
     );
   });
 
@@ -432,7 +432,7 @@ describe("WorkerDetail host", () => {
 
     const line = container.querySelector<HTMLElement>(".host-away");
     expect(line?.textContent?.replace(/\s+/g, " ").trim()).toMatch(
-      /^studio is unreachable since \d+:\d{2}; its Claude Code session there may keep working\.$/,
+      /^studio has been unreachable for \d+:\d{2}; its Claude Code session there may keep working\.$/,
     );
   });
 

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri_plugin_notification::NotificationExt;
 use tauri::async_runtime::JoinHandle;
@@ -1003,6 +1004,64 @@ pub async fn team_snapshot(
     Ok(team
         .snapshot_known(&known_transcripts.unwrap_or_default())
         .await)
+}
+
+/// The paired worker hosts and the hub's state (the `team_hosts list` object).
+#[tauri::command]
+pub async fn worker_hosts_list(state: State<'_, Mnemo2State>) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("list", None, None)
+        .await
+}
+
+/// Offer a one-time pairing code for a new worker host.
+#[tauri::command]
+pub async fn worker_hosts_pair(
+    state: State<'_, Mnemo2State>,
+    name: Option<String>,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("pair", name.as_deref(), None)
+        .await
+}
+
+/// Revoke a worker host; its running workers fail and can be resumed.
+#[tauri::command]
+pub async fn worker_hosts_revoke(
+    state: State<'_, Mnemo2State>,
+    name: String,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("revoke", Some(&name), None)
+        .await
+}
+
+/// Tie a worker host to the saved SSH connection the lead starts Claude Code on.
+#[tauri::command]
+pub async fn worker_hosts_link(
+    state: State<'_, Mnemo2State>,
+    name: String,
+    ssh: String,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("link", Some(&name), Some(&ssh))
+        .await
+}
+
+/// Drop a worker host's SSH connection.
+#[tauri::command]
+pub async fn worker_hosts_unlink(
+    state: State<'_, Mnemo2State>,
+    name: String,
+) -> Result<Value, String> {
+    current_team(&state)
+        .await?
+        .hosts_action("unlink", Some(&name), None)
+        .await
 }
 
 /// Read the plan board: every plan with the workers on each step.

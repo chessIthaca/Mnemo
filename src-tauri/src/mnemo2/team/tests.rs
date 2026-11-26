@@ -22358,3 +22358,110 @@ async fn reconcile_releases_a_merged_remote_workers_checkout() {
         "the remote record stays for history and display"
     );
 }
+
+/// A pair answer with the fields that change on every call removed.
+fn without_pairing_noise(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("code");
+        object.remove("expires_in_s");
+        object.remove("commands");
+    }
+    value
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hosts_action_matches_the_team_hosts_tool_output() {
+    let rig = Rig::start().await;
+    let (team, _plan_id, _plans) = remote_agent_team(&rig).await;
+
+    let tool = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "list"}))
+        .await;
+    assert!(tool.success, "{}", tool.output);
+    let tool: Value = serde_json::from_str(&tool.output).expect("list JSON");
+    let action = team
+        .hosts_action("list", None, None)
+        .await
+        .expect("the list action");
+    // The catalog finishes syncing between the two calls, so it may differ.
+    let steady = |mut value: Value| {
+        if let Some(hosts) = value["hosts"].as_array_mut() {
+            for host in hosts {
+                host["catalog_ready"] = Value::Null;
+            }
+        }
+        value
+    };
+    assert_eq!(steady(tool), steady(action.clone()));
+    assert_eq!(action["action"], "team_hosts");
+    assert_eq!(action["hosts"][0]["name"], "node-a");
+
+    let tool = team
+        .handle_lead_host_tool("team_hosts", json!({"action": "pair", "name": "studio"}))
+        .await;
+    assert!(tool.success, "{}", tool.output);
+    let tool: Value = serde_json::from_str(&tool.output).expect("pair JSON");
+    let action = team
+        .hosts_action("pair", Some("studio"), None)
+        .await
+        .expect("the pair action");
+    assert_eq!(
+        without_pairing_noise(tool.clone()),
+        without_pairing_noise(action.clone())
+    );
+    assert!(action["code"].as_str().is_some_and(|code| !code.is_empty()));
+    assert!(action["expires_in_s"].as_u64().is_some());
+    assert_eq!(action["commands"].as_array().map(Vec::len), Some(2));
+    assert_eq!(tool["hub"], action["hub"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hosts_action_link_unlink_round_trip() {
+    let rig = Rig::start().await;
+    let (team, _plan_id, _plans) = remote_agent_team(&rig).await;
+
+    let linked = team
+        .hosts_action("link", Some("node-a"), Some("studio-ssh"))
+        .await
+        .expect("link");
+    assert_eq!(linked["linked"]["ssh"], "studio-ssh");
+    let listed = team.hosts_action("list", None, None).await.expect("list");
+    assert_eq!(listed["hosts"][0]["ssh"], "studio-ssh");
+
+    let unlinked = team
+        .hosts_action("unlink", Some("node-a"), None)
+        .await
+        .expect("unlink");
+    assert_eq!(unlinked["unlinked"]["name"], "node-a");
+    assert_eq!(unlinked["unlinked"]["ssh"], Value::Null);
+    let listed = team.hosts_action("list", None, None).await.expect("list");
+    assert_eq!(listed["hosts"][0]["ssh"], Value::Null);
+
+    // A bad ssh gives the tool's own error text.
+    let tool = team
+        .handle_lead_host_tool(
+            "team_hosts",
+            json!({"action": "link", "name": "node-a", "ssh": "  "}),
+        )
+        .await;
+    assert!(!tool.success);
+    let error = team
+        .hosts_action("link", Some("node-a"), Some("  "))
+        .await
+        .expect_err("a blank ssh is refused");
+    assert_eq!(error, tool.output);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hosts_action_unknown_action_errors() {
+    let rig = Rig::start().await;
+    let (team, _plan_id, _plans) = remote_agent_team(&rig).await;
+    let error = team
+        .hosts_action("explode", None, None)
+        .await
+        .expect_err("an unknown action");
+    assert_eq!(
+        error,
+        "team_hosts requires 'action' to be list, pair, revoke, link, or unlink"
+    );
+}

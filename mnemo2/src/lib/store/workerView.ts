@@ -13,6 +13,7 @@ import {
   type TeamWorkerRecord,
 } from "../teamState";
 import type { Check, LeadEntry, MergeRecord, Worker, WorkerActivity, WorkerStatus } from "../types";
+import { hostFromRemote } from "../workerHost";
 import { workerThreadFromRecord } from "../workerThread";
 import { workerScreenshotPaths } from "../workbenchState";
 
@@ -184,6 +185,7 @@ export function buildWorker(
     reasoningEffort: effort ?? undefined,
     branch: record.branch,
     worktree: record.worktree,
+    host: hostFromRemote(record.remote),
     files: [],
     tokens: record.total_tokens,
     cost: record.cost_micros == null ? null : record.cost_micros / 1_000_000,

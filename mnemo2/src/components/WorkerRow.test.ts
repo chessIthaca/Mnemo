@@ -305,4 +305,54 @@ describe("WorkerRow", () => {
     expect(label?.hasAttribute("data-agent-phase")).toBe(false);
     expect(label?.hasAttribute("title")).toBe(false);
   });
+
+  it("badges the computer a remote worker runs on", () => {
+    const remote: Worker = {
+      ...worker(),
+      status: "working",
+      host: { name: "studio", os: "macos", offlineSinceMs: null, ssh: null },
+    };
+    const { container } = render(WorkerRow, { worker: remote, onSelect: vi.fn() });
+    const badge = container.querySelector<HTMLElement>(".worker-name .host-badge");
+    expect(badge?.textContent).toBe("studio");
+    expect(badge?.title).toBe("Runs on studio (macOS)");
+    // A connected host is no warning: the badge stays plain.
+    expect(badge?.classList.contains("away")).toBe(false);
+  });
+
+  it("renders no host badge for a worker on this computer", () => {
+    const local: Worker = { ...worker(), status: "working", host: null };
+    const { container } = render(WorkerRow, { worker: local, onSelect: vi.fn() });
+    expect(container.querySelector(".host-badge")).toBeNull();
+  });
+
+  it("marks an active worker's away host and shows for how long", () => {
+    const away: Worker = {
+      ...worker(),
+      status: "working",
+      host: {
+        name: "studio",
+        os: "windows",
+        offlineSinceMs: Date.now() - 125_000,
+        ssh: "studio-ssh",
+      },
+    };
+    const { container } = render(WorkerRow, { worker: away, onSelect: vi.fn() });
+    const badge = container.querySelector<HTMLElement>(".worker-name .host-badge");
+    expect(badge?.classList.contains("away")).toBe(true);
+    expect(badge?.textContent?.replace(/\s+/g, " ").trim()).toMatch(/^studio · away \d+:\d{2}$/);
+    expect(badge?.title).toBe("Runs on studio (Windows), Claude Code session over SSH studio-ssh");
+  });
+
+  it("keeps a finished worker's host badge plain while its host is away", () => {
+    const merged: Worker = {
+      ...worker(),
+      status: "merged",
+      host: { name: "studio", os: "macos", offlineSinceMs: Date.now() - 600_000, ssh: null },
+    };
+    const { container } = render(WorkerRow, { worker: merged, onSelect: vi.fn() });
+    const badge = container.querySelector<HTMLElement>(".worker-name .host-badge");
+    expect(badge?.textContent).toBe("studio");
+    expect(badge?.classList.contains("away")).toBe(false);
+  });
 });

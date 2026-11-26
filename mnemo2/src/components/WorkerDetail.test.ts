@@ -375,3 +375,79 @@ describe("WorkerDetail agent model", () => {
     expect(screen.getByText("effort: medium")).toBeTruthy();
   });
 });
+
+describe("WorkerDetail host", () => {
+  beforeEach(() => app.set(fixtureState()));
+
+  const remoteWorker = (host: Worker["host"], overrides: Partial<Worker> = {}): Worker => ({
+    ...worker(),
+    status: "working",
+    host,
+    ...overrides,
+  });
+
+  it("names the computer a worker runs on next to its tier", () => {
+    const { container } = render(WorkerDetail, {
+      worker: remoteWorker({ name: "studio", os: "macos", offlineSinceMs: null, ssh: null }),
+      measureBriefOverflow: () => false,
+    });
+
+    const pills = [...container.querySelectorAll<HTMLElement>(".effort-pill")];
+    const pill = pills.find((candidate) => candidate.textContent?.trim() === "host: studio");
+    expect(pill).toBeTruthy();
+    expect(pill?.title).toBe("Runs on studio (macOS)");
+    // A connected host needs no explanation under the header.
+    expect(container.querySelector(".host-away")).toBeNull();
+  });
+
+  it("renders no host pill for a worker on this computer", () => {
+    const { container } = render(WorkerDetail, {
+      worker: remoteWorker(null, { host: null }),
+      measureBriefOverflow: () => false,
+    });
+    expect(container.querySelector(".host-pill")).toBeNull();
+    expect(container.querySelector(".host-away")).toBeNull();
+  });
+
+  it("explains a lost link while a Mnemo worker is still active on it", () => {
+    const { container } = render(WorkerDetail, {
+      worker: remoteWorker({ name: "studio", os: "windows", offlineSinceMs: Date.now() - 65_000, ssh: null }),
+      measureBriefOverflow: () => false,
+    });
+
+    const line = container.querySelector<HTMLElement>(".host-away");
+    expect(line?.textContent?.replace(/\s+/g, " ").trim()).toMatch(
+      /^studio is unreachable since \d+:\d{2}; Mnemo continues the worker when it is back\.$/,
+    );
+  });
+
+  it("says a Claude Code worker's session may keep working on the away host", () => {
+    const { container } = render(WorkerDetail, {
+      worker: remoteWorker(
+        { name: "studio", os: "macos", offlineSinceMs: Date.now() - 65_000, ssh: "studio-ssh" },
+        { model: "claude-code/opus", modelSpec: "Ollama Cloud/glm-5.3", runsAsAgent: true },
+      ),
+      measureBriefOverflow: () => false,
+    });
+
+    const line = container.querySelector<HTMLElement>(".host-away");
+    expect(line?.textContent?.replace(/\s+/g, " ").trim()).toMatch(
+      /^studio is unreachable since \d+:\d{2}; its Claude Code session there may keep working\.$/,
+    );
+  });
+
+  it("drops the line once the worker finished, even while its host is away", () => {
+    const { container } = render(WorkerDetail, {
+      worker: remoteWorker(
+        { name: "studio", os: "macos", offlineSinceMs: Date.now() - 600_000, ssh: null },
+        { status: "merged" },
+      ),
+      measureBriefOverflow: () => false,
+    });
+
+    expect(container.querySelector(".host-away")).toBeNull();
+    // The computer it ran on is still named.
+    expect([...container.querySelectorAll<HTMLElement>(".effort-pill")]
+      .some((candidate) => candidate.textContent?.trim() === "host: studio")).toBe(true);
+  });
+});

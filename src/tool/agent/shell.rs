@@ -1819,7 +1819,7 @@ pub(crate) async fn wait_for_temp_dir_release(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::machine_slots::SlotAttempt;
+    use crate::host::machine_slots::{REPORT_WAIT_AFTER, SlotAttempt};
     use tempfile::tempdir;
 
     fn tool_in(dir: &std::path::Path) -> ShellTool {
@@ -1873,45 +1873,76 @@ mod tests {
 
     /// Two instances' heavy commands, one slot: the second WAITS, reports how
     /// long, and the live view announces it ONCE (plan d3336a8a step 3).
+    ///
+    /// The TEST holds the only slot itself and releases it only after the live
+    /// view announced the wait, `REPORT_WAIT_AFTER` + 1 s later — so the queued
+    /// call's wait clears the reporting threshold BY CONSTRUCTION, however
+    /// loaded the machine is. (The previous version raced a 3 s `Start-Sleep`
+    /// holder: under load the second call's first poll ate more than 1 s of that
+    /// hold, its wait stayed under `REPORT_WAIT_AFTER`, it correctly got no note,
+    /// and the no-note output `""` failed the test.)
     #[tokio::test]
     async fn second_heavy_command_waits_for_the_slot() {
         let dir = tempdir().unwrap();
         let slots = tempdir().unwrap();
         let command = slow_heavy_command();
-        let first_tool = slotted_tool(dir.path(), slots.path(), Duration::from_secs(30));
         let second_tool = slotted_tool(dir.path(), slots.path(), Duration::from_secs(30));
-        let first_command = command.clone();
-        let first = tokio::spawn(async move {
-            first_tool
-                .execute(json!({"command": first_command, "purpose": "first heavy"}))
-                .await
-        });
-        // Wait until the first command really holds the only slot.
-        wait_until_slot_is_held(slots.path()).await;
+        // Hold the only slot in the test itself: no first command, so there is
+        // no race about WHEN it really took the slot.
+        let held = HeavySlots::new(slots.path().to_path_buf(), 1)
+            .try_take()
+            .guard()
+            .expect("the only slot is free");
 
+        let wait_line = "waiting for a build slot (1 in use on this machine)";
         let live = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen = Arc::clone(&live);
         let sink = OutputSink::new(move |_stream, text| {
             seen.lock().expect("live sink").push(text.to_string());
         });
         let started = std::time::Instant::now();
-        let second = second_tool
-            .execute_streaming(
-                json!({"command": command, "purpose": "second heavy"}),
-                sink,
-            )
-            .await;
-        let elapsed = started.elapsed();
+        let second_task = tokio::spawn(async move {
+            second_tool
+                .execute_streaming(
+                    json!({"command": command, "purpose": "second heavy"}),
+                    sink,
+                )
+                .await
+        });
 
-        let first = first.await.expect("first join");
-        assert!(first.success, "{}", first.output);
+        // Wait on the EVENT (the live wait line), never on a clock: from here
+        // the second call really is queued behind the held slot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let announced = live
+                .lock()
+                .expect("live sink")
+                .iter()
+                .any(|chunk| chunk.contains(wait_line));
+            if announced {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued command never announced the slot wait: {:?}",
+                live.lock().expect("live sink").as_slice()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Keep holding so the queued call's total wait clears the reporting
+        // threshold by construction, then let it in.
+        tokio::time::sleep(REPORT_WAIT_AFTER + Duration::from_secs(1)).await;
+        drop(held);
+
+        let second = second_task.await.expect("second join");
+        let elapsed = started.elapsed();
         assert!(
             second.success,
             "a queued command still runs: {}",
             second.output
         );
         assert!(
-            elapsed >= Duration::from_millis(700),
+            elapsed >= REPORT_WAIT_AFTER,
             "the second heavy command waited for the slot, took {elapsed:?}"
         );
         assert!(
@@ -1921,8 +1952,7 @@ mod tests {
         );
         let live = live.lock().expect("live sink");
         assert!(
-            live.iter()
-                .any(|chunk| chunk.contains("waiting for a build slot (1 in use on this machine)")),
+            live.iter().any(|chunk| chunk.contains(wait_line)),
             "the live view announces the wait once: {live:?}"
         );
         assert_eq!(

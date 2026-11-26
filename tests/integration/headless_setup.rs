@@ -23,6 +23,41 @@ use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::workspace::Workspace;
 
+/// Receive events until `pick` returns a value — ONE overall 120 s deadline,
+/// not a per-receive budget: a loaded machine delays the pump, it never loses
+/// an event. A closed bus or an expired deadline panics naming `what`, so a
+/// missed event fails loudly instead of silently continuing.
+async fn recv_until<T, U>(
+    rx: &mut mnemo::headless::EventReceiver<T>,
+    what: &str,
+    mut pick: impl FnMut(&T) -> Option<U>,
+) -> U
+where
+    T: Clone,
+{
+    let received = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Some(found) = pick(&event) {
+                        return found;
+                    }
+                }
+                // A lagged subscriber skipped events by design; keep receiving.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => {
+                    panic!("the event bus closed while waiting for {what}")
+                }
+            }
+        }
+    })
+    .await;
+    match received {
+        Ok(found) => found,
+        Err(_) => panic!("timed out after 120 s waiting for {what}"),
+    }
+}
+
 /// The engine options every fixture here uses (the sibling suites'
 /// `opts` twin — this suite is self-contained, main.rs's contract).
 fn opts(workspace: Workspace, config_dir: Option<PathBuf>) -> EngineOptions {
@@ -489,7 +524,10 @@ async fn classifier_setup_disable_persists_and_reports_done() {
     let mut rx = setup.classifier_setup(false).await.expect("the disable leg");
     // The single terminal event, then the channel closes (the sender
     // rode the call).
-    let event = rx.recv().await.expect("the Done event");
+    let event = recv_until(&mut rx, "the classifier setup's Done event", |event| {
+        matches!(event, SetupEvent::Done { .. }).then(|| event.clone())
+    })
+    .await;
     assert!(matches!(
         event,
         SetupEvent::Done {

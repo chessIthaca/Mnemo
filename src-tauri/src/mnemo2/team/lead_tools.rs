@@ -27,6 +27,7 @@ use super::control::ResumeChoice;
 use super::findings_ledger;
 use super::record::{
     session_name, with_launch_token, ChangeSource, MessageSender, RemoteCheckout, WorkerRecord,
+    WorkerStatus,
 };
 use super::remote::{checks_hash, HostDirectory, Qualification};
 use super::routing::tier_ids;
@@ -1077,15 +1078,29 @@ impl TeamRuntime {
                 if worker.claude_agent.is_some()
                     && matches!(name, "team_message" | "team_route_fix") =>
             {
+                // The answer names the SSH connection the worker's host is
+                // linked to now, never the one its record stored: a relink
+                // since placement is the user's approval to start the session
+                // there. A host whose link was withdrawn gets no connection in
+                // the block, plus the line that says so. The stored record is
+                // unchanged (plan e8cb5112, step 2).
+                let mut answer_worker = worker;
+                let unlinked = self.withhold_unlinked_session(&mut answer_worker);
                 // No registered agent: the lead launches a new one with this
                 // message, which carries a fresh one-time launch token. A
                 // session on a host never gets one.
-                let token = if worker.claude_agent_id.is_none() && worker.remote.is_none() {
-                    self.issue_launch_token(&worker.id).await.ok()
+                let token = if answer_worker.claude_agent_id.is_none()
+                    && answer_worker.remote.is_none()
+                {
+                    self.issue_launch_token(&answer_worker.id).await.ok()
                 } else {
                     None
                 };
-                continue_agent_answer(&worker, name, token.as_deref())
+                let mut answer = continue_agent_answer(&answer_worker, name, token.as_deref());
+                if let Some(line) = unlinked {
+                    answer.output = format!("{}\n{line}", answer.output);
+                }
+                answer
             }
             (result, _, _) => worker_result(result, name),
         };
@@ -1540,9 +1555,17 @@ pub(super) fn worker_status_view(worker: &WorkerRecord, detail: bool) -> Value {
     // Which computer runs the worker, and how long its host has been away
     // (plan 9a2f4b67): a local worker always reads "local".
     view["host"] = json!(worker.host_label());
+    // Only a worker that can still run a turn waits on an away host: a
+    // finished one shows its host without an away age (plan e8cb5112, step 2).
+    // An interrupted worker counts with the active ones — the away state
+    // decides whether its turn can be resumed there — without widening
+    // `is_active`, which the host-loss handling relies on.
+    let waiting_on_host = super::is_active(worker.status)
+        || worker.status == WorkerStatus::Interrupted;
     if let Some(offline_since) = worker
         .remote
         .as_ref()
+        .filter(|_| waiting_on_host)
         .and_then(|remote| remote.offline_since_ms)
     {
         let now = u64::try_from(phase3::now_ms()).unwrap_or(u64::MAX);

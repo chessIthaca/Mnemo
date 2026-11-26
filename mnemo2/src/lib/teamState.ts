@@ -112,6 +112,27 @@ export interface TeamAgentView {
   stalled: boolean;
 }
 
+/**
+ * The other computer a worker runs on, as the host records it (`WorkerRecord.
+ * remote`): the paired node's id and display name, its OS, the checkout there,
+ * and — while its link is down — the Unix millisecond it was first seen away
+ * plus the saved SSH connection the worker was placed through.
+ */
+export interface TeamRemoteCheckout {
+  node_id: string;
+  node_name: string;
+  /** The node's operating system (`windows` or `macos`). */
+  os: string;
+  project: string;
+  checkout: string;
+  path: string;
+  synced_tip?: string | null;
+  /** When the node's link was first seen down; absent while it is connected. */
+  offline_since_ms?: number | null;
+  /** The SSH connection a Claude Code agent worker's session starts on. */
+  ssh?: string | null;
+}
+
 export interface TeamWorkerRecord {
   id: string;
   name: string;
@@ -158,6 +179,16 @@ export interface TeamWorkerRecord {
   claude_agent?: string | null;
   /** The Claude Code effort such an agent runs at; null when its tier sets none. */
   claude_agent_effort?: string | null;
+  /**
+   * The other computer this worker runs on, with its checkout there and its
+   * link state; absent (or null) for a worker on this computer.
+   */
+  remote?: TeamRemoteCheckout | null;
+  /**
+   * The Claude Code session the lead started for this worker on that computer;
+   * absent for a local agent worker, a Mnemo worker and before the start.
+   */
+  claude_session?: string | null;
   merge: TeamMergeRecord | null;
   error: string | null;
   /** Serde-defaulted on the host: absent means an implementation worker. */

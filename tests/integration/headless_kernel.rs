@@ -109,6 +109,41 @@ use mnemo::provider::{
 use mnemo::tool::{SafetyLevel, ToolRegistry, ToolResult};
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent};
 
+/// Receive events until `pick` returns a value — ONE overall 120 s deadline,
+/// not a per-receive budget: a loaded machine delays the pump, it never loses
+/// an event. A closed bus or an expired deadline panics naming `what`, so a
+/// missed event fails loudly instead of silently continuing.
+async fn recv_until<T, U>(
+    rx: &mut mnemo::headless::EventReceiver<T>,
+    what: &str,
+    mut pick: impl FnMut(&T) -> Option<U>,
+) -> U
+where
+    T: Clone,
+{
+    let received = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Some(found) = pick(&event) {
+                        return found;
+                    }
+                }
+                // A lagged subscriber skipped events by design; keep receiving.
+                Err(mnemo::headless::RecvError::Lagged(_)) => {}
+                Err(mnemo::headless::RecvError::Closed) => {
+                    panic!("the event bus closed while waiting for {what}")
+                }
+            }
+        }
+    })
+    .await;
+    match received {
+        Ok(found) => found,
+        Err(_) => panic!("timed out after 120 s waiting for {what}"),
+    }
+}
+
 /// A scripted provider that RECORDS every request's message slice — the
 /// byte-prefix fixture's source of truth.
 struct RecordingLlm {
@@ -324,18 +359,13 @@ async fn snapshot_reports_pending_approval() {
         .expect("prompt");
 
     // Wait for the approval, then snapshot mid-block.
-    let mut approval_id = None;
-    while let Ok(ev) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
-    {
-        if let SerializableAgentEvent::ApprovalRequest { tool_call_id, .. } =
-            ev.expect("event").event
-        {
-            approval_id = Some(tool_call_id);
-            break;
+    let approval_id = recv_until(&mut rx, "the ApprovalRequest", |ev| {
+        if let SerializableAgentEvent::ApprovalRequest { tool_call_id, .. } = &ev.event {
+            return Some(tool_call_id.clone());
         }
-    }
-    let approval_id = approval_id.expect("the approval surfaces");
+        None
+    })
+    .await;
     let snap = session.snapshot().await.expect("the snapshot works mid-block");
     match snap.pending {
         Some(PendingInteraction::Approval { request_id }) => {
@@ -352,13 +382,10 @@ async fn snapshot_reports_pending_approval() {
         })
         .await
         .expect("the approval resolves");
-    while let Ok(ev) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
-    {
-        if let SerializableAgentEvent::Finished { .. } = ev.expect("event").event {
-            break;
-        }
-    }
+    recv_until(&mut rx, "the turn's Finished event", |ev| {
+        matches!(&ev.event, SerializableAgentEvent::Finished { .. }).then_some(())
+    })
+    .await;
     let after = session.snapshot().await.expect("the snapshot works after");
     assert!(after.pending.is_none(), "the pending cleared once answered");
     assert!(
@@ -812,16 +839,14 @@ async fn engine_start_emits_index_host_events() {
         .expect("engine starts");
     let mut events = engine.host_events();
     let mut saw_status = false;
-    for _ in 0..16 {
-        if saw_status {
-            break;
+    recv_until(&mut events, "the EmbedderStatus host event", |event| {
+        if matches!(event, HostEvent::EmbedderStatus(_)) {
+            saw_status = true;
+            return Some(());
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
-            Ok(Ok(HostEvent::EmbedderStatus(_))) => saw_status = true,
-            Ok(Ok(_)) => {}
-            Ok(Err(_)) | Err(_) => break,
-        }
-    }
+        None
+    })
+    .await;
     assert!(saw_status, "EmbedderStatus rides host_events()");
     // The graph's startup pass is wire_brain's spawn — its IndexProgress
     // stream flows to whoever subscribes DURING the pass; on a tiny tree
@@ -1047,28 +1072,24 @@ async fn stats_totals_match_events() {
 
     // The output-compaction saving: Compact drives the checkpoint
     // lever — wait for its Savings event (the command runs async in
-    // the task; the poll bounds the wait hermetically). The poll CONSUMES
-    // the bus, so it collects too — the drain later only sees what
-    // arrived after it.
+    // the task; recv_until gives the wait one overall 120 s deadline).
+    // The wait CONSUMES the bus, so it collects too — the drain later
+    // only sees what arrived after it.
     let mut collected: Vec<SessionEvent> = Vec::new();
     session
         .send(SessionCommand::Compact)
         .await
         .expect("compact sends");
     let mut saw_savings = false;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !saw_savings && std::time::Instant::now() < deadline {
-        match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
-            Ok(Ok(ev)) => {
-                if matches!(ev.event, SerializableAgentEvent::Savings { .. }) {
-                    saw_savings = true;
-                }
-                collected.push(ev);
-            }
-            Ok(Err(_)) => break,
-            Err(_) => {}
+    recv_until(&mut rx, "the compact's Savings event", |ev| {
+        collected.push(ev.clone());
+        if matches!(&ev.event, SerializableAgentEvent::Savings { .. }) {
+            saw_savings = true;
+            return Some(());
         }
-    }
+        None
+    })
+    .await;
     assert!(saw_savings, "the compact's Savings event rode events()");
 
     let outcome = session
@@ -1274,31 +1295,29 @@ async fn host_tool_round_trip_and_timeout_row_31() {
     // session immutably (`run_to_completion` + `send` are `&self`), so
     // join them; the answer loop consumes its own subscription copy.
     let answer = async {
-        loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("events keep flowing")
-                .expect("event arrives");
-            if let SerializableAgentEvent::HostToolCall { call_id, name, .. } = ev.event {
+        let call_id = recv_until(&mut rx, "the HostToolCall event", |ev| {
+            if let SerializableAgentEvent::HostToolCall { call_id, name, .. } = &ev.event {
                 assert_eq!(name, "get_weather");
-                // The pump stashed the call — the snapshot reports it
-                // mid-flight (§5.9.5: engine-local, always accurate).
-                let pending = session.snapshot().await.expect("snapshot").pending;
-                assert!(
-                    matches!(pending, Some(PendingInteraction::HostToolCall { .. })),
-                    "the snapshot reports the pending host-tool call: {pending:?}"
-                );
-                session
-                    .send(SessionCommand::HostToolResult {
-                        call_id,
-                        result: Some(ToolResult::success("sunny, 21°C".to_string())),
-                        error: None,
-                    })
-                    .await
-                    .expect("the answer resolves the pending call");
-                return;
+                return Some(call_id.clone());
             }
-        }
+            None
+        })
+        .await;
+        // The pump stashed the call — the snapshot reports it
+        // mid-flight (§5.9.5: engine-local, always accurate).
+        let pending = session.snapshot().await.expect("snapshot").pending;
+        assert!(
+            matches!(pending, Some(PendingInteraction::HostToolCall { .. })),
+            "the snapshot reports the pending host-tool call: {pending:?}"
+        );
+        session
+            .send(SessionCommand::HostToolResult {
+                call_id,
+                result: Some(ToolResult::success("sunny, 21°C".to_string())),
+                error: None,
+            })
+            .await
+            .expect("the answer resolves the pending call");
     };
     let (outcome, ()) = tokio::join!(
         session.run_to_completion("check the weather in Oslo"),
@@ -1453,15 +1472,10 @@ async fn request_scaffolding_never_reaches_exports_or_resumed_history() {
         mid_request.transcript.messages
     );
     llm.release.notify_one();
-    loop {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("the turn finishes")
-            .expect("event");
-        if matches!(event.event, SerializableAgentEvent::Finished { .. }) {
-            break;
-        }
-    }
+    recv_until(&mut rx, "the turn's Finished event", |ev| {
+        matches!(&ev.event, SerializableAgentEvent::Finished { .. }).then_some(())
+    })
+    .await;
 
     // A transcript saved by an older build, scaffolding included, resumes
     // without it.
@@ -1540,38 +1554,36 @@ async fn shared_engine_scopes_events_and_pending_per_session() {
     // The bystander's subscription is the one that used to cross-route.
     let mut rx = bystander.events();
     let answer = async {
-        loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("events keep flowing")
-                .expect("event arrives");
+        let call_id = recv_until(&mut rx, "the caller's HostToolCall event", |ev| {
             if let SerializableAgentEvent::HostToolCall { call_id, .. } = &ev.event {
                 assert!(ev.is_from(caller.id()), "the call is tagged with its session");
                 assert!(
                     !ev.is_from(bystander.id()),
                     "another session's call is not the bystander's"
                 );
-                let theirs = bystander.snapshot().await.expect("bystander snapshot").pending;
-                assert!(
-                    theirs.is_none(),
-                    "a sibling's pending call never shows as the bystander's: {theirs:?}"
-                );
-                let ours = caller.snapshot().await.expect("caller snapshot").pending;
-                assert!(
-                    matches!(&ours, Some(PendingInteraction::HostToolCall { call_id: id }) if id == call_id),
-                    "the caller still reports its own pending call: {ours:?}"
-                );
-                caller
-                    .send(SessionCommand::HostToolResult {
-                        call_id: call_id.clone(),
-                        result: Some(ToolResult::success("sunny".to_string())),
-                        error: None,
-                    })
-                    .await
-                    .expect("the caller resolves its own call");
-                return;
+                return Some(call_id.clone());
             }
-        }
+            None
+        })
+        .await;
+        let theirs = bystander.snapshot().await.expect("bystander snapshot").pending;
+        assert!(
+            theirs.is_none(),
+            "a sibling's pending call never shows as the bystander's: {theirs:?}"
+        );
+        let ours = caller.snapshot().await.expect("caller snapshot").pending;
+        assert!(
+            matches!(&ours, Some(PendingInteraction::HostToolCall { call_id: id }) if id == &call_id),
+            "the caller still reports its own pending call: {ours:?}"
+        );
+        caller
+            .send(SessionCommand::HostToolResult {
+                call_id,
+                result: Some(ToolResult::success("sunny".to_string())),
+                error: None,
+            })
+            .await
+            .expect("the caller resolves its own call");
     };
     let (outcome, ()) = tokio::join!(caller.run_to_completion("weather in Oslo?"), answer);
     assert_eq!(outcome.expect("turn completes").final_text, "sunny");
@@ -1645,45 +1657,43 @@ async fn external_policy_gate_and_turn_end_row_32() {
         .expect("spawn (leg a)");
     let mut rx = session.events();
     let answer = async {
-        loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("events keep flowing")
-                .expect("event arrives");
+        let hook_id = recv_until(&mut rx, "the ToolGate PolicyHook", |ev| {
             if let SerializableAgentEvent::PolicyHook {
                 hook_id,
                 hook_kind,
                 payload,
-            } = ev.event
+            } = &ev.event
             {
                 assert_eq!(hook_id, "hook_1");
-                assert_eq!(hook_kind, HookKind::ToolGate);
+                assert_eq!(hook_kind, &HookKind::ToolGate);
                 assert_eq!(
                     payload,
-                    serde_json::json!({"tool": "get_weather", "args": {"city": "Oslo"}})
+                    &serde_json::json!({"tool": "get_weather", "args": {"city": "Oslo"}})
                 );
-                // The pump stashed the responder — the snapshot reports
-                // the pending hook mid-flight (§5.9.5: engine-local,
-                // always accurate).
-                let pending = session.snapshot().await.expect("snapshot").pending;
-                assert!(
-                    matches!(pending, Some(PendingInteraction::PolicyHook { .. })),
-                    "the snapshot reports the pending policy hook: {pending:?}"
-                );
-                session
-                    .send(SessionCommand::PolicyAnswer {
-                        hook_id,
-                        answer: PolicyAnswer::Gate {
-                            verdict: GateVerdict::Deny {
-                                message: "denied by the external policy".into(),
-                            },
-                        },
-                    })
-                    .await
-                    .expect("the answer resolves the pending hook");
-                return;
+                return Some(hook_id.clone());
             }
-        }
+            None
+        })
+        .await;
+        // The pump stashed the responder — the snapshot reports
+        // the pending hook mid-flight (§5.9.5: engine-local,
+        // always accurate).
+        let pending = session.snapshot().await.expect("snapshot").pending;
+        assert!(
+            matches!(pending, Some(PendingInteraction::PolicyHook { .. })),
+            "the snapshot reports the pending policy hook: {pending:?}"
+        );
+        session
+            .send(SessionCommand::PolicyAnswer {
+                hook_id,
+                answer: PolicyAnswer::Gate {
+                    verdict: GateVerdict::Deny {
+                        message: "denied by the external policy".into(),
+                    },
+                },
+            })
+            .await
+            .expect("the answer resolves the pending hook");
     };
     let (outcome, ()) = tokio::join!(
         session.run_to_completion("check the weather in Oslo"),
@@ -1722,30 +1732,28 @@ async fn external_policy_gate_and_turn_end_row_32() {
         .expect("spawn (leg b)");
     let mut rx = session.events();
     let answer = async {
-        let first_id = loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("events keep flowing")
-                .expect("event arrives");
+        let first_id = recv_until(&mut rx, "the first TurnEnd PolicyHook", |ev| {
             if let SerializableAgentEvent::PolicyHook {
                 hook_id,
                 hook_kind,
                 payload,
-            } = ev.event
+            } = &ev.event
             {
                 assert_eq!(hook_id, "hook_1");
-                assert_eq!(hook_kind, HookKind::TurnEnd);
+                assert_eq!(hook_kind, &HookKind::TurnEnd);
                 assert_eq!(
                     payload,
-                    serde_json::json!({
+                    &serde_json::json!({
                         "success": true,
                         "unattended": false,
                         "stop_reason": null,
                     })
                 );
-                break hook_id;
+                return Some(hook_id.clone());
             }
-        };
+            None
+        })
+        .await;
         session
             .send(SessionCommand::PolicyAnswer {
                 hook_id: first_id,
@@ -1757,20 +1765,18 @@ async fn external_policy_gate_and_turn_end_row_32() {
             })
             .await
             .expect("the Continue answer resolves the pending hook");
-        let second_id = loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("events keep flowing")
-                .expect("event arrives");
+        let second_id = recv_until(&mut rx, "the second TurnEnd PolicyHook", |ev| {
             if let SerializableAgentEvent::PolicyHook {
                 hook_id, hook_kind, ..
-            } = ev.event
+            } = &ev.event
             {
                 assert_eq!(hook_id, "hook_2");
-                assert_eq!(hook_kind, HookKind::TurnEnd);
-                break hook_id;
+                assert_eq!(hook_kind, &HookKind::TurnEnd);
+                return Some(hook_id.clone());
             }
-        };
+            None
+        })
+        .await;
         session
             .send(SessionCommand::PolicyAnswer {
                 hook_id: second_id,
@@ -1830,14 +1836,10 @@ async fn external_policy_gate_and_turn_end_row_32() {
         // the (proceeded) host-tool call fired.
         let mut saw_hook = false;
         let mut saw_host_call = false;
-        loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("events keep flowing")
-                .expect("event arrives");
-            match ev.event {
+        recv_until(&mut rx, "the gate consult and the host-tool call", |ev| {
+            match &ev.event {
                 SerializableAgentEvent::PolicyHook { hook_kind, .. } => {
-                    assert_eq!(hook_kind, HookKind::ToolGate);
+                    assert_eq!(hook_kind, &HookKind::ToolGate);
                     saw_hook = true;
                 }
                 SerializableAgentEvent::HostToolCall { name, .. } => {
@@ -1846,10 +1848,9 @@ async fn external_policy_gate_and_turn_end_row_32() {
                 }
                 _ => {}
             }
-            if saw_hook && saw_host_call {
-                return;
-            }
-        }
+            (saw_hook && saw_host_call).then_some(())
+        })
+        .await;
     };
     let (outcome, ()) = tokio::join!(
         session.run_to_completion("check the weather — nobody will answer"),

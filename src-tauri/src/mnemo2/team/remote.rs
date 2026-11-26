@@ -56,6 +56,13 @@ const CATALOG_APPLY_WAIT: Duration = Duration::from_secs(30);
 /// heavy commands; six hours covers a cold build on a slow node.
 const CHECKS_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// How long a node call that runs git on the project may take.
+///
+/// These calls fetch a bundle, create a checkout or write a bundle, and can
+/// take minutes on a large repository or a busy node; the quick control calls
+/// keep [`CALL_TIMEOUT`] through [`node_call_timeout`].
+const GIT_CALL_TIMEOUT: Duration = mnemo::remote::hub::LONG_TIMEOUT;
+
 /// How long a sync may reuse its last answer without asking the node again.
 const SYNC_REUSE: Duration = Duration::from_secs(5);
 
@@ -68,6 +75,21 @@ const HOSTS_FILE: &str = "hosts.json";
 /// Every bundle the hub builds or receives lands here, under the team state
 /// dir (never the system temp folder).
 const BUNDLES_DIR: &str = "remote/bundles";
+
+/// How long one node call may take, chosen by the work the node does for it.
+///
+/// The git calls ([`mnemo::remote::repo::REPO_PUSH_END`],
+/// [`mnemo::remote::repo::CHECKOUT_PREPARE`] and
+/// [`mnemo::remote::repo::REPO_FETCH_BRANCH`]) get `GIT_CALL_TIMEOUT`; every
+/// other call is a quick control call and keeps `CALL_TIMEOUT`.
+pub(crate) fn node_call_timeout(method: &str) -> Duration {
+    match method {
+        mnemo::remote::repo::REPO_PUSH_END
+        | mnemo::remote::repo::CHECKOUT_PREPARE
+        | mnemo::remote::repo::REPO_FETCH_BRANCH => GIT_CALL_TIMEOUT,
+        _ => CALL_TIMEOUT,
+    }
+}
 
 /// One hub directory of paired worker nodes as the team sees it.
 ///
@@ -621,7 +643,7 @@ impl RemoteWorkers {
                 project: self.project.clone(),
                 want: vec![sha.to_string()],
             }),
-            CALL_TIMEOUT,
+            node_call_timeout(mnemo::remote::repo::REPO_HAVE),
         )
         .await
         .map_err(|error| format!("the worker host: {error}"))?;
@@ -668,7 +690,7 @@ impl RemoteWorkers {
                 size,
                 sha256: digest,
             }),
-            CALL_TIMEOUT,
+            node_call_timeout(mnemo::remote::repo::REPO_PUSH_BEGIN),
         )
         .await
         .map_err(|error| format!("the worker host: {error}"))?;
@@ -683,7 +705,7 @@ impl RemoteWorkers {
                     offset: offset as u64,
                     data,
                 }),
-                CALL_TIMEOUT,
+                node_call_timeout(mnemo::remote::repo::REPO_PUSH_CHUNK),
             )
             .await
             .map_err(|error| format!("the worker host: {error}"))?;
@@ -699,7 +721,7 @@ impl RemoteWorkers {
                     sha: sha.to_string(),
                 }],
             }),
-            CALL_TIMEOUT,
+            node_call_timeout(mnemo::remote::repo::REPO_PUSH_END),
         )
         .await
         .map_err(|error| format!("the worker host: {error}"))?;
@@ -736,7 +758,7 @@ impl RemoteWorkers {
                 base: base.to_string(),
                 keep_existing,
             }),
-            CALL_TIMEOUT,
+            node_call_timeout(mnemo::remote::repo::CHECKOUT_PREPARE),
         )
         .await
         .map_err(|error| host_error(&record.name, error))?;
@@ -860,7 +882,7 @@ impl RemoteWorkers {
             json!(RepoTip {
                 checkout: remote.checkout.clone(),
             }),
-            CALL_TIMEOUT,
+            node_call_timeout(mnemo::remote::repo::REPO_TIP),
         )
         .await
     }
@@ -976,7 +998,7 @@ impl RemoteWorkers {
                     branch: record.branch.clone(),
                     haves,
                 }),
-                CALL_TIMEOUT,
+                node_call_timeout(mnemo::remote::repo::REPO_FETCH_BRANCH),
             )
             .await
             .map_err(|error| host_error(&remote.node_name, error))?;
@@ -1131,7 +1153,7 @@ impl RemoteWorkers {
                 json!(CheckoutRelease {
                     checkout: remote.checkout.clone(),
                 }),
-                CALL_TIMEOUT,
+                node_call_timeout(mnemo::remote::repo::CHECKOUT_RELEASE),
             )
             .await
         {
@@ -1701,6 +1723,32 @@ mod tests {
         assert!(!requires_windows(&["cargo test --workspace".into()]));
         assert!(!requires_windows(&["npm run check --workspace mnemo2".into()]));
         assert!(!requires_windows(&[]));
+    }
+
+    /// A node call that runs git on the project may take minutes on a large
+    /// repository or a busy node; the quick control calls keep the short
+    /// timeout, so a dispatch does not hang on one.
+    #[test]
+    fn git_node_calls_use_the_long_timeout() {
+        use mnemo::remote::hub::{LONG_TIMEOUT, NODE_STATUS};
+        use mnemo::remote::repo::{
+            CHECKOUT_PREPARE, REPO_FETCH_BRANCH, REPO_HAVE, REPO_PUSH_CHUNK, REPO_PUSH_END,
+        };
+
+        for method in [REPO_PUSH_END, CHECKOUT_PREPARE, REPO_FETCH_BRANCH] {
+            assert_eq!(
+                node_call_timeout(method),
+                LONG_TIMEOUT,
+                "{method} runs git on the node and must not time out at 30 s"
+            );
+        }
+        for method in [REPO_HAVE, REPO_PUSH_CHUNK, NODE_STATUS] {
+            assert_eq!(
+                node_call_timeout(method),
+                CALL_TIMEOUT,
+                "{method} is a quick control call and keeps the short timeout"
+            );
+        }
     }
 
     #[test]

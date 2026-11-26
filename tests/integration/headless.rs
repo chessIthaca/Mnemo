@@ -18,6 +18,41 @@ use mnemo::provider::trace::{TraceActorKind, TraceIdentity};
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent, UserAnswer};
 use mnemo::workspace::Workspace;
 
+/// Receive events until `pick` returns a value — ONE overall 120 s deadline,
+/// not a per-receive budget: a loaded machine delays the pump, it never loses
+/// an event. A closed bus or an expired deadline panics naming `what`, so a
+/// missed event fails loudly instead of silently continuing.
+async fn recv_until<T, U>(
+    rx: &mut mnemo::headless::EventReceiver<T>,
+    what: &str,
+    mut pick: impl FnMut(&T) -> Option<U>,
+) -> U
+where
+    T: Clone,
+{
+    let received = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Some(found) = pick(&event) {
+                        return found;
+                    }
+                }
+                // A lagged subscriber skipped events by design; keep receiving.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => {
+                    panic!("the event bus closed while waiting for {what}")
+                }
+            }
+        }
+    })
+    .await;
+    match received {
+        Ok(found) => found,
+        Err(_) => panic!("timed out after 120 s waiting for {what}"),
+    }
+}
+
 /// Serialize → deserialize → re-serialize; the two JSON forms must be
 /// equal (exercises both serde directions without needing PartialEq on
 /// every type).
@@ -561,18 +596,18 @@ async fn run_to_completion_mock_provider() {
     assert_eq!(outcome.final_text, "hello world");
     let mut saw_started = false;
     let mut saw_finished = false;
-    while let Ok(event) =
-        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
-    {
-        match event.expect("event").event {
+    recv_until(&mut rx, "the stream's Finished event", |event| {
+        match &event.event {
             SerializableAgentEvent::Started => saw_started = true,
             SerializableAgentEvent::Finished { .. } => {
                 saw_finished = true;
-                break;
+                return Some(());
             }
             _ => {}
         }
-    }
+        None
+    })
+    .await;
     assert!(saw_started, "the stream shows Started");
     assert!(saw_finished, "the stream shows Finished");
 }
@@ -631,22 +666,20 @@ async fn two_subscribers_both_receive() {
         mut rx: mnemo::headless::EventReceiver<mnemo::headless::SessionEvent>,
     ) -> Vec<String> {
         let mut out = Vec::new();
-        while let Ok(ev) =
-            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
-        {
-            let ev = ev.expect("event");
+        recv_until(&mut rx, "the subscription's Finished event", |ev| {
             let kind = match &ev.event {
                 SerializableAgentEvent::Started => "started".to_string(),
                 SerializableAgentEvent::TextDelta { .. } => "text".to_string(),
                 SerializableAgentEvent::Finished { .. } => {
                     out.push("finished".to_string());
-                    break;
+                    return Some(std::mem::take(&mut out));
                 }
                 _ => "other".to_string(),
             };
             out.push(kind);
-        }
-        out
+            None
+        })
+        .await
     }
 
     let sa = drain_to_finished(a).await;
@@ -698,19 +731,22 @@ async fn steer_command_forwards_images_to_the_kernel() {
         .expect("steer");
     let mut injected: Vec<(String, Vec<String>)> = Vec::new();
     let mut finished = 0;
-    while finished < 2 {
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("the engine stayed responsive")
-            .expect("the bus stayed open");
-        match event.event {
+    recv_until(&mut rx, "the two Finished events", |event| {
+        match &event.event {
             SerializableAgentEvent::SuggestionInjected { text, images } => {
-                injected.push((text, images));
+                injected.push((text.clone(), images.clone()));
             }
-            SerializableAgentEvent::Finished { .. } => finished += 1,
+            SerializableAgentEvent::Finished { .. } => {
+                finished += 1;
+                if finished == 2 {
+                    return Some(());
+                }
+            }
             _ => {}
         }
-    }
+        None
+    })
+    .await;
     assert!(
         injected.iter().any(|(text, images)| {
             text == "a steer"
@@ -844,10 +880,8 @@ async fn override_permissions_runs_merge_push_without_approval() {
     let mut bypassed = 0;
     let mut approval_requested = false;
     let mut saw_tool_result = false;
-    while let Ok(ev) =
-        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
-    {
-        match ev.expect("event").event {
+    recv_until(&mut rx, "the turn's Finished event", |ev| {
+        match &ev.event {
             SerializableAgentEvent::ApprovalBypassed { tool, reason } => {
                 assert_eq!(tool, "git");
                 assert_eq!(reason, "core_op");
@@ -855,10 +889,12 @@ async fn override_permissions_runs_merge_push_without_approval() {
             }
             SerializableAgentEvent::ApprovalRequest { .. } => approval_requested = true,
             SerializableAgentEvent::ToolResult { .. } => saw_tool_result = true,
-            SerializableAgentEvent::Finished { .. } => break,
+            SerializableAgentEvent::Finished { .. } => return Some(()),
             _ => {}
         }
-    }
+        None
+    })
+    .await;
     assert_eq!(bypassed, 1, "exactly one bypass audit event");
     assert!(!approval_requested, "OverridePermissions never prompts");
     assert!(saw_tool_result, "the gated call executed directly");
@@ -899,26 +935,31 @@ async fn approve_via_api_prompts_and_honours_decision() {
         .await
         .expect("prompt");
     let mut approval_requested = false;
+    let request_id = recv_until(&mut rx, "the ApprovalRequest", |ev| {
+        if let SerializableAgentEvent::ApprovalRequest { tool_call_id, .. } = &ev.event {
+            approval_requested = true;
+            return Some(tool_call_id.clone());
+        }
+        None
+    })
+    .await;
+    session
+        .send(SessionCommand::Approve {
+            request_id,
+            decision: Approval::Approve,
+        })
+        .await
+        .expect("the approval resolves");
     let mut saw_tool_result = false;
-    while let Ok(ev) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
-    {
-        match ev.expect("event").event {
-            SerializableAgentEvent::ApprovalRequest { tool_call_id, .. } => {
-                approval_requested = true;
-                session
-                    .send(SessionCommand::Approve {
-                        request_id: tool_call_id,
-                        decision: Approval::Approve,
-                    })
-                    .await
-                    .expect("the approval resolves");
-            }
+    recv_until(&mut rx, "the approved call's Finished event", |ev| {
+        match &ev.event {
             SerializableAgentEvent::ToolResult { .. } => saw_tool_result = true,
-            SerializableAgentEvent::Finished { .. } => break,
+            SerializableAgentEvent::Finished { .. } => return Some(()),
             _ => {}
         }
-    }
+        None
+    })
+    .await;
     assert!(approval_requested, "ApproveViaApi surfaces the request");
     assert!(saw_tool_result, "the approved call executed");
 }
@@ -941,16 +982,13 @@ async fn free_agent_writes_no_plans() {
         .run_to_completion("write the stack")
         .await
         .expect("the turn completes");
-    let mut refusal: Option<(bool, String)> = None;
-    while let Ok(ev) =
-        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
-    {
-        if let SerializableAgentEvent::ToolResult { result, .. } = ev.expect("event").event {
-            refusal = Some((result.success, result.output));
-            break;
+    let (success, output) = recv_until(&mut rx, "the file_write ToolResult", |ev| {
+        if let SerializableAgentEvent::ToolResult { result, .. } = &ev.event {
+            return Some((result.success, result.output.clone()));
         }
-    }
-    let (success, output) = refusal.expect("the file_write call produced a result");
+        None
+    })
+    .await;
     assert!(!success, "the plan write is refused: {output}");
     assert!(
         !root.path().join(".coding/plans/stack.json").exists(),
@@ -1357,7 +1395,10 @@ async fn classifier_setup_flip_reaches_the_live_config_before_the_guard() {
         .classifier_setup(false)
         .await
         .expect("the disable leg");
-    let _ = rx.recv().await; // the terminal Done
+    recv_until(&mut rx, "the classifier setup's Done event", |event| {
+        matches!(event, mnemo::headless::SetupEvent::Done { .. }).then_some(())
+    })
+    .await;
     assert_eq!(
         live.live_laya_enabled().await,
         Some(false),
